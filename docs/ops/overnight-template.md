@@ -102,6 +102,52 @@ node_modules, does not). `frontend/vitest.config.ts` inlines both SDK packages
 to route them through Vite's resolver. Two instruments, one green and one red,
 on the same tree — which is the whole argument for having two.
 
+### Running unattended while 1Password is locked
+
+The question to ask of every credential is not "is it available now" but "is it
+available at 03:00 with the laptop locked and 1Password sealed". Audited
+empirically, not by reading config:
+
+| dependency | needs 1Password? | how it was checked |
+|---|---|---|
+| ssh to the deploy host | **no** | dedicated passphraseless key + `IdentitiesOnly yes`. Authenticates with `SSH_AUTH_SOCK` unset, pointed at a nonexistent socket, and pointed at the empty launchd agent |
+| `git push` / `gh` / PR / merge | **no** | token lives in the **macOS keychain** (`gh auth status` → `keyring`, `credential.helper=osxkeychain`), unlocked for the whole login session. `git ls-remote` succeeds with no ssh agent |
+| reading a secret mid-run | **no** | the deploy host's `.env` is already provisioned, so nothing needs minting or fetching. `grep` for `op`/1Password across `scripts/`, `Makefile`, CI, and the overnight-run scripts returns nothing |
+| **GPG signing** | **effectively yes** | hardware token via `pinentry-mac`. This is the one that breaks — see below |
+
+**`OVERNIGHT_GPG_BLOCKING=0` does not do what it reads like it does.** It is
+consulted by `preflight.sh`, once, before any work — and nothing consults it
+again. At commit time git tries to sign regardless, gpg answers `signing
+failed: No secret key`, and git exits `fatal: failed to write commit object`.
+So a run configured to *tolerate* a locked token still dies at its first
+commit, having done the work and pushed none of it. Unpushed worktree state is
+the one thing a shutdown cannot recover.
+
+Verified by pointing `GNUPGHOME` at an empty directory: the signed commit fails
+exactly as above, and the same commit with `commit.gpgsign=false` succeeds and
+produces an unsigned (`N`) commit.
+
+**Use `scripts/overnight-commit.sh` instead of `git commit`.** It tries signed,
+falls back to unsigned *only* when `OVERNIGHT_GPG_BLOCKING=0`, and stops when
+it is `1` — the setting finally meaning what it says at the moment it matters.
+An unsigned commit prints a notice that belongs in the PR body: it shows as
+unverified on GitHub permanently, and rewriting history after a merge costs
+more than a re-sign now.
+
+It reads the environment in preference to `.overnight.conf`, which is the
+documented rule and which the first version got backwards — `set -a; . conf`
+overwrites what is already exported, so an environment `OVERNIGHT_GPG_BLOCKING=1`
+was replaced by the file's `0` and the stop condition committed unsigned
+instead of stopping.
+
+**Smoke-testing a deployed stack needs no credential.** Run
+`scripts/smoke.sh --base <url> --no-login` — 9 of the 11 checks need no
+authentication, and the two that do would otherwise require an admin password
+the run has no unattended way to obtain. Do not put that password anywhere the
+run can read it just to get two more checks.
+
+---
+
 ### Deploy access
 
 **`docker` works without `sudo`.** The deploy user was initially not in the
