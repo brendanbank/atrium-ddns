@@ -843,19 +843,42 @@ before a deploy is silently a different schema. The importer reads the live
 file out of the `dyndns-route53_dyndns-data` volume, and asserts the column set
 before it starts.
 
-**Three consequences for the migration.**
+**The six non-admin rows are not people. They are devices.**
 
-1. **Legacy users have no email address.** The `users` table is keyed by
-   `username`; atrium's is keyed by email and requires one. Six accounts need an
-   address that does not exist anywhere in the source data. That is an operator
-   decision, not something an importer should invent — see §6.
-2. **The one-device-per-user invariant is cheap here.** Six devices, the largest
-   carrying four hostnames. The admin has none and needs no device — it becomes
-   an atrium super_admin and nothing else.
-3. **`web_login=0` for every non-admin user.** None of them can use the legacy
-   web UI today, so nothing is lost by them not having atrium logins on day one.
-   It also means the DDNS credential is the *only* thing they have, which is
-   exactly what makes carrying the bcrypt hashes verbatim non-negotiable.
+Confirmed by the operator, 2026-08-15, and it is the most important fact about
+this migration. The legacy service had no device concept, so it used the
+`users` table for one: each of those six rows is a router with a username and a
+password that updates DNS, not a person with an account.
+
+Everything the data shows agrees. All six have `web_login=0` — none of them can
+log into the legacy web UI, and never could. Each owns a disjoint set of
+hostnames. None has an email address, because none was ever going to receive
+mail.
+
+**So the migration is:**
+
+| legacy | becomes |
+|---|---|
+| 1 `admin` row (`web_login=1`, 0 hostnames) | **1 atrium user** — a real person |
+| 6 non-admin rows | **6 `ddns_device` rows**, owned by that user |
+| 11 hostnames | assigned to the device that already owns them |
+| 1 domain | owned by that user |
+
+**This dissolves the email problem entirely.** Devices have no email address and
+need none; only the one real account does. The question of what to synthesise
+for six unreachable mailboxes does not arise — it was an artefact of reading the
+legacy schema literally instead of reading what it was being used for.
+
+**And it retires the invariant in §3.3.** There is no risk of splitting a
+legacy user's hostnames across devices, because a legacy row *is* a device and
+its hostnames come with it. Carrying the bcrypt hash verbatim stays
+non-negotiable for the same reason as before: that hash is the credential a
+router in the field is configured with.
+
+**A design note worth keeping.** The legacy data was already device-shaped; it
+just lacked a table to say so. That is corroboration for the model in §3.1
+rather than a coincidence — the concept was there, unnamed, being carried by a
+table that did not fit it.
 
 **The traffic is IPv6-first — but measure it with the right instrument.**
 
@@ -1109,12 +1132,9 @@ These are the operator's, and a run should not start without them.
    host's config namespace. Affordable now the store is MySQL rather than the
    old SQLite file, and pruned by a scheduled job rather than on the write path
    (§3.4).
-11. **What email address do the six legacy users get?** Their accounts are keyed
-   by username; atrium requires an email and there is none in the source data
-   (§3.3.1). Synthesised (`<username>@<domain>`) leaves six addresses that
-   cannot receive mail — password reset and verification both dead-end.
-   Real addresses need collecting from the people. Deferred to V1M4, but it
-   gates the importer.
+11. ~~What email address do the six legacy users get?~~ — **dissolved, not
+   decided.** They are not users; they are devices (§3.3.1). Devices need no
+   email. Only the single real admin account does.
 12. ~~Deploy host and cutover policy~~ — **decided: run beside the existing
    service on port 8443.** Both stacks live on the host during the development
    phase; the old one keeps serving until the exit criterion is demonstrated.
