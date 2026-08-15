@@ -94,7 +94,8 @@ define CHECK_FRESH
 endef
 
 .PHONY: help dev-bootstrap up down build logs ps migrate \
-	seed-admin seed-bundle test test-frontend test-backend test-compat \
+	seed-admin seed-bundle seed-compat-fixture verify-compat-rehash \
+	test test-frontend test-backend test-compat \
 	check-fresh check-compat-fresh check-backend-fresh check-host-pkg-fresh \
 	test-backend-serial test-backend-file typecheck smoke
 
@@ -136,6 +137,27 @@ seed-admin:  ## seed a super_admin (EMAIL=... PASSWORD=... [FULL_NAME=...])
 
 seed-bundle:  ## point system.host_bundle_url at /host/main.js
 	$(COMPOSE) exec -T api python -m atrium_ddns.scripts.seed_host_bundle /host/main.js
+
+# The frozen table's `fixture:` world, read out of protocol_cases.yaml
+# itself rather than restated — see the script's docstring for the four
+# schema mappings and why each is a decision.
+#
+# `tests/compat/conftest.py` builds no fixture and says so; without this
+# target `make test-compat TARGET=host` answers `nohost` to every case
+# that resolves a hostname, which reads exactly like a compatibility
+# finding. Freshness-gated for the same reason `test-compat` is: seeding
+# from a stale copy of the table produces a world the runner's own copy
+# does not describe.
+#
+# Needs ATRIUM_DDNS_COMPAT_STUB=1 in the api container's environment
+# (compose.yaml passes it through); the script refuses rather than
+# seeding a world whose backends nothing can resolve.
+seed-compat-fixture: check-compat-fresh  ## seed the frozen table's fixture world
+	$(COMPOSE) exec -T api /opt/venv/bin/python -m atrium_ddns.scripts.seed_compat_fixture
+
+verify-compat-rehash:  ## print each fixture device's stored hash SHAPE (never the hash)
+	$(COMPOSE) exec -T api /opt/venv/bin/python \
+	  -m atrium_ddns.scripts.seed_compat_fixture --verify-rehash
 
 # Tests. Test tooling is baked into the Dockerfile's `dev` stage
 # (compose builds api with `target: dev`), so there is no per-run pip
