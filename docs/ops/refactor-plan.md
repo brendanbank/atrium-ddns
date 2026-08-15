@@ -27,15 +27,19 @@ them.
 
 - **`Content-Type` is not always `text/plain`.** `/nic/checkip` in its default
   mode answers `text/html; charset=utf-8`, which the very next table in this
-  section says and the sentence above it contradicted. 13 of the frozen table's
-  114 cases are `checkip` cases and 5 of them assert `text/html`.
+  section says and the sentence above it contradicted. 15 of the frozen table's
+  131 cases are `checkip` cases and **7** of them assert `text/html`. (This row
+  read "13 of 114 … and 5" at v2. 13 was right; 5 was not — counted from the
+  data, v2 had 6, the sixth being `checkip-post-is-405-with-an-html-body`,
+  whose HTML is Werkzeug's error page rather than the service's own. #29
+  re-derived both numbers and corrected the second.)
 - **Not every response is 200.** A non-`GET` request answers 405 before any
   handler runs (divergence 7 below). Measured against a throwaway legacy
   instance: `POST`, `PUT`, `DELETE` and `PATCH` on `/nic/update` and `POST` on
   `/nic/checkip` all answer `405`, `text/html; charset=utf-8`, 153 bytes.
 
 The claim that survives is the load-bearing one: **on the `GET` path the status
-is always 200**, `badauth` included. 105 of the table's 114 cases are `GET` and
+is always 200**, `badauth` included. 122 of the table's 131 cases are `GET` and
 every one of them expects 200; the other 9 exist to assert the 405 and the
 `HEAD` decision, and before they were written the "always 200" claim was
 unfalsifiable from inside the table.
@@ -244,7 +248,7 @@ Four things decided it:
   changes is the cost line: V1M2 has to write a deliberate `HEAD` handler (or
   stop the SPA mount shadowing `/nic/*`), because the framework's own refusal
   does not survive the mount. Recorded in the table's `frozen.known_gaps`.
-- **Nothing in the field sends it.** 105 of the 114 cases in the table are
+- **Nothing in the field sends it.** 122 of the 131 cases in the table are
   `GET`; the other 9 — 5 `HEAD`, 4 `POST` — exist to assert this decision and
   divergence 7. ddclient, inadyn, OPNsense and Fritz!Box send `GET`.
 - **The realistic sender is a monitor, and the failure is worse than "an extra
@@ -336,9 +340,14 @@ rather than quoting one:
 
 `tests/compat/baseline.md` is the reading, with both instruments, the five
 mutations that produced the predicted red sets, and what is still not measured.
-The table is **frozen at version 2** (`frozen:` block, guarded by
-`test_the_table_is_frozen_at_its_recorded_shape`), so V1M2 is measured against
-a file that cannot change without a PR that says so.
+The table is **frozen at version 3, 131 cases** (`frozen:` block, guarded by
+`test_the_table_is_frozen_at_its_recorded_shape` and, since #29, by
+`test_the_version_advances_exactly_when_the_data_does`), so V1M2 is measured
+against a file that cannot change without a PR that says so. Version 2 was
+#11's 114-case freeze; #29 took it to 131 for address-family coverage, before
+the router work (#16) is measured against it rather than after, and changed
+none of the 114 — 0 removed and 0 modified, checked case by case on the parsed
+lists.
 
 The old repo's **147** pytest tests are a second source — 121 in `test_app.py`
 plus 26 in `test_hetzner.py`, agreed exactly by `pytest --collect-only` and by
@@ -350,12 +359,14 @@ contents, or Bootstrap markup — atrium owns that surface now.
 ### What the frozen table does not cover — named at freeze time
 
 A contract that overstates its own reach is worse than a narrow one, so the
-gaps are part of §1 rather than a footnote in the test directory. All four are
-in the table's own `frozen.known_gaps`, and all four were measured by #11:
+gaps are part of §1 rather than a footnote in the test directory. All of them
+are in the table's own `frozen.known_gaps`; the first four were measured by
+#11 at v2, and #29 re-measured them at v3 and added two.
 
-- **`effects:` is data, not an assertion.** 15 cases carry a DNS operation or a
-  persisted column; no runner asserts either. The runner prints the count every
-  run so the gap stays a number rather than an assumption.
+- **`effects:` is data, not an assertion.** 25 cases carry a DNS operation or a
+  persisted column (15 at v2); no runner asserts either. The runner prints the
+  selected count every run so the gap stays a number rather than an assumption.
+  #29 measured how big it is: see the last row of this list.
 - **3 cases are not executable over the wire.** `rate_limited: true` is a
   precondition, not a request. They are skipped with the precondition named and
   measured separately — and the measurement is only worth having because the
@@ -371,14 +382,31 @@ in the table's own `frozen.known_gaps`, and all four were measured by #11:
   yet, and the 2 greens are not coverage. The two host `HEAD` cases do **not**
   pass vacuously (they expect 405 and the catch-all answers 404), so the
   overstatement is exactly 2 and not 4.
-- **The table is weighted against the traffic it protects.** 104 of 114 cases
-  are IPv4-only and 4 touch IPv6, measured from the table's `myip`, `client_ip`
-  and expected bodies. §3.3.1 measured production at **143 IPv4 / 305 IPv6**
-  events and concluded, before anyone checked, that "a table exercising `A`
-  thoroughly and `AAAA` once is testing the wrong record type". It was
-  describing this table. The divergence count is unaffected — the document says
-  nothing family-specific — but the *coverage* claim is, and V1M2 inherits it
-  as a known gap rather than discovering it.
+- **The table was weighted against the traffic it protects — closed by #29,
+  which took the table to v3 at 131 cases.** At v2, 4 of 114 cases touched
+  IPv6 against production traffic measured at **143 IPv4 / 305 IPv6** events
+  (§3.3.1), and §3.3.1 had already concluded, before anyone checked, that "a
+  table exercising `A` thoroughly and `AAAA` once is testing the wrong record
+  type". It was describing this table. At v3, 20 of 131 cases touch IPv6 —
+  **15.3%, not 68%, and deliberately not**: #29 replayed every legacy-selected
+  executable case against a throwaway legacy instance twice, once as spelled
+  and once with every IPv4 literal swapped for an IPv6 one, and found that only
+  36 of 104 could change a byte of the reply. Coverage is therefore stated per
+  *mechanism* rather than as a share of the table: IPv6 now covers **5 of 5**
+  update status tokens (1 of 5 at v2), **2 of 2** `checkip` formats (1 of 2),
+  and **3 of 3** family-specific parse refusals (0 of 3). The divergence count
+  is unaffected either way — the document says nothing family-specific — and
+  the spec-row count is unchanged at 37, which is the same fact seen from the
+  data: the gap was never a missing row of §1.
+- **The record type is invisible on the wire, and no case table can fix that.**
+  Found by #29 while closing the row above. `getiptype` was mutated on a
+  throwaway instance to answer `A` for every address — every `AAAA` the service
+  would write became an `A` — and the whole 131-case table ran **121 executed,
+  0 failed**. `/nic/update` echoes the normalised *address*, never the record
+  type; `/nic/delete` echoes neither (divergence 1), so all 36 of its cases are
+  byte-identical between families. V1M2's router work is measured on the
+  address, not the record — asserting the record needs the `effects:`
+  assertion the first gap in this list names.
 
 ---
 

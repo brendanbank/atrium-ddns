@@ -197,6 +197,13 @@ hashes the same as #9's did): **107 selected, 104 executed, 104 pass, 0 fail.**
 The 9 additional legacy-selected cases are the ones that carry D7, D8, D9 and
 the `HEAD` finding, and all 9 agree with what was measured by hand first.
 
+**#29 re-ran it again at v3, on a third independently built fixture**, and got
+the same 16 file digests a third time: **124 selected, 121 executed, 121 pass,
+0 fail.** The 17 new cases are the address-family ones (below); every one was
+measured against the legacy service first — request, exact body, DNS operation
+and the `last_ip_*` columns before and after — and only then written into the
+table. `baseline.md` §7 is the reading.
+
 ### The new cases bite — five mutations, five predictions
 
 A case written from a measurement and then asserted against the same service is
@@ -342,12 +349,18 @@ exist yet — and the other 3 are skipped, not red, which is a third state and
 not a quieter kind of failure. (The earlier version of this block, taken on `8_overnight` with a
 101-case table, read `101 selected / 98 failed / 3 skipped` and `0 excluded`.)
 
+At v3 (#29) the same block reads `131 / 4 excluded / 127 selected / 3 unmet /
+124 executable`, and against the legacy service `131 / 7 excluded / 124
+selected / 3 unmet / 121 executable / 23 wire-only`. `wire-only` moved 15 → 23
+because 8 of the 17 new cases carry an `effects:` block — the number the runner
+prints so the unasserted gap stays a number.
+
 `selected` is what the table offers; `ran this session` is what pytest actually
 executed, counted from its own report objects. They are two numbers on purpose
 — a `-k` filter or a collection that stopped early shows up as a `NOT RUN`
 line rather than as a run that says 98 and did twelve.
 
-Six guards (seven tests — the partition one runs per target) need no service
+Eight guards (nine tests — the partition one runs per target) need no service
 and fail loudly rather than letting the run shrink:
 
 | guard | fails when |
@@ -358,19 +371,27 @@ and fail loudly rather than letting the run shrink:
 | `test_no_url_shape_inference` | a loopback literal appears in `conftest.py` — comments included |
 | `test_request_building_cannot_depend_on_the_target` | `build_request` grows a `target` parameter, i.e. a per-target request |
 | `test_every_case_builds_a_request` | any case in the table, either target, stops turning into a request |
+| `test_the_table_is_frozen_at_its_recorded_shape` | any of the four `frozen:` readings stops describing the table |
+| `test_the_version_advances_exactly_when_the_data_does` | (#29) a re-freeze bumps `version` over an unchanged table, or moves the data past `frozen.previous` without bumping. It does **not** see a change made at the *current* version — see below |
 
 ### Collected-case readings
 
 Taken on `25_overnight`, not inherited. Two instruments, and the runner's own
 collection is the second one:
 
-| instrument | `--target legacy` | `--target host` |
-|---|---|---|
-| `pytest --collect-only`, `test_case[...]` nodes | 107 | 110 |
-| PyYAML over `cases`, filtered on `targets` | 107 | 110 |
+| instrument | `--target legacy` | `--target host` | branch |
+|---|---|---|---|
+| `pytest --collect-only`, `test_case[...]` nodes | 107 | 110 | `25_overnight` |
+| PyYAML over `cases`, filtered on `targets` | 107 | 110 | `25_overnight` |
+| `pytest --collect-only`, `test_case[...]` nodes | **124** | **127** | `29_overnight` |
+| PyYAML over `cases`, filtered on `targets` | **124** | **127** | `29_overnight` |
 
-114 in the table: **103 shared, 4 legacy-only, 7 host-only**; 11
+114 in the table at v2: **103 shared, 4 legacy-only, 7 host-only**; 11
 `deleted_cases`, 0 of them collected. `grep -c '^  - id:'` = 125 = 114 + 11.
+
+131 at v3 (#29): **120 shared, 4 legacy-only, 7 host-only** — all 17 additions
+are shared, because none of them is about a framework's rendering. 11
+`deleted_cases`, still 0 collected; `grep -c '^  - id:'` = 142 = 131 + 11.
 
 `legacy`-only is new in #25 and the asymmetry is deliberate: four cases assert
 what Werkzeug renders (a 405 error page, a `HEAD` that runs the handler) and
@@ -460,6 +481,127 @@ Divergence 6 is preserved for divergence 5's reason: both spellings already end
 at `nohost`, so preserving costs nothing, while "fixing" it would turn a
 per-hostname `nohost` line into a whole-request `notfqdn` — a behaviour change
 for a case nobody hits.
+
+## Address family — where it reaches the wire, and where it cannot
+
+*Added by #29, which took the table from v2 to v3. The gap was named in
+`frozen.known_gaps` at v2 and in plan §1; this is the measurement that closed
+as much of it as a wire table can close.*
+
+Production traffic is **143 IPv4 / 305 IPv6** events (plan §3.3.1, from
+`events.ip_address`). The v2 table was 4 cases touching IPv6 out of 114. The
+obvious response — add v6 cases until the table's ratio looks like the
+traffic's — is wrong, and the reason is measurable rather than aesthetic.
+
+**Which cases can the family reach at all?** Every legacy-selected executable
+case was replayed twice against a throwaway legacy instance: once as the table
+spells it, once with every IPv4 literal in `query` / `client_ip` / `headers`
+swapped for an IPv6 one, comparing status, content-type and body bytes. At v2,
+of 104 executable cases:
+
+| | |
+|---|---:|
+| the reply **changed** | 36 |
+| swapped, reply **identical** | 63 |
+| no IPv4 literal to swap | 5 |
+
+Three states, not two: *"there was nothing to swap"* is not *"swapping changed
+nothing"*, and collapsing them would have inflated the second number by five.
+
+So 68 of 104 cases sit on paths where the address family cannot alter a byte of
+the response — `badauth` and `abuse` return before any address is parsed,
+`notfqdn` returns after `myip` is validated but carries no address, and **every
+single `/nic/delete` case** answers identically because delete's replies carry
+no IP suffix at all (divergence 1). A v6 counterpart for any of those is
+padding.
+
+**Where it does reach the wire, it reaches through three mechanisms**, and
+coverage is stated per mechanism because 36 near-identical IPv4 update cases
+cover one mechanism 36 times, not IPv4 36 times:
+
+| mechanism | IPv6 at v2 | IPv6 at v3 |
+|---|---|---|
+| `/nic/update` interpolates the address after a status token | 1 of 5 tokens (`good`) | **5 of 5** (`good`, `nochg`, `nohost`, `911`, `dnserr`) |
+| `/nic/checkip` echoes it | 1 of 2 formats (`plain`) | **2 of 2** (`plain`, `html`) |
+| `myip` parse **refusals** differ per family | 0 IPv6-shaped against 3 IPv4-shaped | **3 against 3** |
+
+That is the ratio the table is defended on: **15.3% of cases (20 of 131) touch
+IPv6, and 100% of the wire-visible family-sensitive mechanisms are covered in
+both families.** Reaching 68% would have meant roughly thirty more cases
+repeating mechanisms already covered twice over.
+
+**Four of the v6 cases have no IPv4 analogue at all**, and they are the ones
+worth knowing about, because each is a place where a rewrite silently diverges
+and nothing else notices:
+
+- `update-myip-ipv4-mapped-ipv6-stays-an-aaaa-record` — `::ffff:192.0.2.1` is
+  an `IPv6Address`, so `getiptype` answers `AAAA` and the body keeps the mapped
+  spelling. Calling `.ipv4_mapped` changes the body; dispatching on "contains a
+  dot" changes the record type. Both are plausible and both fail here.
+- `update-myip-ipv6-with-embedded-ipv4-is-renormalised` — `64:ff9b::192.0.2.33`
+  comes back as `64:ff9b::c000:221`. The existing normalisation case
+  (`2001:0DB8:0000::1`) can be passed by lowercase-and-compress; this one
+  cannot.
+- `update-myip-ipv6-scope-id-round-trips` — `fe80::1%eth0` is accepted and the
+  zone survives into the body. A stricter validator answers `911`.
+- `update-911-myip-ipv6-with-prefix-length` and
+  `update-911-myip-ipv6-shaped-but-unparseable` — the refusal surface. An
+  implementation whose v4 parser rejects `/32` while its v6 parser falls back
+  to `ip_network` passes the v4 case and fails the v6 one.
+
+**Balancing families means pairing them, not counting them.** One of the 17
+additions is deliberately IPv4: `update-ipv4-persists-last-ip-v4-not-v6`. The
+v2 table asserted `last_ip_v4: unchanged` on a v6 update and nothing asserted
+the mirror, so a host writing **both** columns on every update passed the
+frozen table.
+
+### The record type is invisible on the wire, on both endpoints
+
+This is the honest limit of the whole exercise, and it was measured rather than
+argued. `getiptype` was mutated on a throwaway copy to answer `A` for every
+address — so every `AAAA` the service would have written became an `A` — and
+the whole v3 table was run against it: **121 executed, 0 failed.**
+
+Update's replies carry the normalised **address**, never the record type;
+delete's carry neither. So the family cases in this table assert *parsing,
+normalisation and echo*, which is real, and assert nothing at all about which
+record gets written. A host that echoes `good 2001:db8::1` and writes an `A`
+passes every case here.
+
+That is why `/nic/delete` got 2 of the 17 additions and not a proportional
+share. Of its 36 executable cases at v2, the swap changed **zero** replies while
+the DNS operation underneath changed `rtype` from `A` to `AAAA` — read from the
+stub provider's own call log, not inferred. The two added are one for the v6
+parse branch, which delete reaches through its own `if myip:` block that
+update's cases never execute, and
+`delete-myip-ipv4-mapped-ipv6-deletes-aaaa-only`, whose own `note:` says in as
+many words that it cannot fail on the wire. Closing this needs an `effects:`
+assertion — the first entry in `frozen.known_gaps` — not more rows.
+
+### The new cases bite — five mutations, five predictions
+
+Each applied to a **fresh copy** of the legacy service on its own port and
+database, the whole v3 table run against it, and the copy deleted. The red set
+was predicted before each run. **5 applied, 5 exact.**
+
+| mutation | predicted red | actual red |
+|---|---|---|
+| M-A `getiptype` always answers `A` | **0** — nothing on the wire carries the record type | **0** of 121 |
+| M-B `update` unwraps an IPv4-mapped v6 before echoing it | 1 | **1** — `update-myip-ipv4-mapped-ipv6-stays-an-aaaa-record` |
+| M-C `getip` refuses a scoped IPv6 literal | 1 | **1** — `update-myip-ipv6-scope-id-round-trips` |
+| M-D `getip` falls back to `ip_network` for a prefixed address | 2 | **2** — `update-911-myip-with-prefix-length` **and** the new `-ipv6-` twin |
+| M-E `checkip` unwraps an IPv4-mapped v6 before echoing it | 1 | **1** — `checkip-ipv4-mapped-ipv6-is-not-unwrapped` |
+
+**M-A is the one that argues against its own additions, and it is reported that
+way.** A prediction of zero is only worth making because it is falsifiable —
+had any case gone red, the record type would have been observable somewhere and
+the `effects:` gap smaller than claimed. It went 0 of 121.
+
+**M-D is the one that justifies the pair.** The v4 case and the v6 case both go
+red, because a fallback to `ip_network` is not family-specific — but an
+implementation that reached for it *only* in the v6 branch, which is the
+plausible mistake, would show up as one red and not two. Two cases can tell
+those apart; one cannot.
 
 ## The one thing this table does not preserve, and why
 
@@ -606,15 +748,21 @@ Readings, each taken on the branch that took them and none of them inherited:
 | `grep -c` | 101 | 11 | 112 | `7_overnight` |
 | PyYAML `len()` | **114** | 11 | — | `25_overnight` |
 | `grep -c` | **114** | 11 | **125** | `25_overnight` |
+| PyYAML `len()` | **131** | 11 | — | `29_overnight` |
+| `grep -c` | **131** | 11 | **142** | `29_overnight` |
 
-114 + 11 = 125. Coverage checked from the data: 37 `spec_rows`, **0 uncovered**,
+131 + 11 = 142. Coverage checked from the data: 37 `spec_rows`, **0 uncovered**,
 0 `covers` entries naming a row that does not exist, 0 duplicate ids, 0 cases
-without an `expect.body`, 0 `deleted_cases` carrying an `expect`.
+without an `expect.body`, 0 `deleted_cases` carrying an `expect`. `spec_rows` is
+unchanged at 37 across the v3 additions, and that is itself a reading: the
+address-family gap was never a missing *row* of §1 — the document says nothing
+family-specific — so the 17 new cases map onto rows that already existed.
 
-By endpoint: `/nic/update` 62, `/nic/delete` 39, `/nic/checkip` 13. By method:
-`GET` 105, `HEAD` 5, `POST` 4 — the 9 non-`GET` cases are #25's, and before
-them the table's own divergence 4 ("everything is HTTP 200") was unfalsifiable
-from inside the table, because every case in it was a `GET`.
+By endpoint, v3: `/nic/update` 75, `/nic/delete` 41, `/nic/checkip` 15 (v2:
+62 / 39 / 13). By method: `GET` 122, `HEAD` 5, `POST` 4 — the 9 non-`GET` cases
+are #25's, and before them the table's own divergence 4 ("everything is HTTP
+200") was unfalsifiable from inside the table, because every case in it was a
+`GET`.
 
 **The delta from 101 is +13, and it is not "three divergences, three cases".**
 D7 takes 4 (a legacy/host pair per endpoint, because only the status is shared
@@ -832,7 +980,7 @@ what was being run.
 The requirement now fires at **collection of the wire cases** instead. Without
 `--target`, `test_case` is collected as one skip named
 `NO-TARGET-GIVEN-WIRE-TABLE-NOT-RUN`, every service-free guard runs, and the
-session prints *"the wire table was NOT RUN (0 of 114 cases executed)"* rather
+session prints *"the wire table was NOT RUN (0 of 131 cases executed)"* rather
 than a zeroed accounting block that reads like a clean run. What did **not**
 change: no wire case can execute without an explicit target, and a `--base-url`
 with no `--target` is still refused outright with exit 4 — that one is not a
@@ -841,11 +989,15 @@ sibling suite being swept up, it is a service nobody named.
 subprocess, because a runner cannot assert its own exit code.
 
 Going the other way, `pytest tests/compat --target host` collects these 18
-alongside the wire runner's 117 (110 cases + 7 guards) and the 6 contract
-tests, for 141. The runner's own accounting block is unaffected — it reports
-114 cases, 110 selected, 3 unmet preconditions, 15 wire-only — because it
-counts the table, not the session. (The same numbers read 108 / 126 and
-101 / 11 at #10, and 108 / 132 at #23; the table grew to 114 in #25.)
+alongside the wire runner's **136** (127 cases + 9 guards) and the 6 contract
+tests, for **160** — measured on `29_overnight`. The runner's own accounting
+block is unaffected — it reports 131 cases, 127 selected, 3 unmet
+preconditions — because it counts the table, not the session. (The same numbers
+read 108 / 126 and 101 / 11 at #10, 108 / 132 at #23, 141 with 110 cases + 7
+guards at #25, and 114 cases at #11's freeze. The guard count went 6 → 7 when
+#11 added the freeze guard and 7 → 8 when #29 added the version guard;
+`test_target_selection_partitions_the_table` is parametrised per target, so
+eight functions present as **nine** nodes, with a target and without.)
 
 ## In the gate
 
@@ -855,7 +1007,7 @@ half unconditionally, the wire table not at all.
 | | runs | how |
 |---|---|---|
 | model guards + runner guards + runner contract | every `make test-backend`, so every gate run | `tests/` is COPYed into the Dockerfile's `dev` stage at `/opt/compat_tests`; `make test-backend` runs a second pytest session over it |
-| the 114-case wire table | never automatically | `make test-compat TARGET=legacy\|host BASE_URL=<url>` — both required, neither defaulted |
+| the 131-case wire table | never automatically | `make test-compat TARGET=legacy\|host BASE_URL=<url>` — both required, neither defaulted |
 
 `make test-compat` is deliberately outside `make test` and outside the gate: it
 needs a live service, and which service it is has to be stated. Giving either
