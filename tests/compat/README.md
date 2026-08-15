@@ -384,3 +384,257 @@ is built").
 
 That is a partial calibration and is reported as such: it exercises the
 validation layer, not the resolution or aggregation layers.
+
+---
+
+<!-- BEGIN legacy_behaviour (issue #10) — keep edits inside this block -->
+
+# Model behaviour: `legacy_behaviour/`
+
+`protocol_cases.yaml` owns the **wire**. `legacy_behaviour/` owns the **model** —
+everything about the legacy service that survives the rewrite and that a runner
+pointed at a base URL cannot see.
+
+The two never assert the same thing, and that is enforced rather than intended:
+`test_legacy_behaviour.py` fails if a model case's `then` reduces to a DynDNS
+status token, if a model case grows any of the wire table's schema
+(`expect`, `path`, `query`, `auth`, `client_ip`, `headers`, `targets`), or if a
+case id collides with one in `protocol_cases.yaml`.
+
+| file | what it is |
+|---|---|
+| `model_cases.yaml` | 81 model-behaviour rules. Data only, same discipline as the wire table |
+| `legacy_inventory.yaml` | **the drop list.** All 147 legacy tests, each with a disposition |
+| `test_legacy_behaviour.py` | 18 guards on those two files |
+| `calibrate_against_legacy.py` | replays the rules against the legacy implementation. Not a pytest module — see below |
+
+## The drop list
+
+Every test in `dyndns-route53`'s suite appears in `legacy_inventory.yaml`
+exactly once, with either `disposition: ported` and the model cases it became,
+or `disposition: dropped` and one of three reasons. **A silent drop is
+indistinguishable from an oversight**, so the file is the record that each of
+the 147 decisions was taken.
+
+| | | |
+|---|---:|---|
+| **ported** | 67 | became one or more model cases |
+| dropped — `atrium-owns` | 34 | auth, sessions, TOTP, user CRUD, roles, boot-time admin. Atrium ships all of it |
+| dropped — `flask-internal` | 27 | a template, a redirect, a flash message, a static file, or a form POST whose only surviving content is "a row was inserted" |
+| dropped — `superseded-by-table` | 19 | already owned, byte-for-byte and more thoroughly, by `protocol_cases.yaml` |
+| **total** | **147** | |
+
+The dispositions must partition the suite and the total must equal an
+independently measured count of it; three guards assert exactly that, and a
+fourth re-derives the count from the legacy checkout when it is present.
+
+`superseded-by-table` is the reason that could most easily be a lie, so it is
+checked against the thing it points at: the wire table must be non-empty and
+must cover all three endpoints, or the drop reason means nothing.
+
+## Counting the legacy suite
+
+Two instruments, different shapes. Both belong in any PR that touches these
+files.
+
+**Neither reading is 146.** The issue body says `test_app.py` is
+"1,275 lines / ~146 tests" and plan §1 says "the old repo's 146 pytest tests".
+1,275 lines is right; 146 is not a count of anything. `test_app.py` holds 121,
+and 147 is the two files together. `docs/ops/refactor-plan.md` is outside this
+issue's declared file list, so the number there is flagged rather than edited.
+
+```bash
+L=/path/to/dyndns-route53
+
+# 1. the collector — what pytest would actually run
+(cd $L && .venv/bin/python -m pytest tests/test_app.py tests/test_hetzner.py \
+    --collect-only -q | tail -1)
+
+# 2. grep — a different shape, and blind to collection rules
+grep -cE '^\s*def test_' $L/tests/test_app.py $L/tests/test_hetzner.py
+```
+
+Readings taken 2026-08-15 on `10_overnight`:
+
+| instrument | `test_app.py` | `test_hetzner.py` | total |
+|---|---:|---:|---:|
+| `pytest --collect-only` | 121 | 26 | **147** |
+| `grep -cE '^\s*def test_'` | 121 | 26 | **147** |
+
+They agree exactly, and the slack is worth stating: both count *declarations*,
+so a suite using `@pytest.mark.parametrize` would make them disagree — this one
+does not, which is why the agreement is exact rather than approximate.
+67 + 34 + 27 + 19 = 147.
+
+The third instrument is in the guards: `_ast_count` walks the legacy modules and
+compares against the frozen number, and **skips with a reason** when the checkout
+is absent rather than passing vacuously.
+
+## Model behaviour vs the wire table
+
+Where the boundary sits, in the cases where it is not obvious:
+
+- **`update-911-hostname-with-zero-backends`** (table) owns the status string.
+  `backends-a-domain-with-no-backends-resolves-to-none` (here) owns the resolver
+  returning `[]`. The inventory row carries `wire_half` naming the first, so the
+  split is visible from either side.
+- **The table's aggregate cases assume a stable backend order** — its
+  `firsterr.example.com` fixture is ordered `nochg, 911, dnserr` — and cannot
+  assert one. `backends-resolution-order-decides-the-aggregate-error` is that
+  assumption made explicit.
+- **The table stubs the provider.** Its `stub` service returns `good` / `nochg` /
+  `dnserr` because the fixture says so. Nothing in it proves a *real* adapter
+  converts a raised exception into `dnserr` rather than a 500 — and a 500 breaks
+  every client that parses the body. The whole `provider` subject exists to close
+  that gap.
+- **`update-nochg-single-backend`** records `last_updated_at: unchanged` for one
+  request. `tracked-ip-moves-only-on-good-so-last-updated-at-is-not-a-liveness-signal`
+  is what that means over time.
+- **checkip is entirely the table's.** The issue listed "`checkip` formatting" as
+  something to port; on inspection all four legacy checkip tests are strictly
+  weaker than the table's eight cases, so all four are dropped
+  `superseded-by-table` and nothing is ported. Overturning that clause is
+  recorded here rather than fixed silently.
+
+## Defects and planned changes, recorded rather than inherited
+
+`preserve` is not the default. Every case carries a disposition — `preserve`,
+`fix` (a legacy defect) or `change` (a plan decision) — and the non-preserve
+ones each record what the legacy does (`legacy`) and what must replace it
+(`host`), so the difference stays a decision rather than becoming a drift.
+A `fix` or `change` case missing either half fails a guard.
+
+The split is in the data, not counted here — read it with
+`yaml.safe_load(...)` and `collections.Counter`, so it cannot go stale in prose.
+The ones worth naming:
+
+- `hostname-names-must-be-stored-lowercase` — the lookup lowercases the query and
+  nothing lowercases the row, so a row stored with a capital letter is
+  unreachable under **every** spelling. Replayed: both answer `nohost`.
+- `event-a-rate-limited-delete-is-logged-as-dns_update` — the delete handler's
+  rate-limit branch passes the literal `'dns_update'`. Invisible on the wire; the
+  cost is that "show me this device's refused deletes" silently returns nothing.
+- `event-ip-address-on-delete-is-the-raw-myip-parameter` — update logs
+  `2001:db8::1`, delete logs `2001:0DB8:0000::1`, from the same request. The one
+  endpoint where normalisation cannot be seen from outside (delete responses
+  carry no IP suffix, divergence 1) is the one that skips it.
+- `event-911-and-notfqdn-write-no-row` — a router sending a malformed hostname
+  is refused on every attempt and appears in the log as complete silence,
+  indistinguishable from a router that stopped calling. This is the support
+  case the old service could not answer.
+- `provider-must-not-fall-back-to-environment-credentials` — the legacy test
+  asserts the fallback *works*; plan §2 removes it, so the assertion is ported
+  inverted. Under multi-tenancy the fallback is a cross-tenant credential leak:
+  one operator-set env var would serve every tenant whose row happens to be
+  empty. The table's `update-911-backend-without-stored-credentials` would keep
+  passing on any machine where the env happened to be unset.
+
+One is flagged as a **seam**: `event-badauth-writes-no-row`. No V1M1 issue owns
+"a failed `/nic/*` authentication is recorded somewhere", and today a device
+secret being brute-forced leaves no trace in either store.
+
+## Calibration — the second instrument
+
+`model_cases.yaml` is one reading, authored by reading the legacy source.
+`calibrate_against_legacy.py` is the other: it stands the legacy Flask app up on
+throwaway SQLite databases and executes each rule against it.
+
+```bash
+DYNDNS_LEGACY_ROOT=/path/to/dyndns-route53 \
+  /path/to/dyndns-route53/.venv/bin/python \
+  tests/compat/legacy_behaviour/calibrate_against_legacy.py
+```
+
+It is deliberately **not** a pytest module: it needs the legacy checkout and that
+repo's own virtualenv, neither of which exists in the api container. It refuses
+to run rather than silently measuring nothing when the checkout is missing, and
+it exits non-zero if any reading disagrees, if it replays an id the table does
+not carry, or if the table claims `calibrated: agree` for a case it never
+touched.
+
+Reading taken 2026-08-15: **71 readings, 71 agree, 0 disagree**, covering 70 of
+the 81 cases. The remaining 11 are marked `derived` (read off a schema, a form
+validator or a call site) or `not-replayable`, and are labelled as such in the
+data rather than counted as calibrated.
+
+## Running the guards
+
+```bash
+uv venv /tmp/compat-venv && VIRTUAL_ENV=/tmp/compat-venv uv pip install pyyaml pytest
+/tmp/compat-venv/bin/python -m pytest tests/compat/legacy_behaviour -q \
+    --confcutdir=tests/compat/legacy_behaviour
+```
+
+18 passed, ~0.1s. Same two dependencies as the wire runner, and no others.
+
+**`--confcutdir` is not decoration, and it should not be needed.**
+`tests/compat/conftest.py` raises `UsageError` from `pytest_configure` when
+`--target` is absent, and `pytest_configure` runs whenever that conftest is
+loaded — which is any run rooted at or under `tests/compat/`. So
+`pytest tests/compat/legacy_behaviour` fails with *"--target is required"*
+before collecting anything, and so would `pytest tests/`. These guards have no
+target: they read two YAML files and never open a socket, and passing
+`--target host` to satisfy the parser would be asserting something untrue about
+what is being run.
+
+`--confcutdir` stops pytest walking up to that conftest at all, which is why it
+works. It is a workaround, and it is recorded here rather than smoothed over:
+the durable fix is for the `--target` check to fire when a protocol case is
+*collected* rather than at configure time, so a sibling directory under
+`tests/compat/` can be run on its own. Flagged for #8 rather than edited here —
+`conftest.py` is that issue's declared file.
+
+Going the other way, `pytest tests/compat --target host` now collects these 18
+alongside the wire runner's 108, for 126. The runner's own accounting block is
+unaffected — it still reports 101 selected cases, 3 unmet preconditions, 11
+wire-only — because it counts the table, not the session.
+
+**Neither half of `tests/compat/` is in the milestone gate.** The Dockerfile
+copies `backend` to `/opt/host_app` and nothing else, so `make test-backend`
+(`pytest /opt/host_app/tests`) cannot reach this directory. The wire runner, the
+wire table and these guards are all outside it. That is a real gap in the gate
+and no V1M1 issue owns closing it.
+
+## Prove the guards bite
+
+Thirteen mutations, each reverted immediately. **13 applied, 13 caught, 0
+survived.**
+
+| mutation | caught by |
+|---|---|
+| M1 delete one dropped row from the inventory | partition total, per-file count, AST cross-check (3) |
+| M2 invent a fourth drop reason | vocabulary check, declared counts (2) |
+| M3 move one drop between reasons, total intact | declared counts |
+| M4 rename a model case without updating the inventory | 4 cross-reference guards |
+| M5 strip a case's `source` while a ported row still names it | **back-citation guard only** |
+| M6 a model case whose `then` asserts a wire status | wire-assertion guard |
+| M7 a model case carrying `expect:` / `path:` | wire-schema guard |
+| M8 the frozen legacy count drifts below the real suite | AST cross-check + 2 |
+| M9 rewrite one family-sensitive subject as IPv4-only | IPv6 coverage guard |
+| M10 a ported row that names no case | 5 guards |
+| M11 a `wire_half` naming a protocol case that does not exist | wire_half resolver |
+| M12 a `fix` case that no longer says what replaces the defect | case well-formedness |
+| M13 a case claiming `calibrated: agree` it never earned | the calibration script's own cross-check |
+
+**M5 is the one that justifies its guard.** The first version of this suite
+checked only inventory → case. A case that quietly dropped its `source` left the
+inventory still reading as though the test had been ported — the port becoming a
+claim rather than a link — and nothing failed. The back-citation guard was added
+mid-issue because M5 survived without it.
+
+**M13 was found by the instrument, not by a mutation.** The calibration script's
+id cross-check was added after the harness and the table had already drifted
+apart on seven case ids: readings taken against names the table did not carry,
+reported as coverage. Same defect family as a probe measuring something the
+record does not contain.
+
+## What these guards do not do
+
+They do **not** assert model behaviour. There is no host code to assert it
+against — `backend/src/atrium_ddns/models.py` is still the scaffold's demo table.
+They assert that the *record* of that behaviour cannot decay silently, which is
+a smaller claim and the honest one. When the host models land, the 81 cases
+become the specification the new tests are written from, and
+`calibrate_against_legacy.py` gains a `--target host` sibling.
+
+<!-- END legacy_behaviour (issue #10) -->
