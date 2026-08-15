@@ -1146,6 +1146,46 @@ components. The three looks that AI design work clusters into (cream + serif +
 terracotta; near-black + acid accent; broadsheet hairlines) are defaults, not
 choices; this brief leaves the axis free, so do not spend it there.
 
+### §4 was reconciled against the built model by issue #43
+
+The design pass ran and produced **`docs/ops/ui-design.md`**, which is the
+binding document for every V1M3 implementation issue. It agrees with the
+direction above and corrects three things this section asserted before the
+device model existed. The corrections, in full, are in that file; here is what
+changed and why, so a reader of §4 alone is not misled.
+
+**1. "Three values side by side" is the wrong arrangement, on measurement.**
+Real production IPv6 addresses are 36–39 characters and **never `::`-compressed**
+— 7 colons on 232 of 232 rows in the March snapshot, 158 of them at the full 39.
+Budgeting the schema ceiling (`IPV6_LEN = 45`) at a monospace 0.6em advance
+gives 380px per address cell, so three side-by-side plus a hostname column needs
+≈1436px and atrium's content area at a 1440px viewport is ≈1160px. The failure
+mode is disqualifying rather than merely tight: an IPv6 address wrapped at an
+arbitrary character is indistinguishable from a different address. The strip is
+**three rows on a vertical rail**, ≈592px wide.
+
+**2. "What the device last claimed" is not a fact the schema holds.**
+`Device.last_ip_v4/v6` is the address the device **called from**, not the `myip`
+it asked to publish — `router_nic.py:670` says so explicitly, and `DnsEvent`
+keeps the two as separate columns (`client_ip` vs `ip`) precisely because they
+differ. For a device behind IPv4 NAT declaring `myip=` they differ permanently
+and correctly, so comparing them unconditionally is an indicator that is always
+on. `ui-design.md` §3.3 makes that joint conditional on
+`event.client_ip == event.ip` for the latest successful update, and renders
+*not applicable* — no rail segment — otherwise.
+
+**3. The strip is per (hostname, record family), not per hostname.** A hostname
+can carry both an A and an AAAA record (2 of 10 configured hostnames in the
+snapshot do), so one hostname yields up to two strips. Families with no value at
+any station are not rendered and reserve no space.
+
+One thing §4 got exactly right and the design leans on hard: *spend the boldness
+on the strip and keep everything around it quiet.* `ui-design.md` takes that to
+its conclusion — there is no green in the palette, agreement is achromatic, and
+the single accent appears nowhere except on a measured disagreement. The
+argument is a measurement, not a preference: 225 of 238 real updates are `nochg`,
+so a design that paints the healthy state paints 94.5% of the surface.
+
 ---
 
 ## 5. Milestones
