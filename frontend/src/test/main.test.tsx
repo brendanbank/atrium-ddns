@@ -46,15 +46,20 @@ test('the board is registered as a route and a nav item at one path', async () =
 test('every registered surface still mounts through the wrapper element', async () => {
   await import('../main');
 
-  // Vacuity guard: the sweep has to be over a non-empty population, and
-  // the scaffold's four registrations plus the board's one is five.
+  // Vacuity guard: the sweep has to be over a non-empty population.
+  // Seven — the scaffold's four (home widget, demo page, admin tab,
+  // profile item), the board's one (#44), and #45's two tenant pages.
+  // An exact count rather than a floor, on purpose: a registration
+  // added without going through `makeWrapperElement` would slip past
+  // `toBeGreaterThan` by simply not being in this list, and the whole
+  // point of the sweep is that every surface is covered.
   const rendered = [
     ...handles.homeWidgets,
     ...handles.routes,
     ...handles.adminTabs,
     ...handles.profileItems,
   ];
-  expect(rendered.length).toBe(5);
+  expect(rendered.length).toBe(7);
 
   for (const entry of rendered) {
     const render = entry.render;
