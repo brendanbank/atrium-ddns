@@ -24,3 +24,6 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# Extracted TLS material (a copy of the old service.s ACME cert).
+certs/

@@ -61,11 +61,17 @@ services:
       # caller's cwd is.
       PYTHONPATH: /app
     ports:
-      # Host port is project-specific so several atrium hosts can run
-      # side by side on one dev box. 8053 nods at DNS/53; override with
-      # API_HOST_PORT. The container port stays 8000 — atrium's own
-      # HEALTHCHECK curls localhost:8000 inside the container.
-      - "${API_HOST_PORT:-8053}:8000"
+      # Host port is project-specific so several atrium hosts can run side by
+      # side on one dev box. 8053 nods at DNS/53; override with API_HOST_PORT.
+      # The container port stays 8000 — atrium's own HEALTHCHECK curls
+      # localhost:8000 inside the container.
+      #
+      # In dev this is the way in. In prod, put TLS in front (the `proxy`
+      # profile below) and set API_HOST_PORT to a loopback-only binding, or
+      # drop this mapping entirely: atrium speaks plain HTTP, and DynDNS
+      # clients authenticate with HTTP Basic, so an exposed plaintext port is
+      # every device secret on the wire in base64.
+      - "${API_BIND:-0.0.0.0}:${API_HOST_PORT:-8053}:8000"
     depends_on:
       mysql:
         condition: service_healthy
@@ -105,6 +111,36 @@ services:
         condition: service_started
     healthcheck:
       disable: true
+
+  # TLS terminator. Enabled with `--profile tls`, so dev is unaffected.
+  #
+  # Serves a certificate EXTRACTED from the old service's ACME store rather
+  # than running ACME itself — that store has one writer already and a second
+  # would corrupt it. The copy goes stale when the writer renews; see
+  # scripts/extract-acme-cert.sh and `make tls-refresh`.
+  proxy:
+    image: traefik:3.7
+    profiles: [tls]
+    restart: unless-stopped
+    command:
+      - --entrypoints.websecure.address=:8443
+      - --providers.file.directory=/etc/traefik/dynamic
+      - --providers.file.watch=true
+      - --log.level=INFO
+      - --accesslog=true
+      # Query strings are dropped at the producer. /nic/* accepts only HTTP
+      # Basic (query-parameter auth was removed), but a client that appends
+      # credentials anyway must not have them land in a log. `redact` is NOT
+      # a real mode — it parses, starts cleanly, and behaves as `keep`.
+      - --accesslog.fields.queryparameters.defaultmode=drop
+    ports:
+      - "${TLS_HOST_PORT:-8443}:8443"
+    volumes:
+      - ./infra/traefik/dynamic.yml:/etc/traefik/dynamic/dynamic.yml:ro
+      - ${TLS_CERT_DIR:-./certs}:/certs:ro
+    depends_on:
+      api:
+        condition: service_started
 
   mysql:
     image: mysql:8.0

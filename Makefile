@@ -170,3 +170,26 @@ typecheck:  ## tsc --noEmit on the host bundle
 
 smoke:  ## local smoke test (PASS=... [EMAIL=...] for the login checks)
 	./scripts/smoke.sh $(if $(EMAIL),--user '$(EMAIL)',) $(if $(PASS),--pass '$(PASS)',--no-login)
+
+# --- TLS (prod, "for now" measure) ----------------------------------------
+# The certificate is a COPY of one in the old service's ACME store. That store
+# has a live writer; when it renews, this copy is stale and TLS serves an
+# expired certificate. Re-run tls-refresh after a renewal.
+ACME_JSON ?= /usr/local/dyndns-route53/letsencrypt/acme.json
+TLS_CERT_DIR ?= ./certs
+
+tls-extract:  ## copy cert+key out of the old service's ACME store
+	./scripts/extract-acme-cert.sh $(ACME_JSON) $(TLS_CERT_DIR)
+
+tls-up: tls-extract  ## start the TLS terminator in front of api
+	$(COMPOSE) --profile tls up -d proxy
+
+tls-refresh: tls-extract  ## re-extract after a renewal and reload the proxy
+	$(COMPOSE) --profile tls restart proxy
+	@echo "reloaded; verify with: make tls-verify HOST=<name>"
+
+tls-verify:  ## prove TLS actually serves a valid chain (HOST=<name> required)
+	@test -n "$(HOST)" || { echo "usage: make tls-verify HOST=<name> [PORT=8443]"; exit 2; }
+	@echo | openssl s_client -connect $(HOST):$(or $(PORT),8443) -servername $(HOST) 2>/dev/null \
+	  | openssl x509 -noout -subject -dates -checkend 0 \
+	  && echo "  chain valid and not expired"
