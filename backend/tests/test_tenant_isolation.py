@@ -876,6 +876,19 @@ READ_PATHS_NOT_SCOPED: dict[str, str] = {
         "read back every fixture tenant's rows as the second instrument on "
         "what it has just written."
     ),
+    "import_legacy.py:assert_target_is_empty": (
+        "The one-shot cutover importer's refuse-to-run-twice check, and it "
+        "has to be cross-tenant to be correct. ddns_device.username, "
+        "ddns_domain.name and ddns_hostname.name are all GLOBALLY unique "
+        "(DNS is global, and the device username is read before there is a "
+        "tenant to scope by). Scoped to the importing owner it would miss a "
+        "collision held by another tenant, report the database empty, and "
+        "then fail on the UNIQUE constraint halfway through a transaction "
+        "that is supposed to be all-or-nothing. It selects only the three "
+        "name columns — never a row, never any other tenant's data — and "
+        "reports counts with the names withheld. It is a CLI, mounted on no "
+        "route, and it refuses to run at all once those rows exist."
+    ),
     "seed_compat_fixture.py:verify_rehash": (
         "Same module and same two gates. It reports the SHAPE of every "
         "fixture device's stored password hash across all three fixture "
