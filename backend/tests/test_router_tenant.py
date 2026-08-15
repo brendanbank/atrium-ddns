@@ -305,6 +305,34 @@ async def test_every_data_route_declares_the_scope_dependency():
     )
 
 
+#: ``user_id ==`` comparisons in ``router.py`` that are **not** tenancy,
+#: each with a written reason. Same shape as ``UNSCOPED_ROUTES`` above,
+#: and for the same purpose: an exemption nobody has to justify is not an
+#: exemption, it is a hole.
+#:
+#: Keyed by the exact matched text, so a *different* comparison against
+#: the same column is still an offender. An entry that stops matching is
+#: caught by the staleness assertion at the bottom of the test — the
+#: rule this file already applies to ``UNSCOPED_ROUTES``.
+ALLOWED_USER_ID_COMPARISONS: dict[str, str] = {
+    "DnsEvent.user_id == filters.user_id)": (
+        "#46's log-search *filter*, not a tenancy predicate, and the "
+        "difference is the whole reason this entry is written down. The "
+        "statement it is added to is `scope.select(DnsEvent)`, so the "
+        "scope's own predicate is already on it; this narrows an "
+        "already-scoped query to one tenant *by request*, which is a "
+        "search feature and not an authorisation decision. Deleting the "
+        "line would remove a filter, not close a leak. "
+        "Two things hold the safety property instead of this guard: "
+        "`get_events` refuses with 403 when a caller without "
+        "`atrium_ddns.events.read.all` names another tenant "
+        "(`test_filtering_to_another_tenant_is_refused_not_narrowed`), "
+        "and dropping the scope from that statement reds nine tests in "
+        "`test_router_events.py` — measured by mutation, not assumed."
+    ),
+}
+
+
 async def test_no_hand_written_tenancy_predicate_in_the_router():
     """The rule ``scope.py`` states, checked against the source.
 
@@ -313,6 +341,16 @@ async def test_no_hand_written_tenancy_predicate_in_the_router():
     reviewed"*. A comparison against a ``user_id`` column anywhere in
     this module is that forgetting; assignment (``Domain(user_id=…)``)
     is not, and the two are distinguishable by the operator.
+
+    **One class of comparison is neither**, and #46 found it: a
+    ``?user_id=`` search filter applied *on top of* a scoped statement.
+    The pattern this guard matches on is syntactic (``user_id ==``) and
+    the property it means is *tenancy is enforced by the scope*, and
+    those came apart the first time somebody wanted to filter by user
+    rather than to authorise by user. Rather than widen the pattern —
+    which would stop it catching ``user_id == scope.user_id``, the
+    genuinely dangerous spelling — the exceptions are enumerated with
+    reasons.
     """
     import inspect
     import re
@@ -323,13 +361,26 @@ async def test_no_hand_written_tenancy_predicate_in_the_router():
     # deleted rather than investigated.
     code = re.sub(r"#.*", "", source)
     code = re.sub(r'"""[\s\S]*?"""', "", code)
-    offenders = re.findall(r"[\w.]*user_id\s*==[^\n]*", code)
+    found = re.findall(r"[\w.]*user_id\s*==[^\n]*", code)
+    offenders = [
+        match for match in found if match.strip() not in ALLOWED_USER_ID_COMPARISONS
+    ]
     assert offenders == [], (
         f"hand-written tenancy predicates in atrium_ddns.router: {offenders}. "
-        f"Every filter goes through DdnsScope."
+        f"Every filter goes through DdnsScope. If one of these is a search "
+        f"filter on an already-scoped statement rather than a tenancy "
+        f"predicate, add it to ALLOWED_USER_ID_COMPARISONS with a reason."
     )
     # Vacuity: the sweep must actually be reading the module.
     assert "def create_domain" in code, "the source sweep read nothing"
+    # And the exemptions do not outlive the lines they exempt. A stale
+    # entry silently widens the guard's blind spot by exactly one
+    # spelling, which is how an allowlist stops being an allowlist.
+    stripped = {match.strip() for match in found}
+    assert set(ALLOWED_USER_ID_COMPARISONS) <= stripped, (
+        f"ALLOWED_USER_ID_COMPARISONS names comparisons that are no longer "
+        f"in router.py: {sorted(set(ALLOWED_USER_ID_COMPARISONS) - stripped)}"
+    )
 
 
 async def test_one_tenants_rows_are_invisible_and_immutable_to_another(
