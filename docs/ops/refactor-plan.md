@@ -1090,6 +1090,38 @@ than letting it size itself against the whole box.
 
 ---
 
+## 5c. Behaviour changes accepted at cutover
+
+Settled by the operator 2026-08-15. Each is a deliberate difference from the old
+service, approved rather than inherited.
+
+**The three Route 53 defects #15 fixed stay fixed.** The old adapter mapped
+*every* zone in the AWS account rather than only the tenant's; its zone listing
+ignored `IsTruncated`, so anything past the first page was invisible; and both
+adapters bound a hostname to the **first** enclosing zone rather than the
+closest. The frozen table says "closest", and its `agree` reading was calibrated
+against a one-candidate fixture where first and closest cannot differ — so the
+table never had an opinion here. Fixing was the right call and the divergence is
+recorded rather than silent.
+
+**`HEAD` on the write endpoints is refused.** Confirmed. The old service
+performs the update on a `HEAD`; #25 measured a record moving to the *prober's*
+address. Note this needs a **deliberate handler** in #16: the framework will not
+produce a 405 on its own behind atrium's SPA catch-all — bare FastAPI gives 405,
+the same route behind the mount gives 200, and today's stack with no route at
+all gives 404.
+
+**Dependencies track latest.** All three Dependabot PRs merged, including the
+node builder image 25 → 26-alpine. Gate re-run on the new base: green.
+
+**The borrowed TLS certificate is accepted as-is** until atrium-ddns replaces
+the old service. No refresh automation. It goes stale around **24 Aug** when the
+old Traefik renews; from then the site serves an expired certificate until
+someone re-extracts. That is a known, accepted cost of a temporary measure —
+see §5b.
+
+---
+
 ## 6. Open decisions
 
 These are the operator's, and a run should not start without them.
