@@ -497,6 +497,51 @@ Splitting one migrated device into several is then a **post-cutover** operation
 the owner performs deliberately, per hostname, in the UI — not something the
 importer guesses at.
 
+#### 3.3.1 The actual production population, measured 2026-08-15
+
+Read from the **live** database inside the running legacy container, not from a
+copy. Small enough that the whole migration is a single transaction:
+
+| | |
+|---|---|
+| users | 7 — one `admin` (0 hostnames, `web_login=1`) + six `user` rows |
+| hostnames | 11, spread 4 / 2 / 2 / 1 / 1 / 1 across the six non-admin users |
+| domains | 1 |
+| domain_backends | 1 (`aws`) |
+| backend_configs | 2 (`aws_access_key_id`, `aws_secret_access_key`, Fernet) |
+| hostname_backends | empty — every hostname uses all of its domain's backends |
+| ttl | uniformly 60 |
+| orphan hostnames | 0 |
+
+**⚠ `~/dyndns.db` is a stale snapshot and must not be the migration source.**
+The copy in the home directory (both on the workstation and on the host) is
+**two schema migrations and two hostnames behind** live: its `users` has no
+`web_login`, its `hostnames` has no `ttl` / `last_ip_v4` / `last_ip_v6` /
+`last_updated_at`, and it holds 9 hostnames against live's 11. The legacy app
+adds those columns via one-time `ALTER TABLE` at boot, so a snapshot taken
+before a deploy is silently a different schema. The importer reads the live
+file out of the `dyndns-route53_dyndns-data` volume, and asserts the column set
+before it starts.
+
+**Three consequences for the migration.**
+
+1. **Legacy users have no email address.** The `users` table is keyed by
+   `username`; atrium's is keyed by email and requires one. Six accounts need an
+   address that does not exist anywhere in the source data. That is an operator
+   decision, not something an importer should invent — see §6.
+2. **The one-device-per-user invariant is cheap here.** Six devices, the largest
+   carrying four hostnames. The admin has none and needs no device — it becomes
+   an atrium super_admin and nothing else.
+3. **`web_login=0` for every non-admin user.** None of them can use the legacy
+   web UI today, so nothing is lost by them not having atrium logins on day one.
+   It also means the DDNS credential is the *only* thing they have, which is
+   exactly what makes carrying the bcrypt hashes verbatim non-negotiable.
+
+**The traffic is IPv6-first.** 10 of 11 hostnames have a tracked IPv6 address,
+4 have IPv4. The compat table must not treat `A` as the common case and `AAAA`
+as the variant — production is the other way round, and a suite that exercises
+`A` thoroughly and `AAAA` once is testing the wrong record type.
+
 ### 3.4 Logging — searchable by user, device, and domain
 
 The old `Event` table denormalises `username` and nothing else, and prunes
@@ -725,11 +770,17 @@ These are the operator's, and a run should not start without them.
    host's config namespace. Affordable now the store is MySQL rather than the
    old SQLite file, and pruned by a scheduled job rather than on the write path
    (§3.4).
-11. ~~Deploy host and cutover policy~~ — **decided: run beside the existing
+11. **What email address do the six legacy users get?** Their accounts are keyed
+   by username; atrium requires an email and there is none in the source data
+   (§3.3.1). Synthesised (`<username>@<domain>`) leaves six addresses that
+   cannot receive mail — password reset and verification both dead-end.
+   Real addresses need collecting from the people. Deferred to V1M4, but it
+   gates the importer.
+12. ~~Deploy host and cutover policy~~ — **decided: run beside the existing
    service on port 8443.** Both stacks live on the host during the development
    phase; the old one keeps serving until the exit criterion is demonstrated.
    See § *Deploying beside the old service* for the one thing 8443 implies.
-12. ~~Standing decisions~~ — **all approved, development phase, full
+13. ~~Standing decisions~~ — **all approved, development phase, full
    permissions**, with two constraints that survive it: unsigned commits remain
    a stop condition, and the DNS smoke test's allow-list stays a dedicated test
    zone. Recorded in `overnight-template.md` § *Standing decisions*.
