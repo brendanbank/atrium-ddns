@@ -148,6 +148,18 @@ async def _purge(emails: list[str]) -> None:
     guaranteed to have run. Deleting the users cascades to their
     domains, backends and devices; the event rows only get their FKs
     nulled, so they are cleared by their denormalised email.
+
+    **The orphan sweep of ``user_secret_keys`` was removed** (#14). It
+    read ``DELETE FROM user_secret_keys WHERE user_id NOT IN (SELECT id
+    FROM users)`` and could never delete a row: that table's foreign key
+    is ``ON DELETE CASCADE`` to ``users``, which is asserted by
+    ``test_deleting_a_user_destroys_their_domains_devices_and_credentials``
+    — so the orphan state it swept up is one the database does not
+    permit. What it *could* do is take a scan-wide lock over every
+    worker's key rows, and two workers running it at once deadlock
+    (``(1213, 'Deadlock found when trying to get lock')``). Harmless
+    with two test files sharing the database, 3 not-green runs in 20
+    with three.
     """
     factory = get_session_factory()
     async with factory() as s:
@@ -160,12 +172,6 @@ async def _purge(emails: list[str]) -> None:
         for email in emails:
             await s.execute(
                 sa.text("DELETE FROM users WHERE email = :e"), {"e": email}
-            )
-            await s.execute(
-                sa.text(
-                    "DELETE FROM user_secret_keys WHERE user_id NOT IN "
-                    "(SELECT id FROM users)"
-                )
             )
         await s.commit()
 
@@ -191,6 +197,48 @@ async def test_host_tables_are_not_on_atriums_metadata():
     assert not overlap, f"host tables declared on atrium's metadata: {sorted(overlap)}"
 
 
+#: Prefix of the throwaway tables other modules in this suite create and
+#: drop while this one runs. ``test_user_scope_secrets.py`` builds
+#: ``test_user_secret_probe_<worker>`` per fixture, and the suite is
+#: parallel by default.
+SCRATCH_TABLE_PREFIX = "test_"
+
+
+def _include_name(name, type_: str, parent_names) -> bool:  # noqa: ANN001
+    """Keep autogenerate's *reflection* off other workers' scratch tables.
+
+    ``include_object`` cannot do this: alembic applies it **after**
+    reflecting the object, and reflection is where the race is.
+    ``include_name`` is applied to the name, before the ``SHOW CREATE
+    TABLE``.
+
+    The race, measured rather than guessed:
+    ``test_the_include_object_filter_bites`` reflects the *whole* schema
+    on purpose — that is how it sees atrium's tables — so it lists
+    ``test_user_secret_probe_gwN`` while another worker is dropping it,
+    and the follow-up ``SHOW CREATE TABLE`` fails with
+    ``(1146, "Table … doesn't exist")``. It presents as a flaky
+    autogenerate test with a message about a table this module has never
+    heard of. Swept on this box: **0 failures in 20 runs** of the three
+    pre-#14 files, **5 in 34 runs** once
+    ``test_tenant_isolation.py`` was added — the third DB-heavy file
+    widens the window rather than introducing the defect. Deterministic
+    since this filter went in: 0 in 30.
+    """
+    if type_ == "table" and name and name.startswith(SCRATCH_TABLE_PREFIX):
+        return False
+    return True
+
+
+async def test_no_host_table_is_hidden_by_the_scratch_table_filter():
+    """The exclusion above must not be able to hide a real regression."""
+    hidden = {t for t in m.HostBase.metadata.tables if t.startswith(SCRATCH_TABLE_PREFIX)}
+    assert not hidden, (
+        f"host tables named like scratch tables are invisible to every "
+        f"autogenerate check in this file: {sorted(hidden)}"
+    )
+
+
 async def _autogen_diffs(include_object) -> list:
     factory = get_session_factory()
     async with factory() as s:
@@ -202,6 +250,7 @@ async def _autogen_diffs(include_object) -> list:
                     "target_metadata": m.HostBase.metadata,
                     "compare_type": True,
                     "include_object": include_object,
+                    "include_name": _include_name,
                 },
             )
             return compare_metadata(ctx, m.HostBase.metadata)
