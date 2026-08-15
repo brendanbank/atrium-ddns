@@ -53,9 +53,21 @@ spec_rows:
   divergence/1-nohost-ip-suffix: "nohost {ip} on update, bare nohost on delete"
   divergence/2-no-badagent: "User-Agent is never inspected"
   divergence/3-no-numhost: "there is no 20-hostname cap"
-  divergence/4-always-200: "everything is HTTP 200, badauth included"
+  divergence/4-always-200: "everything is HTTP 200, badauth included -- true of every case here, all of which are GET; bounded by divergence/7"
   divergence/5-single-label: "a single label with no dot passes the regex and falls through to nohost"
   divergence/6-regex-newline-anchor: "a trailing newline in a label passes the regex ($ matches before it) and falls through to nohost"
+
+  # Three more, found by issue #9 sweeping docs/DYNDNS-PROTOCOL.md §1 clause by
+  # clause after the table was frozen, and added here by issue #25. All three
+  # are `preserve`, on the same grounds as 2, 3, 5 and 6.
+  divergence/7-non-get-405: "non-GET methods answer HTTP 405 with the framework's HTML body, not badagent (§1.3)"
+  divergence/8-offline-inert-no-donator: "offline=YES is accepted and silently ignored, and !donator has no writer anywhere (§1.5, §1.6)"
+  divergence/9-client-ip-not-honoured: "Client-IP is not consulted for IP detection; only X-Forwarded-For is (§1.7)"
+
+  # §1 "HEAD is refused where the handler is not safe" -- a decision, not a
+  # divergence: docs/DYNDNS-PROTOCOL.md says nothing about HEAD.
+  head/checkip-preserved: "HEAD /nic/checkip -> 200, headers only, no body. The handler is read-only, so HEAD is safe and is preserved"
+  head/update-refused: "HEAD /nic/update and /nic/delete -> 405 on the host. Legacy runs the handler and writes DNS with no body to say so"
 
 # ---------------------------------------------------------------------------
 # Fixture world. One world, shared by every case; each hostname is configured
@@ -177,8 +189,11 @@ cases:
     note: >-
       §1's table said "empty string" for this row without qualifying the format.
       That is only true for ?format=plain. In the default HTML mode the wrapper
-      is still emitted with an empty IP -- the body is 91 bytes, not 0. §1 has
-      been corrected.
+      is still emitted with an empty IP -- the body is 90 bytes, not 0. §1 has
+      been corrected. (This note read 91 until #9 measured it three ways --
+      Content-Length, wc -c, and len() of the expect.body below -- and #25
+      corrected the count here and in §1. The `body:` was right throughout;
+      only the two prose counts were wrong.)
     path: /nic/checkip
     auth: {type: none}
     client_ip: null
@@ -209,6 +224,119 @@ cases:
     covers: [checkip/format-plain]
     expect:
       body: "203.0.113.10"
+
+  # === GET /nic/checkip -- divergence 9, and the HEAD decision ==============
+
+  - id: checkip-client-ip-header-is-not-honoured
+    note: >-
+      Divergence 9. §1.7 says "if the client sends X-Forwarded-For or Client-IP
+      headers, those values are returned instead". ProxyFix reads only
+      X-Forwarded-For, so half the clause is implemented. The header is sent
+      here with an unparseable X-Forwarded-For, so an implementation that
+      honoured Client-IP *as a fallback* would answer 198.51.100.5 and this
+      case would fail: the assertion is that the header is inert, not that it
+      is absent.
+    path: /nic/checkip
+    auth: {type: none}
+    client_ip: null
+    headers: {client-ip: "198.51.100.5"}
+    query: {format: plain}
+    covers: [divergence/9-client-ip-not-honoured, checkip/remote-addr-unparseable]
+    expect:
+      body: ""
+
+  - id: checkip-client-ip-does-not-shadow-x-forwarded-for
+    note: >-
+      Divergence 9, the other direction. Both headers present and disagreeing:
+      X-Forwarded-For wins because Client-IP is never read. An implementation
+      that preferred Client-IP -- which §1.7 lists first -- would answer
+      198.51.100.5.
+    path: /nic/checkip
+    auth: {type: none}
+    headers: {client-ip: "198.51.100.5"}
+    query: {format: plain}
+    covers: [divergence/9-client-ip-not-honoured, checkip/format-plain]
+    expect:
+      body: "203.0.113.10"
+
+  - id: checkip-head-returns-headers-and-no-body
+    note: >-
+      HEAD is preserved on checkip and only on checkip. The handler is
+      read-only, so HEAD is safe in the RFC 9110 sense and a monitoring probe
+      is exactly what it is for. Content-Length is the full 102 bytes of the
+      HTML wrapper; the body is empty because HEAD suppresses it. See
+      `head/update-refused` for the endpoints where this is NOT preserved --
+      FastAPI's APIRoute does not add HEAD to a GET route, so the host must
+      declare it here and must not declare it there.
+    method: HEAD
+    path: /nic/checkip
+    auth: {type: none}
+    query: {}
+    covers: [head/checkip-preserved, checkip/default]
+    expect:
+      status: 200
+      content_type: "text/html; charset=utf-8"
+      body: ""
+
+  - id: checkip-post-is-405-with-an-html-body
+    note: >-
+      Divergence 7. §1.3 says "other HTTP methods are not supported and trigger
+      a badagent return code"; Flask's default methods are GET/HEAD/OPTIONS and
+      no route in dyndns.py overrides them, so Werkzeug answers 405 before any
+      handler runs. This is the case that BOUNDS divergence 4: "everything is
+      HTTP 200" is true of all 101 GET cases in this table and false of the
+      endpoint. Legacy-only because the body below is Werkzeug's error page,
+      not the service's -- see `checkip-post-is-405-on-the-host` for what the
+      rewrite must answer, and note that only the *status* is common to both.
+    targets: [legacy]
+    method: POST
+    path: /nic/checkip
+    auth: {type: none}
+    query: {}
+    covers: [divergence/7-non-get-405]
+    expect:
+      status: 405
+      content_type: "text/html; charset=utf-8"
+      line_count: 6
+      body_ends_with_newline: true
+      # `|` and not `|-`: this body ends in a newline. Every DynDNS body in
+      # this table does not, which is why the rest of the file uses `|-`.
+      body: |
+        <!doctype html>
+        <html lang=en>
+        <title>405 Method Not Allowed</title>
+        <h1>Method Not Allowed</h1>
+        <p>The method is not allowed for the requested URL.</p>
+
+  - id: checkip-post-is-405-on-the-host
+    note: >-
+      Divergence 7 on the host. The status is the compatibility requirement and
+      is the same 405; the rendering is the framework's and is not. This body
+      was measured against this repository's own running stack (POST to a
+      GET-only path -> 405, application/json, 31 bytes) rather than read out of
+      FastAPI's source, so a change to it is a decision someone has to take
+      here rather than a coincidence nobody notices.
+
+      **This case already passes against a host that has no /nic/* routes at
+      all** -- measured on 25_overnight, where it and its update sibling were 2
+      of the 110 host cases green, beside 105 red and 3 skipped. A 405 is what
+      the SPA catch-all answers for a non-GET too, and nothing on the wire
+      distinguishes "no route" from "GET-only route". It is recorded rather
+      than dressed up: this case cannot tell you /nic/checkip exists, and its
+      whole job is to go red if that route is ever declared with POST.
+    targets: [host]
+    method: POST
+    path: /nic/checkip
+    auth: {type: none}
+    query: {}
+    legacy_behaviour: |-
+      HTTP 405 with Werkzeug's 153-byte HTML error page,
+      Content-Type: text/html; charset=utf-8
+    covers: [divergence/7-non-get-405]
+    expect:
+      status: 405
+      content_type: "application/json"
+      body: '{"detail":"Method Not Allowed"}'
 
   # === GET /nic/update -- authentication and rate limiting ==================
 
@@ -750,6 +878,160 @@ cases:
         nohost 203.0.113.10
         nohost 203.0.113.10
 
+  # === GET /nic/update -- divergences 7, 8 and 9 ============================
+
+  - id: update-post-is-405-with-an-html-body
+    note: >-
+      Divergence 7. POST, PUT, DELETE and PATCH all answer the same 405 and the
+      same 153 bytes; POST stands for the family. Werkzeug answers before the
+      handler runs, so no update is attempted and no event is written -- the
+      405 is the whole observable behaviour. Legacy-only: the body is
+      Werkzeug's error page, and a rewrite that reproduced those exact bytes
+      would be imitating a framework rather than staying compatible.
+    targets: [legacy]
+    method: POST
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: 203.0.113.10}
+    covers: [divergence/7-non-get-405, divergence/4-always-200]
+    expect:
+      status: 405
+      content_type: "text/html; charset=utf-8"
+      line_count: 6
+      body_ends_with_newline: true
+      body: |
+        <!doctype html>
+        <html lang=en>
+        <title>405 Method Not Allowed</title>
+        <h1>Method Not Allowed</h1>
+        <p>The method is not allowed for the requested URL.</p>
+
+  - id: update-post-is-405-on-the-host
+    note: >-
+      Divergence 7 on the host, and the one that matters most: a rewrite on
+      FastAPI answers 405 here for a completely different reason (the route
+      declares GET and Starlette refuses the rest), and that coincidence must
+      not be mistaken for a compatibility guarantee. Pinning it makes it one.
+      With the same caveat as `checkip-post-is-405-on-the-host`: this passes
+      today against a host with no /nic/update at all, so it asserts "POST is
+      refused", never "the endpoint exists". The 105 red cases beside it are
+      what says the endpoint does not exist yet.
+    targets: [host]
+    method: POST
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: 203.0.113.10}
+    legacy_behaviour: |-
+      HTTP 405 with Werkzeug's 153-byte HTML error page,
+      Content-Type: text/html; charset=utf-8
+    covers: [divergence/7-non-get-405]
+    expect:
+      status: 405
+      content_type: "application/json"
+      body: '{"detail":"Method Not Allowed"}'
+
+  - id: update-offline-yes-is-inert-and-never-answers-donator
+    note: >-
+      Divergence 8. §1.5 lists `offline=YES` as "activates offline redirect for
+      the hostname ... requires a credited account" and §1.6 specifies
+      `!donator` for a premium feature requested by a non-credited user.
+      `offline` never reaches a comparison and `!donator` has zero writers in
+      dyndns.py or any provider -- the same family as divergences 2 and 3, and
+      the third documented return code the implementation cannot emit.
+      Distinct from `update-unknown-parameters-are-ignored`: that case sends
+      parameters the document does not define, and this one sends a parameter
+      the document defines and does not mark deprecated. The record is updated
+      normally, which is what makes this "inert" rather than "absent" -- an
+      implementation that recognised `offline` would answer `!donator` or
+      suppress the update, and either would fail here.
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: 203.0.113.10, offline: "YES"}
+    covers: [divergence/8-offline-inert-no-donator, update/aggregate-good]
+    effects:
+      persisted: {last_ip_v4: "203.0.113.10", last_updated_at: set}
+      dns: [{backend: good, op: create, rtype: A, ip: 203.0.113.10}]
+    expect:
+      body: "good 203.0.113.10"
+
+  - id: update-client-ip-does-not-supply-a-missing-myip
+    note: >-
+      Divergence 9 on the endpoint that writes DNS. `myip` is omitted, so it
+      defaults to request.remote_addr, which ProxyFix leaves unparseable. An
+      implementation that honoured Client-IP would answer
+      `good 198.51.100.5` and would have pointed a DNS record at the address in
+      a header nothing validates. The paired case is
+      `update-911-no-myip-and-no-client-ip`, which is this request without the
+      header; both answer 911, and that they answer the *same* thing is the
+      assertion.
+    path: /nic/update
+    client_ip: null
+    headers: {client-ip: "198.51.100.5"}
+    query: {hostname: ok.example.com}
+    covers: [divergence/9-client-ip-not-honoured, update/myip-defaults-remote-addr]
+    effects:
+      persisted: none
+      dns: []
+    expect:
+      body: "911"
+
+  # === GET /nic/update -- the HEAD decision =================================
+
+  - id: update-head-runs-the-handler-and-writes-dns
+    note: >-
+      The legacy behaviour, recorded so that leaving it behind is a decision
+      with a measurement under it. Flask adds HEAD to every GET route
+      (werkzeug/routing/rules.py: `if "HEAD" not in methods and "GET" in
+      methods: methods.add("HEAD")`), and Flask serves HEAD by running the GET
+      handler and discarding the body. So this request is a full update:
+      Content-Length 18 for the `good 203.0.113.10` that is generated and
+      thrown away, and `last_ip_v4` moves. The wire cannot see the write, which
+      is why `effects:` carries it.
+
+      **Declaring `methods=["GET"]` does not fix this** -- measured, not
+      assumed: with that mutation applied to a throwaway copy, POST and PUT
+      become 405 while HEAD stays 200, still updates, and the Allow header
+      still reads `OPTIONS, GET, HEAD`.
+    targets: [legacy]
+    method: HEAD
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: 203.0.113.10}
+    covers: [head/update-refused, update/aggregate-good]
+    effects:
+      persisted: {last_ip_v4: "203.0.113.10", last_updated_at: set}
+      dns: [{backend: good, op: create, rtype: A, ip: 203.0.113.10}]
+      event: {event_type: dns_update, response: good}
+    expect:
+      status: 200
+      content_type: "text/plain; charset=utf-8"
+      body: ""
+
+  - id: update-head-is-refused-by-the-host
+    note: >-
+      The decision, in the table. HEAD must be safe (RFC 9110 §9.2.1) and this
+      handler is not, so the host does not serve HEAD on /nic/update and
+      answers 405. Not a preserved legacy behaviour, and the only wire
+      behaviour in this table the rewrite deliberately changes for a reason
+      other than removing query-parameter auth. Three things make it cheap:
+      no DynDNS client sends HEAD (every one of the cases in this table is a
+      GET), FastAPI's APIRoute does not add HEAD to a GET route so *preserving*
+      is what would take a deliberate line of code, and the realistic sender is
+      an uptime monitor configured with the router's credentials -- measured,
+      a HEAD with no `myip` moved the record to the prober's address
+      (198.51.100.99 -> 198.51.100.77), so the monitor would point the hostname
+      at itself. See plan §1, "HEAD".
+    targets: [host]
+    method: HEAD
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: 203.0.113.10}
+    legacy_behaviour: |-
+      HTTP 200, no body, Content-Length 18 -- and the update is performed
+    covers: [head/update-refused]
+    effects:
+      persisted: none
+      dns: []
+    expect:
+      status: 405
+      content_type: "application/json"
+      body: ""
+
   # === GET /nic/update -- query-parameter auth is gone ======================
 
   - id: update-query-parameter-credentials-are-rejected
@@ -1115,6 +1397,47 @@ cases:
         nohost
         nohost
         nohost
+
+  # === GET /nic/delete -- the HEAD decision =================================
+
+  - id: delete-head-runs-the-handler-and-deletes-records
+    note: >-
+      The same Flask auto-HEAD as `update-head-runs-the-handler-and-writes-dns`,
+      on the endpoint that removes records. Content-Length 4 for the `good`
+      that is generated and discarded. Delete persists nothing, so there is no
+      column to watch here -- the DNS operation is the whole effect, and it is
+      the one the wire cannot see.
+    targets: [legacy]
+    method: HEAD
+    path: /nic/delete
+    query: {hostname: ok.example.com}
+    covers: [head/update-refused, delete/myip-absent-both-families]
+    effects:
+      dns: [{backend: good, op: delete, rtype: null, hostname: ok.example.com}]
+      event: {event_type: dns_update, response: good}
+    expect:
+      status: 200
+      content_type: "text/plain; charset=utf-8"
+      body: ""
+
+  - id: delete-head-is-refused-by-the-host
+    note: >-
+      The decision applies to both writing endpoints, not just update. A HEAD
+      that deletes DNS records is the same defect as a HEAD that rewrites them,
+      and leaving delete out would be the seam between the two.
+    targets: [host]
+    method: HEAD
+    path: /nic/delete
+    query: {hostname: ok.example.com}
+    legacy_behaviour: |-
+      HTTP 200, no body, Content-Length 4 -- and the records are deleted
+    covers: [head/update-refused]
+    effects:
+      dns: []
+    expect:
+      status: 405
+      content_type: "application/json"
+      body: ""
 
   - id: delete-query-parameter-credentials-are-rejected
     note: Legacy answers `good` here. See `deleted_cases`.
