@@ -1224,6 +1224,34 @@ existing terminator (the old service already runs one) routing a hostname to
 `127.0.0.1:8443`, or accept HTTP **only** while no real device credential has
 been issued yet. Decide before the first device is created, not after.
 
+**Settled: the new stack runs its own terminator.** The `proxy` profile in
+`compose.yaml` puts Traefik 3.7 on 8443 in front of `api`, serving a certificate
+*extracted* from the old service's ACME store rather than sharing that store —
+one `acme.json`, one writer, and a second ACME-capable instance pointed at it
+corrupts the account key rather than merging. `api` moved to
+`127.0.0.1:8444` so the only listener reachable from off-host is the TLS one.
+`scripts/extract-acme-cert.sh` + `make tls-up` / `make tls-refresh` do it, and
+`make tls-verify HOST=<name>` proves the chain rather than assuming it. What
+happens to the borrowed arrangement at cutover — and the order the hand-over has
+to happen in, because the store's only writer must stop *before* the copy is
+taken — is `docs/ops/cutover.md` § 2.2 and § 5.4.
+
+**Two networking facts the cutover depends on, measured 2026-08-15.** Both
+belong here rather than only in the runbook, because they are properties of the
+deployment shape rather than of the cutover procedure:
+
+- **The new stack's docker network is IPv4-only and the old one is not** —
+  `atrium-ddns_default EnableIPv6=false` against
+  `dyndns-route53_web-network EnableIPv6=true`. **68% of production requests are
+  IPv6** (288 of 448 in 24 h) and every successful change in that window was.
+  If the container cannot resolve AAAA, `check_hostnameon_server` fails to
+  `False` — "every failure path answers `False`, which makes the write proceed"
+  — so every IPv6 `nochg` becomes a `good` and a real Route 53 write. Gate it
+  before cutover: `cutover.md` § 2.1.
+- **MySQL is published on `0.0.0.0:13353`.** That is the `.env.example` laptop
+  default and it should be loopback-bound or unmapped before this host serves
+  the real name. Nothing in the stack reaches MySQL through it.
+
 **Port collisions.** The old service binds 80/443 on the host. 8443 is free of
 those, and the compose file already parameterises the API and MySQL host ports
 (`API_HOST_PORT`, `MYSQL_HOST_PORT`) precisely so two stacks can coexist. Set
@@ -1272,10 +1300,28 @@ all gives 404.
 node builder image 25 → 26-alpine. Gate re-run on the new base: green.
 
 **The borrowed TLS certificate is accepted as-is** until atrium-ddns replaces
-the old service. No refresh automation. It goes stale around **24 Aug** when the
-old Traefik renews; from then the site serves an expired certificate until
-someone re-extracts. That is a known, accepted cost of a temporary measure —
-see §5b.
+the old service. No refresh automation. ~~It goes stale around **24 Aug** when
+the old Traefik renews; from then the site serves an expired certificate until
+someone re-extracts.~~ **Corrected 2026-08-15 — stale and expired are four weeks
+apart, and the original wording conflated them.** Measured by two instruments
+that agree to the second (the extracted `cert.pem`, and an independent decode of
+the live ACME store): `notBefore=Jun 25 14:53:30 2026 GMT`,
+`notAfter=Sep 23 14:53:29 2026 GMT`, one resolver, one certificate, three chain
+blocks.
+
+So the clock has two hands, not one:
+
+- **~24 Aug** — the old Traefik hits 30 days before expiry and renews. From then
+  the two stacks present *different* certificates. The copy is **stale**; it is
+  still a valid, trusted, unexpired Let's Encrypt certificate. `make tls-refresh`
+  re-syncs it in seconds.
+- **23 Sep** — the copy actually expires. Only from here does TLS on 8443 fail.
+
+That still makes it a temporary measure with a real deadline; it is just a
+deadline in September rather than in August, which is a month of headroom the
+earlier wording gave away. The hand-over that ends the borrowing — old writer
+stops, store is copied, new stack starts and owns ACME, in that order — is
+`docs/ops/cutover.md` § 4 and § 5.4. See also §5b.
 
 ---
 
