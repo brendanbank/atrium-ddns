@@ -1,9 +1,10 @@
 /** Home-widget rendering of the demo state.
  *
- * Wraps itself in MantineProvider + QueryClientProvider + AtriumProvider
- * so the host bundle's Mantine instance, TanStack cache, and atrium
- * user-context query stay isolated from atrium's own copies. Two
- * MantineProviders nested in the DOM is supported by Mantine.
+ * Wraps itself in `<DdnsRoot>`, which owns the MantineProvider +
+ * QueryClientProvider + AtriumProvider stack and the three props that
+ * keep a nested Mantine provider from restyling atrium's shell. See
+ * `host/DdnsRoot.tsx` — the stack used to be repeated here and in three
+ * other files, which is three places to get each of them wrong.
  *
  * Permission gating uses `usePerm()` from
  * `@brendanbank/atrium-host-bundle-utils/react` — a single TanStack
@@ -16,29 +17,19 @@ import {
   Card,
   Group,
   Loader,
-  MantineProvider,
   Stack,
   Text,
   Title,
 } from '@mantine/core';
-import {
-  useMutation,
-  useQuery,
-  useQueryClient,
-  QueryClientProvider,
-} from '@tanstack/react-query';
-import {
-  AtriumProvider,
-  useAtriumColorScheme,
-  usePerm,
-} from '@brendanbank/atrium-host-bundle-utils/react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { usePerm } from '@brendanbank/atrium-host-bundle-utils/react';
 
 import {
   bumpAtriumDdns,
   getAtriumDdnsState,
   type AtriumDdnsState,
 } from './api';
-import { queryClient } from './queryClient';
+import { DdnsRoot } from './host/DdnsRoot';
 
 const STATE_KEY = ['atrium_ddns', 'state'] as const;
 
@@ -106,14 +97,9 @@ function AtriumDdnsWidgetInner() {
 }
 
 export function AtriumDdnsWidget() {
-  const scheme = useAtriumColorScheme();
   return (
-    <MantineProvider defaultColorScheme={scheme}>
-      <QueryClientProvider client={queryClient}>
-        <AtriumProvider>
-          <AtriumDdnsWidgetInner />
-        </AtriumProvider>
-      </QueryClientProvider>
-    </MantineProvider>
+    <DdnsRoot>
+      <AtriumDdnsWidgetInner />
+    </DdnsRoot>
   );
 }
