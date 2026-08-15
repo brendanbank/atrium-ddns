@@ -37,7 +37,7 @@ are listed again at the bottom of this card.
 | `<CREDENTIALS>` | **Signing:** GPG subkey `F60F2EAA7F5ACC52` on a hardware token via `pinentry-mac`. `OVERNIGHT_GPG_BLOCKING=0` for the development phase — a locked token no longer halts the run (see *Standing decisions*). **Transport:** GitHub over HTTPS via the `gh` credential helper; an empty `ssh-add -l` is routine and pre-flight confirms `origin` through the path it actually chose. **Deploy:** `~/.ssh/atrium-ddns-deploy`, ed25519, passphraseless, `IdentitiesOnly yes`. **This is the agent-independent path** — macOS points `SSH_AUTH_SOCK` at the launchd agent, which holds no identities, and 1Password's agent lives at a different socket and may be locked. Verified reaching the host with `SSH_AUTH_SOCK` unset entirely. Refusal is a stop condition. **Registry:** `ghcr.io/brendanbank/atrium:0.28` — public, no token. |
 | `<STATE_FILE>` | `.context/<milestone>-orchestration.md` (the workspace `.context/` is gitignored by Conductor) |
 | `<EPIC>` | the milestone's `epic`-labelled issue. Not yet created — opens with the milestone. |
-| `<MIGRATION_SLOT>` | **two chains, both single-head, both scarce.** `alembic_version_app` — the host chain at `backend/alembic/versions/`, currently `0001_init`; one agent at a time may add a revision, so schedule it. Atrium's own `alembic_version` chain is upstream's and must never be written to — but it *moves* on an image bump (0.28 brought `0012_user_secret_keys`), so an atrium uptake is an image bump **and** `alembic upgrade head`, as one step. |
+| `<MIGRATION_SLOT>` | **two chains, both single-head, both scarce.** `alembic_version_app` — the host chain at `backend/alembic/versions/`, currently `0003_ddns_event_backend_type`; one agent at a time may add a revision, so schedule it. Atrium's own `alembic_version` chain is upstream's and must never be written to — but it *moves* on an image bump (0.28 brought `0012_user_secret_keys`), so an atrium uptake is an image bump **and** `alembic upgrade head`, as one step. |
 
 ### Gate
 
@@ -49,7 +49,7 @@ cd frontend && pnpm install --frozen-lockfile
 pnpm typecheck                     # tsc --noEmit — 0 errors
 pnpm test                          # vitest — 2 passed (2)
 cd .. && make up && make migrate    # both alembic chains to head
-make test-backend                  # host tests 8 passed + compat 29 passed, 3 skipped
+make test-backend                  # host tests 532 passed + compat 31 passed, 3 skipped
 make smoke PASS=<pw> EMAIL=<addr>  # scripts/smoke.sh — 11 passed (11)
 ```
 
@@ -64,9 +64,9 @@ Verified here: editing a case file without rebuilding stops the gate with *"the
 api container is running a STALE copy of tests/"*; rebuilding with the same
 edit fails 3 guards; reverting returns 29 passed.
 
-The 101-case wire table is **not** in the gate and must not be — it needs a live
+The 131-case wire table is **not** in the gate and must not be — it needs a live
 service and an explicit pair (`make test-compat TARGET=… BASE_URL=…`). A run
-without `--target` prints *"the wire table was NOT RUN (0 of 101 cases
+without `--target` prints *"the wire table was NOT RUN (0 of 131 cases
 executed)"* rather than a zeroed accounting block that reads like a pass.
 
 CI gained a Docker-free `compat-guards` job running literally `pytest tests/`
