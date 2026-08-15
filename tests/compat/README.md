@@ -184,6 +184,9 @@ python -m venv .venv && .venv/bin/pip install pytest pyyaml
 
 .venv/bin/python -m pytest tests/compat --target legacy --base-url http://127.0.0.1:5000
 .venv/bin/python -m pytest tests/compat --target host   --base-url http://localhost:8153
+
+# or, without a local venv, from inside the api container (#23):
+make test-compat TARGET=host BASE_URL=http://api:8000
 ```
 
 `pytest` and `PyYAML` are the only dependencies. The wire is spoken with
@@ -196,7 +199,7 @@ runner put there and `omit_headers: [user-agent]` genuinely omits it.
 
 | option | required | notes |
 |---|---|---|
-| `--target legacy\|host` | **always** | decides which cases run. No default: a runner that picks one will be pointed at the wrong service eventually |
+| `--target legacy\|host` | **for any case to run** | decides which cases run. No default: a runner that picks one will be pointed at the wrong service eventually. Absent, the table is collected as one skip and reported as NOT RUN; given a `--base-url` and no target, the session is refused outright (exit 4) |
 | `--base-url` | except with `--collect-only` | used **verbatim**. Nothing reads its shape |
 | `--compat-timeout` | no | seconds, default 10 |
 | `--compat-insecure` | no | skip TLS verification for an `https` base URL |
@@ -683,39 +686,63 @@ data rather than counted as calibrated.
 
 ```bash
 uv venv /tmp/compat-venv && VIRTUAL_ENV=/tmp/compat-venv uv pip install pyyaml pytest
-/tmp/compat-venv/bin/python -m pytest tests/compat/legacy_behaviour -q \
-    --confcutdir=tests/compat/legacy_behaviour
+/tmp/compat-venv/bin/python -m pytest tests/compat/legacy_behaviour -q
 ```
 
 18 passed, ~0.1s. Same two dependencies as the wire runner, and no others.
 
-**`--confcutdir` is not decoration, and it should not be needed.**
-`tests/compat/conftest.py` raises `UsageError` from `pytest_configure` when
-`--target` is absent, and `pytest_configure` runs whenever that conftest is
+**`--confcutdir` used to be needed here and no longer is (#23).**
+`tests/compat/conftest.py` raised `UsageError` from `pytest_configure` when
+`--target` was absent, and `pytest_configure` runs whenever that conftest is
 loaded — which is any run rooted at or under `tests/compat/`. So
-`pytest tests/compat/legacy_behaviour` fails with *"--target is required"*
-before collecting anything, and so would `pytest tests/`. These guards have no
+`pytest tests/compat/legacy_behaviour` failed with *"--target is required"*
+before collecting anything, and so did `pytest tests/`. These guards have no
 target: they read two YAML files and never open a socket, and passing
-`--target host` to satisfy the parser would be asserting something untrue about
-what is being run.
+`--target host` to satisfy the parser would have asserted something untrue about
+what was being run.
 
-`--confcutdir` stops pytest walking up to that conftest at all, which is why it
-works. It is a workaround, and it is recorded here rather than smoothed over:
-the durable fix is for the `--target` check to fire when a protocol case is
-*collected* rather than at configure time, so a sibling directory under
-`tests/compat/` can be run on its own. Flagged for #8 rather than edited here —
-`conftest.py` is that issue's declared file.
+The requirement now fires at **collection of the wire cases** instead. Without
+`--target`, `test_case` is collected as one skip named
+`NO-TARGET-GIVEN-WIRE-TABLE-NOT-RUN`, every service-free guard runs, and the
+session prints *"the wire table was NOT RUN (0 of 101 cases executed)"* rather
+than a zeroed accounting block that reads like a clean run. What did **not**
+change: no wire case can execute without an explicit target, and a `--base-url`
+with no `--target` is still refused outright with exit 4 — that one is not a
+sibling suite being swept up, it is a service nobody named.
+`test_runner_contract.py` asserts all four readings by running pytest as a
+subprocess, because a runner cannot assert its own exit code.
 
-Going the other way, `pytest tests/compat --target host` now collects these 18
-alongside the wire runner's 108, for 126. The runner's own accounting block is
-unaffected — it still reports 101 selected cases, 3 unmet preconditions, 11
-wire-only — because it counts the table, not the session.
+Going the other way, `pytest tests/compat --target host` collects these 18
+alongside the wire runner's 108 and the 6 contract tests, for 132. The runner's
+own accounting block is unaffected — it still reports 101 selected cases, 3
+unmet preconditions, 11 wire-only — because it counts the table, not the
+session.
 
-**Neither half of `tests/compat/` is in the milestone gate.** The Dockerfile
-copies `backend` to `/opt/host_app` and nothing else, so `make test-backend`
-(`pytest /opt/host_app/tests`) cannot reach this directory. The wire runner, the
-wire table and these guards are all outside it. That is a real gap in the gate
-and no V1M1 issue owns closing it.
+## In the gate
+
+**Both halves of `tests/compat/` are in the gate as of #23** — the service-free
+half unconditionally, the wire table not at all.
+
+| | runs | how |
+|---|---|---|
+| model guards + runner guards + runner contract | every `make test-backend`, so every gate run | `tests/` is COPYed into the Dockerfile's `dev` stage at `/opt/compat_tests`; `make test-backend` runs a second pytest session over it |
+| the 101-case wire table | never automatically | `make test-compat TARGET=legacy\|host BASE_URL=<url>` — both required, neither defaulted |
+
+`make test-compat` is deliberately outside `make test` and outside the gate: it
+needs a live service, and which service it is has to be stated. Giving either
+option a default to make the target "work" is the bug #8 was written about.
+`BASE_URL` is resolved **from inside the api container** — `http://api:8000` is
+the compose stack, a legacy service on the dev box is
+`http://host.docker.internal:<port>` on Docker Desktop. Nothing infers that;
+the runner prints the reachability probe it got back.
+
+**`make up` does not rebuild, so an edited case file is invisible to the
+container.** `make check-compat-fresh` (a prerequisite of `make test-backend`)
+digests `tests/` in the worktree and inside the running container and refuses
+when they differ, naming both hashes and the fix (`make build && make up`).
+Without it the gate reads the image's older copy and reports green for it,
+which is the same defect `compose.yaml`'s `image:` comment records for a shared
+tag, one layer along.
 
 ## Prove the guards bite
 
