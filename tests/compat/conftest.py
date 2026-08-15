@@ -9,7 +9,12 @@ runner's clothes; surface it as a failure instead of branching around it.
 Two invariants worth stating before the code:
 
 * **`--target` is required and has no default.** A runner that picks one will
-  eventually be pointed at the wrong service and report green about it.
+  eventually be pointed at the wrong service and report green about it. The
+  requirement is enforced where the wire cases are *collected* — not at
+  `pytest_configure`, which fires whenever this file is loaded and therefore
+  took every sibling suite under `tests/compat/` down with it. See
+  `pytest_configure` and `pytest_generate_tests` below; `test_runner_contract.py`
+  is the proof that narrowing the blast radius did not relax the rule.
 * **`--base-url` is used verbatim.** Nothing here reads the hostname to decide
   anything. `scripts/smoke.sh` inferred "this is the local stack" from the
   shape of a URL and read the wrong stack through an ssh tunnel while
@@ -115,20 +120,57 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
+#: Printed instead of running a wire case when no `--target` was given. It says
+#: *not run*, never *0 failures*: a session that executed no case at all and one
+#: that executed 101 clean ones are different results and must not render the
+#: same.
+NO_TARGET_SKIP_REASON = (
+    "--target was not given, so NO wire case ran. The wire table needs an "
+    "explicit target and base URL, neither of which has a default: "
+    "`make test-compat TARGET=legacy|host BASE_URL=<url>`, or "
+    "`pytest tests/compat --target legacy|host --base-url <url>`. A runner "
+    "that picks a target for you will eventually be pointed at the wrong "
+    "service and report green about it."
+)
+
+
 def pytest_configure(config: pytest.Config) -> None:
     target = config.getoption("--target")
-    if target is None:
-        raise pytest.UsageError(
-            "--target is required and has no default. Pass "
-            "--target legacy or --target host, and make sure it names the "
-            "service that is actually behind --base-url."
-        )
-
     base_url = config.getoption("--base-url")
+
+    if target is None:
+        # No target: the wire table is not run, and that is reported as *not
+        # run* rather than enforced here.
+        #
+        # This hook fires whenever this conftest is loaded, which is any
+        # session rooted at or under `tests/compat/` — including
+        # `pytest tests/`, `pytest tests/compat/legacy_behaviour` and the
+        # guards in `test_protocol.py`, none of which open a socket. Raising
+        # here refused all of them before collection had started, which is why
+        # #10 had to reach for `--confcutdir`. The requirement itself is
+        # unchanged and enforced one level down, at collection of the wire
+        # cases (`pytest_generate_tests`): with no target, `test_case` is
+        # collected as a single skip carrying NO_TARGET_SKIP_REASON, so no case
+        # can execute against a service nobody named.
+        #
+        # One thing does still refuse outright: a `--base-url` with no
+        # `--target`. That is not a sibling suite being swept up, it is someone
+        # pointing the runner at a service without saying which service it is —
+        # exactly the mistake `--target` exists to prevent.
+        if base_url is not None:
+            raise pytest.UsageError(
+                f"--base-url {base_url!r} was given without --target. --target "
+                "is required and has no default: it names which implementation "
+                "is behind that URL, and it decides which cases run. Pass "
+                "--target legacy or --target host, and make sure it names the "
+                "service that is actually behind --base-url."
+            )
+        return
+
     if base_url is None:
-        # Collection does not need a service; execution does. This is the only
-        # conditional in the file, and it is on pytest's own mode, not on the
-        # target or the URL.
+        # Collection does not need a service; execution does. The only
+        # conditional in this file that reads pytest's mode, and it reads
+        # nothing about the target or the shape of the URL.
         if config.getoption("collectonly"):
             return
         raise pytest.UsageError(
@@ -197,9 +239,26 @@ def unmet_preconditions(case: Mapping[str, Any]) -> list[str]:
 
 
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
+    """Where `--target` is actually enforced.
+
+    With a target, one test per selected case. Without one, a single skip
+    naming the reason — *not* an empty parametrisation, which pytest renders as
+    a bare "got empty parameter set" and which reads like a filter rather than
+    like a refusal.
+
+    Either way the wire cases cannot execute without a target, because this is
+    the only thing that supplies `case`.
+    """
     if "case" not in metafunc.fixturenames:
         return
     target = metafunc.config.getoption("--target")
+    if target is None:
+        metafunc.parametrize(
+            "case",
+            [pytest.param(None, marks=pytest.mark.skip(reason=NO_TARGET_SKIP_REASON))],
+            ids=["NO-TARGET-GIVEN-WIRE-TABLE-NOT-RUN"],
+        )
+        return
     selected, _ = select_for_target(target)
     metafunc.parametrize("case", selected, ids=[c["id"] for c in selected])
 
@@ -392,9 +451,26 @@ _PROBE_KEY = pytest.StashKey[str]()
 # ---------------------------------------------------------------------------
 
 
+def _no_target_lines() -> list[str]:
+    """What a session with no `--target` prints — in both hooks, one wording.
+
+    Two numbers, never one: the table's size and the nought that ran. "0 cases
+    failed" and "the table was not run" are different facts and this is the
+    place they get told apart.
+    """
+    return [
+        f"compat: NO --target GIVEN — the wire table was NOT RUN "
+        f"(0 of {len(all_cases())} cases executed; service-free guards only).",
+        "compat: run it with `make test-compat TARGET=legacy|host BASE_URL=<url>`. "
+        "Neither option has a default; see tests/compat/README.md.",
+    ]
+
+
 def pytest_report_header(config: pytest.Config) -> list[str]:
     target = config.getoption("--target")
     base_url = config.getoption("--base-url")
+    if target is None:
+        return _no_target_lines()
     selected, excluded = select_for_target(target)
     skipped = [c for c in selected if unmet_preconditions(c)]
     return [
@@ -410,6 +486,15 @@ def pytest_report_header(config: pytest.Config) -> list[str]:
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config: pytest.Config) -> None:
     target = config.getoption("--target")
+    if target is None:
+        # Not the accounting block with zeroes in it. A table of zeroes next to
+        # a green summary line is the shape this whole file exists to refuse:
+        # it reads as "101 cases, none of them a problem" when the fact is
+        # "nothing was asked of the service at all".
+        terminalreporter.write_line("")
+        for line in _no_target_lines():
+            terminalreporter.write_line(line)
+        return
     selected, excluded = select_for_target(target)
     skipped = [c for c in selected if unmet_preconditions(c)]
     write = terminalreporter.write_line

@@ -5,8 +5,40 @@
 
 COMPOSE := docker compose
 
+# Where the Dockerfile's `dev` stage puts the repo-root `tests/` tree. Mirrors
+# the repo layout, so `/opt/compat_tests/compat/...` is `tests/compat/...`.
+COMPAT_TESTS := /opt/compat_tests
+
+# Content digest of a directory tree: every file's path and bytes, in sorted
+# order. Run against the worktree and against the container (see
+# check-compat-fresh) — one script, so the two readings cannot differ by
+# method. Exported rather than inlined because the recipe would otherwise be
+# unreadable through two layers of quoting.
+define COMPAT_DIGEST_PY
+import hashlib, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+digest = hashlib.sha256()
+def tracked(path):
+    # Byte-compiled output and pytest's own cache appear on one side and not
+    # the other, and a digest that counts them reports drift that is not there.
+    parts = path.relative_to(root).parts
+    return not any(part == "__pycache__" or part.startswith(".") for part in parts)
+
+files = [p for p in sorted(root.rglob("*")) if p.is_file() and tracked(p)]
+if not files:
+    sys.exit("no files under " + str(root))
+for path in files:
+    digest.update(path.relative_to(root).as_posix().encode())
+    digest.update(b"\0")
+    digest.update(path.read_bytes())
+print(digest.hexdigest())
+endef
+export COMPAT_DIGEST_PY
+
 .PHONY: help dev-bootstrap up down build logs ps migrate \
-	seed-admin seed-bundle test test-frontend test-backend typecheck
+	seed-admin seed-bundle test test-frontend test-backend test-compat \
+	check-compat-fresh \
+	test-backend-serial test-backend-file typecheck smoke
 
 help:  ## show this help
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-18s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -57,8 +89,75 @@ test-frontend:  ## frontend unit tests via vitest
 	cd frontend && pnpm install --frozen-lockfile 2>/dev/null || (cd frontend && pnpm install)
 	cd frontend && pnpm test
 
-test-backend:  ## backend tests inside the api container (parallel)
+# Two pytest sessions, deliberately. The host suite runs under
+# backend/pyproject.toml (`-n auto`, asyncio auto-mode); the compat tree has no
+# ini of its own and wants neither. Separate sessions also keep the two counts
+# separate in the output — one merged "N passed" is the number that lets a
+# suite stop running without anyone noticing.
+#
+# The compat half is the service-free half: the 18 model-behaviour guards and
+# the wire runner's own arithmetic guards. It opens no socket and needs no
+# `--target`, and the wire table is reported as NOT RUN rather than as nought
+# failures. The table itself is `make test-compat`, which is not in the gate
+# because it needs a live service named on the command line.
+test-backend: check-compat-fresh  ## backend tests + service-free compat guards, in the api container
 	$(COMPOSE) exec -T api /opt/venv/bin/python -m pytest /opt/host_app/tests $(PYTEST_ARGS)
+	$(COMPOSE) exec -T api /opt/venv/bin/python -m pytest $(COMPAT_TESTS) -ra $(PYTEST_ARGS)
+
+# `tests/` is baked into the image, and `make up` does not rebuild. So editing
+# a compat file and re-running the gate reads the *old* copy and reports green
+# for it — the same defect compose.yaml's `image:` comment records for a shared
+# tag, one layer along, and the one this whole issue is about.
+#
+# Two readings of one tree, and they must agree. `docker compose exec` is the
+# only instrument that can see what the running container actually holds;
+# anything derived from the Dockerfile or from a build log is a statement about
+# what should be there.
+check-compat-fresh:  ## fail if the container's copy of tests/ is not this worktree's
+	@host=$$(python3 -c "$$COMPAT_DIGEST_PY" tests | tr -d '\r'); \
+	img=$$($(COMPOSE) exec -T api /opt/venv/bin/python -c "$$COMPAT_DIGEST_PY" \
+		$(COMPAT_TESTS) | tr -d '\r'); \
+	if [ -z "$$host" ] || [ -z "$$img" ]; then \
+		echo "check-compat-fresh: could not read both digests (worktree=$$host container=$$img)"; \
+		exit 1; \
+	fi; \
+	if [ "$$host" != "$$img" ]; then \
+		echo "check-compat-fresh: the api container is running a STALE copy of tests/."; \
+		echo "  worktree  $$host"; \
+		echo "  container $$img"; \
+		echo "  tests/ is COPYed into the image (Dockerfile, dev stage) and"; \
+		echo "  \`make up\` does not rebuild. Run: make build && make up"; \
+		exit 1; \
+	fi; \
+	echo "check-compat-fresh: container matches worktree ($$host)"
+
+# The wire table. NOT part of `make test` and NOT part of the gate: it replays
+# 101 cases against a running service, and which service that is has to be
+# stated, not guessed. Defaulting either option to make this target "work" is
+# the bug #8 was written about.
+#
+# BASE_URL is resolved from inside the api container, because that is the one
+# environment guaranteed to have pytest and PyYAML. `http://api:8000` is this
+# stack; a legacy service on the dev box is `http://host.docker.internal:<port>`
+# on Docker Desktop. Nothing infers any of that — the runner uses the URL
+# verbatim and prints the reachability probe it got back, and the three
+# host-only cases carry the legacy body so a mis-paired target is caught by the
+# response rather than by the URL.
+test-compat:  ## wire table vs a live service (TARGET=legacy|host BASE_URL=http://...)
+	@if [ -z "$(TARGET)" ] || [ -z "$(BASE_URL)" ]; then \
+		echo "usage: make test-compat TARGET=legacy|host BASE_URL=http://host:port"; \
+		echo; \
+		echo "Neither has a default, and this target will not invent one."; \
+		echo "  TARGET   which implementation is behind BASE_URL. It decides"; \
+		echo "           which cases run; guessing it runs the wrong table"; \
+		echo "           against the wrong service and reports green."; \
+		echo "  BASE_URL used verbatim, resolved from inside the api container."; \
+		echo; \
+		echo "See tests/compat/README.md for worked invocations."; \
+		exit 2; \
+	fi
+	$(COMPOSE) exec -T api /opt/venv/bin/python -m pytest $(COMPAT_TESTS)/compat \
+		--target "$(TARGET)" --base-url "$(BASE_URL)" -ra $(PYTEST_ARGS)
 
 test-backend-serial:  ## same, one worker — for bisecting a failing test
 	$(COMPOSE) exec -T api /opt/venv/bin/python -m pytest /opt/host_app/tests -n 0
