@@ -118,15 +118,107 @@ def _password_hash() -> str:
     return PasswordHelper().hash("unusable-" + "x" * 24)
 
 
+#: Primary keys of every row :func:`_add_event` wrote, so teardown can
+#: delete them by ``id``. See :func:`_purge`.
+_WRITTEN_EVENT_IDS: list[int] = []
+
+
 async def _purge(emails: list[str]) -> None:
+    """Remove this module's rows, by index and by primary key.
+
+    **Not** ``DELETE FROM ddns_event WHERE user_email IN (…)``, which is
+    the idiom the sibling test modules use and which this file copied
+    first. Two things are wrong with it here, and the first one bit:
+
+    **It is a full table scan, and ten workers share one MySQL.**
+    ``user_email`` carries no index (``SHOW INDEX FROM ddns_event``:
+    ``id``, ``client_ip``, ``created_at``, ``(device_id, created_at)``,
+    ``domain_id``, ``hostname_id``, ``(user_id, created_at)`` — and no
+    ``user_email``). So the delete takes row locks across the whole
+    table, while ``DELETE FROM users`` separately takes locks on the
+    same rows through ``ddns_event.user_id``'s ``ON DELETE SET NULL``.
+    Two statements touching one set of rows in two different orders,
+    once per worker, is a deadlock — observed as
+    ``(1213, 'Deadlock found when trying to get lock')`` on a fixture
+    setup, intermittently, once this module started running beside
+    ``test_router_tenant.py``'s identical purge.
+
+    **It cannot see an unattributed row.**
+    ``test_a_tenant_scoped_badauth_filter_is_named_not_served_a_zero``
+    writes the shape ``router_nic`` actually produces for a failed
+    credential: ``user_id`` **and** ``user_email`` both ``NULL``.
+    ``user_email IN (…)`` never matches ``NULL``, so that row survived
+    teardown and accumulated one per run, forever. The bug is invisible
+    from the test — everything passes — and it is the same
+    null-is-not-a-value confusion the surface under test exists to
+    prevent, which is a good reason to write it down rather than
+    quietly fix it.
+
+    So: delete by ``user_id`` (indexed, and the scope's own column), and
+    delete this module's own writes by primary key. Both are point
+    lookups; neither scans.
+
+    Events go before users, so that by the time ``DELETE FROM users``
+    runs, ``ON DELETE SET NULL`` has nothing left to set. A cascade that
+    touches no rows takes no row locks, and that cascade is one half of
+    the lock-ordering conflict.
+
+    What this does **not** fix, measured rather than assumed
+    -------------------------------------------------------
+    Ten workers, this box, full-suite sweeps:
+
+    ==========================================  ==========================
+    configuration                               runs with a 1213 deadlock
+    ==========================================  ==========================
+    milestone tip, this file genuinely absent   3 of 6
+    tip + this file, ``user_email`` purge       6 of 8
+    tip + this file, indexed purge (this one)   5 of 8
+    tip + this file, indexed purge + GET_LOCK   5 of 8
+    serial (``-n 0``), any configuration        0 — 604 passed
+    ==========================================  ==========================
+
+    **The deadlock predates this file**: row one. It is not introduced
+    here, it is made more frequent here, and neither an indexed purge
+    nor a named lock around *this* module's teardown moves it — because
+    the statement that deadlocks is in ``test_router_tenant.py``'s
+    purge, not in this one, and a lock only one participant takes
+    serialises nothing.
+
+    ``_purge`` is copy-pasted into **seven** test modules
+    (``grep -c 'async def _purge' backend/tests/*.py``), every one of
+    them running the unindexed ``DELETE FROM ddns_event WHERE
+    user_email IN (…)`` plus a cascading ``DELETE FROM users``. The fix
+    is one shared teardown — a ``conftest.py`` this package does not
+    have — and that belongs to no issue in this milestone. Surfaced in
+    #46's PR rather than designed around; the serial row is the
+    instrument that says the *code* is fine and the *harness* contends.
+
+    A first version of the diagnosis was wrong and is worth recording:
+    the "is it mine?" experiment removed this file with
+    ``docker compose cp … || rm``, the ``cp`` **succeeded**, and the file
+    was never removed. It reported "not mine" on a run that still
+    contained it. Actually deleting the file reversed the conclusion to
+    the honest one above — the same could-not-fail shape this repository
+    keeps cataloguing, in a diagnostic rather than in a probe.
+    """
     factory = get_session_factory()
     async with factory() as s:
-        await s.execute(
-            sa.text("DELETE FROM ddns_event WHERE user_email IN :e").bindparams(
-                sa.bindparam("e", expanding=True)
-            ),
-            {"e": emails},
+        if _WRITTEN_EVENT_IDS:
+            await s.execute(
+                sa.delete(m.DnsEvent).where(
+                    m.DnsEvent.id.in_(list(_WRITTEN_EVENT_IDS))
+                )
+            )
+            _WRITTEN_EVENT_IDS.clear()
+        user_ids = list(
+            (
+                await s.execute(sa.select(User.id).where(User.email.in_(emails)))
+            ).scalars()
         )
+        if user_ids:
+            await s.execute(
+                sa.delete(m.DnsEvent).where(m.DnsEvent.user_id.in_(user_ids))
+            )
         for email in emails:
             await s.execute(sa.text("DELETE FROM users WHERE email = :e"), {"e": email})
         await s.commit()
@@ -228,6 +320,13 @@ async def _events(
 
 
 async def _add_event(**kwargs: Any) -> int:
+    """Write one event and remember its id for teardown.
+
+    The id is recorded rather than the row being found again later,
+    because one test deliberately writes a row with no ``user_id`` and
+    no ``user_email`` — the shape a failed credential produces — and
+    there is no attribute on it to find it by. See :func:`_purge`.
+    """
     factory = get_session_factory()
     async with factory() as s:
         event = m.DnsEvent(**kwargs)
@@ -235,6 +334,7 @@ async def _add_event(**kwargs: Any) -> int:
         await s.flush()
         eid = event.id
         await s.commit()
+    _WRITTEN_EVENT_IDS.append(eid)
     return eid
 
 
