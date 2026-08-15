@@ -528,6 +528,24 @@ class DnsEvent(HostBase):
     # the same as client_ip, and the difference is the interesting
     # part of a NAT'd update.
     ip: Mapped[str | None] = mapped_column(String(IPV6_LEN), nullable=True)
+    # Which provider this row is about, when the row is about one.
+    #
+    # NULL is a *meaning*, not a missing value: "decided before any
+    # backend was contacted" — badauth, abuse, 911, notfqdn, nohost, and
+    # a hostname whose domain has zero backends. The legacy service has
+    # the same property (`event-backend-type-is-null-for-outcomes-
+    # decided-before-any-backend`, disposition `preserve`), and it is
+    # what makes `backend_type IS NULL` a filter rather than a
+    # data-quality complaint.
+    #
+    # Deliberately not folded into `message`: that column is set on
+    # exactly one kind of row, the rate-limit refusal
+    # (`event-detail-is-populated-only-for-rate-limit-refusals`, also
+    # `preserve`), and a free-text column that sometimes holds a
+    # provider name and sometimes a refusal reason cannot be filtered
+    # on. Same width as `ddns_domain_backend.backend_type`, which is
+    # where the value comes from.
+    backend_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
     message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (

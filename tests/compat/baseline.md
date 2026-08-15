@@ -1,24 +1,34 @@
-# Baseline: the case table against the legacy service
+# Baseline: the case table against the legacy service, and against the host
 
-Three readings, kept side by side.
+Four readings, kept side by side. The first three are `--target legacy`; the
+fourth is the same frozen table pointed at **this repository's own service**,
+which is half of V1M2's exit criterion.
 
-| | issue #9, the 101-case table | issue #11, the frozen 114-case table | **issue #29, the 131-case table at v3** |
-|---|---|---|---|
-| selected for `--target legacy` | 98 | 107 | **124** |
-| executed by the runner | 95 | 104 | **121** |
-| measured out of band | 3 | 3 | **3** |
-| agree with the table | 98 | 107 | **124** |
-| diverge from the table | **0** | **0** | **0** |
-| divergences from `docs/DYNDNS-PROTOCOL.md` §1 | 9 (6 carried + 3 found) | 9, all carried, all confirmed live | **9, unchanged — the document says nothing family-specific** |
+| | issue #9, the 101-case table | issue #11, the frozen 114-case table | issue #29, the 131-case table at v3 | **issue #18, v3 vs `--target host`** |
+|---|---|---|---|---|
+| target | legacy | legacy | legacy | **host** |
+| selected for the target | 98 | 107 | 124 | **127** |
+| executed by the runner | 95 | 104 | 121 | **124** |
+| measured out of band | 3 | 3 | 3 | **3** |
+| agree with the table | 98 | 107 | 124 | **124** |
+| diverge from the table | **0** | **0** | **0** | **0** |
+| divergences from `docs/DYNDNS-PROTOCOL.md` §1 | 9 (6 carried + 3 found) | 9, all carried, all confirmed live | 9, unchanged | *not re-derived — §8 measures the host, not the document* |
 
-**§7 is the current reading**, taken by #29 on a third independently built
-fixture when the table went from v2 to v3 for address-family coverage. §0 is
-#11's V1M1 close-out re-run at v2, and §§1–6 are #9's; both are kept because the
-mutation work and the failure modes in them are not superseded by a later green
-run. Nothing in §7 is inherited from either: every number in it, including the
-"before" figures it improves on, was re-derived with #29's own instruments, and
-where one disagrees with what was already written down the disagreement is
-stated rather than reconciled (§7.7).
+The two target columns do not have the same denominator and must not be read as
+if they did: 4 cases are legacy-only (`targets: [legacy]`) and 7 are host-only,
+so 124 legacy-selected and 127 host-selected share 120. §8.3 runs the
+*legacy*-selected table against the host to say exactly how far that partition
+is a real difference rather than a convenience.
+
+**§8 is the current reading for the host and §7 for the legacy service.** §7 was
+taken by #29 on a third independently built fixture when the table went from v2
+to v3 for address-family coverage; §0 is #11's V1M1 close-out re-run at v2, and
+§§1–6 are #9's. All are kept because the mutation work and the failure modes in
+them are not superseded by a later green run. Nothing in §7 or §8 is inherited:
+every number in each, including the "before" figures it improves on, was
+re-derived with that issue's own instruments, and where one disagrees with what
+was already written down the disagreement is stated rather than reconciled
+(§7.7, §8.5).
 
 ---
 
@@ -359,16 +369,25 @@ in §1 said refusing `HEAD` is free on FastAPI. Three readings:
 | stack | `HEAD` on a `GET`-only route |
 |---|---|
 | bare FastAPI, no catch-all (in-process `TestClient`) | **405** — what the table freezes |
-| the same route behind a `GET`-only SPA catch-all mount | **200** |
+| the same route behind a `GET`-only SPA catch-all mount | ~~**200**~~ → **404** |
 | this repository's own stack, over the wire, `/api/healthz` | **404** |
+
+> **Corrected by #16 and re-measured by #18 — the middle row is 404, not 200.**
+> The reading struck through above was #11's and it stood in this file, in plan
+> §1 and in the frozen table's `known_gaps` for two issues. It is wrong against
+> `app.static.SPAStaticFiles` as shipped in `atrium:0.28`: the fallback to
+> `index.html` is guarded by `scope["method"] == "GET"`, so a `HEAD` miss
+> re-raises the underlying 404 rather than being served the shell. #18's own
+> reading, five stacks, taken in the api container and over the wire — see
+> §8.4 for the full table and for why the wrong *reason* mattered even though
+> the decision did not move.
 
 A `Mount` matches every method, so the 405 the route would have produced never
 reaches the wire. `POST` still answers 405 through the same mount, which is
 exactly why the two `-post-` cases pass. **The decision stands and the two
 frozen `HEAD` cases stay at 405** — what changes is that V1M2 has to write a
-deliberate `HEAD` handler, or stop the SPA mount shadowing `/nic/*`. That is
-now in the plan and in `frozen.known_gaps` instead of being discovered by a
-red case in the next milestone.
+deliberate `HEAD` handler. #16 wrote one; §8.4 has the reading that proves it
+is the handler and not the framework.
 
 ### 0.11 The table's own arithmetic, two instruments
 
@@ -1264,3 +1283,270 @@ Expected: `154 passed, 3 skipped`, and an accounting block reading `131 cases`,
 work, not the end of it.** §7.4 and §7.6 are what has to happen next: measure
 which cases the thing you changed can even reach, then break the service in the
 way you are protecting against and check the right cases go red.
+
+---
+
+## 8. The frozen table against the **host** — issue #18, 2026-08-15, V1M2 close-out
+
+The first seven sections measure the *legacy* service. This one is the other
+half of V1M2's exit criterion:
+
+> the **frozen** V1M1 table green against `--target host`
+
+**Nothing here is inherited.** The close-out rule is to re-run rather than quote
+the reading on file, so this issue stood up its own stack
+(`COMPOSE_PROJECT_NAME=ddns18`, `API_HOST_PORT=8018`, `MYSQL_HOST_PORT=13318`),
+built its own image, ran both alembic chains, seeded its own fixture world with
+`make seed-compat-fixture`, and re-derived every number below — including the
+gate baselines the dispatch brief supplied. Where a reading disagrees with what
+the milestone had been claiming, the disagreement is stated rather than
+reconciled (§8.5).
+
+### 8.1 The verdict
+
+```
+compat accounting (target=host):
+  cases in table             131
+  excluded by `targets:`       4  ['checkip-post-is-405-with-an-html-body',
+                                   'update-post-is-405-with-an-html-body',
+                                   'update-head-runs-the-handler-and-writes-dns',
+                                   'delete-head-runs-the-handler-and-deletes-records']
+  selected for this target   127
+  unmet preconditions          3  ['update-abuse-rate-limited',
+                                   'update-abuse-precedes-911',
+                                   'delete-abuse-rate-limited']
+  executable                 124
+  wire-only                   23  cases carrying `effects:` (DNS ops / persisted columns)
+                                  that this runner does NOT assert
+  ran this session           127  124 passed, 3 skipped
+  reachability probe        GET http://api:8000/nic/checkip -> HTTP 200
+======================== 155 passed, 5 skipped in 6.67s ========================
+```
+
+**124 executable, 124 passed, 0 failed, 3 skipped.** The 3 skips are the
+`rate_limited: true` cases: that is fixture state and not a request, so the
+runner refuses them with the precondition named rather than reporting them as
+noughts. They are measured out of band by seven host tests —
+`test_the_limit_answers_abuse_and_is_per_device`,
+`test_a_zero_limit_is_not_the_same_as_an_absent_one`,
+`test_abuse_precedes_the_hostname_parameter`, `test_badauth_precedes_abuse`,
+`test_a_rate_limited_delete_is_logged_as_a_delete`,
+`test_message_is_set_on_rate_limit_refusals_and_nothing_else`,
+`test_badauth_and_abuse_rows_carry_no_backend_type` — **7 passed, 0 failed**.
+
+The fixture stores the busiest tenant's secret as bcrypt on purpose, so a full
+table run exercises the legacy verify path and the self-upgrade for real:
+
+```
+make verify-compat-rehash
+  alice    seeded bcrypt   now argon2id
+  carol    seeded argon2id now argon2id
+  dave     seeded argon2id now argon2id
+devices still stored as bcrypt: 0
+```
+
+### 8.2 Instrument 2: `curl`, from outside the container
+
+The runner above is one instrument. The second is deliberately different in
+every dimension that could hide a fault:
+
+| | instrument 1 | instrument 2 |
+|---|---|---|
+| vantage point | inside the api container, compose network | the workstation, across the published host port |
+| base URL | `http://api:8000` | `http://localhost:8018` |
+| HTTP client | `httpx` via `conftest.CompatClient` | `/usr/bin/curl`, `--http1.1 --no-keepalive` |
+| request building | `conftest.build_request` | written for this run |
+| comparison | `test_protocol._compare` | written for this run |
+| runner | pytest, fixtures, plugins | none |
+
+```
+curl replay (target=host, base=http://localhost:8018)
+  cases in table           131
+  deleted_cases            11  (never executed)
+  excluded by `targets:`   4
+  selected for this target 127
+  unmet preconditions      3  ['update-abuse-rate-limited', 'update-abuse-precedes-911',
+                               'delete-abuse-rate-limited']
+  executed                 124
+  passed                   124
+  FAILED                   0
+```
+
+**The two agree exactly**, on every line of the accounting and on 124 / 124.
+
+**The slack, stated because agreement without it is a formality.** The two
+instruments share the YAML parse and the `defaults:` merge — the replay reads
+the *resolved* cases out of the container rather than re-implementing
+`resolve_case`. So a fault in the defaults merge is invisible to both. What is
+not shared is everything downstream of a resolved case: selection,
+percent-encoding, Basic-auth assembly, header override and removal, the request
+itself, and every comparison. The `targets:` partition is re-derived
+independently and reaches the same 4 / 127 split.
+
+**The replay is shown able to fail**, because a comparator that has only ever
+returned zero failures is not a comparator. Pointed at the same host with
+`--target legacy` it selects the *legacy* half of the table and reports
+**117 passed, 4 FAILED of 121 executed** — and the four are exactly the four
+cases the `targets:` partition already excludes from `host`:
+
+```
+  checkip-post-is-405-with-an-html-body: content_type 'application/json' != 'text/html; charset=utf-8';
+    body b'{"detail":"Method Not Allowed"}' != b'<!doctype html>\n<html lang=en>\n<title>405 Method Not
+    Allowed</title>\n...'; line_count 1 != 6; trailing newline False != True
+  update-post-is-405-with-an-html-body:  (the same, on /nic/update)
+  update-head-runs-the-handler-and-writes-dns: status 405 != 200;
+    content_type 'application/json' != 'text/plain; charset=utf-8'
+  delete-head-runs-the-handler-and-deletes-records: status 405 != 200;
+    content_type 'application/json' != 'text/plain; charset=utf-8'
+```
+
+That is a stronger result than it looks. It says the `targets:` lists are not
+merely a filter someone maintained: run the legacy-selected table against the
+host and **117 of 121 cases pass unchanged**, and the only four that do not are
+the four where the two frameworks genuinely differ — Werkzeug's HTML 405 page
+against FastAPI's JSON one, and the `HEAD`-writes-DNS behaviour this project
+decided against. Nothing else in the legacy half of the table diverges.
+
+### 8.3 The two vacuous host-only passes, re-measured
+
+`frozen.known_gaps` records that `checkip-post-is-405-on-the-host` and
+`update-post-is-405-on-the-host` pass against a host with **no** `/nic` routes
+at all, because a non-`GET` on an unmatched path meets atrium's SPA catch-all,
+which also declares only `GET`. Still true, and #18's own method matrix says
+why: `POST` is 405 on **every** row of §8.4's table, including the rows with no
+route at all. Those two cases assert "POST is refused" and never "the endpoint
+exists".
+
+What has changed is that the vacuity is no longer load-bearing. The non-vacuous
+half is asserted in the host suite by `test_non_get_methods_are_refused` against
+an app with no catch-all, and the reachability probe printed at the top of every
+accounting block (`GET /nic/checkip -> HTTP 200`) fails against a host with no
+routes.
+
+### 8.4 The `HEAD` reading, corrected — 404, not 200
+
+§0.10 and plan §1 recorded three readings of `HEAD` on a `GET`-only route, and
+the middle one — *"behind a `GET`-only SPA catch-all mount: **200**, the
+catch-all serves it"* — was wrong. #16 measured 404; #18 re-measured at
+close-out, in the api container against the real `app.static.SPAStaticFiles`
+from `atrium:0.28`, and over the wire against this stack:
+
+| stack | `HEAD` | `GET` | `POST` |
+|---|---|---|---|
+| bare FastAPI, `GET`-only `/nic/update`, no mount | **405** | 200 | 405 |
+| the same route behind `app.static.SPAStaticFiles` | **404** | 200 | 405 |
+| the same route behind a stock `StaticFiles(html=True)` | **404** | 200 | 405 |
+| `SPAStaticFiles` alone, no `/nic` route at all | 404 | 200 | 405 |
+| stock `StaticFiles` alone, no `/nic` route at all | 404 | **404** | 405 |
+| this stack over the wire, `/api/healthz` (no `HEAD` declared) | 404 | 200 | 405 |
+| this stack over the wire, `/definitely-not-a-route` | 404 | 200 | 405 |
+| this stack over the wire, `/nic/update` (#16's handler) | **405** | 200 | 405 |
+| this stack over the wire, `/nic/checkip` (`HEAD` declared) | **200** | 200 | 405 |
+
+**The mechanism.** `SPAStaticFiles.get_response` catches the underlying 404 and
+falls back to `index.html` only `if exc.status_code == 404 and
+scope.get("method") == "GET"`; otherwise it re-raises. So a `HEAD` miss is a
+404, never the shell. Stock `StaticFiles(html=True)` reaches 404 by a different
+road — it has no arbitrary-path fallback at all, only a directory index and a
+`404.html`, which is visible in row five where even `GET` is 404.
+
+**Why the wrong reason mattered although the decision did not move.** 404 is no
+more the frozen 405 than 200 was, so the two `-head-is-refused-by-the-host`
+cases fail without a hand-written handler either way. But "the catch-all serves
+it" reads as though making the mount decline non-`GET` would restore the 405 —
+and it already declines non-`GET`. A `Mount` is a **full** route match whatever
+it then answers, so the `GET`-only route's own 405 never runs. The only thing
+that produces the frozen status is declaring the method, which is what #16 did.
+
+**The correction is recorded at v3 and is NOT a version bump.** `known_gaps`
+lives in the `frozen:` block, and `frozen.content_digest` is sha256 over the
+parsed `cases` and `deleted_cases` **only** — so correcting an entry there does
+not move the digest, and `test_the_table_is_frozen_at_its_recorded_shape` stays
+green with all four readings unchanged. Spelling the correction as a v3 → v4
+bump was tried and the mechanism refuses it in its own words. By the book —
+copy the outgoing block into `frozen.previous`, then bump:
+
+```
+E  AssertionError: `frozen.version: 4` claims a new freeze, but its content_digest
+E  is identical to version 3's. The data did not move, so there is nothing to
+E  re-freeze: either the change was lost, or the bump was reflexive.
+```
+
+…and bumping *without* copying `previous` fails the other direction of the same
+guard: `frozen.version is 4 and frozen.previous.version is 2; the digest has
+moved, so this must be 3`.
+
+So the freeze mechanism, by construction, does not admit a `known_gaps`
+correction as a re-freeze — and it should not: a version is a statement about
+the *data* a runner iterates. What guards `known_gaps` instead is a PR review
+plus, for any entry making an executable claim, a test.
+`test_the_head_refusal_does_not_fall_out_of_the_framework` in
+`backend/tests/test_router_nic.py` is that test for this entry: it takes four of
+the readings above in one run and asserts the whole dict. Prose that can be
+measured belongs in a guard, not in a digest.
+
+### 8.5 What disagrees with what was written down
+
+Four things, in the order they were found.
+
+1. **`known_gaps`' fourth entry recorded 200 for the middle `HEAD` reading.**
+   §8.4. It is 404. Plan §1, `known_gaps` and this file's §0.10 all carried it;
+   all three are corrected.
+2. **#16 declined to correct it for a reason that is also wrong.** Its write-up
+   and the docstring of
+   `test_the_head_refusal_does_not_fall_out_of_the_framework` both say
+   "`known_gaps` is inside the digest, so correcting it is a version bump".
+   `_content_digest` hashes `cases` and `deleted_cases`; `known_gaps` is outside
+   it, and a bump over unmoved data is refused. Both halves false, and between
+   them they kept a wrong reason on file for an extra issue. The docstring is
+   corrected.
+3. **The exit criterion's second clause was being measured against the wrong
+   population.** "Every read path returns nothing for a second tenant's rows"
+   was demonstrated per *model* — six models, six zero-row assertions, six
+   emitted predicates. A read path is a *call site*. Measured: the host package
+   has **14** query call sites naming a tenant model (10 through the scope, 1
+   composed inside a scope call, 3 excused in writing). A fifteenth, written as
+   a bare `sa.select(Domain)` in a new function, was caught by **1 test of 532**
+   — the one added by this issue — and by nothing else. Swapping `scope.get` for
+   `session.get` on the live `/nic/update` persist path is likewise caught by
+   that one test and by no behavioural test.
+4. **The census's own first cut counted 13 of 14.** `get` is spelled twice in
+   this codebase — `session.get` (unscopeable) and `scope.get` (its
+   replacement) — and the narrowing that keeps arbitrary `.get()` calls out
+   dropped the scope's own, taking `router_nic.py:_persist_updates` with it. It
+   reported a clean sweep over a population short by one. Caught by
+   `test_every_scope_entry_point_appears_in_the_census`, which compares the
+   census against the package's **call graph** and not against its source text,
+   because `scope.predicate(DnsEvent)` appears in `scope.py`'s module docstring
+   and a substring search calls that a call site.
+
+Everything else on file survived re-measurement: 131 cases, the 4 / 127
+`targets:` split, the 3 unmet preconditions, and the two vacuous host-only
+passes.
+
+### 8.6 Reproducing this
+
+```bash
+# pick your own ports; ATRIUM_DDNS_COMPAT_STUB=1 in .env
+make build && make up && make migrate
+make seed-compat-fixture
+
+# instrument 1 — in the container, on the compose network
+make test-compat TARGET=host BASE_URL=http://api:8000
+
+# instrument 2 — curl, from the workstation, over the published port.
+#   Dump the resolved cases out of the container, then replay them with
+#   curl and compare status / content-type / body bytes / line count /
+#   trailing newline against each case's `expect`, in code that shares
+#   nothing with conftest.py below the resolved-case dict.
+#   Then run it again with --target legacy and check it reports 4 failures.
+```
+
+Expected: `155 passed, 5 skipped`, an accounting block reading `131 cases`,
+`127 selected`, `3 unmet preconditions`, `124 executable`; and the second
+instrument reporting `124 passed, 0 FAILED` on the same partition.
+
+**If both come back green on the first attempt, that is the beginning of the
+work.** §8.2's `--target legacy` run and §8.4's nine stacks are what has to
+happen next: show the comparator failing, and show that the readings being
+quoted were taken rather than copied.

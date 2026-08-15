@@ -110,14 +110,47 @@ frozen:
       cases and not a property of adding cases.
     - >-
       the two host-only HEAD cases (`update-head-is-refused-by-the-host`,
-      `delete-head-is-refused-by-the-host`) freeze `status: 405`, and #11
-      measured that the natural implementation does not produce it behind
-      atrium's SPA catch-all. Bare FastAPI, GET-only route: HEAD -> 405. The
-      same route behind a GET-only catch-all mount: HEAD -> 200. Atrium's own
-      stack today, no /nic route at all: HEAD -> 404. The decision (405) is
-      kept and the cases stay as frozen; what changes is that V1M2 has to
-      write a deliberate HEAD handler, because the framework's refusal does
-      not survive the mount. Same mechanism as the two vacuous passes above.
+      `delete-head-is-refused-by-the-host`) freeze `status: 405`, and the
+      natural implementation does not produce it behind atrium's SPA
+      catch-all. Bare FastAPI, GET-only route: HEAD -> 405. The same route
+      behind atrium's catch-all mount: HEAD -> **404**. The mount alone, no
+      /nic route at all: HEAD -> 404. Decided in V1M2 that this entry keeps
+      the 405 and that V1M2 writes a deliberate HEAD handler, which #16 did.
+      **The middle reading used to say 200 -- "the catch-all serves it" --
+      and that reason was wrong.** #16 measured 404 against
+      `app.static.SPAStaticFiles` as shipped in atrium:0.28 and #18
+      re-measured it four ways at close-out: the SPA fallback to index.html
+      is guarded by `scope["method"] == "GET"`, so a HEAD miss re-raises the
+      404 rather than being served the shell; a stock
+      `StaticFiles(html=True)` answers 404 too, for the different reason that
+      it has no arbitrary-path fallback at all; and over the wire this
+      stack answers HEAD 404 / GET 200 / POST 405 on any unrouted path. The
+      *decision* and the code are unaffected -- 404 is no more the frozen 405
+      than 200 was -- but the wrong reason pointed at a fix that does not
+      work: if the catch-all "serves" HEAD, making it decline non-GET reads
+      as the remedy, and it already declines non-GET. A Mount is a FULL route
+      match whatever it then answers, so the route's own 405 never runs. The
+      only thing that produces the frozen 405 is the hand-written HEAD
+      handler. Same shadowing mechanism as the two vacuous passes above,
+      different status.
+    - >-
+      this `known_gaps` list is NOT covered by `frozen.content_digest`, which
+      is sha256 over the parsed `cases` and `deleted_cases` only. Correcting
+      an entry here is therefore not a re-freeze and must NOT be spelled as
+      a version bump: #18 tried it and
+      `test_the_version_advances_exactly_when_the_data_does` refuses in its
+      own words -- *"the data did not move, so there is nothing to
+      re-freeze: either the change was lost, or the bump was reflexive"* --
+      because `previous.content_digest` would equal `frozen.content_digest`.
+      #16 declined to correct the HEAD entry above on the stated grounds
+      that "`known_gaps` is inside the digest, so correcting it is a version
+      bump"; that premise is false in both halves and it is the reason the
+      wrong reason survived an extra issue. What guards this list instead is
+      a PR review plus, for any entry making a claim that can be executed, a
+      test: the HEAD readings above are now asserted by
+      `test_the_head_refusal_does_not_fall_out_of_the_framework` in
+      `backend/tests/test_router_nic.py`. Prose that can be measured belongs
+      in a guard, not in a digest.
     - >-
       address family, v3. The v6 share of the table is 20 of 131 cases (15.3%):
       18 carry a parseable IPv6 literal and 2 more carry an IPv6-SHAPED literal

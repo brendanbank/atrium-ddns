@@ -499,6 +499,7 @@ def record_event(
     plan: HostnamePlan | None = None,
     client_ip: str | None = None,
     ip: str | None = None,
+    backend_type: str | None = None,
     message: str | None = None,
 ) -> None:
     """Queue one ``ddns_event`` row. Never raises.
@@ -528,15 +529,20 @@ def record_event(
       ``dns_update``, so "show me this device's refused deletes"
       silently returned nothing).
 
-    **Known gap, stated rather than worked around:** ``ddns_event`` has
-    no ``backend_type`` column, so
+    **``backend_type`` — the gap #16 named, closed by #18's ``0003``.**
     ``event-backend-type-is-null-for-outcomes-decided-before-any-backend``
-    is not expressible on this schema. It is *not* smuggled into
-    ``message``: ``event-detail-is-populated-only-for-rate-limit-refusals``
-    is a preserved case, and a free-text column that sometimes carries a
-    backend name and sometimes a refusal reason is not a filter. Adding
-    the column is a migration, and the host chain admits one author at a
-    time.
+    is ``preserve``, and it is now expressible: the per-attempt rows
+    carry the provider they were about, and everything decided before a
+    provider was reached — ``badauth``, ``abuse``, ``911``, ``notfqdn``,
+    ``nohost``, and a hostname whose domain has zero backends — leaves
+    it ``NULL``. That NULL is the meaning, not a missing value, which is
+    what makes ``backend_type IS NULL`` a filter.
+
+    It is deliberately **not** folded into ``message``:
+    ``event-detail-is-populated-only-for-rate-limit-refusals`` is also
+    ``preserve``, and a free-text column that sometimes carries a
+    provider name and sometimes a refusal reason is not something a
+    filter can index.
     """
     session.add(
         DnsEvent(
@@ -553,6 +559,7 @@ def record_event(
             response_code=response_code,
             client_ip=client_ip,
             ip=ip,
+            backend_type=backend_type,
             message=message,
         )
     )
@@ -698,6 +705,13 @@ def _record_hostname_events(
 ) -> None:
     for result in results:
         if not result.attempts:
+            # No provider was reached — `nohost`, `notfqdn`, or a
+            # hostname whose domain carries zero backends. The row is
+            # still written (the legacy service's silence here is the
+            # `fix` in `event-911-and-notfqdn-write-no-row`) and
+            # `backend_type` stays NULL, which is what
+            # `event-backend-type-is-null-for-outcomes-decided-before-
+            # any-backend` records as the meaningful state.
             record_event(
                 session,
                 event_type=event_type,
@@ -708,7 +722,7 @@ def _record_hostname_events(
                 ip=ip,
             )
             continue
-        for _backend_type, status in result.attempts:
+        for backend_type, status in result.attempts:
             record_event(
                 session,
                 event_type=event_type,
@@ -717,6 +731,7 @@ def _record_hostname_events(
                 plan=result.plan,
                 client_ip=client_ip,
                 ip=ip,
+                backend_type=backend_type,
             )
 
 
