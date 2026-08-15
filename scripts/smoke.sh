@@ -25,13 +25,14 @@ env_get() { [ -f .env ] && sed -n "s/^$1=//p" .env | tail -n1; }
 API_HOST_PORT="${API_HOST_PORT:-$(env_get API_HOST_PORT)}"
 
 BASE="http://localhost:${API_HOST_PORT:-8053}"
+BASE_EXPLICIT=0
 USER_EMAIL="${SMOKE_USER:-admin@example.com}"
 USER_PASS="${SMOKE_PASS:-}"
 SKIP_LOGIN=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --base) BASE="$2"; shift 2 ;;
+    --base) BASE="$2"; BASE_EXPLICIT=1; shift 2 ;;
     --user) USER_EMAIL="$2"; shift 2 ;;
     --pass) USER_PASS="$2"; shift 2 ;;
     --no-login) SKIP_LOGIN=1; shift ;;
@@ -151,18 +152,22 @@ fi
 # Both chains, read from the database rather than from a migration tool's
 # exit code. An unrun host chain is invisible until the first query fails.
 # These read the LOCAL compose stack via `docker compose exec`, so they are
-# only meaningful when --base points at that same stack. Running them against
-# a remote target would report local revisions as if they were the remote's —
-# a probe that cannot fail, answering a question nobody asked. Gate on the
-# host actually being local.
-case "$BASE" in
-  http://localhost:*|http://127.0.0.1:*|http://[::1]:*) BASE_IS_LOCAL=1 ;;
-  *) BASE_IS_LOCAL=0 ;;
-esac
-
-if [ "$BASE_IS_LOCAL" = "0" ]; then
-  info "migration checks skipped — $BASE is not this compose stack"
-  info "for a remote target, read the chains on that host instead"
+# only meaningful when --base points at that same stack.
+#
+# Gating on the URL *looking* local is not enough, and the first version of
+# this did exactly that. Smoke-testing a deployed host through an ssh tunnel
+# (`-L 18443:localhost:8443`) gives a base of http://localhost:18443, which
+# matched the "is it local" test — so the script read the local stack's
+# alembic revisions and printed them under a run aimed at the remote. Both
+# happened to be on the same revisions, so it rendered as two green checks
+# confirming a deployment it had never looked at.
+#
+# So: any explicit --base disables them. The checks only run in the default
+# no-argument case, which is the one situation where the compose stack and
+# the base URL are provably the same thing.
+if [ "$BASE_EXPLICIT" = "1" ]; then
+  info "migration checks skipped — --base was given, so this may not be the local stack"
+  info "on the target: docker compose exec -T api alembic current"
 elif command -v docker >/dev/null 2>&1 && docker compose ps -q api >/dev/null 2>&1; then
   for chain in alembic_version alembic_version_app; do
     rev="$(docker compose exec -T api /opt/venv/bin/python -c "

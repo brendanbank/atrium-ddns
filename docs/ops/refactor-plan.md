@@ -639,6 +639,14 @@ demonstration — not a count of closed issues.
 during the development phase. The old one keeps serving real clients until the
 exit criterion is demonstrated, which is what makes the cutover reversible.
 
+**The milestone tip may be deployed to production during this phase** — an
+unattended run does not have to wait for a release PR to see its work running
+on the host. That is deliberate: the whole reason deploy is a standing decision
+is that a run which cannot deploy ships work that passes CI and does not run.
+It is safe here *because* the new stack is beside the old one rather than in
+front of it; the blast radius of a bad milestone tip is a service nothing yet
+depends on.
+
 Three things that follow, one of them load-bearing:
 
 **8443 implies TLS, and atrium does not terminate it.** The atrium image speaks
