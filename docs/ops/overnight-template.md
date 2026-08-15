@@ -29,7 +29,7 @@ are listed again at the bottom of this card.
 | `<BOARD>` | Projects v2 board **2**, *atrium-ddns delivery* (`OVERNIGHT_PROJECT=2`), `Status` = Todo / In Progress / Done. Claim with `find_ready.py --claim <issue> --slug overnight`, then `find_ready.py --verify <issue>` — the claim is not a claim until the board moved. `bootstrap-github.sh --check`: setup COMPLETE. |
 | `<READY_CHECK>` | `find_ready.py --list` / `--graph`. Reads `Depends on:` from each issue body; every issue this repo opens must carry one (`Depends on: none` if free). |
 | `<GATE>` | see *Gate* below — four commands, measured 2026-08-15 on the scaffold. |
-| `<DEPLOY>` | `git bundle` over the deploy key → `docker compose up -d --build` on the host → verified by content with `scripts/deploy-verify.sh`. Identity file is `backend/src/atrium_ddns/router.py`, compared byte-for-byte against `/opt/host_app/src/atrium_ddns/router.py` inside the running `api` container. `compose up` exiting 0 proves nothing. |
+| `<DEPLOY>` | `git bundle` over the deploy key → `docker compose up -d --build` on the host → verified by content with `scripts/deploy-verify.sh`. Identity file is `backend/src/atrium_ddns/router.py`, compared byte-for-byte against the **installed** package at `/opt/venv/.../site-packages/atrium_ddns/router.py`. **Not `/opt/host_app`** — the image copies `backend/` there *and* pip-installs it, and only the installed copy is on `sys.path`, so comparing `/opt/host_app` asserts about a tree the app never imports (found by #36). `compose up` exiting 0 proves nothing, and neither does hashing the wrong file. |
 | `<DEPLOY_HOST>` | ssh alias **`atrium-ddns-deploy`** — one host, serial, one deployer (the orchestrator). The alias resolves in `~/.ssh/config`; the hostname is never in the repo, so `OVERNIGHT_DEPLOY_HOST` is safe to commit. Ubuntu 24.04, docker 29.1.3, 3 containers already running (the old service among them), 31 G free, 2.9 G RAM available, **port 8443 free**. The new stack goes up **beside** the old one on 8443 (`API_HOST_PORT=8443`, a distinct `MYSQL_HOST_PORT`, explicit `COMPOSE_PROJECT_NAME`). See plan § 5b — 8443 implies TLS and atrium does not terminate it. |
 | `<PROMOTION>` | **yes, this repo has one.** Atrium reads branding, feature flags, PAT policy and `system.host_bundle_url` from the `app_settings` KV table, not from the merged file. A merged bundle that nothing points at does not run: `make seed-bundle` (or an equivalent write to `system.host_bundle_url`) is the promotion step. Same for any `register_namespace` default a migration seeds. |
 | `<SMOKE>` | `scripts/smoke.sh` (`make smoke`) — 11 local checks against a running stack, exits non-zero on any failure. Later joined by `tests/smoke_test_dns.sh`, ported from `dyndns-route53`. `smoke_test_dns.sh` performs **real DNS writes** against whatever zone it is pointed at — allow-list is a dedicated test zone, never a zone carrying live records. Widening it is the operator's call. |
@@ -56,8 +56,9 @@ make smoke PASS=<pw> EMAIL=<addr>  # scripts/smoke.sh — 11 passed (11)
 `make test-backend` grew a second pytest session (#23): the compat suites now
 reach the image via `COPY tests /opt/compat_tests` in the Dockerfile's **`dev`
 stage only**, so they run in the gate without shipping to production. It is
-gated on `make check-compat-fresh`, which digests `tests/` in the worktree and
-in the running container and **refuses when they differ** — `make up` does not
+gated on `make check-fresh`, which digests **three** trees — `tests/`,
+`backend/`, and the *installed* `atrium_ddns` package — in the worktree and in
+the running container, and **refuses when any differs** — `make up` does not
 rebuild, so without it the gate silently reads a stale copy and reports green.
 Verified here: editing a case file without rebuilding stops the gate with *"the
 api container is running a STALE copy of tests/"*; rebuilding with the same
