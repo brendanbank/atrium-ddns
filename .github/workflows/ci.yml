@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENCE.md"
+  push:
+    branches: [main, master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit tests
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
+
+  smoke:
+    # Stand up the full stack (atrium image + this host extension on
+    # top), run migrations, seed an admin, hit /api/readyz. Catches the
+    # bootstrap-time failures (missing env, broken init_app, alembic
+    # chain mismatch) the frontend job won't see.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare smoke .env
+        run: |
+          cat > .env <<'EOF'
+          ENVIRONMENT=dev
+          APP_TIMEZONE=UTC
+          APP_SECRET_KEY=smoke-secret
+          # The runner has the ports to itself, so pin the dev defaults
+          # (8053 / 13353, chosen to avoid collisions on a shared dev
+          # box) back to 8000 and keep the curls below unchanged.
+          API_HOST_PORT=8000
+          MYSQL_HOST_PORT=3306
+          APP_BASE_URL=http://localhost:8000
+          # Not a real key. Required from atrium 0.27 onward — a prod
+          # stack refuses to boot without it, and every encrypted host
+          # column derives from it.
+          SECRET_ENCRYPTION_KEY=0000000000000000000000000000000000000000000000000000000000000000
+          MYSQL_ROOT_PASSWORD=smoke-root-pw
+          MYSQL_DATABASE=atrium_ddns
+          MYSQL_USER=atrium_ddns
+          MYSQL_PASSWORD=smoke-pw
+          DATABASE_URL=mysql+aiomysql://atrium_ddns:smoke-pw@mysql:3306/atrium_ddns
+          JWT_SECRET=smoke-jwt-secret
+          JWT_ACCESS_TOKEN_EXPIRE_MINUTES=10080
+          WEBAUTHN_RP_ID=localhost
+          WEBAUTHN_RP_NAME=Atrium Ddns
+          WEBAUTHN_ORIGIN=http://localhost:8000
+          MAIL_BACKEND=console
+          MAIL_FROM=no-reply@example.com
+          ATRIUM_IMAGE=ghcr.io/brendanbank/atrium:0.28
+          EOF
+
+      - name: Build + start stack
+        run: docker compose up -d --build
+
+      - name: Wait for API
+        run: |
+          for i in $(seq 1 40); do
+            if curl -fsS http://localhost:8000/api/readyz > /dev/null; then exit 0; fi
+            sleep 3
+          done
+          echo "API did not become ready" >&2
+          docker compose logs api
+          exit 1
+
+      - name: Run migrations
+        run: make migrate
+
+      - name: Seed admin
+        run: make seed-admin EMAIL=admin@example.com PASSWORD=smoke-pw-12345
+
+      - name: Backend smoke tests
+        run: make test-backend
+
+      - name: Dump stack logs on failure
+        if: failure()
+        run: docker compose logs

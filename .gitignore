@@ -1,0 +1,26 @@
+# Secrets. The scaffolder's own next-steps say `cp .env.example .env`, and it
+# ships no .gitignore — so this file is the only thing standing between a
+# `git add -A` and a committed APP_SECRET_KEY / JWT_SECRET /
+# SECRET_ENCRYPTION_KEY.
+.env
+.env.*
+!.env.example
+
+# Local overnight-run overrides (deploy host lives here, not in the tracked
+# .overnight.conf).
+.overnight.local.conf
+
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# OS
+.DS_Store
