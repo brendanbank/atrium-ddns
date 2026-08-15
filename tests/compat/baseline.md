@@ -1,19 +1,24 @@
 # Baseline: the case table against the legacy service
 
-Two readings, taken six issues apart and kept side by side.
+Three readings, kept side by side.
 
-| | issue #9, the 101-case table | **issue #11, the frozen 114-case table** |
-|---|---|---|
-| selected for `--target legacy` | 98 | **107** |
-| executed by the runner | 95 | **104** |
-| measured out of band | 3 | **3** |
-| agree with the table | 98 | **107** |
-| diverge from the table | **0** | **0** |
-| divergences from `docs/DYNDNS-PROTOCOL.md` §1 | 9 (6 carried + 3 found) | **9, all carried, all confirmed live** |
+| | issue #9, the 101-case table | issue #11, the frozen 114-case table | **issue #29, the 131-case table at v3** |
+|---|---|---|---|
+| selected for `--target legacy` | 98 | 107 | **124** |
+| executed by the runner | 95 | 104 | **121** |
+| measured out of band | 3 | 3 | **3** |
+| agree with the table | 98 | 107 | **124** |
+| diverge from the table | **0** | **0** | **0** |
+| divergences from `docs/DYNDNS-PROTOCOL.md` §1 | 9 (6 carried + 3 found) | 9, all carried, all confirmed live | **9, unchanged — the document says nothing family-specific** |
 
-§0 is #11's re-run, which is the current reading and the one V1M1's exit
-criterion is demonstrated against. §§1–6 are #9's, kept because the mutation
-work and the failure modes in them are not superseded by a later green run.
+**§7 is the current reading**, taken by #29 on a third independently built
+fixture when the table went from v2 to v3 for address-family coverage. §0 is
+#11's V1M1 close-out re-run at v2, and §§1–6 are #9's; both are kept because the
+mutation work and the failure modes in them are not superseded by a later green
+run. Nothing in §7 is inherited from either: every number in it, including the
+"before" figures it improves on, was re-derived with #29's own instruments, and
+where one disagrees with what was already written down the disagreement is
+stated rather than reconciled (§7.7).
 
 ---
 
@@ -889,3 +894,373 @@ Expected: `95 passed, 3 skipped`, and an accounting block reading `98 selected`,
 
 **If it comes back green on the first attempt, that is the beginning of the
 work, not the end of it.** §3 is what has to happen next.
+
+---
+
+## 7. Address family — issue #29, 2026-08-15, table v2 → v3
+
+The table was frozen at v2 carrying its own weighting as a known gap: 4 of 114
+cases touched IPv6 against production traffic measured at **143 IPv4 / 305
+IPv6** events (plan §3.3.1). This section is the measurement that closed as
+much of it as a wire table can close, and the measurement of what it cannot.
+
+**Landed before #16, not after.** V1M2's router work is measured against this
+file, so changing it afterwards would mean re-measuring #16 against a table it
+did not develop against.
+
+### 7.1 The verdict
+
+> **The table is frozen at version 3, 131 cases. 124 selected for
+> `--target legacy`, 121 executed, 121 agree, 0 diverge. All 17 additions were
+> measured against a throwaway legacy instance before being asserted. IPv6 now
+> covers 5 of 5 update status tokens, 2 of 2 `checkip` formats and 3 of 3
+> family-specific parse refusals, against 1, 1 and 0 at v2. The v6 share of the
+> table is 15.3%, not §3.3.1's 68%, and §7.4 is the defence.**
+
+And the finding that argues against the issue's own framing:
+
+> **The DNS record type is invisible on the wire on both endpoints.**
+> `getiptype` was mutated to answer `A` for every address — turning every
+> `AAAA` the service would write into an `A` — and the whole 131-case table ran
+> **121 executed, 0 failed**. No number of cases in this file can detect it.
+
+### 7.2 The service under test
+
+A third throwaway local copy, built independently of #9's and #11's. Never the
+deployed one.
+
+```
+legacy checkout HEAD  = 5d1c941fe31ea41175cb0a75849367dc94871d18
+legacy checkout dirty = 0 file(s) modified
+
+same  auth.py                      sha=4d6c4add8801
+same  config.py                    sha=2cf2d5a884da
+same  dyndns.py                    sha=b6a608e7a213
+same  forms.py                     sha=fb0f65c6afd4
+same  getpwd.py                    sha=6421cbacefed
+same  health_checker.py            sha=8b421835eb91
+same  lib/__init__.py              sha=4974036dcccd
+same  lib/account/__init__.py      sha=5bdd5bb48253
+same  lib/account/aws.py           sha=5055cd6e7748
+same  lib/account/hetzner.py       sha=6cd7612a98e0
+same  lib/account/nsupdate.py      sha=fc148aeb2871
+same  lib/accounts.py              sha=15831a998ebb
+same  lib/log.py                   sha=7bf57ded827c
+same  models.py                    sha=4de73398b22f
+same  rate_limiter.py              sha=28c606bf3970
+same  web_routes.py                sha=bc52a6d6101a
+ADDED  lib/account/stub.py          (harness, not legacy source)
+
+integrity: 16 legacy .py files compared, 0 differ
+```
+
+**Every digest matches #11's, which matched #9's** — three independent copies,
+three milestones apart, the same sixteen values. `dyndns.py` at `b6a608e7a213`
+is also byte-identical to the `ec605c5` the table names as its source of truth:
+`git diff --stat ec605c5 HEAD -- dyndns.py lib/ auth.py rate_limiter.py
+config.py models.py` is empty, so the checkout having moved to `5d1c941` since
+the freeze moved nothing on a request path.
+
+Seeded and served in **one process**, from the table's own `fixture:` block, on
+port 5229. All twelve hostnames came back in their declared backend order:
+
+```
+  backend creation order = ['nochg-a', 'no-credentials', 'dnserr', 'good',
+                            'unknown-service', 'wrong-zone', 'nochg-b']
+  ok  firsterr.example.com   get_backends()=['stub-nochg-a','stub-nocreds','stub-dnserr']
+  ok  mixed.example.com      get_backends()=['stub-dnserr','stub-good']
+  ok  allnochg.example.com   get_backends()=['stub-nochg-a','stub-nochg-b']
+```
+
+And the probe that says the *fixture* exists rather than that the *service* is
+up — `/nic/checkip` touches no database and answers 200 either way:
+
+```
+$ curl -s -u alice:… -H 'X-Forwarded-For: 203.0.113.10' \
+    'http://127.0.0.1:5229/nic/update?hostname=ok.example.com&myip=203.0.113.10'
+good 203.0.113.10
+```
+
+The stub provider was extended to append every `createrecords` /
+`deleterecords` call to a JSONL file — backend, op, `rtype`, hostname, IP — so
+`effects:` is a reading rather than an assumption. It stays strictly below
+`hostnameperzone`.
+
+### 7.3 The baseline, re-derived before anything changed
+
+Run against the **v2** table on this fixture, to establish that the harness
+reproduces the number it is about to move:
+
+```
+compat accounting (target=legacy):
+  cases in table             114
+  selected for this target   107
+  unmet preconditions          3
+  executable                 104
+  ran this session           107  104 passed, 3 skipped
+136 passed, 3 skipped in 16.89s
+```
+
+**107 selected, 104 executed, 104 pass, 0 fail** — #11's reading exactly, on a
+fixture built without reference to it. (136 against #11's 135 because #11 added
+the freeze guard as its last act; the case count is what matters and it agrees.)
+
+The family split, re-derived with #29's own instrument rather than inherited:
+
+| | #11's reading, v2 | #29's instrument, v2 | #29's instrument, v3 |
+|---|---:|---:|---:|
+| IPv4-only | 104 | **106** | **107** |
+| touches IPv6 | 4 | **4** | **18** |
+| IPv6-*shaped* literal, deliberately unparseable | — | **0** | **2** |
+| no address at all | 6 | **4** | **4** |
+| total | 114 | 114 | 131 |
+
+**The two instruments agree exactly on the load-bearing number and differ by 2
+on a bystander.** The IPv6 set is the same four case ids under both. The
+difference is where the line between "IPv4-only" and "no address at all" is
+drawn — #11's instrument is not in the repo, so the boundary cannot be
+reproduced, and the honest report is the disagreement rather than a
+reconciliation. The claim the gap was about is "4 cases touch IPv6", and both
+instruments say 4.
+
+### 7.4 Which cases can the family reach at all — the defence of 15.3%
+
+Every legacy-selected executable case was replayed **twice** against the
+throwaway instance: once as the table spells it, once with every IPv4 literal
+in `query` / `client_ip` / `headers` swapped for an IPv6 counterpart, comparing
+status, content-type and body bytes. Deliberately not through `conftest.py` —
+it speaks `http.client` directly and reads the YAML itself, so it is a second
+instrument and not the runner twice.
+
+At v2, of 104 executable cases:
+
+| | |
+|---|---:|
+| reply **changed** | **36** |
+| swapped, reply **identical** | **63** |
+| no IPv4 literal to swap | **5** |
+
+Three states, not two. *"There was nothing to swap"* is not *"swapping changed
+nothing"*; collapsing them would have reported 68 identical and overstated the
+dead ground by five.
+
+So **68 of 104 cases sit where the family cannot alter a byte**: `badauth` and
+`abuse` return before any address is parsed, `notfqdn` returns carrying no
+address, and every `/nic/delete` case answers identically because delete's
+replies carry no IP suffix at all. A v6 counterpart to any of those is padding.
+
+Where it *does* reach the wire it reaches through three enumerable mechanisms,
+and coverage is stated per mechanism — 36 near-identical IPv4 update cases
+cover one mechanism 36 times, not IPv4 36 times:
+
+| mechanism | IPv6 at v2 | IPv6 at v3 |
+|---|---|---|
+| `/nic/update` interpolates the address after a status token | **1 of 5** (`good`) | **5 of 5** |
+| `/nic/checkip` echoes it | **1 of 2** formats (`plain`) | **2 of 2** |
+| `myip` parse **refusals**, which differ per family | **0** IPv6-shaped vs 3 IPv4-shaped | **3 vs 3** |
+
+Per status token, distinct cases whose reply carries an address of that family:
+
+| token | IPv4 v2 | IPv6 v2 | IPv4 v3 | IPv6 v3 |
+|---|---:|---:|---:|---:|
+| `good` | 15 | 2 | 16 | 8 |
+| `nochg` | 3 | 0 | 3 | 2 |
+| `nohost` | 11 | 0 | 11 | 2 |
+| `911` | 5 | 0 | 5 | 2 |
+| `dnserr` | 1 | 0 | 1 | 1 |
+
+**Reaching 68% would have meant roughly thirty more cases repeating mechanisms
+already covered in both families.** The ratio the table is defended on is the
+mechanism table above, not the share.
+
+### 7.5 The 17 additions, each measured before it was asserted
+
+Every one was sent by hand against the legacy service first — request line,
+exact response bytes, the DNS operations the stub recorded, and the hostname
+row's `last_ip_v4` / `last_ip_v6` / `last_updated_at` before and after — and
+only then written into the table. The readings that are not obvious:
+
+| case | measured reply |
+|---|---|
+| `checkip-ipv6-default-is-html` | 106-byte wrapper, against the v4 case's 102 and the empty-IP case's 90 |
+| `checkip-ipv4-mapped-ipv6-is-not-unwrapped` | `::ffff:192.0.2.1` — **not** `192.0.2.1` |
+| `update-myip-ipv4-mapped-ipv6-stays-an-aaaa-record` | `good ::ffff:192.0.2.1`, `rtype=AAAA`, `last_ip_v6` written |
+| `update-myip-ipv6-with-embedded-ipv4-is-renormalised` | `64:ff9b::192.0.2.33` → `good 64:ff9b::c000:221` — the dotted tail re-rendered in hex |
+| `update-myip-ipv6-scope-id-round-trips` | `fe80::1%eth0` accepted, zone preserved into the body, `rtype=AAAA` |
+| `update-911-myip-ipv6-with-prefix-length` | `2001:db8::1/64` → `911` |
+| `update-911-myip-ipv6-shaped-but-unparseable` | `2001:db8:::1` → `911` |
+| `update-myip-defaults-to-a-v6-client-ip` | no `myip`, `X-Forwarded-For: 2001:db8:113::77` → `good 2001:db8:113::77`, `rtype=AAAA` |
+| `update-nochg-single-backend-ipv6` | `nochg 2001:db8:113::20`, and `last_ip_v6` measured **unmoved** |
+| `update-aggregate-any-good-wins-ipv6` | both stub calls carried `rtype=AAAA`, including the one answering `dnserr` |
+| `update-multi-hostname-mixed-statuses-in-order-ipv6` | 89 bytes against the v4 twin's 73, same four hostnames, same order |
+| `update-ipv4-persists-last-ip-v4-not-v6` | `last_ip_v4` moved, `last_ip_v6` measured unmoved beside it |
+| `delete-myip-ipv4-mapped-ipv6-deletes-aaaa-only` | `good` on the wire; `op=delete, rtype=AAAA` in the stub log |
+| `delete-911-myip-ipv6-shaped-but-unparseable` | `911` |
+
+**One of the seventeen is deliberately IPv4.**
+`update-ipv4-persists-last-ip-v4-not-v6` is the mirror of the v2 case that
+asserted `last_ip_v4: unchanged` on a v6 update; nothing asserted the other
+direction, so a host writing **both** columns on every update passed the frozen
+table. Balancing families means pairing them, not counting them.
+
+**`update-nochg-single-backend-ipv6` records a measurement it does not
+assert.** `createrecords` *is* called on a `nochg` backend, with `rtype=AAAA` —
+the stub log says so. Its v4 twin's `effects:` block records no `dns:` entry, so
+the v6 twin does not either: the pair reads as a pair, and the reading is here
+instead of quietly changing a convention in half the table.
+
+### 7.6 The run, and proving the new cases bite
+
+Instrument 1, the pytest runner, against the v3 table:
+
+```
+compat accounting (target=legacy):
+  cases in table             131
+  excluded by `targets:`       7
+  selected for this target   124
+  unmet preconditions          3  ['update-abuse-rate-limited',
+                                   'update-abuse-precedes-911',
+                                   'delete-abuse-rate-limited']
+  executable                 121
+  wire-only                   23  cases carrying `effects:` that this runner does NOT assert
+  ran this session           124  121 passed, 3 skipped
+  reachability probe        GET http://127.0.0.1:5229/nic/checkip -> HTTP 200
+154 passed, 3 skipped
+```
+
+154 = 121 cases + 9 runner-guard nodes + 18 model guards + 6 contract tests.
+
+Instrument 2 is the by-hand replay of §7.5: raw `http.client`, its own query
+encoder, and SQLite reads of the hostname row, importing none of `conftest.py`.
+Both instruments agree on all 17.
+
+**Five mutations, five predictions, five exact matches.** Each applied to a
+**fresh copy** of the legacy service on its own port and database; the whole v3
+table run against it; the copy **deleted** afterwards rather than reverted,
+because there is no revert to get wrong.
+
+| mutation | predicted red | actual red |
+|---|---|---|
+| M-A `getiptype` always answers `A` | **0** | **0** of 121 |
+| M-B `update` unwraps an IPv4-mapped v6 before echoing it | 1 | **1** — `update-myip-ipv4-mapped-ipv6-stays-an-aaaa-record` |
+| M-C `getip` refuses a scoped IPv6 literal | 1 | **1** — `update-myip-ipv6-scope-id-round-trips` |
+| M-D `getip` falls back to `ip_network` for a prefixed address | 2 | **2** — `update-911-myip-with-prefix-length` and its new `-ipv6-` twin |
+| M-E `checkip` unwraps an IPv4-mapped v6 before echoing it | 1 | **1** — `checkip-ipv4-mapped-ipv6-is-not-unwrapped` |
+
+Each mutated instance was checked with the fixture probe before its run; all
+five answered `good 203.0.113.10`, so a red set of zero is a measurement and
+not a broken fixture.
+
+**M-A is the mutation that argues against this issue's own additions.** A
+prediction of zero is only worth making because it is falsifiable: had a single
+case gone red, the record type would have been observable somewhere and the
+`effects:` gap smaller than claimed. It went **0 of 121**. `/nic/update` echoes
+the normalised *address* and never the record type; `/nic/delete` echoes
+neither. So the family cases here assert parsing, normalisation and echo — real
+things — and assert nothing whatever about which record gets written. That is
+now the first entry in `frozen.known_gaps`, with this number in it.
+
+**M-D is the mutation that justifies keeping a pair rather than one case.** Both
+halves go red, because a fallback to `ip_network` is not family-specific — but
+the *plausible* mistake, reaching for it only in the v6 branch, shows up as one
+red and not two. Two cases distinguish those; one cannot.
+
+### 7.7 The freeze, and proving the freeze bites
+
+Re-frozen at **version 3**: `cases: 131`, `deleted_cases: 11`, `spec_rows: 37`,
+`content_digest: 2add2f37f3b5a41e82bd247353d633c99cdd00b2509de283f1d4ea748d93b83f`.
+`spec_rows` is unchanged at 37 and that is a reading, not an omission: the
+address-family gap was never a missing row of §1 — the document says nothing
+family-specific — so all 17 cases map onto rows that already existed, with 0
+uncovered rows and 0 `covers` entries naming a row that does not exist.
+
+**The change is strictly additive, checked rather than asserted.** Comparing the
+*parsed* case lists of v2 and v3 by id: **0 removed, 0 modified, 17 added**, and
+`deleted_cases` and `spec_rows` identical. A purely additive change with
+non-zero deletions is a defect until proven otherwise, so the check is run
+rather than the intention stated.
+
+Two counting instruments, both re-run:
+
+| instrument | live cases | deleted | ids |
+|---|---:|---:|---:|
+| PyYAML `len()` | **131** | 11 | — |
+| `grep -c '^    expect:'` / `'^    reason:'` / `'^  - id:'` | **131** | 11 | **142** |
+
+131 + 11 = 142.
+
+**Eight mutations against the freeze guards. 6 caught, 2 survived, and both
+survivors are named.**
+
+| mutation | outcome |
+|---|---|
+| M1 `frozen.cases` 131 → 130 | caught — `cases: recorded 130, actual 131` |
+| M2 one expected byte changed in a new case | caught — digest `2add2f37…` vs `5752efc9…` |
+| M3 top-level `version: 3`, `frozen.version: 2` | caught by both guards |
+| M4 a whole new case deleted, counts not updated | caught — count **and** digest |
+| M5 `frozen:` block removed entirely | caught by both guards |
+| M6 a byte changed, all four readings recomputed, `version` left at 3 | **SURVIVED** |
+| M7 `version` bumped to 4 over an unchanged table, `previous` copied wholesale | caught — digest identical to `previous` |
+| M8 `frozen.previous` removed | caught |
+
+**M6 is the hole #11's guard left, and it is the reason `frozen.previous` and
+`test_the_version_advances_exactly_when_the_data_does` exist.** The four
+readings say *"these numbers describe this table"*, which stays true however
+often the table changes — so `version` was still on the honour system, one level
+up from where #11 found it, and recomputing the readings is exactly what an
+agent changing the table will do. The new guard reads `frozen.previous`, the
+outgoing freeze recorded as **data** rather than as the prose comment it was
+first written as, and requires the version to advance by exactly one when the
+digest moves and not to advance when it does not.
+
+**It still does not catch M6, and that is reported rather than papered over.**
+`previous` is the last recorded *freeze*, not the file's last *state*, so a
+change made at the current version passes. The evasion is available exactly
+once: the next bump copies the current block into `previous`, and M9 — the same
+mutation with `previous` correctly maintained — **is** caught. The freeze is
+enforced at the boundary between versions; between edits inside one version the
+enforcement is the PR review, which is why changing this file is a PR.
+
+The worktree file was restored from a saved copy after every mutation and
+verified byte-identical afterwards; the service-free guards run green at 33
+passed, 1 skipped.
+
+### 7.8 What §7 does not measure
+
+- **The record type**, on either endpoint — §7.6, M-A, 0 of 121. This is the
+  largest thing the table does not check and it is now a number.
+- **`effects:` generally.** 25 cases carry a DNS operation or a persisted
+  column and no runner asserts any of them. #29 read them from the stub's call
+  log while authoring, which is how the `effects:` blocks got their values —
+  but that is a harness reading, not an assertion the gate makes.
+- **The host side.** All 17 additions are `targets: [legacy, host]`, and run
+  against the host stack they are all red, because `/nic/*` does not exist
+  there yet. They are calibration findings against the legacy service first,
+  which is the ordering V1M1 was built on. The host reading was taken anyway,
+  because it checks one thing: `make test-compat TARGET=host
+  BASE_URL=http://api:8000` gives `127 selected / 124 executable / 122 failed /
+  **2 passed** / 3 skipped`, and the 2 are the same two vacuous passes #11
+  named. **The overstatement did not grow with the table** — 17 more cases and
+  still exactly 2 — which is what says it is those two cases and not a property
+  of adding cases.
+- **The three `rate_limited: true` cases**, unchanged at 3 and still measured
+  out of band — see §0.6.
+
+### 7.9 Reproducing this
+
+```bash
+# 1. copy the legacy checkout, excluding .env* and instance/; verify by sha256
+# 2. add a stub provider under lib/account/ that logs its calls and answers
+#    from the service name; seed and serve in ONE process on a port of your own
+# 3. the runner
+.venv/bin/python -m pytest tests/compat --target legacy --base-url http://127.0.0.1:<port>
+```
+
+Expected: `154 passed, 3 skipped`, and an accounting block reading `131 cases`,
+`124 selected`, `3 unmet preconditions`, `121 executable`, `ran this session
+124`.
+
+**If it comes back green on the first attempt, that is the beginning of the
+work, not the end of it.** §7.4 and §7.6 are what has to happen next: measure
+which cases the thing you changed can even reach, then break the service in the
+way you are protecting against and check the right cases go red.
