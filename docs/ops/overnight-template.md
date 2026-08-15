@@ -76,6 +76,24 @@ the run is *slower* in parallel — ten worker processes each import the app —
 which is the honest shape of the trade and the reason the number is recorded
 against 800 rather than against today's suite.
 
+**CI does not run on milestone branches — by design, and the gate is why.**
+The workflow fires only for `master` (PRs into it, and pushes to it). A
+per-issue PR into the milestone branch gets **no** GitHub CI at all, so the
+local gate is not a first opinion ahead of a second one: it is the only one.
+That is the contract's own rule (*a local gate as the only quality bar*) made
+literal, and it is safe because the gate is a strict superset of the workflow —
+same typecheck, same vitest suite, same backend tests, plus a smoke test
+against a stack it stood up itself, which CI's `smoke` job also does but only
+after a full image build.
+
+Two consequences an agent must not get wrong:
+
+- **Running the gate is not optional and not delegable to CI.** There is no
+  green tick coming later to catch what you skipped. An issue whose PR was
+  opened without a full local gate run has been merged unverified.
+- **Report the gate's real numbers in the PR body**, measured in your own
+  worktree. They are the only record that it ran.
+
 **The gate as scaffolded was not green.** `pnpm test` failed to collect every
 suite — `@brendanbank/atrium-host-bundle-utils@0.27.0` ships extensionless
 relative ESM imports, which Vite's bundler resolution tolerates (so `pnpm build`
@@ -161,7 +179,7 @@ wrong at 03:00.
 
 | | |
 |---|---|
-| **Deploy** | ✅ Approved. The run may deploy to the deploy host — **beside the existing service, on port 8443** (§ Project card). Nothing else, and no other host. |
+| **Deploy** | ✅ Approved, and **the milestone tip may go to production** during this phase — the run does not wait for a release PR to see its work running. Target is the deploy host, **beside the existing service on port 8443** (§ Project card). Nothing else, and no other host. Deploys stay serial and the orchestrator's alone; agents merge and hold. |
 | **Live data** | ✅ On for the whole milestone. No per-issue asking. |
 | **Production writes** | ✅ Approved for the development phase. Still: narrowly scoped, labelled synthetic, reverted in-session, and **the revert verified** — an unverified revert is the thing that turns an approved write into an incident. The old service's live DNS records are not a test target. |
 | **Release PR** | ✅ The run opens and merges it once the exit criterion is *demonstrated* — met or not. An honest "exit 2 with named numbers" still merges. |

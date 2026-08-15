@@ -1,13 +1,28 @@
 name: CI
 
+# CI runs for `master` only — the release boundary.
+#
+# An overnight run opens one PR per issue into a milestone branch and merges
+# them there, which under the default triggers meant a full stack build per
+# issue: minutes of queue time per merge, and a second quality bar competing
+# with the one the contract actually names. The contract is explicit that the
+# **local gate is the only quality bar** for per-issue work
+# (`docs/ops/overnight-template.md`), and the gate is a superset of this
+# workflow — it runs the same typecheck, the same vitest suite, the same
+# backend tests, plus a smoke test against a stack it stood up itself.
+#
+# So: nothing fires for a PR into a milestone branch, or for a push to one.
+# CI is the gate on the way into `master`, where it is the last check before
+# a release, and there it is worth the wall-clock.
 on:
   pull_request:
+    branches: [master]
     paths-ignore:
       - "**.md"
       - "docs/**"
       - "LICENCE.md"
   push:
-    branches: [main, master]
+    branches: [master]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
