@@ -38,9 +38,13 @@ collide on every one of them.
 """
 from __future__ import annotations
 
+import ast
 import contextlib
+import inspect
 import os
+import pathlib
 import re
+import textwrap
 from typing import Any, Iterator
 
 import pytest
@@ -780,4 +784,435 @@ async def test_get_scope_is_mountable_as_a_fastapi_dependency():
     assert current_principal in sub_calls, (
         "get_scope no longer resolves through current_principal, so PAT "
         "requests would carry un-intersected permissions"
+    )
+
+
+# --------------------------------------------------------------------- #
+# Instrument C — the read-path census
+#
+# V1M2's exit criterion says "every read path returns nothing for a
+# second tenant's rows". Instruments A and B above prove that of every
+# *model*: six models, six zero-row assertions, six emitted predicates.
+# That is not the same population. A read path is a **call site**, and a
+# call site that never reaches ``DdnsScope`` at all is invisible to both
+# — it is not a wrong predicate, it is an absent one, and neither a
+# per-model assertion nor a query log has anything to notice.
+#
+# ``test_no_hand_written_tenancy_filter_survives_in_the_worker`` in
+# test_worker_jobs.py is the closest existing guard and it looks for a
+# different shape: it catches ``Hostname.user_id == uid`` written by
+# hand. A bare ``sa.select(Hostname)`` carries no ``user_id`` comparison
+# at all, so it passes that guard, returns every tenant's rows, and is
+# exactly what someone adding an admin listing endpoint writes first.
+#
+# So the population is derived here — from the package directory and
+# from ``DdnsScope``'s own method list, not from a list anyone maintains
+# — and every member is classified. The default for a call site nobody
+# classified is failure, not silence.
+# --------------------------------------------------------------------- #
+
+
+def _host_package_modules() -> list[pathlib.Path]:
+    """Every module in the host package, read off the directory.
+
+    Derived rather than listed, so a module added by a later issue is
+    swept the moment it exists — the same mechanism as
+    ``_package_modules`` in test_worker_jobs.py.
+    """
+    root = pathlib.Path(inspect.getsourcefile(sc)).parent
+    return sorted(root.rglob("*.py"))
+
+
+def _scope_query_methods() -> frozenset[str]:
+    """``DdnsScope``'s public methods that take a model.
+
+    Read off the class, so renaming ``select`` does not silently
+    reclassify every call site as unscoped — the rename moves the name
+    in both places at once, or this census goes red.
+    """
+    names = set()
+    for name, fn in inspect.getmembers(DdnsScope, inspect.isfunction):
+        if name.startswith("_"):
+            continue
+        if "model" in inspect.signature(fn).parameters:
+            names.add(name)
+    return frozenset(names)
+
+
+#: The SQLAlchemy statement constructors a read path can be spelled
+#: with, resolved against the installed ``sqlalchemy`` rather than left
+#: as bare strings — a name that stops existing upstream then shows up
+#: as a shrinking census instead of a clause that matches nothing.
+_SA_CONSTRUCTORS = frozenset(
+    name
+    for name in ("select", "update", "delete", "insert")
+    if callable(getattr(sa, name, None))
+)
+
+#: ``session.get(Model, pk)`` is a read path and **cannot** be scoped —
+#: the identity-map lookup takes no ``WHERE``. It is in the census on
+#: purpose, so writing one is a failure rather than an omission;
+#: :meth:`DdnsScope.get` is the replacement and the reason that method
+#: exists at all.
+_SESSION_READERS = frozenset({"get"})
+
+#: ``module:function`` -> why this call site does not go through the
+#: scope. Every entry is a claim in writing; the tests below refuse an
+#: empty one and refuse a stale one.
+READ_PATHS_NOT_SCOPED: dict[str, str] = {
+    "auth_device.py:authenticate_device": (
+        "This is the query that ESTABLISHES the tenant. A device presents "
+        "HTTP Basic credentials and there is no atrium session, no cookie "
+        "and no principal anywhere in the request; the lookup is by the "
+        "globally-unique ddns_device.username, and its result is what "
+        "DdnsScope.for_user_id() is then built from. Scoping it would "
+        "require the answer it is being asked for. It reads one device row "
+        "by unique key and returns no other tenant data."
+    ),
+    "seed_compat_fixture.py:read_back": (
+        "Development-only fixture seeder for the frozen compat table. It is "
+        "refused unless ATRIUM_DDNS_COMPAT_STUB=1, refused outright when "
+        "ENVIRONMENT=prod, and mounted on no route. Its whole purpose is to "
+        "read back every fixture tenant's rows as the second instrument on "
+        "what it has just written."
+    ),
+    "seed_compat_fixture.py:verify_rehash": (
+        "Same module and same two gates. It reports the SHAPE of every "
+        "fixture device's stored password hash across all three fixture "
+        "tenants, which is a cross-tenant read by design and never runs on "
+        "a real installation."
+    ),
+}
+
+#: One census row: ``(module:function, lineno, callee, verdict, models)``.
+_CensusRow = tuple[str, int, str, str, tuple[str, ...]]
+
+
+def _read_path_census(modules: list[tuple[str, str]]) -> list[_CensusRow]:
+    """Every query call site naming a tenant model, classified.
+
+    ``modules`` is ``(filename, source)`` rather than a directory, so
+    the classifier can be run over synthetic source too — which is the
+    only way to watch it fail.
+
+    ``verdict`` is one of ``scoped`` (the call is
+    ``scope.<method>(...)``), ``nested`` (it is lexically inside one —
+    ``scope.apply(sa.update(X), X)`` is one read path spelled with two
+    constructors), ``exempt`` (named in ``READ_PATHS_NOT_SCOPED``), or
+    ``UNSCOPED``.
+    """
+    tenant_names = {model.__name__ for model in TENANT_PATHS}
+    scope_methods = _scope_query_methods()
+    callees = _SA_CONSTRUCTORS | scope_methods | _SESSION_READERS
+
+    out: list[_CensusRow] = []
+    for filename, source in modules:
+        tree = ast.parse(source)
+        parents: dict[ast.AST, ast.AST] = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+
+        def enclosing_function(node: ast.AST) -> str:
+            cur = parents.get(node)
+            while cur is not None:
+                if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    return cur.name
+                cur = parents.get(cur)
+            return "<module>"
+
+        def is_scope_call(node: ast.AST) -> bool:
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in scope_methods
+                and ast.unparse(node.func.value) == "scope"
+            )
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name):
+                name, receiver = func.id, ""
+            elif isinstance(func, ast.Attribute):
+                name, receiver = func.attr, ast.unparse(func.value)
+            else:
+                continue
+            if name not in callees:
+                continue
+            # `get` is a bare, extremely common method name, and it is
+            # spelled twice in this codebase: `session.get` (a read
+            # path that cannot be scoped) and `scope.get` (the
+            # replacement for it). Both are read paths and both must
+            # stay in; anything else called `get` is not.
+            #
+            # The first cut of this line narrowed to the session's
+            # receiver alone and silently dropped
+            # `router_nic.py:_persist_updates`, so the census counted
+            # 13 sites where there are 14 and still reported a clean
+            # sweep. `test_every_scope_entry_point_appears_in_the_census`
+            # is the guard that caught it.
+            if name in _SESSION_READERS and receiver not in {"session", "s", "scope"}:
+                continue
+
+            models = tuple(
+                sorted(
+                    {
+                        child.id if isinstance(child, ast.Name) else child.attr
+                        for child in ast.walk(node)
+                        if (isinstance(child, ast.Name) and child.id in tenant_names)
+                        or (
+                            isinstance(child, ast.Attribute)
+                            and child.attr in tenant_names
+                        )
+                    }
+                )
+            )
+            if not models:
+                continue
+
+            key = f"{filename}:{enclosing_function(node)}"
+            if is_scope_call(node):
+                verdict = "scoped"
+            else:
+                verdict = "exempt" if key in READ_PATHS_NOT_SCOPED else "UNSCOPED"
+                cur = parents.get(node)
+                while cur is not None:
+                    if is_scope_call(cur):
+                        verdict = "nested"
+                        break
+                    cur = parents.get(cur)
+            out.append((key, node.lineno, f"{receiver}.{name}", verdict, models))
+    return sorted(out)
+
+
+def _package_census() -> list[_CensusRow]:
+    return _read_path_census(
+        [(path.name, path.read_text()) for path in _host_package_modules()]
+    )
+
+
+async def test_every_read_path_in_the_host_package_is_scoped_or_excused():
+    """The criterion's word "every", given a population it can count.
+
+    Anything not routed through ``DdnsScope`` has to be named in
+    ``READ_PATHS_NOT_SCOPED`` with a reason. A new call site nobody
+    classified fails here on the day it is written, which is the only
+    moment at which its author knows why it is shaped that way.
+    """
+    census = _package_census()
+    assert census, (
+        "the read-path census found no query call sites at all in the host "
+        "package. That is not a clean bill of health, it is a broken "
+        "instrument — router_nic.py and worker_jobs.py both query tenant "
+        "tables. Check _SA_CONSTRUCTORS and _scope_query_methods()."
+    )
+
+    unscoped = [row for row in census if row[3] == "UNSCOPED"]
+    assert unscoped == [], (
+        "these query call sites name a tenant model and reach neither "
+        "DdnsScope nor READ_PATHS_NOT_SCOPED:\n"
+        + "\n".join(
+            f"  {key} line {lineno}: {callee}{list(models)}"
+            for key, lineno, callee, _, models in unscoped
+        )
+        + "\n\nA bare sa.select(Model) returns every tenant's rows and "
+        "carries no user_id comparison for a filter-shaped guard to catch."
+    )
+
+    assert [row for row in census if row[3] in {"scoped", "nested"}], (
+        "no call site reaches the scope at all — the census is inverted"
+    )
+
+
+async def test_every_scope_entry_point_appears_in_the_census():
+    """A census that cannot see one spelling under-counts silently.
+
+    ``DdnsScope`` has four entry points and the host uses all four. If
+    the classifier stops recognising one, every call site written that
+    way vanishes from the population — and the criterion's "every read
+    path" is then measured against a denominator that quietly shrank,
+    which is the whole defect family this file is written against.
+
+    The comparison is against the **call graph**, not the source text.
+    ``scope.predicate(DnsEvent)`` appears in ``scope.py``'s own module
+    docstring as an example, and a substring search reports that as a
+    call site — the identical defect
+    ``test_the_blocking_resolver_is_not_used_on_the_event_loop`` in
+    test_worker_jobs.py was written for. Measured: a text search says
+    ``predicate`` is used and the AST says it is not, and the AST is
+    right.
+
+    This caught a real one: ``get`` was being narrowed to
+    ``session.get``, ``scope.get`` was dropped with it, and the census
+    counted 13 sites where there are 14 while still reporting a clean
+    sweep.
+    """
+    tenant_names = {model.__name__ for model in TENANT_PATHS}
+    called: set[str] = set()
+    for path in _host_package_modules():
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute):
+                continue
+            if ast.unparse(func.value) != "scope":
+                continue
+            if func.attr not in _scope_query_methods():
+                continue
+            names = {
+                child.id if isinstance(child, ast.Name) else child.attr
+                for child in ast.walk(node)
+                if isinstance(child, (ast.Name, ast.Attribute))
+            }
+            if names & tenant_names:
+                called.add(func.attr)
+
+    assert called, "no scope call on a tenant model anywhere — instrument broken"
+    seen = {row[2].split(".", 1)[1] for row in _package_census()}
+    missing = called - seen
+    assert missing == set(), (
+        f"these DdnsScope entry points are called on a tenant model in the "
+        f"package and appear in no census row: {sorted(missing)}. The "
+        "classifier has lost a spelling, so the population is short by every "
+        "call site written that way."
+    )
+
+
+async def test_the_read_path_census_fails_on_a_bare_select():
+    """The guard, shown biting, against the two shapes it is written for.
+
+    Run over synthetic source rather than by mutating the package, which
+    cannot be done under a running test — but naming the real models, so
+    a rename in ``models.py`` breaks this too.
+    """
+    leak = textwrap.dedent(
+        """
+        import sqlalchemy as sa
+        from .models import Domain
+
+        async def list_everything(session):
+            return await session.execute(sa.select(Domain))
+
+        async def fetch_one(session, pk):
+            return await session.get(Domain, pk)
+        """
+    )
+    verdicts = {
+        (row[0], row[2]): row[3] for row in _read_path_census([("leak.py", leak)])
+    }
+    assert verdicts == {
+        ("leak.py:list_everything", "sa.select"): "UNSCOPED",
+        ("leak.py:fetch_one", "session.get"): "UNSCOPED",
+    }, verdicts
+
+    # Both scoped spellings, and `scope.get` specifically: it shares a
+    # bare method name with `session.get`, and the narrowing that keeps
+    # arbitrary `.get()` calls out of the census dropped it once.
+    ok = textwrap.dedent(
+        """
+        from .models import Domain
+
+        async def list_mine(session, scope):
+            return await session.execute(scope.select(Domain))
+
+        async def fetch_mine(session, scope, pk):
+            return await scope.get(session, Domain, pk)
+        """
+    )
+    assert sorted(
+        (row[0], row[2], row[3]) for row in _read_path_census([("ok.py", ok)])
+    ) == [
+        ("ok.py:fetch_mine", "scope.get", "scoped"),
+        ("ok.py:list_mine", "scope.select", "scoped"),
+    ]
+
+
+async def test_a_statement_composed_inside_a_scope_call_counts_as_scoped():
+    """``scope.apply(sa.update(Hostname), Hostname)`` is one read path.
+
+    The inner constructor is genuinely unscoped on its own and the
+    census must not report it: worker_jobs.py writes exactly this shape
+    for the health-check writeback, and a classifier that flagged it
+    would be switched off within a week.
+    """
+    composed = textwrap.dedent(
+        """
+        import sqlalchemy as sa
+        from .models import Hostname
+
+        async def writeback(session, scope):
+            return await session.execute(
+                scope.apply(sa.update(Hostname).values(dns_ip_v4=None), Hostname)
+            )
+        """
+    )
+    assert sorted(row[3] for row in _read_path_census([("c.py", composed)])) == [
+        "nested",
+        "scoped",
+    ]
+
+
+async def test_every_excused_read_path_still_exists_and_says_why():
+    """A stale exemption is an exemption for code that is gone.
+
+    Both directions: every entry must still name a live call site, and
+    every entry must carry a reason long enough to be one.
+    """
+    excused = {row[0] for row in _package_census() if row[3] == "exempt"}
+    stale = set(READ_PATHS_NOT_SCOPED) - excused
+    assert stale == set(), (
+        "READ_PATHS_NOT_SCOPED excuses call sites that no longer exist: "
+        f"{sorted(stale)}. The entry goes when the code does."
+    )
+    for key, reason in READ_PATHS_NOT_SCOPED.items():
+        assert reason and reason.strip(), key
+        assert len(reason.split()) >= 20, (
+            f"{key}'s exemption reads as a placeholder: {reason!r}"
+        )
+
+
+async def test_the_census_and_the_model_registry_see_the_same_models():
+    """Instrument C's population is derived from instrument A's.
+
+    ``_read_path_census`` recognises the names in ``TENANT_PATHS``. A
+    name it cannot recognise would silently drop call sites, so the two
+    are compared rather than assumed aligned.
+
+    The reverse direction is the interesting one and it is **not** a
+    failure. Measured on this package, two of the six registered models
+    — ``Domain`` and ``DomainBackend`` — appear in no query call site at
+    all: they are loaded through relationships off ``Hostname``, so the
+    predicate that protects them is ``Hostname``'s. That is a real
+    property of the read paths and it is asserted here as reachability
+    over the mappers' own relationships rather than as a list, so a
+    model that becomes genuinely unreachable stops being excused.
+    """
+    census = _package_census()
+    queried = {name for row in census for name in row[4]}
+    registered = {model.__name__ for model in TENANT_PATHS}
+    assert queried <= registered, sorted(queried - registered)
+
+    # Transitive closure over relationships, read off the mappers.
+    by_name = {model.__name__: model for model in TENANT_PATHS}
+    reachable = set(queried)
+    changed = True
+    while changed:
+        changed = False
+        for name in sorted(reachable):
+            model = by_name.get(name)
+            if model is None:
+                continue
+            for rel in sa.inspect(model).relationships:
+                target = rel.mapper.class_.__name__
+                if target in registered and target not in reachable:
+                    reachable.add(target)
+                    changed = True
+
+    assert registered <= reachable, (
+        "these tenant models are neither queried directly nor reachable "
+        "through a relationship from one that is, so no read path in this "
+        f"package covers them: {sorted(registered - reachable)}"
     )

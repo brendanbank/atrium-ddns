@@ -1068,10 +1068,21 @@ async def test_the_head_refusal_does_not_fall_out_of_the_framework(
     ``-head-is-refused-by-the-host`` cases fail without a hand-written
     handler either way. What changes is the *reason*, and it is worth
     correcting because the recorded one — "the catch-all serves it" —
-    suggests the fix might be to stop the mount shadowing ``/nic/*``,
-    which would not produce a 405 either. The frozen table is **not**
-    edited for this: ``known_gaps`` is inside the digest and rewriting
-    it is a version bump, i.e. a deliberate act with its own PR.
+    reads as though making the mount decline non-GET would restore the
+    405. It already declines non-GET. A ``Mount`` is a **full** route
+    match whatever it then answers, so the ``GET``-only route's own 405
+    never runs; the only thing that produces the frozen status is the
+    hand-written handler this file asserts.
+
+    **Corrected by #18: the reason this test gave for not editing the
+    frozen table was itself wrong.** It read "``known_gaps`` is inside
+    the digest and rewriting it is a version bump".
+    ``_content_digest`` in ``tests/compat/test_protocol.py`` hashes the
+    parsed ``cases`` and ``deleted_cases`` and nothing else, so
+    ``known_gaps`` is outside it — and a version bump over unmoved data
+    is refused by ``test_the_version_advances_exactly_when_the_data_does``
+    in as many words. The entry is corrected at v3, and this test is
+    what makes the corrected reading executable rather than prose.
 
     Row two is what this repository answered before this issue, and it
     is why the two frozen ``-post-is-405-on-the-host`` cases passed
@@ -1682,6 +1693,116 @@ async def test_message_is_set_on_rate_limit_refusals_and_nothing_else(
     rows = await events_for(world.alice_id)
     assert rows, "no rows written — the assertion below would be vacuous"
     assert [row.message for row in rows] == [None] * len(rows)
+
+
+async def test_backend_type_names_the_provider_on_a_per_attempt_row(
+    client, world
+) -> None:
+    """``event-backend-type-is-null-for-outcomes-decided-before-any-backend``.
+
+    ``preserve``, and it was **not expressible** until #18's ``0003``
+    added the column: ``_record_hostname_events`` already unpacked the
+    backend type out of ``result.attempts`` and threw it away, because
+    there was nowhere to put it.
+
+    ``mixed`` has two backends, ``stub1`` (dnserr) and ``stub2`` (good),
+    so one request writes two rows and they must name *different*
+    providers in the order the attempts ran. Asserting the pair rather
+    than "the column is not null" is what makes this fail if every row
+    were stamped with the same value — which is what a writer reading
+    the aggregate instead of the attempt would produce.
+    """
+    await clear_events()
+    response = await get(
+        client, "/nic/update", headers=alice(world),
+        hostname=world.name("mixed"), myip="203.0.113.10",
+    )
+    assert response.text == "good 203.0.113.10"
+
+    rows = await events_for(world.alice_id)
+    assert [(row.backend_type, row.response_code) for row in rows] == [
+        ("stub1", "dnserr"),
+        ("stub2", "good"),
+    ], [(row.backend_type, row.response_code) for row in rows]
+
+
+@pytest.mark.parametrize(
+    "hostname_key,expected",
+    [
+        # No provider is reachable at all: the domain has none.
+        ("nobackend", "911 203.0.113.10"),
+        # The name resolves to nothing this device owns, so resolution
+        # stops before any backend is looked at.
+        (None, "nohost 203.0.113.10"),
+    ],
+)
+async def test_backend_type_is_null_when_the_outcome_precedes_any_backend(
+    client, world, hostname_key, expected
+) -> None:
+    """The NULL half — and NULL here is a *meaning*, not a missing value.
+
+    ``backend_type IS NULL`` is the filter for "refused before any
+    provider was contacted". If these rows carried a placeholder
+    instead, that filter would return nothing and read like a healthy
+    estate.
+    """
+    await clear_events()
+    hostname = (
+        world.name(hostname_key)
+        if hostname_key
+        else "never-registered.example.com"
+    )
+    response = await get(
+        client, "/nic/update", headers=alice(world),
+        hostname=hostname, myip="203.0.113.10",
+    )
+    assert response.text == expected
+
+    rows = await events_for(world.alice_id)
+    assert rows, "no rows written — the assertion below would be vacuous"
+    assert [row.backend_type for row in rows] == [None] * len(rows)
+
+
+async def test_badauth_and_abuse_rows_carry_no_backend_type(
+    client, world
+) -> None:
+    """The two refusals decided before a hostname is even parsed.
+
+    Read back with the filter the column exists to serve —
+    ``backend_type IS NULL`` in SQL — rather than through the ORM
+    attribute, so the assertion is about what the database stores and
+    not about what the mapper hands back.
+    """
+    await clear_events()
+    await get(
+        client, "/nic/update",
+        headers=basic(world.device_usernames["alice"], "wrong"),
+        hostname=world.name("ok"), myip="203.0.113.10",
+    )
+    await _set_limit(world.alice_device, 0)
+    try:
+        await get(
+            client, "/nic/update", headers=alice(world),
+            hostname=world.name("ok"), myip="203.0.113.10",
+        )
+    finally:
+        await _set_limit(world.alice_device, BIG_LIMIT)
+
+    factory = get_session_factory()
+    async with factory() as s:
+        total, nulls = (
+            await s.execute(
+                sa.text(
+                    "SELECT COUNT(*), SUM(backend_type IS NULL) "
+                    "FROM ddns_event WHERE response_code IN "
+                    "('badauth', 'abuse')"
+                )
+            )
+        ).one()
+    # The denominator is published beside the zero, so "0 rows carry a
+    # backend type" cannot be satisfied by there being no rows.
+    assert total >= 2, f"only {total} refusal rows — the ratio below is vacuous"
+    assert int(nulls) == total, f"{total - int(nulls)} of {total} carry one"
 
 
 async def test_delete_logs_the_normalised_address(client, world) -> None:
