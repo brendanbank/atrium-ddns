@@ -17,9 +17,39 @@ The thing that must survive is the **wire behaviour of three endpoints**, not
 any internal structure. Routers in the field — OPNsense, ddclient, inadyn,
 Fritz!Box — are the users, and they cannot be asked to change.
 
-Extracted from `dyndns-route53/dyndns.py` at `main`. Every response is HTTP
-**200** with `Content-Type: text/plain`, including failures; clients parse the
-body, and a 401 would break them.
+Extracted from `dyndns-route53/dyndns.py` at `main`. Every **`GET`** response is
+HTTP **200**, including failures; clients parse the body, and a 401 would break
+them.
+
+**This paragraph used to read "every response is HTTP 200 with
+`Content-Type: text/plain`", and both halves were wrong** — corrected by issue
+#11 against measurements taken in that issue, not against a reading of the code:
+
+- **`Content-Type` is not always `text/plain`.** `/nic/checkip` in its default
+  mode answers `text/html; charset=utf-8`, which the very next table in this
+  section says and the sentence above it contradicted. 13 of the frozen table's
+  114 cases are `checkip` cases and 5 of them assert `text/html`.
+- **Not every response is 200.** A non-`GET` request answers 405 before any
+  handler runs (divergence 7 below). Measured against a throwaway legacy
+  instance: `POST`, `PUT`, `DELETE` and `PATCH` on `/nic/update` and `POST` on
+  `/nic/checkip` all answer `405`, `text/html; charset=utf-8`, 153 bytes.
+
+The claim that survives is the load-bearing one: **on the `GET` path the status
+is always 200**, `badauth` included. 105 of the table's 114 cases are `GET` and
+every one of them expects 200; the other 9 exist to assert the 405 and the
+`HEAD` decision, and before they were written the "always 200" claim was
+unfalsifiable from inside the table.
+
+### §1 was reconciled against measurement by issue #11
+
+This section was extracted before any of it had been run. Six issues corrected
+it, and the corrections are in place below rather than appended: **nine
+divergences, not five**; **90 bytes, not 91**; **147 legacy tests, not 146**;
+the `HEAD` decision; and the two above. Issue #11 re-derived every number in
+this section against its own throwaway legacy instance rather than inheriting
+one — `tests/compat/baseline.md` is that reading, and where it disagrees with
+what was written here, this section has been changed and the disagreement is
+named rather than smoothed over.
 
 ### `GET /nic/checkip` — unauthenticated
 
@@ -42,7 +72,13 @@ See `tests/compat/README.md`.
 ### `GET /nic/update`
 
 Auth: HTTP Basic **only** — see *Removed: query-parameter auth* below. Response
-is one line per requested hostname, newline-joined, **in request order**.
+is one line per requested hostname, newline-joined, **in request order** and
+**with no trailing newline** — `"\n".join(lines)`, so 25 hostnames give 25 lines
+and 24 newlines. The trailing newline is stated because a framework adding one
+is the single most likely way this regresses, it is invisible to any comparison
+that strips whitespace, and the table asserts it byte-for-byte
+(`update-multi-hostname-body-has-no-trailing-newline`, plus `line_count` and
+`body_ends_with_newline` on the multi-hostname cases).
 
 | condition | body |
 |---|---|
@@ -122,7 +158,16 @@ the doc:
    §1.3 of the document says otherwise. Flask's default `methods` are
    `GET`/`HEAD`/`OPTIONS` and no route in `dyndns.py` overrides them, so
    Werkzeug answers 405 with a 153-byte error page before any handler runs;
-   `OPTIONS` answers 200 with `Allow: GET, HEAD, OPTIONS`. *Preserve* — a
+   `OPTIONS` answers 200 with an `Allow` header naming those same three
+   methods. **The `Allow` header's order is not stable and must never be
+   asserted** — this sentence used to name a specific order, and #11 measured
+   two throwaway instances of the *same* checkout answering
+   `HEAD, GET, OPTIONS` and `GET, OPTIONS, HEAD`, each stable within its own
+   process. Werkzeug joins a Python `set`, so the order follows the process's
+   hash seed. Nothing in the table asserts it — there is no `OPTIONS` case —
+   which is luck rather than design, and is written down here so that adding
+   one is a deliberate decision to assert a set rather than a sequence.
+   *Preserve* — a
    rewrite on FastAPI answers 405 here anyway, for the different reason that
    the route declares `GET`. **This bounds divergence 4**: "everything is HTTP
    200" is true of every case in the table, all of which are `GET`, and false
@@ -179,13 +224,29 @@ Four things decided it:
 - **Preserving is the expensive option, not the cheap one.** FastAPI's
   `APIRoute` does not add `HEAD` to a `GET` route (Starlette's plain `Route`
   does; FastAPI's does not), so the rewrite refuses `HEAD` unless someone
-  writes `methods=["GET", "HEAD"]` on purpose. Measured against this
-  repository's own stack: a non-declared method on a matched path answers
-  405 `application/json`. Preserving would mean deliberately re-enabling an
-  unsafe `HEAD` on the endpoint that writes DNS.
-- **Nothing in the field sends it.** All 114 cases in the table are `GET` bar
-  the ones added to assert this. ddclient, inadyn, OPNsense and Fritz!Box send
-  `GET`.
+  writes `methods=["GET", "HEAD"]` on purpose. Preserving would mean
+  deliberately re-enabling an unsafe `HEAD` on the endpoint that writes DNS.
+
+  **But "refusing is free" is only true of a bare FastAPI app, and this is not
+  one.** #11 measured it three ways and the readings do not agree with each
+  other, which is the finding:
+
+  | stack | `HEAD` on a `GET`-only route |
+  |---|---|
+  | bare FastAPI, no catch-all (in-process `TestClient`) | **405** — what the table freezes |
+  | the same route behind a `GET`-only SPA catch-all mount | **200** — the catch-all serves it |
+  | this repository's own stack today, over the wire | **404** |
+
+  Atrium mounts a catch-all at the root, and a `Mount` matches every method, so
+  the 405 the route would have produced never reaches the wire. `POST` still
+  answers 405 through the same mount, which is why the two `-post-is-405-on-the-host`
+  cases pass. **The decision stands and the cases stay frozen at 405** — what
+  changes is the cost line: V1M2 has to write a deliberate `HEAD` handler (or
+  stop the SPA mount shadowing `/nic/*`), because the framework's own refusal
+  does not survive the mount. Recorded in the table's `frozen.known_gaps`.
+- **Nothing in the field sends it.** 105 of the 114 cases in the table are
+  `GET`; the other 9 — 5 `HEAD`, 4 `POST` — exist to assert this decision and
+  divergence 7. ddclient, inadyn, OPNsense and Fritz!Box send `GET`.
 - **The realistic sender is a monitor, and the failure is worse than "an extra
   update".** `HEAD` needs valid Basic credentials, so it is not an open door —
   but a DynDNS update URL carries its credentials, and pasting one into an
@@ -195,8 +256,16 @@ Four things decided it:
   monitoring service, refreshed every poll.
 - **`checkip` is safe, so `HEAD` stays.** The split is the rule applied rather
   than a blanket: `HEAD` is preserved exactly where the handler is read-only.
-  `HEAD /nic/checkip` answers 200, `Content-Length: 102`, empty body — a
-  perfectly reasonable liveness probe, and the host must declare `HEAD` there.
+  `HEAD /nic/checkip` answers 200 with an empty body — a perfectly reasonable
+  liveness probe, and the host must declare `HEAD` there.
+
+  **The `Content-Length` figures in this section are not constants**, and #11
+  re-measured them rather than repeating them: the length tracks the IP in the
+  body. `HEAD /nic/checkip` is 102 bytes for `203.0.113.10` and 99 for
+  `127.0.0.1`; `HEAD /nic/update` is 18 bytes for `good 203.0.113.201` and 17
+  for `good 203.0.113.10`. What is load-bearing is that a body is *generated*
+  at all, and — for update — that `last_ip_v4` moves, which is the half a
+  `Content-Length` cannot show and the wire cannot see.
 
 **The mechanism named in issue #25 does not work, and that is worth recording
 rather than quietly not using.** The issue proposes `methods=["GET"]` "turning
@@ -254,9 +323,62 @@ alongside proves nothing about compatibility. Report the legacy baseline as a
 **negative result**: "we ran N cases against the legacy service, and exactly M
 diverge from the protocol document, enumerated here."
 
-The old repo's **147** pytest tests are a second source — 121 in `test_app.py` plus 26 in `test_hetzner.py`. (`dyndns-route53/CLAUDE.md` says 146; it is stale, and this plan repeated it without counting.) Port the ones asserting
-*behaviour*; drop the ones asserting Flask internals, template contents, or
-Bootstrap markup — atrium owns that surface now.
+**N and M, filled in.** Issue #11 stood up its own throwaway legacy instance
+and ran the frozen table end to end, deriving every number in this paragraph
+rather than quoting one:
+
+> **107 cases were selected for `--target legacy` and all 107 were measured —
+> 104 by the pytest runner and 3 out of band, because their precondition is
+> fixture state the wire cannot arrange. 107 agree with the table and 0
+> diverge. Separately, exactly 9 behaviours diverge from
+> `docs/DYNDNS-PROTOCOL.md` §1, all 9 confirmed live, and a clause-by-clause
+> re-walk of §1 found no tenth.**
+
+`tests/compat/baseline.md` is the reading, with both instruments, the five
+mutations that produced the predicted red sets, and what is still not measured.
+The table is **frozen at version 2** (`frozen:` block, guarded by
+`test_the_table_is_frozen_at_its_recorded_shape`), so V1M2 is measured against
+a file that cannot change without a PR that says so.
+
+The old repo's **147** pytest tests are a second source — 121 in `test_app.py`
+plus 26 in `test_hetzner.py`, agreed exactly by `pytest --collect-only` and by
+`grep -cE '^\s*def test_'`, re-measured by #11. (`dyndns-route53/CLAUDE.md` says
+146; it is stale, and this plan repeated it without counting.) Port the ones
+asserting *behaviour*; drop the ones asserting Flask internals, template
+contents, or Bootstrap markup — atrium owns that surface now.
+
+### What the frozen table does not cover — named at freeze time
+
+A contract that overstates its own reach is worse than a narrow one, so the
+gaps are part of §1 rather than a footnote in the test directory. All four are
+in the table's own `frozen.known_gaps`, and all four were measured by #11:
+
+- **`effects:` is data, not an assertion.** 15 cases carry a DNS operation or a
+  persisted column; no runner asserts either. The runner prints the count every
+  run so the gap stays a number rather than an assumption.
+- **3 cases are not executable over the wire.** `rate_limited: true` is a
+  precondition, not a request. They are skipped with the precondition named and
+  measured separately — and the measurement is only worth having because the
+  same three were run against an *unlimited* instance and went red there, which
+  is what tells you `abuse` was measured rather than printed by construction.
+- **2 host-only cases pass against a host with no `/nic/*` routes at all.**
+  `checkip-post-is-405-on-the-host` and `update-post-is-405-on-the-host` meet
+  atrium's SPA catch-all, which also declares only `GET`, so nothing on the
+  wire distinguishes "no route" from "`GET`-only route". They assert *`POST` is
+  refused*, never *the endpoint exists*. Re-measured by #11 against a host
+  whose route table contains **zero** `/nic` paths: 110 selected, **2 passed,
+  105 failed, 3 skipped** — the 105 are what says the endpoint is not there
+  yet, and the 2 greens are not coverage. The two host `HEAD` cases do **not**
+  pass vacuously (they expect 405 and the catch-all answers 404), so the
+  overstatement is exactly 2 and not 4.
+- **The table is weighted against the traffic it protects.** 104 of 114 cases
+  are IPv4-only and 4 touch IPv6, measured from the table's `myip`, `client_ip`
+  and expected bodies. §3.3.1 measured production at **143 IPv4 / 305 IPv6**
+  events and concluded, before anyone checked, that "a table exercising `A`
+  thoroughly and `AAAA` once is testing the wrong record type". It was
+  describing this table. The divergence count is unaffected — the document says
+  nothing family-specific — but the *coverage* claim is, and V1M2 inherits it
+  as a known gap rather than discovering it.
 
 ---
 

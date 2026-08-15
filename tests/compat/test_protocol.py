@@ -14,7 +14,9 @@ rendered as text.
 """
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -270,3 +272,73 @@ def test_every_case_builds_a_request() -> None:
         request = build_request(case)
         assert request.target_path.startswith(case["path"])
         assert request.method
+
+
+def test_the_table_is_frozen_at_its_recorded_shape() -> None:
+    """The freeze is a guard, not a comment (issue #11, closing V1M1).
+
+    V1M2 is measured against this table, so a change to it has to be a
+    deliberate act. `version: 1` was written by #7 against a 101-case table and
+    was still reading 1 when the table reached 114 — a version field nothing
+    checks is a version field nobody bumps, which is the whole argument for
+    this being a test rather than a paragraph.
+
+    Four readings, because a single count is the easiest thing to satisfy by
+    accident: the two list lengths, the spec-row count, and a digest over the
+    *parsed* data. The digest is what makes a changed expected byte a failure
+    while a reflowed comment is not; the counts are what makes the failure
+    legible when a whole case is added or removed.
+
+    To change the table: change it, bump `frozen.version`, and put the four new
+    readings here in the same PR. The failure message carries the values.
+    """
+    table = load_table()
+    frozen = table.get("frozen")
+    assert frozen, (
+        "protocol_cases.yaml has no `frozen:` block. It was frozen by issue "
+        "#11 to close V1M1; removing the block removes the only thing that "
+        "makes a change to the table visible."
+    )
+
+    assert table["version"] == frozen["version"], (
+        f"top-level `version: {table['version']}` disagrees with "
+        f"`frozen.version: {frozen['version']}`. They are the same number "
+        "written twice on purpose — bump both."
+    )
+
+    actual = {
+        "cases": len(table["cases"]),
+        "deleted_cases": len(table["deleted_cases"]),
+        "spec_rows": len(table["spec_rows"]),
+        "content_digest": _content_digest(table),
+    }
+    recorded = {key: frozen.get(key) for key in actual}
+
+    drifted = {k: (recorded[k], actual[k]) for k in actual if recorded[k] != actual[k]}
+    assert drifted == {}, (
+        "the table has changed since it was frozen. Recorded vs actual:\n"
+        + "\n".join(f"  {k}: recorded {r!r}, actual {a!r}" for k, (r, a) in drifted.items())
+        + f"\n\nIf the change is intended: bump `frozen.version` (now "
+        f"{frozen['version']}), write the actual values above into the "
+        "`frozen:` block, and re-run the table against a throwaway legacy "
+        "instance — baseline.md is where that reading goes. If it is not "
+        "intended, this is the regression the freeze exists to catch."
+    )
+
+
+def _content_digest(table: Mapping[str, Any]) -> str:
+    """sha256 over the parsed `cases` and `deleted_cases`, canonicalised.
+
+    Over the *parsed* data rather than the file's bytes, so reflowing a comment
+    or a block scalar does not trip it and changing one expected byte does. A
+    byte digest of the file would fail on every prose edit and would therefore
+    be routinely regenerated without anyone reading what changed, which is a
+    guard that has been trained not to bite.
+    """
+    payload = json.dumps(
+        [table["cases"], table["deleted_cases"]],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
