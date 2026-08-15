@@ -23,14 +23,14 @@
   },
   "devDependencies": {
     "@brendanbank/atrium-test-utils": "^0.28",
-    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/jest-dom": "^7.0.1",
     "@testing-library/react": "^16.3.2",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
-    "jsdom": "^29.0.2",
-    "typescript": "^6.0.3",
+    "jsdom": "^30.0.1",
+    "typescript": "^7.0.2",
     "vite": "^8.0.10",
-    "vite-plugin-css-injected-by-js": "^3.5.2",
+    "vite-plugin-css-injected-by-js": "^5.0.2",
     "vitest": "^4.1.5"
   }
 }
