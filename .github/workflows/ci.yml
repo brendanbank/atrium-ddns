@@ -60,6 +60,43 @@ jobs:
       - name: Build
         run: pnpm build
 
+  compat-guards:
+    # The service-free half of `tests/compat/`: 18 model-behaviour guards over
+    # `legacy_inventory.yaml` / `model_cases.yaml`, the wire runner's own
+    # arithmetic guards, and the runner's command-line contract. No Docker, no
+    # database, no service — pytest and PyYAML and nothing else — so this
+    # answers in seconds and still answers when the stack build below is broken.
+    #
+    # Not a duplicate of `make test-backend` in the smoke job. That runs the
+    # same tree from the copy baked into the image; this runs it from the
+    # checkout, on a machine that has never seen this repo. Two instruments:
+    # green here and red there means the image is stale rather than the tests
+    # wrong, which is what `make check-compat-fresh` exists to say out loud.
+    #
+    # The command is `pytest tests/` with no flags on purpose — that exact
+    # invocation used to fail before collecting anything, and being the literal
+    # command is what stops the fix regressing.
+    #
+    # The 101-case wire table is NOT run here and must not be: it needs a live
+    # service and an explicit --target/--base-url pair (`make test-compat`).
+    # The run prints "the wire table was NOT RUN" rather than nought failures.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # setup-python is new to this workflow, so it goes in at the current
+      # major (v7.0.0). checkout stays at the pin the rest of the file uses;
+      # dependabot owns moving them together.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install the runner's two dependencies
+        run: python -m pip install --disable-pip-version-check pytest pyyaml
+
+      - name: Compat guards
+        run: python -m pytest tests/ -ra
+
   smoke:
     # Stand up the full stack (atrium image + this host extension on
     # top), run migrations, seed an admin, hit /api/readyz. Catches the

@@ -1,0 +1,1608 @@
+# DynDNS v2 compatibility case table.
+#
+# Data only. No Python, no expressions, no code. A runner (see README.md) loads
+# this file, executes `cases` against a base URL, and compares the response
+# byte-for-byte with `expect`.
+#
+# Source of truth is the *behaviour* of `brendanbank/dyndns-route53`'s
+# `dyndns.py` at `main` (commit ec605c5), read directly, not
+# `docs/DYNDNS-PROTOCOL.md`. Where the two disagree the implementation wins and
+# the case carries a `divergence` tag. See README.md.
+
+# ---------------------------------------------------------------------------
+# FROZEN. Issue #11, 2026-08-15, closing V1M1.
+#
+# V1M2 is measured against this file, so changing it is a deliberate act with a
+# PR and not a tidy-up. To change it:
+#
+#   1. change the cases,
+#   2. bump `frozen.version`,
+#   3. recompute `frozen.cases` / `frozen.deleted_cases` / `frozen.spec_rows` /
+#      `frozen.content_digest`,
+#   4. re-run the table against a throwaway legacy instance and record the
+#      reading in `baseline.md`.
+#
+# Steps 2 and 3 are not optional and not on the honour system:
+# `test_the_table_is_frozen_at_its_recorded_shape` in `test_protocol.py`
+# recomputes all four every gate run and fails naming both values. `version: 1`
+# was written by #7 against a 101-case table and was still reading 1 when #25
+# left the table at 114, which is the reason the guard exists rather than a
+# note asking politely.
+#
+# `content_digest` is sha256 over the *parsed* `cases` and `deleted_cases`
+# lists, canonicalised as JSON -- so reflowing a comment or a block scalar does
+# not trip it, and changing a single expected byte does. It is a freeze on the
+# data, which is what a runner iterates.
+# ---------------------------------------------------------------------------
+version: 2
+
+frozen:
+  issue: 11
+  date: 2026-08-15
+  milestone: V1M1
+  version: 2
+  cases: 114
+  deleted_cases: 11
+  spec_rows: 37
+  content_digest: d46d789a71fa20d0d493670be0b6c6843f5e326541aff833715ff40467569bda
+  # What the frozen table is known NOT to cover. Recorded here rather than in
+  # prose somewhere, because a frozen table that overstates its own coverage is
+  # worse than one that is honestly narrow.
+  known_gaps:
+    - >-
+      effects: is data, not an assertion. 15 cases carry a DNS operation or a
+      persisted column and no runner asserts either; the accounting block
+      prints the count every run so the gap stays a number.
+    - >-
+      3 cases carry `rate_limited: true`. That is fixture state, not a request,
+      so the runner skips them with the precondition named and they are
+      measured out of band -- see baseline.md.
+    - >-
+      2 host-only cases (`checkip-post-is-405-on-the-host`,
+      `update-post-is-405-on-the-host`) pass against a host with NO /nic/*
+      routes at all, because a non-GET on an unmatched path meets atrium's
+      SPA catch-all, which also declares only GET. They assert "POST is
+      refused", never "the endpoint exists". Measured again by #11 against a
+      host whose route table contains zero /nic paths: 2 passed, 105 failed.
+    - >-
+      the two host-only HEAD cases (`update-head-is-refused-by-the-host`,
+      `delete-head-is-refused-by-the-host`) freeze `status: 405`, and #11
+      measured that the natural implementation does not produce it behind
+      atrium's SPA catch-all. Bare FastAPI, GET-only route: HEAD -> 405. The
+      same route behind a GET-only catch-all mount: HEAD -> 200. Atrium's own
+      stack today, no /nic route at all: HEAD -> 404. The decision (405) is
+      kept and the cases stay as frozen; what changes is that V1M2 has to
+      write a deliberate HEAD handler, because the framework's refusal does
+      not survive the mount. Same mechanism as the two vacuous passes above.
+    - >-
+      address family. 104 of 114 cases are IPv4-only and 4 touch IPv6, against
+      production traffic measured at 143 IPv4 / 305 IPv6 events (plan §3.3.1).
+      The table is weighted the opposite way from the population it protects.
+      This is a real coverage gap, named at freeze time rather than discovered
+      in V1M2.
+
+# ---------------------------------------------------------------------------
+# Spec rows. Every row of refactor-plan.md §1's three tables, given an id so
+# that "every row has at least one case" is checkable from the data rather than
+# asserted in prose. A case names the rows it covers in `covers`.
+# ---------------------------------------------------------------------------
+spec_rows:
+  # §1 `GET /nic/checkip`
+  checkip/default: "default -> Current IP Check HTML, text/html"
+  checkip/format-plain: "?format=plain -> bare {ip}, text/plain"
+  checkip/remote-addr-unparseable: "remote_addr not parseable as an IP -> empty IP"
+
+  # §1 `GET /nic/update`
+  update/badauth: "missing / wrong credentials, or inactive user -> badauth"
+  update/abuse: "rate limit exceeded -> abuse"
+  update/no-hostname-911: "no hostname parameter -> 911"
+  update/myip-unparseable-911: "myip present but unparseable -> 911"
+  update/notfqdn: "hostname fails the label regex, or the comma list has an empty element -> notfqdn"
+  update/nohost: "hostname not owned by the caller -> nohost {ip}"
+  update/no-backends-911: "hostname owned, but zero backends -> 911 {ip}"
+  update/backend-no-credentials-911: "backend row has no stored credentials -> contributes 911"
+  update/backend-unknown-service-911: "backend service name unknown to the factory -> contributes 911"
+  update/backend-out-of-zone-nohost: "hostname is not inside the backend's zone -> contributes nohost"
+  update/backend-status: "backend returned good / unchanged / error -> contributes good / nochg / dnserr"
+  update/aggregate-good: "any good -> good {ip}, and last_ip_v4/last_ip_v6 + last_updated_at are persisted"
+  update/aggregate-nochg: "all nochg -> nochg {ip}"
+  update/aggregate-other: "otherwise -> {first non-good/nochg status} {ip}"
+  update/myip-defaults-remote-addr: "myip defaults to remote_addr when omitted"
+  update/updatetype-ignored: "updatetype is accepted, warned about, and ignored"
+  update/request-order: "one line per requested hostname, newline-joined, in request order"
+
+  # §1 `GET /nic/delete`
+  delete/auth: "same auth as update"
+  delete/rate-limit: "same rate limit as update"
+  delete/hostname-resolution: "same hostname resolution as update"
+  delete/no-ip-suffix: "response codes carry no IP suffix -- good, nochg, nohost, 911"
+  delete/myip-selects-family: "myip present => delete only the matching family"
+  delete/myip-absent-both-families: "myip absent => delete both A and AAAA"
+
+  # §1 "Deliberate divergences from the protocol doc"
+  divergence/1-nohost-ip-suffix: "nohost {ip} on update, bare nohost on delete"
+  divergence/2-no-badagent: "User-Agent is never inspected"
+  divergence/3-no-numhost: "there is no 20-hostname cap"
+  divergence/4-always-200: "everything is HTTP 200, badauth included -- true of every case here, all of which are GET; bounded by divergence/7"
+  divergence/5-single-label: "a single label with no dot passes the regex and falls through to nohost"
+  divergence/6-regex-newline-anchor: "a trailing newline in a label passes the regex ($ matches before it) and falls through to nohost"
+
+  # Three more, found by issue #9 sweeping docs/DYNDNS-PROTOCOL.md §1 clause by
+  # clause after the table was frozen, and added here by issue #25. All three
+  # are `preserve`, on the same grounds as 2, 3, 5 and 6.
+  divergence/7-non-get-405: "non-GET methods answer HTTP 405 with the framework's HTML body, not badagent (§1.3)"
+  divergence/8-offline-inert-no-donator: "offline=YES is accepted and silently ignored, and !donator has no writer anywhere (§1.5, §1.6)"
+  divergence/9-client-ip-not-honoured: "Client-IP is not consulted for IP detection; only X-Forwarded-For is (§1.7)"
+
+  # §1 "HEAD is refused where the handler is not safe" -- a decision, not a
+  # divergence: docs/DYNDNS-PROTOCOL.md says nothing about HEAD.
+  head/checkip-preserved: "HEAD /nic/checkip -> 200, headers only, no body. The handler is read-only, so HEAD is safe and is preserved"
+  head/update-refused: "HEAD /nic/update and /nic/delete -> 405 on the host. Legacy runs the handler and writes DNS with no body to say so"
+
+# ---------------------------------------------------------------------------
+# Fixture world. One world, shared by every case; each hostname is configured
+# to exercise exactly one backend condition, so no case has to describe its own
+# universe. The runner builds this once per target.
+# ---------------------------------------------------------------------------
+fixture:
+  users:
+    - name: alice
+      username: alice
+      password: alice-basic-secret
+      active: true
+    - name: carol
+      username: carol
+      password: carol-basic-secret
+      active: true
+    - name: dave
+      username: dave
+      password: dave-basic-secret
+      active: false
+
+  # `service: stub` is a provider the account factory knows and whose result is
+  # scripted by `result`. `service: no-such-service` is deliberately absent from
+  # the factory. `credentials: absent` models a backend row with nothing stored.
+  backends:
+    - {name: good, service: stub, zone: example.com, credentials: present, result: good}
+    - {name: nochg-a, service: stub, zone: example.com, credentials: present, result: nochg}
+    - {name: nochg-b, service: stub, zone: example.com, credentials: present, result: nochg}
+    - {name: dnserr, service: stub, zone: example.com, credentials: present, result: dnserr}
+    - {name: no-credentials, service: stub, zone: example.com, credentials: absent, result: null}
+    - {name: unknown-service, service: no-such-service, zone: example.com, credentials: present, result: null}
+    - {name: wrong-zone, service: stub, zone: elsewhere.example.org, credentials: present, result: null}
+
+  hostnames:
+    - {name: ok.example.com, owner: alice, backends: [good]}
+    - {name: zz-ok.example.com, owner: alice, backends: [good]}
+    - {name: nochg.example.com, owner: alice, backends: [nochg-a]}
+    - {name: dnserr.example.com, owner: alice, backends: [dnserr]}
+    - {name: nobackend.example.com, owner: alice, backends: []}
+    - {name: nocreds.example.com, owner: alice, backends: [no-credentials]}
+    - {name: unknownsvc.example.com, owner: alice, backends: [unknown-service]}
+    - {name: outofzone.example.com, owner: alice, backends: [wrong-zone]}
+    - {name: mixed.example.com, owner: alice, backends: [dnserr, good]}
+    - {name: allnochg.example.com, owner: alice, backends: [nochg-a, nochg-b]}
+    - {name: firsterr.example.com, owner: alice, backends: [nochg-a, no-credentials, dnserr]}
+    - {name: carols.example.com, owner: carol, backends: [good]}
+
+# ---------------------------------------------------------------------------
+# Defaults applied to every case that does not override them.
+# ---------------------------------------------------------------------------
+defaults:
+  method: GET
+  client_ip: 203.0.113.10
+  auth: {type: basic, username: alice, password: alice-basic-secret}
+  rate_limited: false
+  targets: [legacy, host]
+  expect:
+    status: 200
+    content_type: "text/plain; charset=utf-8"
+
+# ---------------------------------------------------------------------------
+# Cases.
+# ---------------------------------------------------------------------------
+cases:
+
+  # === GET /nic/checkip =====================================================
+
+  - id: checkip-default-is-html
+    path: /nic/checkip
+    auth: {type: none}
+    query: {}
+    covers: [checkip/default, divergence/4-always-200]
+    expect:
+      status: 200
+      content_type: "text/html; charset=utf-8"
+      body: "<html><head><title>Current IP Check</title></head><body>Current IP Address: 203.0.113.10</body></html>"
+
+  - id: checkip-format-plain
+    path: /nic/checkip
+    auth: {type: none}
+    query: {format: plain}
+    covers: [checkip/format-plain]
+    expect:
+      body: "203.0.113.10"
+
+  - id: checkip-format-plain-is-exact-match-only
+    note: >-
+      `fmt == "plain"` is an exact string comparison, so any other value --
+      including a different case -- falls back to HTML.
+    path: /nic/checkip
+    auth: {type: none}
+    query: {format: PLAIN}
+    covers: [checkip/default]
+    expect:
+      status: 200
+      content_type: "text/html; charset=utf-8"
+      body: "<html><head><title>Current IP Check</title></head><body>Current IP Address: 203.0.113.10</body></html>"
+
+  - id: checkip-unknown-format-falls-back-to-html
+    path: /nic/checkip
+    auth: {type: none}
+    query: {format: json}
+    covers: [checkip/default]
+    expect:
+      status: 200
+      content_type: "text/html; charset=utf-8"
+      body: "<html><head><title>Current IP Check</title></head><body>Current IP Address: 203.0.113.10</body></html>"
+
+  - id: checkip-unparseable-remote-addr-plain
+    path: /nic/checkip
+    auth: {type: none}
+    client_ip: null
+    query: {format: plain}
+    covers: [checkip/remote-addr-unparseable]
+    expect:
+      body: ""
+
+  - id: checkip-unparseable-remote-addr-html
+    note: >-
+      §1's table said "empty string" for this row without qualifying the format.
+      That is only true for ?format=plain. In the default HTML mode the wrapper
+      is still emitted with an empty IP -- the body is 90 bytes, not 0. §1 has
+      been corrected. (This note read 91 until #9 measured it three ways --
+      Content-Length, wc -c, and len() of the expect.body below -- and #25
+      corrected the count here and in §1. The `body:` was right throughout;
+      only the two prose counts were wrong.)
+    path: /nic/checkip
+    auth: {type: none}
+    client_ip: null
+    query: {}
+    covers: [checkip/remote-addr-unparseable, checkip/default]
+    expect:
+      status: 200
+      content_type: "text/html; charset=utf-8"
+      body: "<html><head><title>Current IP Check</title></head><body>Current IP Address: </body></html>"
+
+  - id: checkip-ipv6-is-normalised
+    note: >-
+      The body carries str(ipaddress.ip_address(...)), not the spelling the
+      client sent. 2001:0db8:0000::1 comes back as 2001:db8::1.
+    path: /nic/checkip
+    auth: {type: none}
+    client_ip: "2001:0db8:0000::1"
+    query: {format: plain}
+    covers: [checkip/format-plain]
+    expect:
+      body: "2001:db8::1"
+
+  - id: checkip-ignores-credentials-entirely
+    note: Unauthenticated endpoint -- wrong credentials are neither consulted nor rejected.
+    path: /nic/checkip
+    auth: {type: basic, username: alice, password: wrong}
+    query: {format: plain}
+    covers: [checkip/format-plain]
+    expect:
+      body: "203.0.113.10"
+
+  # === GET /nic/checkip -- divergence 9, and the HEAD decision ==============
+
+  - id: checkip-client-ip-header-is-not-honoured
+    note: >-
+      Divergence 9. §1.7 says "if the client sends X-Forwarded-For or Client-IP
+      headers, those values are returned instead". ProxyFix reads only
+      X-Forwarded-For, so half the clause is implemented. The header is sent
+      here with an unparseable X-Forwarded-For, so an implementation that
+      honoured Client-IP *as a fallback* would answer 198.51.100.5 and this
+      case would fail: the assertion is that the header is inert, not that it
+      is absent.
+    path: /nic/checkip
+    auth: {type: none}
+    client_ip: null
+    headers: {client-ip: "198.51.100.5"}
+    query: {format: plain}
+    covers: [divergence/9-client-ip-not-honoured, checkip/remote-addr-unparseable]
+    expect:
+      body: ""
+
+  - id: checkip-client-ip-does-not-shadow-x-forwarded-for
+    note: >-
+      Divergence 9, the other direction. Both headers present and disagreeing:
+      X-Forwarded-For wins because Client-IP is never read. An implementation
+      that preferred Client-IP -- which §1.7 lists first -- would answer
+      198.51.100.5.
+    path: /nic/checkip
+    auth: {type: none}
+    headers: {client-ip: "198.51.100.5"}
+    query: {format: plain}
+    covers: [divergence/9-client-ip-not-honoured, checkip/format-plain]
+    expect:
+      body: "203.0.113.10"
+
+  - id: checkip-head-returns-headers-and-no-body
+    note: >-
+      HEAD is preserved on checkip and only on checkip. The handler is
+      read-only, so HEAD is safe in the RFC 9110 sense and a monitoring probe
+      is exactly what it is for. Content-Length is the full 102 bytes of the
+      HTML wrapper; the body is empty because HEAD suppresses it. See
+      `head/update-refused` for the endpoints where this is NOT preserved --
+      FastAPI's APIRoute does not add HEAD to a GET route, so the host must
+      declare it here and must not declare it there.
+    method: HEAD
+    path: /nic/checkip
+    auth: {type: none}
+    query: {}
+    covers: [head/checkip-preserved, checkip/default]
+    expect:
+      status: 200
+      content_type: "text/html; charset=utf-8"
+      body: ""
+
+  - id: checkip-post-is-405-with-an-html-body
+    note: >-
+      Divergence 7. §1.3 says "other HTTP methods are not supported and trigger
+      a badagent return code"; Flask's default methods are GET/HEAD/OPTIONS and
+      no route in dyndns.py overrides them, so Werkzeug answers 405 before any
+      handler runs. This is the case that BOUNDS divergence 4: "everything is
+      HTTP 200" is true of all 101 GET cases in this table and false of the
+      endpoint. Legacy-only because the body below is Werkzeug's error page,
+      not the service's -- see `checkip-post-is-405-on-the-host` for what the
+      rewrite must answer, and note that only the *status* is common to both.
+    targets: [legacy]
+    method: POST
+    path: /nic/checkip
+    auth: {type: none}
+    query: {}
+    covers: [divergence/7-non-get-405]
+    expect:
+      status: 405
+      content_type: "text/html; charset=utf-8"
+      line_count: 6
+      body_ends_with_newline: true
+      # `|` and not `|-`: this body ends in a newline. Every DynDNS body in
+      # this table does not, which is why the rest of the file uses `|-`.
+      body: |
+        <!doctype html>
+        <html lang=en>
+        <title>405 Method Not Allowed</title>
+        <h1>Method Not Allowed</h1>
+        <p>The method is not allowed for the requested URL.</p>
+
+  - id: checkip-post-is-405-on-the-host
+    note: >-
+      Divergence 7 on the host. The status is the compatibility requirement and
+      is the same 405; the rendering is the framework's and is not. This body
+      was measured against this repository's own running stack (POST to a
+      GET-only path -> 405, application/json, 31 bytes) rather than read out of
+      FastAPI's source, so a change to it is a decision someone has to take
+      here rather than a coincidence nobody notices.
+
+      **This case already passes against a host that has no /nic/* routes at
+      all** -- measured on 25_overnight, where it and its update sibling were 2
+      of the 110 host cases green, beside 105 red and 3 skipped. A 405 is what
+      the SPA catch-all answers for a non-GET too, and nothing on the wire
+      distinguishes "no route" from "GET-only route". It is recorded rather
+      than dressed up: this case cannot tell you /nic/checkip exists, and its
+      whole job is to go red if that route is ever declared with POST.
+    targets: [host]
+    method: POST
+    path: /nic/checkip
+    auth: {type: none}
+    query: {}
+    legacy_behaviour: |-
+      HTTP 405 with Werkzeug's 153-byte HTML error page,
+      Content-Type: text/html; charset=utf-8
+    covers: [divergence/7-non-get-405]
+    expect:
+      status: 405
+      content_type: "application/json"
+      body: '{"detail":"Method Not Allowed"}'
+
+  # === GET /nic/update -- authentication and rate limiting ==================
+
+  - id: update-badauth-no-credentials
+    path: /nic/update
+    auth: {type: none}
+    query: {hostname: ok.example.com, myip: 203.0.113.10}
+    covers: [update/badauth, divergence/4-always-200]
+    expect:
+      status: 200
+      content_type: "text/plain; charset=utf-8"
+      body: "badauth"
+
+  - id: update-badauth-wrong-password
+    path: /nic/update
+    auth: {type: basic, username: alice, password: not-alices-password}
+    query: {hostname: ok.example.com, myip: 203.0.113.10}
+    covers: [update/badauth]
+    expect:
+      body: "badauth"
+
+  - id: update-badauth-unknown-user
+    path: /nic/update
+    auth: {type: basic, username: nobody, password: whatever}
+    query: {hostname: ok.example.com, myip: 203.0.113.10}
+    covers: [update/badauth]
+    expect:
+      body: "badauth"
+
+  - id: update-badauth-inactive-user
+    path: /nic/update
+    auth: {type: basic, username: dave, password: dave-basic-secret}
+    query: {hostname: ok.example.com, myip: 203.0.113.10}
+    covers: [update/badauth]
+    expect:
+      body: "badauth"
+
+  - id: update-badauth-empty-password
+    note: authenticate_dyndns_user returns None when username or password is falsy.
+    path: /nic/update
+    auth: {type: basic, username: alice, password: ""}
+    query: {hostname: ok.example.com, myip: 203.0.113.10}
+    covers: [update/badauth]
+    expect:
+      body: "badauth"
+
+  - id: update-badauth-precedes-911
+    note: Auth is checked before the hostname parameter, so a bad credential wins.
+    path: /nic/update
+    auth: {type: none}
+    query: {myip: 203.0.113.10}
+    covers: [update/badauth, update/no-hostname-911]
+    expect:
+      body: "badauth"
+
+  - id: update-abuse-rate-limited
+    path: /nic/update
+    rate_limited: true
+    query: {hostname: ok.example.com, myip: 203.0.113.10}
+    covers: [update/abuse]
+    expect:
+      body: "abuse"
+
+  - id: update-abuse-precedes-911
+    note: Rate limiting is checked before the hostname parameter.
+    path: /nic/update
+    rate_limited: true
+    query: {myip: 203.0.113.10}
+    covers: [update/abuse, update/no-hostname-911]
+    expect:
+      body: "abuse"
+
+  # === GET /nic/update -- request validation ================================
+
+  - id: update-911-missing-hostname
+    path: /nic/update
+    query: {myip: 203.0.113.10}
+    covers: [update/no-hostname-911]
+    expect:
+      body: "911"
+
+  - id: update-911-empty-hostname
+    note: >-
+      hostname= is falsy, so `not hostnames` fires before the regex ever runs.
+      An empty hostname is 911, not notfqdn.
+    path: /nic/update
+    query: {hostname: "", myip: 203.0.113.10}
+    covers: [update/no-hostname-911]
+    expect:
+      body: "911"
+
+  - id: update-911-unparseable-myip
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: notanip}
+    covers: [update/myip-unparseable-911]
+    expect:
+      body: "911"
+
+  - id: update-911-myip-with-prefix-length
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: "203.0.113.10/32"}
+    covers: [update/myip-unparseable-911]
+    expect:
+      body: "911"
+
+  - id: update-911-myip-with-leading-zeros
+    note: >-
+      ipaddress.ip_address rejects zero-padded octets on Python >= 3.9.5, which
+      is what the deployed legacy service runs (3.12).
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: "192.168.001.1"}
+    covers: [update/myip-unparseable-911]
+    expect:
+      body: "911"
+
+  - id: update-911-myip-checked-before-hostname-syntax
+    note: IP validation runs before isvalidhostname, so 911 beats notfqdn.
+    path: /nic/update
+    query: {hostname: "_dmarc.example.com", myip: notanip}
+    covers: [update/myip-unparseable-911, update/notfqdn]
+    expect:
+      body: "911"
+
+  - id: update-911-no-myip-and-no-client-ip
+    note: >-
+      myip defaults to remote_addr; when both are absent `not myip` fires and
+      the answer is 911 even though the hostname is valid and registered.
+    path: /nic/update
+    client_ip: null
+    query: {hostname: ok.example.com}
+    covers: [update/no-hostname-911, update/myip-defaults-remote-addr]
+    expect:
+      body: "911"
+
+  - id: update-notfqdn-underscore-label
+    path: /nic/update
+    query: {hostname: "_dmarc.example.com", myip: 203.0.113.10}
+    covers: [update/notfqdn]
+    expect:
+      body: "notfqdn"
+
+  - id: update-notfqdn-leading-hyphen
+    path: /nic/update
+    query: {hostname: "-bad.example.com", myip: 203.0.113.10}
+    covers: [update/notfqdn]
+    expect:
+      body: "notfqdn"
+
+  - id: update-notfqdn-trailing-hyphen
+    path: /nic/update
+    query: {hostname: "bad-.example.com", myip: 203.0.113.10}
+    covers: [update/notfqdn]
+    expect:
+      body: "notfqdn"
+
+  - id: update-notfqdn-empty-label
+    path: /nic/update
+    query: {hostname: "example..com", myip: 203.0.113.10}
+    covers: [update/notfqdn]
+    expect:
+      body: "notfqdn"
+
+  - id: update-notfqdn-label-over-63-chars
+    path: /nic/update
+    query:
+      hostname: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example.com"
+      myip: 203.0.113.10
+    covers: [update/notfqdn]
+    expect:
+      body: "notfqdn"
+
+  - id: update-notfqdn-name-over-255-chars
+    path: /nic/update
+    query:
+      hostname: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example.com"
+      myip: 203.0.113.10
+    covers: [update/notfqdn]
+    expect:
+      body: "notfqdn"
+
+  - id: update-notfqdn-empty-element-in-list
+    path: /nic/update
+    query: {hostname: "ok.example.com,,zz-ok.example.com", myip: 203.0.113.10}
+    covers: [update/notfqdn]
+    expect:
+      body: "notfqdn"
+
+  - id: update-notfqdn-trailing-comma
+    note: A trailing comma yields an empty final element, which is rejected wholesale.
+    path: /nic/update
+    query: {hostname: "ok.example.com,", myip: 203.0.113.10}
+    covers: [update/notfqdn]
+    expect:
+      body: "notfqdn"
+
+  - id: update-notfqdn-one-bad-element-rejects-the-whole-request
+    note: >-
+      notfqdn is a single-line whole-request answer, not a per-hostname line --
+      a valid hostname alongside an invalid one produces no line of its own.
+    path: /nic/update
+    query: {hostname: "ok.example.com,_dmarc.example.com", myip: 203.0.113.10}
+    covers: [update/notfqdn, update/request-order]
+    expect:
+      body: "notfqdn"
+
+  # === GET /nic/update -- hostname resolution ===============================
+
+  - id: update-nohost-unregistered-hostname
+    note: The IP suffix is divergence 1 -- the protocol doc says bare `nohost`.
+    path: /nic/update
+    query: {hostname: never-registered.example.com, myip: 203.0.113.10}
+    covers: [update/nohost, divergence/1-nohost-ip-suffix]
+    expect:
+      body: "nohost 203.0.113.10"
+
+  - id: update-nohost-hostname-owned-by-another-user
+    note: find_hostname filters by user_id, so another tenant's hostname is invisible.
+    path: /nic/update
+    query: {hostname: carols.example.com, myip: 203.0.113.10}
+    covers: [update/nohost, divergence/1-nohost-ip-suffix]
+    expect:
+      body: "nohost 203.0.113.10"
+
+  - id: update-nohost-single-label-no-dot
+    note: >-
+      Divergence 5. `foo`.split(".") is ["foo"], which the label regex accepts,
+      so validation passes and the request falls through to the hostname lookup.
+      The protocol doc would call this notfqdn.
+    path: /nic/update
+    query: {hostname: "foo", myip: 203.0.113.10}
+    covers: [update/nohost, divergence/5-single-label]
+    expect:
+      body: "nohost 203.0.113.10"
+
+  - id: update-nohost-trailing-newline-in-label
+    note: >-
+      Divergence 6, found by this issue and not listed in §1 as written. The
+      label regex ends in `$`, which in Python matches before a trailing
+      newline, so "foo\n" passes validation. isvalidhostname returns the
+      *unstripped* element, so the lookup then misses and the answer is nohost.
+      Preserve, for the same reason as divergence 5 -- both spellings already
+      end at nohost, so preserving costs nothing and a "fix" would turn a
+      per-hostname nohost line into a whole-request notfqdn.
+    path: /nic/update
+    query: {hostname: "foo\n", myip: 203.0.113.10}
+    covers: [update/nohost, divergence/6-regex-newline-anchor]
+    expect:
+      body: "nohost 203.0.113.10"
+
+  - id: update-nohost-trailing-dot
+    note: >-
+      isvalidhostname strips one trailing dot for the regex check but returns
+      the original element, so the lookup is for "ok.example.com." and misses.
+    path: /nic/update
+    query: {hostname: "ok.example.com.", myip: 203.0.113.10}
+    covers: [update/nohost]
+    expect:
+      body: "nohost 203.0.113.10"
+
+  - id: update-hostname-lookup-is-case-insensitive
+    note: find_hostname lowercases before querying.
+    path: /nic/update
+    query: {hostname: "OK.EXAMPLE.COM", myip: 203.0.113.10}
+    covers: [update/backend-status, update/aggregate-good]
+    expect:
+      body: "good 203.0.113.10"
+
+  # === GET /nic/update -- backend conditions ================================
+
+  - id: update-911-hostname-with-zero-backends
+    path: /nic/update
+    query: {hostname: nobackend.example.com, myip: 203.0.113.10}
+    covers: [update/no-backends-911]
+    expect:
+      body: "911 203.0.113.10"
+
+  - id: update-911-backend-without-stored-credentials
+    path: /nic/update
+    query: {hostname: nocreds.example.com, myip: 203.0.113.10}
+    covers: [update/backend-no-credentials-911, update/aggregate-other]
+    expect:
+      body: "911 203.0.113.10"
+
+  - id: update-911-backend-service-unknown-to-factory
+    path: /nic/update
+    query: {hostname: unknownsvc.example.com, myip: 203.0.113.10}
+    covers: [update/backend-unknown-service-911, update/aggregate-other]
+    expect:
+      body: "911 203.0.113.10"
+
+  - id: update-nohost-hostname-outside-backend-zone
+    note: >-
+      hostnameperzone returns falsy, contributing `nohost`, which aggregates to
+      a nohost line carrying the IP -- indistinguishable on the wire from an
+      unregistered hostname.
+    path: /nic/update
+    query: {hostname: outofzone.example.com, myip: 203.0.113.10}
+    covers: [update/backend-out-of-zone-nohost, update/aggregate-other, divergence/1-nohost-ip-suffix]
+    expect:
+      body: "nohost 203.0.113.10"
+
+  - id: update-good-single-backend
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: 203.0.113.10}
+    covers: [update/backend-status, update/aggregate-good]
+    effects:
+      dns: [{backend: good, op: create, rtype: A, hostname: ok.example.com, ip: 203.0.113.10}]
+      persist: {hostname: ok.example.com, last_ip_v4: 203.0.113.10, last_updated_at: set}
+    expect:
+      body: "good 203.0.113.10"
+
+  - id: update-nochg-single-backend
+    path: /nic/update
+    query: {hostname: nochg.example.com, myip: 203.0.113.10}
+    covers: [update/backend-status, update/aggregate-nochg]
+    effects:
+      persist: {hostname: nochg.example.com, last_ip_v4: unchanged, last_updated_at: unchanged}
+    expect:
+      body: "nochg 203.0.113.10"
+
+  - id: update-dnserr-single-backend
+    path: /nic/update
+    query: {hostname: dnserr.example.com, myip: 203.0.113.10}
+    covers: [update/backend-status, update/aggregate-other]
+    expect:
+      body: "dnserr 203.0.113.10"
+
+  - id: update-aggregate-any-good-wins
+    note: results are [dnserr, good]; `'good' in results` short-circuits the error.
+    path: /nic/update
+    query: {hostname: mixed.example.com, myip: 203.0.113.10}
+    covers: [update/aggregate-good]
+    effects:
+      persist: {hostname: mixed.example.com, last_ip_v4: 203.0.113.10, last_updated_at: set}
+    expect:
+      body: "good 203.0.113.10"
+
+  - id: update-aggregate-all-nochg
+    path: /nic/update
+    query: {hostname: allnochg.example.com, myip: 203.0.113.10}
+    covers: [update/aggregate-nochg]
+    expect:
+      body: "nochg 203.0.113.10"
+
+  - id: update-aggregate-first-non-good-nochg-status
+    note: >-
+      results are [nochg, 911, dnserr]. The answer is 911, not dnserr and not
+      nochg -- it is the first element that is neither good nor nochg, in
+      backend order. Ordering the backends nochg-then-911-then-dnserr makes an
+      implementation that returns "the last error" or "the first error overall"
+      fail.
+    path: /nic/update
+    query: {hostname: firsterr.example.com, myip: 203.0.113.10}
+    covers: [update/aggregate-other]
+    expect:
+      body: "911 203.0.113.10"
+
+  # === GET /nic/update -- myip handling =====================================
+
+  - id: update-myip-defaults-to-client-ip
+    path: /nic/update
+    client_ip: 203.0.113.77
+    query: {hostname: ok.example.com}
+    covers: [update/myip-defaults-remote-addr, update/aggregate-good]
+    expect:
+      body: "good 203.0.113.77"
+
+  - id: update-empty-myip-defaults-to-client-ip
+    note: myip= is falsy, so it takes the same path as an omitted myip.
+    path: /nic/update
+    client_ip: 203.0.113.77
+    query: {hostname: ok.example.com, myip: ""}
+    covers: [update/myip-defaults-remote-addr]
+    expect:
+      body: "good 203.0.113.77"
+
+  - id: update-myip-ipv6-is-normalised-in-the-response
+    note: >-
+      The body echoes str(validated_ip), not the spelling the client sent. A
+      case asserting the request spelling would pass against a naive
+      implementation and fail against the legacy one.
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: "2001:0DB8:0000::1"}
+    covers: [update/aggregate-good, update/backend-status]
+    effects:
+      dns: [{backend: good, op: create, rtype: AAAA, hostname: ok.example.com, ip: "2001:db8::1"}]
+      persist: {hostname: ok.example.com, last_ip_v6: "2001:db8::1", last_updated_at: set}
+    expect:
+      body: "good 2001:db8::1"
+
+  - id: update-ipv6-persists-last-ip-v6-not-v4
+    note: The A/AAAA choice is invisible on the wire and only observable in the effects.
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: "2001:db8::2"}
+    covers: [update/aggregate-good]
+    effects:
+      dns: [{backend: good, op: create, rtype: AAAA, hostname: ok.example.com, ip: "2001:db8::2"}]
+      persist: {hostname: ok.example.com, last_ip_v6: "2001:db8::2", last_ip_v4: unchanged, last_updated_at: set}
+    expect:
+      body: "good 2001:db8::2"
+
+  - id: update-updatetype-is-accepted-and-ignored
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: 203.0.113.10, updatetype: nsupdate}
+    covers: [update/updatetype-ignored]
+    expect:
+      body: "good 203.0.113.10"
+
+  - id: update-unknown-parameters-are-ignored
+    note: >-
+      The protocol doc says unrecognised parameters may trigger `abuse`. The
+      implementation never looks at them.
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: 203.0.113.10, wildcard: "ON", mx: mail.example.com, offline: "YES", system: dyndns}
+    covers: [update/aggregate-good]
+    expect:
+      body: "good 203.0.113.10"
+
+  # === GET /nic/update -- multi-hostname ordering ===========================
+
+  - id: update-multi-hostname-in-request-order
+    note: >-
+      Paired with update-multi-hostname-in-reverse-request-order. The two
+      requests carry the same hostnames and produce different bodies, which is
+      what proves the join is in request order rather than sorted, grouped or
+      set-ordered. Either case alone would pass against a sorted implementation.
+    path: /nic/update
+    query: {hostname: "zz-ok.example.com,never-registered.example.com", myip: 203.0.113.10}
+    covers: [update/request-order]
+    expect:
+      body: |-
+        good 203.0.113.10
+        nohost 203.0.113.10
+
+  - id: update-multi-hostname-in-reverse-request-order
+    path: /nic/update
+    query: {hostname: "never-registered.example.com,zz-ok.example.com", myip: 203.0.113.10}
+    covers: [update/request-order]
+    expect:
+      body: |-
+        nohost 203.0.113.10
+        good 203.0.113.10
+
+  - id: update-multi-hostname-mixed-statuses-in-order
+    path: /nic/update
+    query: {hostname: "nochg.example.com,nobackend.example.com,ok.example.com,outofzone.example.com", myip: 203.0.113.10}
+    covers: [update/request-order, update/aggregate-nochg, update/no-backends-911, update/aggregate-good, update/backend-out-of-zone-nohost]
+    expect:
+      body: |-
+        nochg 203.0.113.10
+        911 203.0.113.10
+        good 203.0.113.10
+        nohost 203.0.113.10
+
+  - id: update-multi-hostname-body-has-no-trailing-newline
+    note: >-
+      "\n".join produces no trailing newline. Asserted explicitly because a
+      framework that appends one is the most likely way this regresses, and a
+      comparison that strips whitespace would not see it.
+    path: /nic/update
+    query: {hostname: "never-registered.example.com,also-never-registered.example.com", myip: 203.0.113.10}
+    covers: [update/request-order]
+    expect:
+      body_ends_with_newline: false
+      body: |-
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+
+  - id: update-duplicate-hostname-produces-two-lines
+    note: The list is not deduplicated.
+    path: /nic/update
+    query: {hostname: "ok.example.com,ok.example.com", myip: 203.0.113.10}
+    covers: [update/request-order]
+    expect:
+      body: |-
+        good 203.0.113.10
+        good 203.0.113.10
+
+  # === GET /nic/update -- divergences 2, 3 and 4 ============================
+
+  - id: update-no-badagent-for-missing-user-agent
+    note: Divergence 2 -- the User-Agent header is never read.
+    path: /nic/update
+    headers: {}
+    omit_headers: [user-agent]
+    query: {hostname: ok.example.com, myip: 203.0.113.10}
+    covers: [divergence/2-no-badagent, update/aggregate-good]
+    expect:
+      body: "good 203.0.113.10"
+
+  - id: update-no-badagent-for-generic-user-agent
+    note: >-
+      Divergence 2. The protocol doc requires a descriptive "Company - Device -
+      Version" User-Agent and specifies badagent otherwise.
+    path: /nic/update
+    headers: {user-agent: "curl/8.4.0"}
+    query: {hostname: ok.example.com, myip: 203.0.113.10}
+    covers: [divergence/2-no-badagent]
+    expect:
+      body: "good 203.0.113.10"
+
+  - id: update-no-numhost-for-25-hostnames
+    note: >-
+      Divergence 3. The protocol doc caps hostname lists at 20 and answers
+      numhost above that. There is no cap, and the response is 25 lines. Using
+      unregistered hostnames keeps the case independent of the fixture and
+      makes the line count the whole assertion.
+    path: /nic/update
+    query:
+      hostname: "h01.example.com,h02.example.com,h03.example.com,h04.example.com,h05.example.com,h06.example.com,h07.example.com,h08.example.com,h09.example.com,h10.example.com,h11.example.com,h12.example.com,h13.example.com,h14.example.com,h15.example.com,h16.example.com,h17.example.com,h18.example.com,h19.example.com,h20.example.com,h21.example.com,h22.example.com,h23.example.com,h24.example.com,h25.example.com"
+      myip: 203.0.113.10
+    covers: [divergence/3-no-numhost, update/request-order]
+    expect:
+      line_count: 25
+      body: |-
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+        nohost 203.0.113.10
+
+  # === GET /nic/update -- divergences 7, 8 and 9 ============================
+
+  - id: update-post-is-405-with-an-html-body
+    note: >-
+      Divergence 7. POST, PUT, DELETE and PATCH all answer the same 405 and the
+      same 153 bytes; POST stands for the family. Werkzeug answers before the
+      handler runs, so no update is attempted and no event is written -- the
+      405 is the whole observable behaviour. Legacy-only: the body is
+      Werkzeug's error page, and a rewrite that reproduced those exact bytes
+      would be imitating a framework rather than staying compatible.
+    targets: [legacy]
+    method: POST
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: 203.0.113.10}
+    covers: [divergence/7-non-get-405, divergence/4-always-200]
+    expect:
+      status: 405
+      content_type: "text/html; charset=utf-8"
+      line_count: 6
+      body_ends_with_newline: true
+      body: |
+        <!doctype html>
+        <html lang=en>
+        <title>405 Method Not Allowed</title>
+        <h1>Method Not Allowed</h1>
+        <p>The method is not allowed for the requested URL.</p>
+
+  - id: update-post-is-405-on-the-host
+    note: >-
+      Divergence 7 on the host, and the one that matters most: a rewrite on
+      FastAPI answers 405 here for a completely different reason (the route
+      declares GET and Starlette refuses the rest), and that coincidence must
+      not be mistaken for a compatibility guarantee. Pinning it makes it one.
+      With the same caveat as `checkip-post-is-405-on-the-host`: this passes
+      today against a host with no /nic/update at all, so it asserts "POST is
+      refused", never "the endpoint exists". The 105 red cases beside it are
+      what says the endpoint does not exist yet.
+    targets: [host]
+    method: POST
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: 203.0.113.10}
+    legacy_behaviour: |-
+      HTTP 405 with Werkzeug's 153-byte HTML error page,
+      Content-Type: text/html; charset=utf-8
+    covers: [divergence/7-non-get-405]
+    expect:
+      status: 405
+      content_type: "application/json"
+      body: '{"detail":"Method Not Allowed"}'
+
+  - id: update-offline-yes-is-inert-and-never-answers-donator
+    note: >-
+      Divergence 8. §1.5 lists `offline=YES` as "activates offline redirect for
+      the hostname ... requires a credited account" and §1.6 specifies
+      `!donator` for a premium feature requested by a non-credited user.
+      `offline` never reaches a comparison and `!donator` has zero writers in
+      dyndns.py or any provider -- the same family as divergences 2 and 3, and
+      the third documented return code the implementation cannot emit.
+      Distinct from `update-unknown-parameters-are-ignored`: that case sends
+      parameters the document does not define, and this one sends a parameter
+      the document defines and does not mark deprecated. The record is updated
+      normally, which is what makes this "inert" rather than "absent" -- an
+      implementation that recognised `offline` would answer `!donator` or
+      suppress the update, and either would fail here.
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: 203.0.113.10, offline: "YES"}
+    covers: [divergence/8-offline-inert-no-donator, update/aggregate-good]
+    effects:
+      persisted: {last_ip_v4: "203.0.113.10", last_updated_at: set}
+      dns: [{backend: good, op: create, rtype: A, ip: 203.0.113.10}]
+    expect:
+      body: "good 203.0.113.10"
+
+  - id: update-client-ip-does-not-supply-a-missing-myip
+    note: >-
+      Divergence 9 on the endpoint that writes DNS. `myip` is omitted, so it
+      defaults to request.remote_addr, which ProxyFix leaves unparseable. An
+      implementation that honoured Client-IP would answer
+      `good 198.51.100.5` and would have pointed a DNS record at the address in
+      a header nothing validates. The paired case is
+      `update-911-no-myip-and-no-client-ip`, which is this request without the
+      header; both answer 911, and that they answer the *same* thing is the
+      assertion.
+    path: /nic/update
+    client_ip: null
+    headers: {client-ip: "198.51.100.5"}
+    query: {hostname: ok.example.com}
+    covers: [divergence/9-client-ip-not-honoured, update/myip-defaults-remote-addr]
+    effects:
+      persisted: none
+      dns: []
+    expect:
+      body: "911"
+
+  # === GET /nic/update -- the HEAD decision =================================
+
+  - id: update-head-runs-the-handler-and-writes-dns
+    note: >-
+      The legacy behaviour, recorded so that leaving it behind is a decision
+      with a measurement under it. Flask adds HEAD to every GET route
+      (werkzeug/routing/rules.py: `if "HEAD" not in methods and "GET" in
+      methods: methods.add("HEAD")`), and Flask serves HEAD by running the GET
+      handler and discarding the body. So this request is a full update:
+      Content-Length 18 for the `good 203.0.113.10` that is generated and
+      thrown away, and `last_ip_v4` moves. The wire cannot see the write, which
+      is why `effects:` carries it.
+
+      **Declaring `methods=["GET"]` does not fix this** -- measured, not
+      assumed: with that mutation applied to a throwaway copy, POST and PUT
+      become 405 while HEAD stays 200, still updates, and the Allow header
+      still reads `OPTIONS, GET, HEAD`.
+    targets: [legacy]
+    method: HEAD
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: 203.0.113.10}
+    covers: [head/update-refused, update/aggregate-good]
+    effects:
+      persisted: {last_ip_v4: "203.0.113.10", last_updated_at: set}
+      dns: [{backend: good, op: create, rtype: A, ip: 203.0.113.10}]
+      event: {event_type: dns_update, response: good}
+    expect:
+      status: 200
+      content_type: "text/plain; charset=utf-8"
+      body: ""
+
+  - id: update-head-is-refused-by-the-host
+    note: >-
+      The decision, in the table. HEAD must be safe (RFC 9110 §9.2.1) and this
+      handler is not, so the host does not serve HEAD on /nic/update and
+      answers 405. Not a preserved legacy behaviour, and the only wire
+      behaviour in this table the rewrite deliberately changes for a reason
+      other than removing query-parameter auth. Three things make it cheap:
+      no DynDNS client sends HEAD (every one of the cases in this table is a
+      GET), FastAPI's APIRoute does not add HEAD to a GET route so *preserving*
+      is what would take a deliberate line of code, and the realistic sender is
+      an uptime monitor configured with the router's credentials -- measured,
+      a HEAD with no `myip` moved the record to the prober's address
+      (198.51.100.99 -> 198.51.100.77), so the monitor would point the hostname
+      at itself. See plan §1, "HEAD".
+    targets: [host]
+    method: HEAD
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: 203.0.113.10}
+    legacy_behaviour: |-
+      HTTP 200, no body, Content-Length 18 -- and the update is performed
+    covers: [head/update-refused]
+    effects:
+      persisted: none
+      dns: []
+    expect:
+      status: 405
+      content_type: "application/json"
+      body: ""
+
+  # === GET /nic/update -- query-parameter auth is gone ======================
+
+  - id: update-query-parameter-credentials-are-rejected
+    note: >-
+      Not a preserved legacy case. Legacy answers `good 203.0.113.10` here; the
+      rewrite answers badauth because ?username=&password= is no longer read.
+      Runs against the host only, and exists so the removal is asserted rather
+      than merely absent. See `deleted_cases` for what was taken out.
+    targets: [host]
+    path: /nic/update
+    auth: {type: none}
+    query: {hostname: ok.example.com, myip: 203.0.113.10, username: alice, password: alice-basic-secret}
+    legacy_behaviour: "good 203.0.113.10"
+    covers: [update/badauth]
+    expect:
+      body: "badauth"
+
+  - id: update-query-parameter-credentials-do-not-shadow-basic-auth
+    note: >-
+      Valid Basic credentials plus junk query credentials still succeed --
+      the query parameters are not consulted at all, in either direction.
+    targets: [host]
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: 203.0.113.10, username: nobody, password: wrong}
+    covers: [update/aggregate-good]
+    expect:
+      body: "good 203.0.113.10"
+
+  # === GET /nic/delete -- authentication and rate limiting ==================
+
+  - id: delete-badauth-no-credentials
+    path: /nic/delete
+    auth: {type: none}
+    query: {hostname: ok.example.com}
+    covers: [delete/auth, divergence/4-always-200]
+    expect:
+      status: 200
+      content_type: "text/plain; charset=utf-8"
+      body: "badauth"
+
+  - id: delete-badauth-wrong-password
+    path: /nic/delete
+    auth: {type: basic, username: alice, password: not-alices-password}
+    query: {hostname: ok.example.com}
+    covers: [delete/auth]
+    expect:
+      body: "badauth"
+
+  - id: delete-badauth-inactive-user
+    path: /nic/delete
+    auth: {type: basic, username: dave, password: dave-basic-secret}
+    query: {hostname: ok.example.com}
+    covers: [delete/auth]
+    expect:
+      body: "badauth"
+
+  - id: delete-abuse-rate-limited
+    path: /nic/delete
+    rate_limited: true
+    query: {hostname: ok.example.com}
+    covers: [delete/rate-limit]
+    expect:
+      body: "abuse"
+
+  # === GET /nic/delete -- request validation ================================
+
+  - id: delete-911-missing-hostname
+    path: /nic/delete
+    query: {}
+    covers: [delete/hostname-resolution, delete/no-ip-suffix]
+    expect:
+      body: "911"
+
+  - id: delete-911-empty-hostname
+    path: /nic/delete
+    query: {hostname: ""}
+    covers: [delete/hostname-resolution]
+    expect:
+      body: "911"
+
+  - id: delete-911-unparseable-myip
+    path: /nic/delete
+    query: {hostname: ok.example.com, myip: notanip}
+    covers: [delete/hostname-resolution, delete/myip-selects-family]
+    expect:
+      body: "911"
+
+  - id: delete-911-myip-checked-before-hostname-syntax
+    path: /nic/delete
+    query: {hostname: "_dmarc.example.com", myip: notanip}
+    covers: [delete/hostname-resolution]
+    expect:
+      body: "911"
+
+  - id: delete-notfqdn-underscore-label
+    path: /nic/delete
+    query: {hostname: "_dmarc.example.com"}
+    covers: [delete/hostname-resolution]
+    expect:
+      body: "notfqdn"
+
+  - id: delete-notfqdn-empty-element-in-list
+    path: /nic/delete
+    query: {hostname: "ok.example.com,,zz-ok.example.com"}
+    covers: [delete/hostname-resolution]
+    expect:
+      body: "notfqdn"
+
+  - id: delete-notfqdn-leading-hyphen
+    path: /nic/delete
+    query: {hostname: "-bad.example.com"}
+    covers: [delete/hostname-resolution]
+    expect:
+      body: "notfqdn"
+
+  # === GET /nic/delete -- hostname resolution, no IP suffix =================
+
+  - id: delete-nohost-unregistered-hostname
+    note: >-
+      Divergence 1, the other half. Update answers "nohost {ip}" for the same
+      condition; delete answers a bare "nohost". A table that reused the update
+      expectation here would be asserting the doc, not the behaviour.
+    path: /nic/delete
+    query: {hostname: never-registered.example.com}
+    covers: [delete/no-ip-suffix, delete/hostname-resolution, divergence/1-nohost-ip-suffix]
+    expect:
+      body: "nohost"
+
+  - id: delete-nohost-carries-no-ip-suffix-even-when-myip-is-given
+    note: >-
+      myip is used only to pick the record family. It never reaches the
+      response body.
+    path: /nic/delete
+    query: {hostname: never-registered.example.com, myip: 203.0.113.10}
+    covers: [delete/no-ip-suffix, divergence/1-nohost-ip-suffix]
+    expect:
+      body: "nohost"
+
+  - id: delete-nohost-hostname-owned-by-another-user
+    path: /nic/delete
+    query: {hostname: carols.example.com}
+    covers: [delete/hostname-resolution, delete/no-ip-suffix]
+    expect:
+      body: "nohost"
+
+  - id: delete-nohost-single-label-no-dot
+    note: Divergence 5, on the delete path -- and with no IP suffix.
+    path: /nic/delete
+    query: {hostname: "foo"}
+    covers: [delete/hostname-resolution, divergence/5-single-label, divergence/1-nohost-ip-suffix]
+    expect:
+      body: "nohost"
+
+  - id: delete-nohost-trailing-newline-in-label
+    note: Divergence 6, on the delete path.
+    path: /nic/delete
+    query: {hostname: "foo\n"}
+    covers: [delete/hostname-resolution, divergence/6-regex-newline-anchor]
+    expect:
+      body: "nohost"
+
+  - id: delete-911-hostname-with-zero-backends
+    path: /nic/delete
+    query: {hostname: nobackend.example.com}
+    covers: [delete/no-ip-suffix, delete/hostname-resolution]
+    expect:
+      body: "911"
+
+  - id: delete-911-backend-without-stored-credentials
+    path: /nic/delete
+    query: {hostname: nocreds.example.com}
+    covers: [delete/hostname-resolution, delete/no-ip-suffix]
+    expect:
+      body: "911"
+
+  - id: delete-911-backend-service-unknown-to-factory
+    path: /nic/delete
+    query: {hostname: unknownsvc.example.com}
+    covers: [delete/hostname-resolution, delete/no-ip-suffix]
+    expect:
+      body: "911"
+
+  - id: delete-nohost-hostname-outside-backend-zone
+    path: /nic/delete
+    query: {hostname: outofzone.example.com}
+    covers: [delete/hostname-resolution, delete/no-ip-suffix]
+    expect:
+      body: "nohost"
+
+  - id: delete-good-single-backend
+    path: /nic/delete
+    query: {hostname: ok.example.com}
+    covers: [delete/no-ip-suffix, delete/myip-absent-both-families]
+    effects:
+      dns: [{backend: good, op: delete, rtype: null, hostname: ok.example.com}]
+      persist: {hostname: ok.example.com, last_ip_v4: unchanged, last_ip_v6: unchanged, last_updated_at: unchanged}
+    expect:
+      body: "good"
+
+  - id: delete-nochg-single-backend
+    path: /nic/delete
+    query: {hostname: nochg.example.com}
+    covers: [delete/no-ip-suffix]
+    expect:
+      body: "nochg"
+
+  - id: delete-dnserr-single-backend
+    path: /nic/delete
+    query: {hostname: dnserr.example.com}
+    covers: [delete/no-ip-suffix]
+    expect:
+      body: "dnserr"
+
+  - id: delete-aggregate-any-good-wins
+    path: /nic/delete
+    query: {hostname: mixed.example.com}
+    covers: [delete/no-ip-suffix]
+    expect:
+      body: "good"
+
+  - id: delete-aggregate-all-nochg
+    path: /nic/delete
+    query: {hostname: allnochg.example.com}
+    covers: [delete/no-ip-suffix]
+    expect:
+      body: "nochg"
+
+  - id: delete-aggregate-first-non-good-nochg-status
+    note: results are [nochg, 911, dnserr]; the answer is the first that is neither good nor nochg.
+    path: /nic/delete
+    query: {hostname: firsterr.example.com}
+    covers: [delete/no-ip-suffix]
+    expect:
+      body: "911"
+
+  # === GET /nic/delete -- record family selection ===========================
+
+  - id: delete-myip-absent-deletes-both-families
+    note: rtype stays None and is passed through to deleterecords as such.
+    path: /nic/delete
+    query: {hostname: ok.example.com}
+    covers: [delete/myip-absent-both-families]
+    effects:
+      dns: [{backend: good, op: delete, rtype: null, hostname: ok.example.com}]
+    expect:
+      body: "good"
+
+  - id: delete-myip-v4-deletes-a-only
+    path: /nic/delete
+    query: {hostname: ok.example.com, myip: 203.0.113.10}
+    covers: [delete/myip-selects-family]
+    effects:
+      dns: [{backend: good, op: delete, rtype: A, hostname: ok.example.com}]
+    expect:
+      body: "good"
+
+  - id: delete-myip-v6-deletes-aaaa-only
+    path: /nic/delete
+    query: {hostname: ok.example.com, myip: "2001:db8::1"}
+    covers: [delete/myip-selects-family]
+    effects:
+      dns: [{backend: good, op: delete, rtype: AAAA, hostname: ok.example.com}]
+    expect:
+      body: "good"
+
+  - id: delete-empty-myip-deletes-both-families
+    note: myip= is falsy, so the family filter is never set.
+    path: /nic/delete
+    query: {hostname: ok.example.com, myip: ""}
+    covers: [delete/myip-absent-both-families]
+    effects:
+      dns: [{backend: good, op: delete, rtype: null, hostname: ok.example.com}]
+    expect:
+      body: "good"
+
+  - id: delete-myip-does-not-default-to-client-ip
+    note: >-
+      The one real asymmetry with update. Update substitutes remote_addr for a
+      missing myip and answers 911 when both are absent; delete never does, so
+      the same request succeeds. Paired with
+      update-911-no-myip-and-no-client-ip, which is the identical request shape
+      on the other endpoint.
+    path: /nic/delete
+    client_ip: null
+    query: {hostname: ok.example.com}
+    covers: [delete/myip-absent-both-families]
+    effects:
+      dns: [{backend: good, op: delete, rtype: null, hostname: ok.example.com}]
+    expect:
+      body: "good"
+
+  # === GET /nic/delete -- ordering and divergences ==========================
+
+  - id: delete-multi-hostname-in-request-order
+    path: /nic/delete
+    query: {hostname: "zz-ok.example.com,never-registered.example.com"}
+    covers: [delete/hostname-resolution, delete/no-ip-suffix]
+    expect:
+      body: |-
+        good
+        nohost
+
+  - id: delete-multi-hostname-in-reverse-request-order
+    path: /nic/delete
+    query: {hostname: "never-registered.example.com,zz-ok.example.com"}
+    covers: [delete/hostname-resolution, delete/no-ip-suffix]
+    expect:
+      body: |-
+        nohost
+        good
+
+  - id: delete-multi-hostname-mixed-statuses-in-order
+    path: /nic/delete
+    query: {hostname: "nochg.example.com,nobackend.example.com,ok.example.com,outofzone.example.com"}
+    covers: [delete/hostname-resolution, delete/no-ip-suffix]
+    expect:
+      body: |-
+        nochg
+        911
+        good
+        nohost
+
+  - id: delete-no-badagent-for-generic-user-agent
+    note: Divergence 2, on the delete path.
+    path: /nic/delete
+    headers: {user-agent: "curl/8.4.0"}
+    query: {hostname: ok.example.com}
+    covers: [divergence/2-no-badagent]
+    expect:
+      body: "good"
+
+  - id: delete-no-numhost-for-25-hostnames
+    note: Divergence 3, on the delete path.
+    path: /nic/delete
+    query:
+      hostname: "h01.example.com,h02.example.com,h03.example.com,h04.example.com,h05.example.com,h06.example.com,h07.example.com,h08.example.com,h09.example.com,h10.example.com,h11.example.com,h12.example.com,h13.example.com,h14.example.com,h15.example.com,h16.example.com,h17.example.com,h18.example.com,h19.example.com,h20.example.com,h21.example.com,h22.example.com,h23.example.com,h24.example.com,h25.example.com"
+    covers: [divergence/3-no-numhost]
+    expect:
+      line_count: 25
+      body: |-
+        nohost
+        nohost
+        nohost
+        nohost
+        nohost
+        nohost
+        nohost
+        nohost
+        nohost
+        nohost
+        nohost
+        nohost
+        nohost
+        nohost
+        nohost
+        nohost
+        nohost
+        nohost
+        nohost
+        nohost
+        nohost
+        nohost
+        nohost
+        nohost
+        nohost
+
+  # === GET /nic/delete -- the HEAD decision =================================
+
+  - id: delete-head-runs-the-handler-and-deletes-records
+    note: >-
+      The same Flask auto-HEAD as `update-head-runs-the-handler-and-writes-dns`,
+      on the endpoint that removes records. Content-Length 4 for the `good`
+      that is generated and discarded. Delete persists nothing, so there is no
+      column to watch here -- the DNS operation is the whole effect, and it is
+      the one the wire cannot see.
+    targets: [legacy]
+    method: HEAD
+    path: /nic/delete
+    query: {hostname: ok.example.com}
+    covers: [head/update-refused, delete/myip-absent-both-families]
+    effects:
+      dns: [{backend: good, op: delete, rtype: null, hostname: ok.example.com}]
+      event: {event_type: dns_update, response: good}
+    expect:
+      status: 200
+      content_type: "text/plain; charset=utf-8"
+      body: ""
+
+  - id: delete-head-is-refused-by-the-host
+    note: >-
+      The decision applies to both writing endpoints, not just update. A HEAD
+      that deletes DNS records is the same defect as a HEAD that rewrites them,
+      and leaving delete out would be the seam between the two.
+    targets: [host]
+    method: HEAD
+    path: /nic/delete
+    query: {hostname: ok.example.com}
+    legacy_behaviour: |-
+      HTTP 200, no body, Content-Length 4 -- and the records are deleted
+    covers: [head/update-refused]
+    effects:
+      dns: []
+    expect:
+      status: 405
+      content_type: "application/json"
+      body: ""
+
+  - id: delete-query-parameter-credentials-are-rejected
+    note: Legacy answers `good` here. See `deleted_cases`.
+    targets: [host]
+    path: /nic/delete
+    auth: {type: none}
+    query: {hostname: ok.example.com, username: alice, password: alice-basic-secret}
+    legacy_behaviour: "good"
+    covers: [delete/auth]
+    expect:
+      body: "badauth"
+
+# ---------------------------------------------------------------------------
+# Deleted cases.
+#
+# Query-parameter authentication (?username=&password=) is removed in the
+# rewrite -- refactor-plan.md §1, "Removed: query-parameter auth". These cases
+# were drafted from the legacy behaviour and then deleted. They are recorded
+# here, as data, so the deletion is auditable and cannot shrink silently: the
+# count in the PR body is the length of this list, and a runner that starts
+# executing them will fail because they carry no `expect`.
+#
+# Do not add `expect` blocks to these. If query-parameter auth is ever
+# reinstated, that is a design change to §1 first.
+# ---------------------------------------------------------------------------
+deleted_cases:
+  - id: update-query-param-auth-succeeds
+    endpoint: /nic/update
+    legacy_behaviour: "?username=alice&password=... with no Authorization header -> good {ip}"
+    reason: query-parameter credentials are no longer read
+
+  - id: delete-query-param-auth-succeeds
+    endpoint: /nic/delete
+    legacy_behaviour: "?username=alice&password=... with no Authorization header -> good"
+    reason: query-parameter credentials are no longer read
+
+  - id: update-query-param-auth-wrong-password-badauth
+    endpoint: /nic/update
+    legacy_behaviour: "?username=alice&password=wrong -> badauth via the query-parameter path"
+    reason: >-
+      the body is still badauth in the rewrite, but for a different reason --
+      the credentials are not read rather than read and rejected. Replaced by
+      update-query-parameter-credentials-are-rejected, which is host-only.
+
+  - id: delete-query-param-auth-wrong-password-badauth
+    endpoint: /nic/delete
+    legacy_behaviour: "?username=alice&password=wrong -> badauth via the query-parameter path"
+    reason: as above; replaced by delete-query-parameter-credentials-are-rejected
+
+  - id: update-query-param-username-without-password-badauth
+    endpoint: /nic/update
+    legacy_behaviour: "?username=alice with no password -> badauth, plus a warning log line"
+    reason: query-parameter credentials are no longer read
+
+  - id: delete-query-param-username-without-password-badauth
+    endpoint: /nic/delete
+    legacy_behaviour: "?username=alice with no password -> badauth, plus a warning log line"
+    reason: query-parameter credentials are no longer read
+
+  - id: update-basic-auth-takes-precedence-over-query-params
+    endpoint: /nic/update
+    legacy_behaviour: >-
+      an Authorization header wins over ?username=&password= -- `if (auth)` is
+      checked first and the query parameters are not consulted
+    reason: >-
+      there is no precedence left to test. The surviving positive form is
+      update-query-parameter-credentials-do-not-shadow-basic-auth, which asserts
+      the query parameters are inert rather than lower-priority.
+
+  - id: delete-basic-auth-takes-precedence-over-query-params
+    endpoint: /nic/delete
+    legacy_behaviour: an Authorization header wins over ?username=&password=
+    reason: as above
+
+  - id: update-query-param-auth-emits-deprecation-warning
+    endpoint: /nic/update
+    legacy_behaviour: >-
+      "credentials passed via query parameters - use HTTP Basic Auth instead"
+      is logged at WARNING whenever either query parameter is present
+    reason: the warning was the guard for an input that no longer exists
+
+  - id: delete-query-param-auth-emits-deprecation-warning
+    endpoint: /nic/delete
+    legacy_behaviour: as above, on the delete path
+    reason: the warning was the guard for an input that no longer exists
+
+  - id: password-is-scrubbed-from-the-wsgi-environ
+    endpoint: "*"
+    legacy_behaviour: >-
+      the _scrub_password_from_environ before-request hook rewrites
+      QUERY_STRING and RAW_URI to password=REDACTED after forcing request.args
+      to cache, so view functions still see the real value while gunicorn's
+      error log does not
+    reason: >-
+      the whole leak apparatus -- this hook, the producer-side stripping, the
+      Traefik queryparameters.defaultmode setting and the standing Loki query --
+      exists only because the password could arrive in a query string. Removing
+      the input removes all of it.

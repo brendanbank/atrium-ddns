@@ -17,9 +17,39 @@ The thing that must survive is the **wire behaviour of three endpoints**, not
 any internal structure. Routers in the field — OPNsense, ddclient, inadyn,
 Fritz!Box — are the users, and they cannot be asked to change.
 
-Extracted from `dyndns-route53/dyndns.py` at `main`. Every response is HTTP
-**200** with `Content-Type: text/plain`, including failures; clients parse the
-body, and a 401 would break them.
+Extracted from `dyndns-route53/dyndns.py` at `main`. Every **`GET`** response is
+HTTP **200**, including failures; clients parse the body, and a 401 would break
+them.
+
+**This paragraph used to read "every response is HTTP 200 with
+`Content-Type: text/plain`", and both halves were wrong** — corrected by issue
+#11 against measurements taken in that issue, not against a reading of the code:
+
+- **`Content-Type` is not always `text/plain`.** `/nic/checkip` in its default
+  mode answers `text/html; charset=utf-8`, which the very next table in this
+  section says and the sentence above it contradicted. 13 of the frozen table's
+  114 cases are `checkip` cases and 5 of them assert `text/html`.
+- **Not every response is 200.** A non-`GET` request answers 405 before any
+  handler runs (divergence 7 below). Measured against a throwaway legacy
+  instance: `POST`, `PUT`, `DELETE` and `PATCH` on `/nic/update` and `POST` on
+  `/nic/checkip` all answer `405`, `text/html; charset=utf-8`, 153 bytes.
+
+The claim that survives is the load-bearing one: **on the `GET` path the status
+is always 200**, `badauth` included. 105 of the table's 114 cases are `GET` and
+every one of them expects 200; the other 9 exist to assert the 405 and the
+`HEAD` decision, and before they were written the "always 200" claim was
+unfalsifiable from inside the table.
+
+### §1 was reconciled against measurement by issue #11
+
+This section was extracted before any of it had been run. Six issues corrected
+it, and the corrections are in place below rather than appended: **nine
+divergences, not five**; **90 bytes, not 91**; **147 legacy tests, not 146**;
+the `HEAD` decision; and the two above. Issue #11 re-derived every number in
+this section against its own throwaway legacy instance rather than inheriting
+one — `tests/compat/baseline.md` is that reading, and where it disagrees with
+what was written here, this section has been changed and the disagreement is
+named rather than smoothed over.
 
 ### `GET /nic/checkip` — unauthenticated
 
@@ -27,12 +57,28 @@ body, and a 401 would break them.
 |---|---|
 | default | `<html><head><title>Current IP Check</title></head><body>Current IP Address: {ip}</body></html>`, `text/html`, IP HTML-escaped |
 | `?format=plain` | bare `{ip}`, `text/plain` |
-| `remote_addr` not parseable as an IP | empty string |
+| `remote_addr` not parseable as an IP, `?format=plain` | empty string |
+| `remote_addr` not parseable as an IP, default format | the same HTML wrapper with an empty IP — 90 bytes, **not** an empty body |
+
+`format` is compared for exact equality with `plain`; every other value,
+including `PLAIN`, falls back to HTML.
+
+The IP is `str(ipaddress.ip_address(...))`, so it is **normalised**:
+`2001:0db8:0000::1` comes back as `2001:db8::1`. The `html.escape` on it is
+structurally unreachable — every string that constructor can produce is drawn
+from `[0-9a-f.:%]` — so the compat suite documents it rather than asserting it.
+See `tests/compat/README.md`.
 
 ### `GET /nic/update`
 
 Auth: HTTP Basic **only** — see *Removed: query-parameter auth* below. Response
-is one line per requested hostname, newline-joined, **in request order**.
+is one line per requested hostname, newline-joined, **in request order** and
+**with no trailing newline** — `"\n".join(lines)`, so 25 hostnames give 25 lines
+and 24 newlines. The trailing newline is stated because a framework adding one
+is the single most likely way this regresses, it is invisible to any comparison
+that strips whitespace, and the table asserts it byte-for-byte
+(`update-multi-hostname-body-has-no-trailing-newline`, plus `line_count` and
+`body_ends_with_newline` on the multi-hostname cases).
 
 | condition | body |
 |---|---|
@@ -51,20 +97,41 @@ is one line per requested hostname, newline-joined, **in request order**.
 | **aggregate**: all `nochg` | `nochg {ip}` |
 | **aggregate**: otherwise | `{first non-good/nochg status} {ip}` |
 
-`myip` defaults to `request.remote_addr` when omitted. `updatetype` is accepted,
-warned about, and ignored.
+`myip` defaults to `request.remote_addr` when omitted, and an empty `myip=`
+takes the same path as an omitted one. `updatetype` is accepted, warned about,
+and ignored; unrecognised parameters are ignored outright (the protocol doc says
+they may trigger `abuse`).
+
+Three orderings the table above does not show, and which the compat suite
+asserts because getting them wrong is invisible in the common case:
+
+- `hostname=` present-and-empty is `911`, not `notfqdn` — `not hostnames` fires
+  before the regex runs. A *trailing comma* is `notfqdn`, because the empty
+  element is inside the list.
+- `myip` is validated before hostname syntax, so a request wrong in both ways
+  answers `911`.
+- the response echoes the **normalised** IP, not the spelling the client sent.
 
 ### `GET /nic/delete`
 
 Same auth, same rate limit, same hostname resolution. **Response codes carry no
-IP suffix** — `good`, `nochg`, `nohost`, `911`. `myip` present ⇒ delete only the
-matching family; absent ⇒ delete both A and AAAA.
+IP suffix** — `good`, `nochg`, `nohost`, `911`, `dnserr`. `myip` present ⇒ delete
+only the matching family; absent (or empty) ⇒ delete both A and AAAA.
+
+**One real asymmetry with update:** delete does *not* substitute `remote_addr`
+for a missing `myip`. On update, `myip` absent and no parseable client address
+gives `911` even for a valid registered hostname; on delete the same request
+succeeds. Delete also persists nothing — `last_ip_v4`/`last_ip_v6` are untouched.
 
 ### Deliberate divergences from the protocol doc
 
 `docs/DYNDNS-PROTOCOL.md` in the old repo documents the de-facto standard. The
-implementation diverges from it in five places. Each is a **preserve-or-fix
-decision**, and the compat suite must encode the decision, not the doc:
+implementation diverges from it in **nine** places — five listed when this plan
+was written, a sixth found by issue #7 while reading the regex rather than the
+summary of it, and three more (7–9) found by issue #9 sweeping §1 of the
+document clause by clause after the table had been frozen. Each is a
+**preserve-or-fix decision**, and the compat suite must encode the decision, not
+the doc:
 
 1. `nohost {ip}` on update, bare `nohost` on delete. The doc says bare `nohost`.
    *Preserve* — clients parse the first token.
@@ -73,13 +140,150 @@ decision**, and the compat suite must encode the decision, not the doc:
 3. No `numhost`. There is no 20-hostname cap. *Preserve*, and add a cap only
    behind a config knob defaulting to off.
 4. Everything is HTTP 200, `badauth` included. *Preserve* — load-bearing.
+   **Bounded by D7 below:** that is true of every case in the table, all of
+   which are `GET`. It is not true of the *endpoint* — a non-`GET` request gets
+   Werkzeug's 405 and an HTML body.
 5. A single label with no dot (`foo`) passes the hostname regex and falls
    through to `nohost`. *Preserve* — it is unreachable in practice and changing
    it moves a `nohost` to a `notfqdn`.
+6. A **trailing newline** in a label passes the regex too. The pattern ends in
+   `$`, which in Python matches before a trailing newline, so `foo\n` validates;
+   `isvalidhostname` then returns the *unstripped* element, the lookup misses,
+   and the answer is `nohost`. *Preserve*, for divergence 5's reason — both
+   spellings already end at `nohost`, so preserving costs nothing, while a "fix"
+   would turn a per-hostname `nohost` line into a whole-request `notfqdn`.
+   Added by issue #7; verified by executing `BaseAccount.isvalidhostname` from
+   the legacy checkout, not by reading it.
+7. **Non-`GET` methods answer HTTP 405 with an HTML body**, not `badagent`.
+   §1.3 of the document says otherwise. Flask's default `methods` are
+   `GET`/`HEAD`/`OPTIONS` and no route in `dyndns.py` overrides them, so
+   Werkzeug answers 405 with a 153-byte error page before any handler runs;
+   `OPTIONS` answers 200 with an `Allow` header naming those same three
+   methods. **The `Allow` header's order is not stable and must never be
+   asserted** — this sentence used to name a specific order, and #11 measured
+   two throwaway instances of the *same* checkout answering
+   `HEAD, GET, OPTIONS` and `GET, OPTIONS, HEAD`, each stable within its own
+   process. Werkzeug joins a Python `set`, so the order follows the process's
+   hash seed. Nothing in the table asserts it — there is no `OPTIONS` case —
+   which is luck rather than design, and is written down here so that adding
+   one is a deliberate decision to assert a set rather than a sequence.
+   *Preserve* — a
+   rewrite on FastAPI answers 405 here anyway, for the different reason that
+   the route declares `GET`. **This bounds divergence 4**: "everything is HTTP
+   200" is true of every case in the table, all of which are `GET`, and false
+   of the endpoint. Cases `update-post-is-405-with-an-html-body` and
+   `checkip-post-is-405-with-an-html-body` (legacy), with `-on-the-host`
+   counterparts, because only the *status* is common to the two frameworks —
+   Werkzeug renders HTML, FastAPI renders `{"detail":"Method Not Allowed"}`.
+8. **`offline=YES` is accepted and silently ignored, and `!donator` has no
+   writer anywhere.** §1.5 defines `offline` (and does *not* mark it
+   deprecated, unlike `wildcard`/`mx`/`backmx`, which are ignored
+   *compliantly*), and §1.6 defines `!donator`. Counting writers across
+   `dyndns.py` and every provider: `numhost` 0, `badagent` 0, `!donator` 0.
+   *Preserve* — the same family as divergences 2 and 3, and the third
+   documented return code the implementation cannot emit. Case
+   `update-offline-yes-is-inert-and-never-answers-donator`, which asserts the
+   parameter is **inert** (the update happens normally) rather than merely
+   absent.
+9. **`Client-IP` is not honoured for IP detection.** §1.7 names it beside
+   `X-Forwarded-For`; `ProxyFix` reads only `X-Forwarded-For`, so half the
+   clause is implemented. *Preserve* — honouring it now would let any client
+   nominate the address written into DNS through a header nothing validates,
+   which is a behaviour change dressed as a compliance fix. Cases
+   `checkip-client-ip-header-is-not-honoured`,
+   `checkip-client-ip-does-not-shadow-x-forwarded-for` and
+   `update-client-ip-does-not-supply-a-missing-myip`.
 
-**These five are exactly the cases where a "fix" looks like an improvement and
+**These nine are exactly the cases where a "fix" looks like an improvement and
 is a regression.** They are the reason the suite is written against the old
-implementation first.
+implementation first — and divergence 6 is the reason it is written against the
+old *implementation* rather than against this document: five of them were
+visible in a careful reading and the sixth was not. Divergences 7–9 are the
+reason it is written against the *whole* document rather than against this
+plan's summary of it: they were found only by walking §1 clause by clause, and
+three of the nine were invisible to the reading that produced the first six.
+
+### `HEAD`: refused where the handler is not safe — decided
+
+**`HEAD /nic/update` performs the update.** Flask adds `HEAD` to every route
+that allows `GET` and serves it by running the `GET` handler and discarding the
+body, so a `HEAD` is a full update with no body to say so. Measured against a
+throwaway legacy instance: `Content-Length: 18`, empty body, and
+`last_ip_v4` moves `198.51.100.99 → 203.0.113.201`. The document says nothing
+about `HEAD`, so this is not a divergence from it; it is a property that needs a
+decision, and leaving it unstated would make it an accidental one.
+
+**Decision: the host answers `405` to `HEAD /nic/update` and `HEAD /nic/delete`,
+and keeps `HEAD /nic/checkip` at `200`.** Not preserve-everything — and the
+argument is not that HTTP requires `HEAD` to be safe, though it does
+(RFC 9110 §9.2.1). It is that the protocol's `GET` is *already* unsafe by
+design and cannot be fixed without breaking every router in the field, so
+`HEAD` is the only place where safety is recoverable at zero cost to clients.
+Four things decided it:
+
+- **Preserving is the expensive option, not the cheap one.** FastAPI's
+  `APIRoute` does not add `HEAD` to a `GET` route (Starlette's plain `Route`
+  does; FastAPI's does not), so the rewrite refuses `HEAD` unless someone
+  writes `methods=["GET", "HEAD"]` on purpose. Preserving would mean
+  deliberately re-enabling an unsafe `HEAD` on the endpoint that writes DNS.
+
+  **But "refusing is free" is only true of a bare FastAPI app, and this is not
+  one.** #11 measured it three ways and the readings do not agree with each
+  other, which is the finding:
+
+  | stack | `HEAD` on a `GET`-only route |
+  |---|---|
+  | bare FastAPI, no catch-all (in-process `TestClient`) | **405** — what the table freezes |
+  | the same route behind a `GET`-only SPA catch-all mount | **200** — the catch-all serves it |
+  | this repository's own stack today, over the wire | **404** |
+
+  Atrium mounts a catch-all at the root, and a `Mount` matches every method, so
+  the 405 the route would have produced never reaches the wire. `POST` still
+  answers 405 through the same mount, which is why the two `-post-is-405-on-the-host`
+  cases pass. **The decision stands and the cases stay frozen at 405** — what
+  changes is the cost line: V1M2 has to write a deliberate `HEAD` handler (or
+  stop the SPA mount shadowing `/nic/*`), because the framework's own refusal
+  does not survive the mount. Recorded in the table's `frozen.known_gaps`.
+- **Nothing in the field sends it.** 105 of the 114 cases in the table are
+  `GET`; the other 9 — 5 `HEAD`, 4 `POST` — exist to assert this decision and
+  divergence 7. ddclient, inadyn, OPNsense and Fritz!Box send `GET`.
+- **The realistic sender is a monitor, and the failure is worse than "an extra
+  update".** `HEAD` needs valid Basic credentials, so it is not an open door —
+  but a DynDNS update URL carries its credentials, and pasting one into an
+  uptime checker is ordinary. Measured: a `HEAD /nic/update?hostname=…` with no
+  `myip` set the record to **the prober's** address
+  (`198.51.100.99 → 198.51.100.77`). The hostname ends up pointing at the
+  monitoring service, refreshed every poll.
+- **`checkip` is safe, so `HEAD` stays.** The split is the rule applied rather
+  than a blanket: `HEAD` is preserved exactly where the handler is read-only.
+  `HEAD /nic/checkip` answers 200 with an empty body — a perfectly reasonable
+  liveness probe, and the host must declare `HEAD` there.
+
+  **The `Content-Length` figures in this section are not constants**, and #11
+  re-measured them rather than repeating them: the length tracks the IP in the
+  body. `HEAD /nic/checkip` is 102 bytes for `203.0.113.10` and 99 for
+  `127.0.0.1`; `HEAD /nic/update` is 18 bytes for `good 203.0.113.201` and 17
+  for `good 203.0.113.10`. What is load-bearing is that a body is *generated*
+  at all, and — for update — that `last_ip_v4` moves, which is the half a
+  `Content-Length` cannot show and the wire cannot see.
+
+**The mechanism named in issue #25 does not work, and that is worth recording
+rather than quietly not using.** The issue proposes `methods=["GET"]` "turning
+`HEAD` from 200 into 405". Werkzeug adds `HEAD` to any rule that allows `GET`
+(`routing/rules.py`: `if "HEAD" not in methods and "GET" in methods:
+methods.add("HEAD")`). Measured on a mutated throwaway copy: with
+`methods=["GET"]`, `POST` and `PUT` become 405 while `HEAD` stays 200, still
+updates, and the `Allow` header still reads `OPTIONS, GET, HEAD`. In Flask the
+fix has to be taken in the view (or with a custom rule); in FastAPI it is the
+default. Nobody is going to fix the legacy service, so this changes nothing
+about the decision — but a future reader who tries `methods=["GET"]` and
+believes it worked would ship an unsafe `HEAD` with a green table.
+
+Cases: `update-head-runs-the-handler-and-writes-dns` and
+`delete-head-runs-the-handler-and-deletes-records` (legacy, with the write
+recorded in `effects:` because the wire cannot see it),
+`update-head-is-refused-by-the-host` and `delete-head-is-refused-by-the-host`
+(host), and `checkip-head-returns-headers-and-no-body` (both).
 
 ### Removed: query-parameter auth — decided
 
@@ -97,6 +301,12 @@ The compat table must **delete** those cases rather than mark them expected-fail
 and record the deletion. HTTP Basic is the only accepted transport for
 `/nic/*` credentials.
 
+Done in issue #7: **11 cases deleted**, kept as data in the table's
+`deleted_cases` block — id, legacy behaviour and reason, no `expect` — so the
+deletion is auditable and the table cannot shrink silently. Three replacement
+cases run against the **host only** and assert the input is inert rather than
+merely absent.
+
 ### How the suite is built — two instruments
 
 One table, two targets. `tests/compat/protocol_cases.yaml` holds every case as
@@ -113,9 +323,62 @@ alongside proves nothing about compatibility. Report the legacy baseline as a
 **negative result**: "we ran N cases against the legacy service, and exactly M
 diverge from the protocol document, enumerated here."
 
-The old repo's 146 pytest tests are a second source. Port the ones asserting
-*behaviour*; drop the ones asserting Flask internals, template contents, or
-Bootstrap markup — atrium owns that surface now.
+**N and M, filled in.** Issue #11 stood up its own throwaway legacy instance
+and ran the frozen table end to end, deriving every number in this paragraph
+rather than quoting one:
+
+> **107 cases were selected for `--target legacy` and all 107 were measured —
+> 104 by the pytest runner and 3 out of band, because their precondition is
+> fixture state the wire cannot arrange. 107 agree with the table and 0
+> diverge. Separately, exactly 9 behaviours diverge from
+> `docs/DYNDNS-PROTOCOL.md` §1, all 9 confirmed live, and a clause-by-clause
+> re-walk of §1 found no tenth.**
+
+`tests/compat/baseline.md` is the reading, with both instruments, the five
+mutations that produced the predicted red sets, and what is still not measured.
+The table is **frozen at version 2** (`frozen:` block, guarded by
+`test_the_table_is_frozen_at_its_recorded_shape`), so V1M2 is measured against
+a file that cannot change without a PR that says so.
+
+The old repo's **147** pytest tests are a second source — 121 in `test_app.py`
+plus 26 in `test_hetzner.py`, agreed exactly by `pytest --collect-only` and by
+`grep -cE '^\s*def test_'`, re-measured by #11. (`dyndns-route53/CLAUDE.md` says
+146; it is stale, and this plan repeated it without counting.) Port the ones
+asserting *behaviour*; drop the ones asserting Flask internals, template
+contents, or Bootstrap markup — atrium owns that surface now.
+
+### What the frozen table does not cover — named at freeze time
+
+A contract that overstates its own reach is worse than a narrow one, so the
+gaps are part of §1 rather than a footnote in the test directory. All four are
+in the table's own `frozen.known_gaps`, and all four were measured by #11:
+
+- **`effects:` is data, not an assertion.** 15 cases carry a DNS operation or a
+  persisted column; no runner asserts either. The runner prints the count every
+  run so the gap stays a number rather than an assumption.
+- **3 cases are not executable over the wire.** `rate_limited: true` is a
+  precondition, not a request. They are skipped with the precondition named and
+  measured separately — and the measurement is only worth having because the
+  same three were run against an *unlimited* instance and went red there, which
+  is what tells you `abuse` was measured rather than printed by construction.
+- **2 host-only cases pass against a host with no `/nic/*` routes at all.**
+  `checkip-post-is-405-on-the-host` and `update-post-is-405-on-the-host` meet
+  atrium's SPA catch-all, which also declares only `GET`, so nothing on the
+  wire distinguishes "no route" from "`GET`-only route". They assert *`POST` is
+  refused*, never *the endpoint exists*. Re-measured by #11 against a host
+  whose route table contains **zero** `/nic` paths: 110 selected, **2 passed,
+  105 failed, 3 skipped** — the 105 are what says the endpoint is not there
+  yet, and the 2 greens are not coverage. The two host `HEAD` cases do **not**
+  pass vacuously (they expect 405 and the catch-all answers 404), so the
+  overstatement is exactly 2 and not 4.
+- **The table is weighted against the traffic it protects.** 104 of 114 cases
+  are IPv4-only and 4 touch IPv6, measured from the table's `myip`, `client_ip`
+  and expected bodies. §3.3.1 measured production at **143 IPv4 / 305 IPv6**
+  events and concluded, before anyone checked, that "a table exercising `A`
+  thoroughly and `AAAA` once is testing the wrong record type". It was
+  describing this table. The divergence count is unaffected — the document says
+  nothing family-specific — but the *coverage* claim is, and V1M2 inherits it
+  as a known gap rather than discovering it.
 
 ---
 
@@ -497,6 +760,70 @@ Splitting one migrated device into several is then a **post-cutover** operation
 the owner performs deliberately, per hostname, in the UI — not something the
 importer guesses at.
 
+#### 3.3.1 The actual production population, measured 2026-08-15
+
+Read from the **live** database inside the running legacy container, not from a
+copy. Small enough that the whole migration is a single transaction:
+
+| | |
+|---|---|
+| users | 7 — one `admin` (0 hostnames, `web_login=1`) + six `user` rows |
+| hostnames | 11, spread 4 / 2 / 2 / 1 / 1 / 1 across the six non-admin users |
+| domains | 1 |
+| domain_backends | 1 (`aws`) |
+| backend_configs | 2 (`aws_access_key_id`, `aws_secret_access_key`, Fernet) |
+| hostname_backends | empty — every hostname uses all of its domain's backends |
+| ttl | uniformly 60 |
+| orphan hostnames | 0 |
+
+**⚠ `~/dyndns.db` is a stale snapshot and must not be the migration source.**
+The copy in the home directory (both on the workstation and on the host) is
+**two schema migrations and two hostnames behind** live: its `users` has no
+`web_login`, its `hostnames` has no `ttl` / `last_ip_v4` / `last_ip_v6` /
+`last_updated_at`, and it holds 9 hostnames against live's 11. The legacy app
+adds those columns via one-time `ALTER TABLE` at boot, so a snapshot taken
+before a deploy is silently a different schema. The importer reads the live
+file out of the `dyndns-route53_dyndns-data` volume, and asserts the column set
+before it starts.
+
+**Three consequences for the migration.**
+
+1. **Legacy users have no email address.** The `users` table is keyed by
+   `username`; atrium's is keyed by email and requires one. Six accounts need an
+   address that does not exist anywhere in the source data. That is an operator
+   decision, not something an importer should invent — see §6.
+2. **The one-device-per-user invariant is cheap here.** Six devices, the largest
+   carrying four hostnames. The admin has none and needs no device — it becomes
+   an atrium super_admin and nothing else.
+3. **`web_login=0` for every non-admin user.** None of them can use the legacy
+   web UI today, so nothing is lost by them not having atrium logins on day one.
+   It also means the DDNS credential is the *only* thing they have, which is
+   exactly what makes carrying the bcrypt hashes verbatim non-negotiable.
+
+**The traffic is IPv6-first — but measure it with the right instrument.**
+
+The first version of this paragraph read `hostnames.last_ip_v4/v6` and reported
+"10 of 11 track a v6 address". That column is **not** a record of client
+traffic: `dyndns.py` seeds it from `dns.resolver.resolve()` at boot for any
+hostname with no tracked IP, so it counts hostnames that have an AAAA record in
+the zone — including ones no client has ever updated. #10's agent caught it.
+
+The instrument that answers the question is `events.ip_address`. Measured on
+production: **448 events, 143 IPv4 and 305 IPv6** — about 68% of real client
+updates are v6, from 3 distinct users. (The events table is pruned to 24 hours,
+so that is a day of traffic, not all of it. The direction is unambiguous; treat
+the ratio as indicative.)
+
+The conclusion survives and is strengthened: `AAAA` is the common path here and
+`A` is the variant, which is the opposite of how the legacy suite is weighted. A
+table exercising `A` thoroughly and `AAAA` once is testing the wrong record
+type.
+
+**And the general lesson, which cost two corrections in one milestone:** a
+column named `last_ip_v6` looks like it answers "do clients send v6". It
+answers "did a zone lookup at boot find an AAAA record". Before trusting a
+number, ask what it would read if the thing being measured were absent.
+
 ### 3.4 Logging — searchable by user, device, and domain
 
 The old `Event` table denormalises `username` and nothing else, and prunes
@@ -725,11 +1052,17 @@ These are the operator's, and a run should not start without them.
    host's config namespace. Affordable now the store is MySQL rather than the
    old SQLite file, and pruned by a scheduled job rather than on the write path
    (§3.4).
-11. ~~Deploy host and cutover policy~~ — **decided: run beside the existing
+11. **What email address do the six legacy users get?** Their accounts are keyed
+   by username; atrium requires an email and there is none in the source data
+   (§3.3.1). Synthesised (`<username>@<domain>`) leaves six addresses that
+   cannot receive mail — password reset and verification both dead-end.
+   Real addresses need collecting from the people. Deferred to V1M4, but it
+   gates the importer.
+12. ~~Deploy host and cutover policy~~ — **decided: run beside the existing
    service on port 8443.** Both stacks live on the host during the development
    phase; the old one keeps serving until the exit criterion is demonstrated.
    See § *Deploying beside the old service* for the one thing 8443 implies.
-12. ~~Standing decisions~~ — **all approved, development phase, full
+13. ~~Standing decisions~~ — **all approved, development phase, full
    permissions**, with two constraints that survive it: unsigned commits remain
    a stop condition, and the DNS smoke test's allow-list stays a dedicated test
    zone. Recorded in `overnight-template.md` § *Standing decisions*.

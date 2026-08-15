@@ -25,7 +25,12 @@ services:
       target: ${ATRIUM_BUILD_TARGET:-dev}
       args:
         ATRIUM_IMAGE: ${ATRIUM_IMAGE:-ghcr.io/brendanbank/atrium:0.28}
-    image: atrium-ddns:latest
+    # Tagged per compose project, not a fixed literal. Pinned to a bare
+    # `atrium-ddns:latest` with `pull_policy: never`, two worktrees building
+    # concurrently overwrite each other's tag and the loser silently runs the
+    # winner's image — no error, no bind mount to correct it, and a green
+    # suite testing code the worktree did not write.
+    image: ${COMPOSE_PROJECT_NAME:-atrium-ddns}:latest
     pull_policy: never
     restart: unless-stopped
     environment:
@@ -66,7 +71,12 @@ services:
         condition: service_healthy
 
   worker:
-    image: atrium-ddns:latest
+    # Tagged per compose project, not a fixed literal. Pinned to a bare
+    # `atrium-ddns:latest` with `pull_policy: never`, two worktrees building
+    # concurrently overwrite each other's tag and the loser silently runs the
+    # winner's image — no error, no bind mount to correct it, and a green
+    # suite testing code the worktree did not write.
+    image: ${COMPOSE_PROJECT_NAME:-atrium-ddns}:latest
     pull_policy: never
     restart: unless-stopped
     environment:
@@ -121,5 +131,14 @@ services:
       retries: 10
 
 volumes:
+  # No `name:` override on purpose. Compose already namespaces volumes by
+  # project (`<project>_mysql_data`), which is exactly the isolation wanted;
+  # pinning a literal defeated it, so a second worktree's MySQL attached the
+  # first's data directory and died on `InnoDB: Unable to lock ./ibdata1`.
+  #
+  # UPGRADING an existing deployment: the volume name changes from
+  # `atrium_ddns_mysql_data` to `<project>_mysql_data`. The old volume is
+  # orphaned, not deleted — a fresh empty database comes up beside it. Either
+  # re-run migrations and re-seed, or copy the data across first. Do not
+  # discover this on a stack that matters.
   mysql_data:
-    name: atrium_ddns_mysql_data

@@ -1,0 +1,596 @@
+# The drop list. Every test in the legacy suite, and what happened to it.
+#
+# Data only. Generated once from `pytest --collect-only` on the legacy checkout
+# so that the file cannot name a test that does not exist, or miss one that
+# does, and hand-classified from there.
+#
+# A silent drop is indistinguishable from an oversight. This file is the record
+# that each of the 147 decisions was taken deliberately, and
+# `test_legacy_behaviour.py` fails if the four dispositions stop summing to the
+# measured total.
+
+version: 1
+
+legacy:
+  repo: brendanbank/dyndns-route53
+  commit: 5d1c941
+  files:
+    - tests/test_app.py
+    - tests/test_hetzner.py
+  # Two instruments, different shapes, both taken on 2026-08-15. See
+  # ../README.md, "Counting the legacy suite".
+  measured:
+    collected: 147      # pytest --collect-only -q
+    grepped: 147        # grep -cE '^\s*def test_' over both files
+    by_file:
+      tests/test_app.py: 121
+      tests/test_hetzner.py: 26
+  # The issue body and refactor-plan.md 1 both say "~146 tests". 146 is not a
+  # count of anything: test_app.py holds 121 and 147 is both files together.
+  # refactor-plan.md is outside this issue's declared file list, so the number
+  # there is flagged in the PR rather than edited here.
+  #
+  # protocol_cases.yaml cites the legacy repo at ec605c5; this file cites
+  # 5d1c941, its child. `git diff --stat ec605c5 5d1c941` is one file,
+  # docker-compose.override.yml.example, and no Python at all -- so the two
+  # readings are of the same behaviour.
+
+reasons:
+  atrium-owns: >-
+    authentication, sessions, TOTP, user CRUD, roles and boot-time admin
+    creation. Atrium ships all of it and reimplementing it is the one hard rule
+    in docs/new-project/SKILL.md.
+  flask-internal: >-
+    a template rendering, a redirect, a flash message, a Bootstrap class, a
+    static file, or a form POST whose only surviving content is "a row was
+    inserted". The host bundle replaces this surface entirely.
+  superseded-by-table: >-
+    the assertion is already owned, byte-for-byte and more thoroughly, by
+    ../protocol_cases.yaml. Porting it would be a second, weaker copy of a
+    frozen contract -- and a weaker copy that disagrees is worse than no copy.
+
+counts:
+  ported: 67
+  dropped:
+    atrium-owns: 34
+    flask-internal: 27
+    superseded-by-table: 19
+  dropped_total: 80
+  total: 147
+
+# ---------------------------------------------------------------------------
+# Fields
+#
+#   id           the pytest node id, verbatim
+#   disposition  ported | dropped
+#   reason       dropped only; one of `reasons`
+#   cases        ported only; ids in model_cases.yaml. A test may map to
+#                several, and several tests may map to one
+#   wire_half    optional. The protocol_cases.yaml case that owns the part of
+#                this test the model cases deliberately do not assert
+# ---------------------------------------------------------------------------
+tests:
+  - id: tests/test_app.py::TestAuthentication::test_login_page_loads
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestAuthentication::test_valid_login_redirects_to_totp_setup
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestAuthentication::test_valid_login_redirects_to_totp_verify
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestAuthentication::test_invalid_password_rejected
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestAuthentication::test_nonexistent_user_rejected
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestAuthentication::test_inactive_user_rejected
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestAuthentication::test_web_login_disabled_user_rejected
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestAuthentication::test_web_login_disabled_user_can_use_api
+    disposition: ported
+    cases:
+      - auth-the-ddns-credential-is-independent-of-any-web-login
+  - id: tests/test_app.py::TestAuthentication::test_full_totp_setup_flow
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestAuthentication::test_full_totp_verify_flow
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestAuthentication::test_invalid_totp_code_rejected
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestAuthentication::test_totp_verify_without_pending_session
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestAuthentication::test_totp_setup_without_pending_session
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestAuthentication::test_logout_clears_session
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestAuthorization::test_unauthenticated_redirects_to_login
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestAuthorization::test_regular_user_cannot_access_user_list
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestAuthorization::test_regular_user_cannot_create_users
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestAuthorization::test_admin_can_access_user_list
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestAuthorization::test_admin_can_access_dashboard
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestAuthorization::test_regular_user_can_access_dashboard
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestAuthorization::test_regular_user_can_access_events
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestAuthorization::test_regular_user_can_access_profile
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestAuthorization::test_regular_user_cannot_access_domains
+    disposition: ported
+    cases:
+      - domains-are-tenant-owned-not-admin-only
+  - id: tests/test_app.py::TestAuthorization::test_regular_user_can_access_hostnames
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestUserManagement::test_create_user
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestUserManagement::test_create_user_with_web_login
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestUserManagement::test_edit_user
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestUserManagement::test_delete_user
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestUserManagement::test_cannot_delete_self
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestUserManagement::test_duplicate_username_rejected
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestTOTPManagement::test_admin_reset_user_2fa
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestTOTPManagement::test_self_reset_2fa_correct_password
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestTOTPManagement::test_self_reset_2fa_wrong_password
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestProfile::test_password_change_success
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestProfile::test_password_change_wrong_current
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestProfile::test_password_change_mismatch_confirm
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestDynDNSAPI::test_no_auth_returns_badauth
+    disposition: dropped
+    reason: superseded-by-table
+  - id: tests/test_app.py::TestDynDNSAPI::test_bad_auth_returns_badauth
+    disposition: dropped
+    reason: superseded-by-table
+  - id: tests/test_app.py::TestDynDNSAPI::test_missing_hostname_returns_911
+    disposition: dropped
+    reason: superseded-by-table
+  - id: tests/test_app.py::TestDynDNSAPI::test_no_matching_hostname_returns_nohost
+    disposition: dropped
+    reason: superseded-by-table
+  - id: tests/test_app.py::TestDynDNSAPI::test_invalid_hostname_returns_notfqdn
+    disposition: dropped
+    reason: superseded-by-table
+  - id: tests/test_app.py::TestDynDNSAPI::test_query_param_auth_works
+    disposition: dropped
+    reason: superseded-by-table
+  - id: tests/test_app.py::TestDynDNSAPI::test_inactive_user_badauth
+    disposition: dropped
+    reason: superseded-by-table
+  - id: tests/test_app.py::TestDynDNSAPI::test_no_totp_required_for_api
+    disposition: ported
+    cases:
+      - auth-the-ddns-path-never-consults-a-second-factor
+  - id: tests/test_app.py::TestDynDNSAPI::test_registered_hostname_no_backend_returns_911
+    disposition: ported
+    cases:
+      - backends-a-domain-with-no-backends-resolves-to-none
+    wire_half: update-911-hostname-with-zero-backends
+  - id: tests/test_app.py::TestDynDNSAPI::test_updatetype_param_ignored
+    disposition: dropped
+    reason: superseded-by-table
+  - id: tests/test_app.py::TestDynDNSDeleteAPI::test_delete_no_auth_returns_badauth
+    disposition: dropped
+    reason: superseded-by-table
+  - id: tests/test_app.py::TestDynDNSDeleteAPI::test_delete_unregistered_hostname_returns_nohost
+    disposition: dropped
+    reason: superseded-by-table
+  - id: tests/test_app.py::TestDynDNSDeleteAPI::test_delete_invalid_hostname_returns_notfqdn
+    disposition: dropped
+    reason: superseded-by-table
+  - id: tests/test_app.py::TestDynDNSDeleteAPI::test_delete_registered_hostname_no_backend_returns_911
+    disposition: dropped
+    reason: superseded-by-table
+  - id: tests/test_app.py::TestDynDNSDeleteAPI::test_delete_missing_hostname_returns_911
+    disposition: dropped
+    reason: superseded-by-table
+  - id: tests/test_app.py::TestDynDNSDeleteAPI::test_delete_with_invalid_myip_returns_911
+    disposition: dropped
+    reason: superseded-by-table
+  - id: tests/test_app.py::TestDynDNSDeleteAPI::test_delete_creates_event
+    disposition: ported
+    cases:
+      - event-type-is-dns_update-on-update-and-dns_delete-on-delete
+      - event-username-is-a-snapshot-not-a-join
+  - id: tests/test_app.py::TestEvents::test_event_page_loads
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestEvents::test_api_call_creates_event
+    disposition: ported
+    cases:
+      - event-one-row-per-backend-attempt
+      - event-type-is-dns_update-on-update-and-dns_delete-on-delete
+      - event-username-is-a-snapshot-not-a-join
+  - id: tests/test_app.py::TestDomainManagement::test_domain_list_page_loads
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestDomainManagement::test_create_domain
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestDomainManagement::test_duplicate_domain_rejected
+    disposition: ported
+    cases:
+      - domain-name-is-globally-unique
+  - id: tests/test_app.py::TestDomainManagement::test_edit_domain
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestDomainManagement::test_delete_domain
+    disposition: ported
+    cases:
+      - domain-delete-cascades-to-its-backends-and-hostnames
+  - id: tests/test_app.py::TestDomainManagement::test_add_backend_to_domain
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestDomainManagement::test_duplicate_backend_rejected
+    disposition: ported
+    cases:
+      - domain-backend-is-unique-per-domain-and-service
+  - id: tests/test_app.py::TestDomainManagement::test_delete_backend
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestDomainManagement::test_backend_config_page_loads
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestDomainManagement::test_save_backend_credentials
+    disposition: ported
+    cases:
+      - backend-credentials-are-stored-as-one-encrypted-row-per-key
+  - id: tests/test_app.py::TestDomainManagement::test_backend_config_does_not_leak_credentials
+    disposition: ported
+    cases:
+      - backend-credentials-are-never-redisplayed
+  - id: tests/test_app.py::TestHostnameManagement::test_admin_hostname_page_loads
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestHostnameManagement::test_admin_add_hostname
+    disposition: ported
+    cases:
+      - hostname-fqdn-is-the-prefix-joined-to-the-domain
+      - hostname-belongs-to-exactly-one-user
+  - id: tests/test_app.py::TestHostnameManagement::test_admin_delete_hostname
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestHostnameManagement::test_duplicate_hostname_rejected
+    disposition: ported
+    cases:
+      - hostname-name-is-globally-unique
+  - id: tests/test_app.py::TestHostnameManagement::test_user_self_service_hostnames
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestHostnameManagement::test_user_add_own_hostname
+    disposition: ported
+    cases:
+      - hostname-fqdn-is-the-prefix-joined-to-the-domain
+      - hostname-belongs-to-exactly-one-user
+  - id: tests/test_app.py::TestHostnameManagement::test_user_delete_own_hostname
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestHostnameBackendSelection::test_hostname_backends_page_loads
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestHostnameBackendSelection::test_select_specific_backend
+    disposition: ported
+    cases:
+      - backends-explicit-selection-wins
+  - id: tests/test_app.py::TestHostnameBackendSelection::test_clear_backend_selection
+    disposition: ported
+    cases:
+      - backends-empty-selection-resolves-to-all-of-the-domains-backends
+  - id: tests/test_app.py::TestHostnameBackendSelection::test_get_backends_returns_specific_when_set
+    disposition: ported
+    cases:
+      - backends-explicit-selection-wins
+  - id: tests/test_app.py::TestHostnameBackendSelection::test_get_backends_returns_all_domain_when_not_set
+    disposition: ported
+    cases:
+      - backends-empty-selection-resolves-to-all-of-the-domains-backends
+  - id: tests/test_app.py::TestHostnameBackendSelection::test_user_can_configure_own_hostname_backends
+    disposition: ported
+    cases:
+      - backends-explicit-selection-wins
+  - id: tests/test_app.py::TestHostnameBackendSelection::test_user_cannot_configure_others_hostname
+    disposition: ported
+    cases:
+      - backends-selection-is-owner-scoped
+  - id: tests/test_app.py::TestMiscRoutes::test_root_redirects
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestMiscRoutes::test_help_requires_auth
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestMiscRoutes::test_static_css_loads
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestMiscRoutes::test_help_page_loads_when_authenticated
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestBootAdminCreation::test_fails_without_admin_password
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestBootAdminCreation::test_creates_admin_from_bcrypt_hash
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestBootAdminCreation::test_creates_admin_from_plaintext
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestBootAdminCreation::test_skips_if_admin_exists
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestCheckIP::test_checkip_returns_html
+    disposition: dropped
+    reason: superseded-by-table
+  - id: tests/test_app.py::TestCheckIP::test_checkip_plain_format
+    disposition: dropped
+    reason: superseded-by-table
+  - id: tests/test_app.py::TestCheckIP::test_checkip_no_auth_required
+    disposition: dropped
+    reason: superseded-by-table
+  - id: tests/test_app.py::TestCheckIP::test_checkip_rejects_non_ip_remote_addr
+    disposition: dropped
+    reason: superseded-by-table
+  - id: tests/test_app.py::TestTTLManagement::test_hostname_default_ttl
+    disposition: ported
+    cases:
+      - ttl-default-is-60
+  - id: tests/test_app.py::TestTTLManagement::test_hostname_custom_ttl
+    disposition: ported
+    cases:
+      - ttl-is-stored-per-hostname-not-per-domain
+  - id: tests/test_app.py::TestTTLManagement::test_admin_create_hostname_with_ttl
+    disposition: ported
+    cases:
+      - ttl-is-stored-per-hostname-not-per-domain
+  - id: tests/test_app.py::TestTTLManagement::test_user_create_hostname_with_ttl
+    disposition: ported
+    cases:
+      - ttl-is-stored-per-hostname-not-per-domain
+  - id: tests/test_app.py::TestTTLManagement::test_ttl_validation_too_low
+    disposition: ported
+    cases:
+      - ttl-below-30-is-rejected
+      - ttl-30-and-86400-are-accepted
+  - id: tests/test_app.py::TestTTLManagement::test_ttl_validation_too_high
+    disposition: ported
+    cases:
+      - ttl-above-86400-is-rejected
+      - ttl-30-and-86400-are-accepted
+  - id: tests/test_app.py::TestTTLManagement::test_update_ttl_via_backends_page
+    disposition: ported
+    cases:
+      - ttl-is-stored-per-hostname-not-per-domain
+  - id: tests/test_app.py::TestTTLManagement::test_ttl_passed_to_backend
+    disposition: ported
+    cases:
+      - ttl-reaches-the-create-call
+      - ttl-is-absent-from-the-delete-call
+  - id: tests/test_app.py::TestRateLimiting::test_rate_limiter_allows_requests
+    disposition: ported
+    cases:
+      - rate-limit-triggers-at-greater-than-or-equal
+  - id: tests/test_app.py::TestRateLimiting::test_rate_limiter_blocks_after_limit
+    disposition: ported
+    cases:
+      - rate-limit-triggers-at-greater-than-or-equal
+  - id: tests/test_app.py::TestRateLimiting::test_rate_limiter_per_hour_limit
+    disposition: ported
+    cases:
+      - rate-limit-per-minute-and-per-hour-are-independent
+  - id: tests/test_app.py::TestRateLimiting::test_rate_limiter_independent_users
+    disposition: ported
+    cases:
+      - rate-limit-counters-are-per-user
+  - id: tests/test_app.py::TestRateLimiting::test_abuse_returned_on_rate_limit
+    disposition: ported
+    cases:
+      - rate-limit-is-checked-before-the-request-is-recorded
+      - rate-limit-a-refused-request-is-not-recorded
+    wire_half: update-abuse-rate-limited
+  - id: tests/test_app.py::TestRateLimiting::test_admin_rate_limit_page
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestRateLimiting::test_admin_update_global_rate_limit
+    disposition: ported
+    cases:
+      - rate-limit-config-precedence-is-user-then-global-then-hardcoded
+  - id: tests/test_app.py::TestRateLimiting::test_admin_create_user_rate_limit_override
+    disposition: ported
+    cases:
+      - rate-limit-config-precedence-is-user-then-global-then-hardcoded
+  - id: tests/test_app.py::TestRateLimiting::test_admin_delete_user_rate_limit_override
+    disposition: ported
+    cases:
+      - rate-limit-config-precedence-is-user-then-global-then-hardcoded
+  - id: tests/test_app.py::TestHealthChecks::test_global_rate_limit_created_on_boot
+    disposition: ported
+    cases:
+      - rate-limit-seeded-default-is-30-per-minute-and-500-per-hour
+  - id: tests/test_app.py::TestHealthChecks::test_health_check_config_created_on_boot
+    disposition: ported
+    cases:
+      - health-check-is-disabled-by-default
+  - id: tests/test_app.py::TestHealthChecks::test_last_ip_tracked_on_update
+    disposition: dropped
+    reason: superseded-by-table
+  - id: tests/test_app.py::TestHealthChecks::test_health_check_list_page
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestHealthChecks::test_health_check_config_page
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestHealthChecks::test_health_check_update_config
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestHealthChecks::test_run_health_checks_manually
+    disposition: ported
+    cases:
+      - health-check-ok-requires-the-first-answer-to-equal-the-tracked-address
+      - health-check-examines-each-tracked-family-separately
+  - id: tests/test_app.py::TestHealthChecks::test_health_check_detects_mismatch
+    disposition: ported
+    cases:
+      - health-check-mismatch-records-both-addresses
+  - id: tests/test_app.py::TestHealthChecks::test_health_check_detects_missing
+    disposition: ported
+    cases:
+      - health-check-nxdomain-and-noanswer-are-missing
+  - id: tests/test_app.py::TestHealthChecks::test_health_check_clear
+    disposition: dropped
+    reason: flask-internal
+  - id: tests/test_app.py::TestHealthChecks::test_health_check_requires_admin
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_app.py::TestHealthChecks::test_rate_limit_requires_admin
+    disposition: dropped
+    reason: atrium-owns
+  - id: tests/test_hetzner.py::TestHetznerStatic::test_match_hetzner
+    disposition: ported
+    cases:
+      - provider-is-selected-by-the-stored-service-name
+  - id: tests/test_hetzner.py::TestHetznerStatic::test_match_other
+    disposition: ported
+    cases:
+      - provider-is-selected-by-the-stored-service-name
+  - id: tests/test_hetzner.py::TestHetznerStatic::test_known_services
+    disposition: ported
+    cases:
+      - provider-is-selected-by-the-stored-service-name
+  - id: tests/test_hetzner.py::TestHetznerCredentials::test_credentials_from_account
+    disposition: ported
+    cases:
+      - provider-credentials-come-from-the-stored-row
+  - id: tests/test_hetzner.py::TestHetznerCredentials::test_credentials_env_fallback
+    disposition: ported
+    cases:
+      - provider-must-not-fall-back-to-environment-credentials
+  - id: tests/test_hetzner.py::TestHetznerZones::test_gethostedzones
+    disposition: ported
+    cases:
+      - provider-zone-candidates-are-limited-to-the-configured-domains
+      - provider-zone-is-the-closest-enclosing-hosted-zone
+  - id: tests/test_hetzner.py::TestHetznerZones::test_gethostedzones_skips_reverse
+    disposition: ported
+    cases:
+      - provider-reverse-zones-are-never-zone-candidates
+  - id: tests/test_hetzner.py::TestHetznerZones::test_gethostedzones_api_error
+    disposition: ported
+    cases:
+      - provider-zone-discovery-failure-is-not-fatal
+  - id: tests/test_hetzner.py::TestHetznerZones::test_gethostedzones_no_credentials
+    disposition: ported
+    cases:
+      - provider-zone-discovery-failure-is-not-fatal
+      - provider-missing-credentials-is-dnserr
+  - id: tests/test_hetzner.py::TestParentZoneMapping::test_parent_zone_maps_domain_to_api_zone_id
+    disposition: ported
+    cases:
+      - provider-zone-is-the-closest-enclosing-hosted-zone
+  - id: tests/test_hetzner.py::TestParentZoneMapping::test_create_uses_correct_relative_name_for_parent_zone
+    disposition: ported
+    cases:
+      - provider-relative-name-is-computed-against-the-hosted-zone
+  - id: tests/test_hetzner.py::TestParentZoneMapping::test_delete_uses_correct_relative_name_for_parent_zone
+    disposition: ported
+    cases:
+      - provider-relative-name-is-computed-against-the-hosted-zone
+  - id: tests/test_hetzner.py::TestRelativeName::test_subdomain
+    disposition: ported
+    cases:
+      - provider-relative-name-is-computed-against-the-hosted-zone
+  - id: tests/test_hetzner.py::TestRelativeName::test_multi_level_subdomain
+    disposition: ported
+    cases:
+      - provider-relative-name-is-computed-against-the-hosted-zone
+  - id: tests/test_hetzner.py::TestRelativeName::test_zone_apex
+    disposition: ported
+    cases:
+      - provider-zone-apex-relative-name-is-at
+  - id: tests/test_hetzner.py::TestHetznerCreateRecords::test_create_new_record
+    disposition: ported
+    cases:
+      - provider-create-returns-good-for-a-new-record
+      - provider-status-vocabulary-is-good-nochg-dnserr
+  - id: tests/test_hetzner.py::TestHetznerCreateRecords::test_update_existing_record
+    disposition: ported
+    cases:
+      - provider-create-returns-good-for-a-changed-record
+  - id: tests/test_hetzner.py::TestHetznerCreateRecords::test_create_nochg
+    disposition: ported
+    cases:
+      - provider-create-returns-nochg-when-the-record-already-matches
+  - id: tests/test_hetzner.py::TestHetznerCreateRecords::test_create_api_error
+    disposition: ported
+    cases:
+      - provider-any-api-failure-is-dnserr-never-an-exception
+  - id: tests/test_hetzner.py::TestHetznerCreateRecords::test_create_no_credentials
+    disposition: ported
+    cases:
+      - provider-missing-credentials-is-dnserr
+  - id: tests/test_hetzner.py::TestHetznerDeleteRecords::test_delete_existing
+    disposition: ported
+    cases:
+      - provider-delete-returns-good-when-the-record-existed
+      - provider-status-vocabulary-is-good-nochg-dnserr
+  - id: tests/test_hetzner.py::TestHetznerDeleteRecords::test_delete_not_found
+    disposition: ported
+    cases:
+      - provider-delete-returns-nochg-when-the-record-was-absent
+  - id: tests/test_hetzner.py::TestHetznerDeleteRecords::test_delete_both_types
+    disposition: ported
+    cases:
+      - provider-delete-without-a-record-type-covers-both-families
+  - id: tests/test_hetzner.py::TestHetznerDeleteRecords::test_delete_one_exists_one_not
+    disposition: ported
+    cases:
+      - provider-delete-of-both-families-is-good-if-either-existed
+  - id: tests/test_hetzner.py::TestHetznerDeleteRecords::test_delete_api_error
+    disposition: ported
+    cases:
+      - provider-any-api-failure-is-dnserr-never-an-exception
+  - id: tests/test_hetzner.py::TestHetznerDeleteRecords::test_delete_no_credentials
+    disposition: ported
+    cases:
+      - provider-missing-credentials-is-dnserr

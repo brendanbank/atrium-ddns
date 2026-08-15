@@ -49,9 +49,29 @@ cd frontend && pnpm install --frozen-lockfile
 pnpm typecheck                     # tsc --noEmit — 0 errors
 pnpm test                          # vitest — 2 passed (2)
 cd .. && make up && make migrate    # both alembic chains to head
-make test-backend                  # pytest -n auto in the api container — 8 passed (8)
-make smoke PASS=<admin-password>   # scripts/smoke.sh — 11 passed (11)
+make test-backend                  # host tests 8 passed + compat 29 passed, 3 skipped
+make smoke PASS=<pw> EMAIL=<addr>  # scripts/smoke.sh — 11 passed (11)
 ```
+
+`make test-backend` grew a second pytest session (#23): the compat suites now
+reach the image via `COPY tests /opt/compat_tests` in the Dockerfile's **`dev`
+stage only**, so they run in the gate without shipping to production. It is
+gated on `make check-compat-fresh`, which digests `tests/` in the worktree and
+in the running container and **refuses when they differ** — `make up` does not
+rebuild, so without it the gate silently reads a stale copy and reports green.
+Verified here: editing a case file without rebuilding stops the gate with *"the
+api container is running a STALE copy of tests/"*; rebuilding with the same
+edit fails 3 guards; reverting returns 29 passed.
+
+The 101-case wire table is **not** in the gate and must not be — it needs a live
+service and an explicit pair (`make test-compat TARGET=… BASE_URL=…`). A run
+without `--target` prints *"the wire table was NOT RUN (0 of 101 cases
+executed)"* rather than a zeroed accounting block that reads like a pass.
+
+CI gained a Docker-free `compat-guards` job running literally `pytest tests/`
+from the checkout — the invocation that used to die before collecting anything.
+Two instruments: green there and red in the image means the image is stale, not
+the tests wrong.
 
 The gate needs Docker: `OVERNIGHT_NEED_DOCKER=1`, and `docker info` failing is a
 stop condition, not a routine.
@@ -75,6 +95,14 @@ per-test cost runs **11.13s serial → 3.58s parallel (3.1×)**. At 8 real tests
 the run is *slower* in parallel — ten worker processes each import the app —
 which is the honest shape of the trade and the reason the number is recorded
 against 800 rather than against today's suite.
+
+**Parallel agents need distinct host ports.** Compose isolation now covers the
+image tag and the volume, but `API_HOST_PORT` / `MYSQL_HOST_PORT` come from
+`.env`, which each worktree copies from the same example. Two agents on the
+defaults collide. Docker fails loudly on the bind (`port is already allocated`),
+so this is a stall rather than a silent corruption — but pick your own pair and
+set `COMPOSE_PROJECT_NAME` too. If you find a stack you did not create, stop and
+report it; do not reuse it and do not tear it down.
 
 **CI does not run on milestone branches — by design, and the gate is why.**
 The workflow fires only for `master` (PRs into it, and pushes to it). A
@@ -141,10 +169,16 @@ was replaced by the file's `0` and the stop condition committed unsigned
 instead of stopping.
 
 **Smoke-testing a deployed stack needs no credential.** Run
-`scripts/smoke.sh --base <url> --no-login` — 9 of the 11 checks need no
-authentication, and the two that do would otherwise require an admin password
-the run has no unattended way to obtain. Do not put that password anywhere the
-run can read it just to get two more checks.
+`scripts/smoke.sh --base <url> --no-login`. Measured, because the first version
+of this paragraph guessed: **8 checks locally** (`make smoke`), **6 against a
+remote `--base`** — the three login checks drop, and against a remote target the
+two migration checks drop as well. The credentialed checks would need an admin
+password the run has no unattended way to obtain; do not put one where the run
+can read it just to get three more checks.
+
+Numbers in this file are measurable. Do not write one you have not run — #8's
+agent caught the guessed "9 of 11" above, which is exactly the class of error
+this contract keeps telling agents not to make.
 
 ---
 

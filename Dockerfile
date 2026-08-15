@@ -68,4 +68,28 @@ RUN /opt/venv/bin/python -m pip install --no-cache-dir \
 # user cannot write a cache there — pytest warns on every run. Point it
 # somewhere writable instead of silencing the warning.
 ENV PYTEST_ADDOPTS="-o cache_dir=/tmp/pytest-cache"
+
+# The compatibility suites (`tests/` at the repo root, not `backend/tests`).
+#
+# Only `backend/` reached the image, so `make test-backend` — the gate's only
+# backend command — could not see `tests/compat/` at all: a 101-case wire table,
+# 81 model rules and 18 guards, none of them executed by anything. V1M1 was
+# about to freeze artefacts with no writer.
+#
+# Copied into `dev` rather than `runtime` on purpose: `dev` is the test image
+# (compose builds it by default, `--target runtime` is the prod one), so tests
+# reach the gate without shipping to production. Last layer in the stage, so
+# editing a case file rebuilds one COPY rather than a pip install — the
+# mutation checks in #23's PR body each cost a ~1s rebuild because of it.
+#
+# `/opt/compat_tests/compat/...` mirrors the repo's own `tests/compat/...`, so
+# a path in a failure report reads the same in both places. Deliberately NOT
+# under /opt/host_app: pytest would then take backend/pyproject.toml as the
+# config file and run these under `-n auto --dist=loadfile`, which buys nothing
+# on an 0.1s data suite and hides its per-test output.
+COPY tests /opt/compat_tests
+# Whatever the developer's local pytest left behind is not part of the image.
+# Without this the image content depends on whether someone ran the suite in
+# their checkout, which makes `make check-compat-fresh` argue with itself.
+RUN find /opt/compat_tests -type d -name __pycache__ -prune -exec rm -rf {} +
 USER app
