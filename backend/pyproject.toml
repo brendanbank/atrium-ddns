@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "atrium-ddns-host"
+version = "0.1.0"
+description = "Atrium Ddns host extension for Atrium"
+requires-python = ">=3.12"
+
+# All runtime deps come from the atrium image (FastAPI, SQLAlchemy,
+# Alembic, structlog). Listing them here would just shadow atrium's
+# pinned versions. The package is installed via `pip install ./backend`
+# inside the image so `atrium_ddns` is importable on PYTHONPATH.
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/atrium_ddns"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+# Parallel by default, matching the recipe that gets atrium-pa to ~72
+# tests/sec (6197 tests in 86s). `-n auto` is one worker per CPU;
+# `--dist=loadfile` keeps every test in a file on the same worker, which is
+# what makes module- and session-scoped fixtures behave — with the default
+# `--dist=load` a session fixture is built once per worker and tests that
+# share state through one get scheduled apart from it.
+#
+# To bisect a failure serially: `-n 0` (NOT `-p no:xdist` — that unloads the
+# plugin while these addopts still pass `-n`, and pytest dies with
+# "unrecognized arguments: -n"; `-o addopts=""` also works).
+#
+# Do NOT reach for serial mode to diagnose an apparent *hang*. xdist absorbs
+# per-test output, so a hung run looks identical to a slow one — run
+# `pytest <path> -v` from a terminal and let the test names print instead
+# (`make test-backend-file FILE=...`). Forcing a serial run to investigate a
+# hang has its own pathology and burns more time than it saves.
+addopts = "-n auto --dist=loadfile -ra --strict-markers"
+# One event loop for the whole session, not one per test.
+#
+# `app.db.get_session_factory()` caches a process-global engine, and its
+# connection pool holds sockets bound to whichever loop first opened them.
+# Under pytest-asyncio's default function-scoped loop, test 2 gets a fresh
+# loop, pulls a pooled connection created on test 1's dead loop, and fails
+# with "got Future attached to a different loop" — from the *fixture*, so it
+# reports as an ERROR rather than a failure and looks like a fixture bug.
+# Session scope matches how the app actually runs: one loop, one pool.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"

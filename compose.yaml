@@ -1,0 +1,111 @@
+# Atrium Ddns — self-contained prod compose.
+#
+# Pulls atrium from GHCR, builds the host extension on top, brings up
+# api + worker + mysql. No proxy, no TLS — atrium speaks plain HTTP on
+# :8000 by design. Put your own TLS terminator (Caddy, nginx, the load
+# balancer at your edge) in front for production.
+#
+# Usage (from this directory):
+#
+#   cp .env.example .env  # fill in JWT_SECRET, DB password
+#   docker compose up -d --build
+#   make migrate
+#   make seed-admin EMAIL=you@example.com PASSWORD=...
+#
+# Environment variables come from .env via ${VAR} interpolation.
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # `dev` adds pytest + xdist on top of `runtime`; it is a superset, so
+      # the stack behaves identically. Build with `--target runtime` (or
+      # override ATRIUM_BUILD_TARGET) for a prod image without test tooling.
+      target: ${ATRIUM_BUILD_TARGET:-dev}
+      args:
+        ATRIUM_IMAGE: ${ATRIUM_IMAGE:-ghcr.io/brendanbank/atrium:0.28}
+    image: atrium-ddns:latest
+    pull_policy: never
+    restart: unless-stopped
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-prod}
+      APP_TIMEZONE: ${APP_TIMEZONE:-UTC}
+      APP_SECRET_KEY: ${APP_SECRET_KEY}
+      APP_BASE_URL: ${APP_BASE_URL:-http://localhost:8000}
+      DATABASE_URL: ${DATABASE_URL}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ACCESS_TOKEN_EXPIRE_MINUTES: ${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:-10080}
+      WEBAUTHN_RP_ID: ${WEBAUTHN_RP_ID:-localhost}
+      WEBAUTHN_RP_NAME: ${WEBAUTHN_RP_NAME:-Atrium Ddns}
+      WEBAUTHN_ORIGIN: ${WEBAUTHN_ORIGIN:-http://localhost:8000}
+      MAIL_BACKEND: ${MAIL_BACKEND:-console}
+      MAIL_FROM: ${MAIL_FROM:-no-reply@example.com}
+      ATRIUM_HOST_MODULE: atrium_ddns.bootstrap
+      # Host alembic runs with cwd=/opt/host_app (via -c
+      # /opt/host_app/alembic.ini) and its env.py imports from
+      # atrium's `app` package. Atrium's source lives at /app — put
+      # it on PYTHONPATH so the import resolves no matter where the
+      # caller's cwd is.
+      PYTHONPATH: /app
+    ports:
+      # Host port is project-specific so several atrium hosts can run
+      # side by side on one dev box. 8053 nods at DNS/53; override with
+      # API_HOST_PORT. The container port stays 8000 — atrium's own
+      # HEALTHCHECK curls localhost:8000 inside the container.
+      - "${API_HOST_PORT:-8053}:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  worker:
+    image: atrium-ddns:latest
+    pull_policy: never
+    restart: unless-stopped
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-prod}
+      APP_TIMEZONE: ${APP_TIMEZONE:-UTC}
+      APP_SECRET_KEY: ${APP_SECRET_KEY}
+      APP_BASE_URL: ${APP_BASE_URL:-http://localhost:8000}
+      DATABASE_URL: ${DATABASE_URL}
+      JWT_SECRET: ${JWT_SECRET}
+      MAIL_BACKEND: ${MAIL_BACKEND:-console}
+      MAIL_FROM: ${MAIL_FROM:-no-reply@example.com}
+      ATRIUM_HOST_MODULE: atrium_ddns.bootstrap
+      PYTHONPATH: /app
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      api:
+        condition: service_started
+    healthcheck:
+      disable: true
+
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --default-time-zone=+00:00
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    ports:
+      # Published so a local client (mysql CLI, TablePlus) can reach it
+      # without `docker compose exec`. Deliberately NOT 3306: every
+      # other project on this box would collide with it. Override with
+      # MYSQL_HOST_PORT; set it empty and delete this mapping if you
+      # don't want the port exposed at all.
+      - "${MYSQL_HOST_PORT:-13353}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mysql_data:
+    name: atrium_ddns_mysql_data

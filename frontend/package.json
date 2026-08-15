@@ -1,0 +1,36 @@
+{
+  "name": "atrium-ddns-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Host extension bundle for atrium — registers a home widget, route, nav item, admin tab, and profile slot.",
+  "scripts": {
+    "build": "vite build",
+    "build:watch": "vite build --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@brendanbank/atrium-host-bundle-utils": "^0.28",
+    "@brendanbank/atrium-host-types": "^0.28",
+    "@mantine/core": "^9.1.0",
+    "@mantine/hooks": "^9.1.0",
+    "@tabler/icons-react": "^3.41.1",
+    "@tanstack/react-query": "^5.100.1",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5"
+  },
+  "devDependencies": {
+    "@brendanbank/atrium-test-utils": "^0.28",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "jsdom": "^29.0.2",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.10",
+    "vite-plugin-css-injected-by-js": "^3.5.2",
+    "vitest": "^4.1.5"
+  }
+}
