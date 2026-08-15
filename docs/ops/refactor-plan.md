@@ -158,7 +158,7 @@ alongside proves nothing about compatibility. Report the legacy baseline as a
 **negative result**: "we ran N cases against the legacy service, and exactly M
 diverge from the protocol document, enumerated here."
 
-The old repo's 146 pytest tests are a second source. Port the ones asserting
+The old repo's **147** pytest tests are a second source — 121 in `test_app.py` plus 26 in `test_hetzner.py`. (`dyndns-route53/CLAUDE.md` says 146; it is stale, and this plan repeated it without counting.) Port the ones asserting
 *behaviour*; drop the ones asserting Flask internals, template contents, or
 Bootstrap markup — atrium owns that surface now.
 
@@ -582,10 +582,29 @@ before it starts.
    It also means the DDNS credential is the *only* thing they have, which is
    exactly what makes carrying the bcrypt hashes verbatim non-negotiable.
 
-**The traffic is IPv6-first.** 10 of 11 hostnames have a tracked IPv6 address,
-4 have IPv4. The compat table must not treat `A` as the common case and `AAAA`
-as the variant — production is the other way round, and a suite that exercises
-`A` thoroughly and `AAAA` once is testing the wrong record type.
+**The traffic is IPv6-first — but measure it with the right instrument.**
+
+The first version of this paragraph read `hostnames.last_ip_v4/v6` and reported
+"10 of 11 track a v6 address". That column is **not** a record of client
+traffic: `dyndns.py` seeds it from `dns.resolver.resolve()` at boot for any
+hostname with no tracked IP, so it counts hostnames that have an AAAA record in
+the zone — including ones no client has ever updated. #10's agent caught it.
+
+The instrument that answers the question is `events.ip_address`. Measured on
+production: **448 events, 143 IPv4 and 305 IPv6** — about 68% of real client
+updates are v6, from 3 distinct users. (The events table is pruned to 24 hours,
+so that is a day of traffic, not all of it. The direction is unambiguous; treat
+the ratio as indicative.)
+
+The conclusion survives and is strengthened: `AAAA` is the common path here and
+`A` is the variant, which is the opposite of how the legacy suite is weighted. A
+table exercising `A` thoroughly and `AAAA` once is testing the wrong record
+type.
+
+**And the general lesson, which cost two corrections in one milestone:** a
+column named `last_ip_v6` looks like it answers "do clients send v6". It
+answers "did a zone lookup at boot find an AAAA record". Before trusting a
+number, ask what it would read if the thing being measured were absent.
 
 ### 3.4 Logging — searchable by user, device, and domain
 
