@@ -1,0 +1,26 @@
+# Static TLS for the host stack. No ACME here on purpose — the certificate is
+# extracted from the old service's store by scripts/extract-acme-cert.sh, and
+# that store has exactly one writer (the old service's Traefik). A second
+# ACME-capable instance pointed at the same file corrupts it.
+tls:
+  certificates:
+    - certFile: /certs/cert.pem
+      keyFile: /certs/key.pem
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /certs/cert.pem
+        keyFile: /certs/key.pem
+
+http:
+  routers:
+    host-api:
+      rule: PathPrefix(`/`)
+      entryPoints: [websecure]
+      service: host-api
+      tls: {}
+  services:
+    host-api:
+      loadBalancer:
+        servers:
+          - url: http://api:8000
