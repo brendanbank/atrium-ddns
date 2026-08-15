@@ -32,6 +32,13 @@ services:
       ENVIRONMENT: ${ENVIRONMENT:-prod}
       APP_TIMEZONE: ${APP_TIMEZONE:-UTC}
       APP_SECRET_KEY: ${APP_SECRET_KEY}
+      # Passing this is not optional and its absence is silent in dev.
+      # `.env` only feeds ${...} interpolation — a variable the container
+      # actually needs must be listed here too. Omitted, atrium falls back to
+      # its dev-default key: dev boots and encrypts happily against it (so the
+      # whole test suite passes), and prod refuses to start with "still the dev
+      # default". Caught by a test deploy, not by the gate.
+      SECRET_ENCRYPTION_KEY: ${SECRET_ENCRYPTION_KEY}
       APP_BASE_URL: ${APP_BASE_URL:-http://localhost:8000}
       DATABASE_URL: ${DATABASE_URL}
       JWT_SECRET: ${JWT_SECRET}
@@ -66,6 +73,13 @@ services:
       ENVIRONMENT: ${ENVIRONMENT:-prod}
       APP_TIMEZONE: ${APP_TIMEZONE:-UTC}
       APP_SECRET_KEY: ${APP_SECRET_KEY}
+      # Passing this is not optional and its absence is silent in dev.
+      # `.env` only feeds ${...} interpolation — a variable the container
+      # actually needs must be listed here too. Omitted, atrium falls back to
+      # its dev-default key: dev boots and encrypts happily against it (so the
+      # whole test suite passes), and prod refuses to start with "still the dev
+      # default". Caught by a test deploy, not by the gate.
+      SECRET_ENCRYPTION_KEY: ${SECRET_ENCRYPTION_KEY}
       APP_BASE_URL: ${APP_BASE_URL:-http://localhost:8000}
       DATABASE_URL: ${DATABASE_URL}
       JWT_SECRET: ${JWT_SECRET}
