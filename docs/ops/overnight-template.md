@@ -49,9 +49,29 @@ cd frontend && pnpm install --frozen-lockfile
 pnpm typecheck                     # tsc --noEmit — 0 errors
 pnpm test                          # vitest — 2 passed (2)
 cd .. && make up && make migrate    # both alembic chains to head
-make test-backend                  # pytest -n auto in the api container — 8 passed (8)
-make smoke PASS=<admin-password>   # scripts/smoke.sh — 11 passed (11)
+make test-backend                  # host tests 8 passed + compat 29 passed, 3 skipped
+make smoke PASS=<pw> EMAIL=<addr>  # scripts/smoke.sh — 11 passed (11)
 ```
+
+`make test-backend` grew a second pytest session (#23): the compat suites now
+reach the image via `COPY tests /opt/compat_tests` in the Dockerfile's **`dev`
+stage only**, so they run in the gate without shipping to production. It is
+gated on `make check-compat-fresh`, which digests `tests/` in the worktree and
+in the running container and **refuses when they differ** — `make up` does not
+rebuild, so without it the gate silently reads a stale copy and reports green.
+Verified here: editing a case file without rebuilding stops the gate with *"the
+api container is running a STALE copy of tests/"*; rebuilding with the same
+edit fails 3 guards; reverting returns 29 passed.
+
+The 101-case wire table is **not** in the gate and must not be — it needs a live
+service and an explicit pair (`make test-compat TARGET=… BASE_URL=…`). A run
+without `--target` prints *"the wire table was NOT RUN (0 of 101 cases
+executed)"* rather than a zeroed accounting block that reads like a pass.
+
+CI gained a Docker-free `compat-guards` job running literally `pytest tests/`
+from the checkout — the invocation that used to die before collecting anything.
+Two instruments: green there and red in the image means the image is stale, not
+the tests wrong.
 
 The gate needs Docker: `OVERNIGHT_NEED_DOCKER=1`, and `docker info` failing is a
 stop condition, not a routine.
