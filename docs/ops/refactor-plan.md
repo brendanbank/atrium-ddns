@@ -28,7 +28,7 @@ body, and a 401 would break them.
 | default | `<html><head><title>Current IP Check</title></head><body>Current IP Address: {ip}</body></html>`, `text/html`, IP HTML-escaped |
 | `?format=plain` | bare `{ip}`, `text/plain` |
 | `remote_addr` not parseable as an IP, `?format=plain` | empty string |
-| `remote_addr` not parseable as an IP, default format | the same HTML wrapper with an empty IP — 91 bytes, **not** an empty body |
+| `remote_addr` not parseable as an IP, default format | the same HTML wrapper with an empty IP — 90 bytes, **not** an empty body |
 
 `format` is compared for exact equality with `plain`; every other value,
 including `PLAIN`, falls back to HTML.
@@ -90,10 +90,12 @@ succeeds. Delete also persists nothing — `last_ip_v4`/`last_ip_v6` are untouch
 ### Deliberate divergences from the protocol doc
 
 `docs/DYNDNS-PROTOCOL.md` in the old repo documents the de-facto standard. The
-implementation diverges from it in six places — five listed when this plan was
-written, and a sixth found by issue #7 while reading the regex rather than the
-summary of it. Each is a **preserve-or-fix decision**, and the compat suite must
-encode the decision, not the doc:
+implementation diverges from it in **nine** places — five listed when this plan
+was written, a sixth found by issue #7 while reading the regex rather than the
+summary of it, and three more (7–9) found by issue #9 sweeping §1 of the
+document clause by clause after the table had been frozen. Each is a
+**preserve-or-fix decision**, and the compat suite must encode the decision, not
+the doc:
 
 1. `nohost {ip}` on update, bare `nohost` on delete. The doc says bare `nohost`.
    *Preserve* — clients parse the first token.
@@ -116,12 +118,103 @@ encode the decision, not the doc:
    would turn a per-hostname `nohost` line into a whole-request `notfqdn`.
    Added by issue #7; verified by executing `BaseAccount.isvalidhostname` from
    the legacy checkout, not by reading it.
+7. **Non-`GET` methods answer HTTP 405 with an HTML body**, not `badagent`.
+   §1.3 of the document says otherwise. Flask's default `methods` are
+   `GET`/`HEAD`/`OPTIONS` and no route in `dyndns.py` overrides them, so
+   Werkzeug answers 405 with a 153-byte error page before any handler runs;
+   `OPTIONS` answers 200 with `Allow: GET, HEAD, OPTIONS`. *Preserve* — a
+   rewrite on FastAPI answers 405 here anyway, for the different reason that
+   the route declares `GET`. **This bounds divergence 4**: "everything is HTTP
+   200" is true of every case in the table, all of which are `GET`, and false
+   of the endpoint. Cases `update-post-is-405-with-an-html-body` and
+   `checkip-post-is-405-with-an-html-body` (legacy), with `-on-the-host`
+   counterparts, because only the *status* is common to the two frameworks —
+   Werkzeug renders HTML, FastAPI renders `{"detail":"Method Not Allowed"}`.
+8. **`offline=YES` is accepted and silently ignored, and `!donator` has no
+   writer anywhere.** §1.5 defines `offline` (and does *not* mark it
+   deprecated, unlike `wildcard`/`mx`/`backmx`, which are ignored
+   *compliantly*), and §1.6 defines `!donator`. Counting writers across
+   `dyndns.py` and every provider: `numhost` 0, `badagent` 0, `!donator` 0.
+   *Preserve* — the same family as divergences 2 and 3, and the third
+   documented return code the implementation cannot emit. Case
+   `update-offline-yes-is-inert-and-never-answers-donator`, which asserts the
+   parameter is **inert** (the update happens normally) rather than merely
+   absent.
+9. **`Client-IP` is not honoured for IP detection.** §1.7 names it beside
+   `X-Forwarded-For`; `ProxyFix` reads only `X-Forwarded-For`, so half the
+   clause is implemented. *Preserve* — honouring it now would let any client
+   nominate the address written into DNS through a header nothing validates,
+   which is a behaviour change dressed as a compliance fix. Cases
+   `checkip-client-ip-header-is-not-honoured`,
+   `checkip-client-ip-does-not-shadow-x-forwarded-for` and
+   `update-client-ip-does-not-supply-a-missing-myip`.
 
-**These six are exactly the cases where a "fix" looks like an improvement and
+**These nine are exactly the cases where a "fix" looks like an improvement and
 is a regression.** They are the reason the suite is written against the old
 implementation first — and divergence 6 is the reason it is written against the
 old *implementation* rather than against this document: five of them were
-visible in a careful reading and the sixth was not.
+visible in a careful reading and the sixth was not. Divergences 7–9 are the
+reason it is written against the *whole* document rather than against this
+plan's summary of it: they were found only by walking §1 clause by clause, and
+three of the nine were invisible to the reading that produced the first six.
+
+### `HEAD`: refused where the handler is not safe — decided
+
+**`HEAD /nic/update` performs the update.** Flask adds `HEAD` to every route
+that allows `GET` and serves it by running the `GET` handler and discarding the
+body, so a `HEAD` is a full update with no body to say so. Measured against a
+throwaway legacy instance: `Content-Length: 18`, empty body, and
+`last_ip_v4` moves `198.51.100.99 → 203.0.113.201`. The document says nothing
+about `HEAD`, so this is not a divergence from it; it is a property that needs a
+decision, and leaving it unstated would make it an accidental one.
+
+**Decision: the host answers `405` to `HEAD /nic/update` and `HEAD /nic/delete`,
+and keeps `HEAD /nic/checkip` at `200`.** Not preserve-everything — and the
+argument is not that HTTP requires `HEAD` to be safe, though it does
+(RFC 9110 §9.2.1). It is that the protocol's `GET` is *already* unsafe by
+design and cannot be fixed without breaking every router in the field, so
+`HEAD` is the only place where safety is recoverable at zero cost to clients.
+Four things decided it:
+
+- **Preserving is the expensive option, not the cheap one.** FastAPI's
+  `APIRoute` does not add `HEAD` to a `GET` route (Starlette's plain `Route`
+  does; FastAPI's does not), so the rewrite refuses `HEAD` unless someone
+  writes `methods=["GET", "HEAD"]` on purpose. Measured against this
+  repository's own stack: a non-declared method on a matched path answers
+  405 `application/json`. Preserving would mean deliberately re-enabling an
+  unsafe `HEAD` on the endpoint that writes DNS.
+- **Nothing in the field sends it.** All 114 cases in the table are `GET` bar
+  the ones added to assert this. ddclient, inadyn, OPNsense and Fritz!Box send
+  `GET`.
+- **The realistic sender is a monitor, and the failure is worse than "an extra
+  update".** `HEAD` needs valid Basic credentials, so it is not an open door —
+  but a DynDNS update URL carries its credentials, and pasting one into an
+  uptime checker is ordinary. Measured: a `HEAD /nic/update?hostname=…` with no
+  `myip` set the record to **the prober's** address
+  (`198.51.100.99 → 198.51.100.77`). The hostname ends up pointing at the
+  monitoring service, refreshed every poll.
+- **`checkip` is safe, so `HEAD` stays.** The split is the rule applied rather
+  than a blanket: `HEAD` is preserved exactly where the handler is read-only.
+  `HEAD /nic/checkip` answers 200, `Content-Length: 102`, empty body — a
+  perfectly reasonable liveness probe, and the host must declare `HEAD` there.
+
+**The mechanism named in issue #25 does not work, and that is worth recording
+rather than quietly not using.** The issue proposes `methods=["GET"]` "turning
+`HEAD` from 200 into 405". Werkzeug adds `HEAD` to any rule that allows `GET`
+(`routing/rules.py`: `if "HEAD" not in methods and "GET" in methods:
+methods.add("HEAD")`). Measured on a mutated throwaway copy: with
+`methods=["GET"]`, `POST` and `PUT` become 405 while `HEAD` stays 200, still
+updates, and the `Allow` header still reads `OPTIONS, GET, HEAD`. In Flask the
+fix has to be taken in the view (or with a custom rule); in FastAPI it is the
+default. Nobody is going to fix the legacy service, so this changes nothing
+about the decision — but a future reader who tries `methods=["GET"]` and
+believes it worked would ship an unsafe `HEAD` with a green table.
+
+Cases: `update-head-runs-the-handler-and-writes-dns` and
+`delete-head-runs-the-handler-and-deletes-records` (legacy, with the write
+recorded in `effects:` because the wire cannot see it),
+`update-head-is-refused-by-the-host` and `delete-head-is-refused-by-the-host`
+(host), and `checkip-head-returns-headers-and-no-body` (both).
 
 ### Removed: query-parameter auth — decided
 

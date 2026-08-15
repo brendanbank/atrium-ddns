@@ -9,7 +9,7 @@ The source of truth is the **behaviour of `brendanbank/dyndns-route53`'s
 `dyndns.py` at `main`** (commit `ec605c5`), read directly, together with
 `auth.py`, `rate_limiter.py` and `lib/accounts.py`. It is **not**
 `docs/DYNDNS-PROTOCOL.md` in that repo, which documents the de-facto standard
-the implementation deliberately departs from in six places. Where the two
+the implementation deliberately departs from in nine places. Where the two
 disagree, the implementation wins and the case carries a `divergence/*` tag.
 
 Routers in the field — OPNsense, ddclient, inadyn, Fritz!Box — are the users,
@@ -20,7 +20,7 @@ the behaviour is a bug in this file.
 
 | key | what it is |
 |---|---|
-| `spec_rows` | every row of `docs/ops/refactor-plan.md` §1's three tables, plus the six divergences, given an id |
+| `spec_rows` | every row of `docs/ops/refactor-plan.md` §1's three tables, plus the nine divergences and the two `HEAD` rows, given an id |
 | `fixture` | one shared world: three users, seven backends, twelve hostnames. Each hostname exercises exactly one backend condition |
 | `defaults` | applied to any case that does not override them |
 | `cases` | the table. Each names the `spec_rows` it `covers` |
@@ -162,17 +162,69 @@ Start it with an absolute path so `pkill -f` can find it, check the listener's
 the fixture is there — `GET /nic/update?hostname=ok.example.com&myip=…` should
 answer `good`, not `nohost` — before writing up a single divergence.
 
+**Better: make the trap unreachable rather than checkable.** #25 seeded and
+served **in one process** — `create_app(config_class=…)` against a database
+directory that is deleted and rebuilt at the top of the same script, then
+`app.run()` at the bottom of it. There is no second process to go stale, no
+`pkill` to mis-target, and the listener's start time *is* the seed time. The
+three checks above are still worth running; they are just no longer the only
+thing between you and 40 coherent, wrong failures. Mutation runs (below) each
+got a fresh copy on a fresh port and the copy was **deleted** afterwards rather
+than reverted, for the same reason: there is no revert to get wrong.
+
+**Do not point the app at the checkout's own `config.py` defaults.** They
+resolve `instance/dyndns.db` next to `config.py` — which, in a copy made
+without excluding `instance/`, is a copy of whatever the operator had there —
+and `load_dotenv(basedir/.env)` pulls the checkout's real `.env` into the
+process environment. Passing a config class with explicit throwaway paths, and
+excluding `.env*` and `instance/` from the copy, avoids both.
+
 **Pick a port, and not 5000 on macOS.** `Control Centre` listens on 5000 for
 AirPlay, so the worked invocation below will connect to something that is not
-the legacy service. #9 used 5109. Two agents calibrating at once need two ports,
-same as the compose stack.
+the legacy service. #9 used 5109, #25 used 5125 (and 5131–5136 for mutations).
+Two agents calibrating at once need two ports, same as the compose stack.
 
 ### The result
 
 `baseline.md`. Short version: 98 cases selected for `--target legacy`, 95
 executed and 3 measured out of band, **98 agree and 0 diverge** — but three
-divergences from `docs/DYNDNS-PROTOCOL.md` that this table does **not** carry
+divergences from `docs/DYNDNS-PROTOCOL.md` that this table did **not** carry
 were found by sweeping §1 of the document, and they are the actual finding.
+
+**#25 re-ran it on the extended table, on an independently built fixture**
+(seeded in the same process that serves it, from a copy whose every legacy file
+hashes the same as #9's did): **107 selected, 104 executed, 104 pass, 0 fail.**
+The 9 additional legacy-selected cases are the ones that carry D7, D8, D9 and
+the `HEAD` finding, and all 9 agree with what was measured by hand first.
+
+### The new cases bite — five mutations, five predictions
+
+A case written from a measurement and then asserted against the same service is
+one instrument twice. Each mutation below was applied to a **fresh copy** of the
+legacy service on its own port and database, the whole table was run against it,
+and the copy was deleted. The red set was predicted before each run.
+
+| mutation | predicted red | actual red |
+|---|---|---|
+| M1 `update` falls back to `Client-IP` when `remote_addr` is unparseable | 1 | **1** — `update-client-ip-does-not-supply-a-missing-myip` |
+| M2 `checkip` prefers `Client-IP` over `X-Forwarded-For` | 2 | **2** — both `checkip-client-ip-*` cases |
+| M3 `offline=YES` answers `!donator` | 2 | **2** — the D8 case **and** `update-unknown-parameters-are-ignored` |
+| M4 `/nic/update` declares `methods=["GET", "POST"]` | 1 | **1** — `update-post-is-405-with-an-html-body` |
+| M5 `httpReply` aborts 405 on `HEAD` | 2 | **2** — the two legacy `HEAD` cases |
+
+**M3 is the one that argues against its own case, and it is reported that way.**
+`update-unknown-parameters-are-ignored` already sends `offline=YES` among four
+others, so it goes red too: the new case adds *intent*, not detection. What it
+adds is that the existing case would have flagged it as "an unknown parameter
+stopped being ignored", which is the wrong diagnosis for a parameter the
+protocol document defines and does not deprecate.
+
+**M5 is the one that argues for the split decision.** It refuses `HEAD` inside
+`httpReply`, which every `/nic/*` reply goes through **except** the `checkip`
+HTML path, which builds its own response. So `checkip-head-returns-headers-and-no-body`
+stayed green while the two write-side `HEAD` cases went red — the exact shape
+of "refuse `HEAD` where the handler is not safe, keep it where it is",
+demonstrated rather than asserted.
 
 ## Running the table
 
@@ -263,21 +315,32 @@ Every run ends with its own arithmetic, because the failure mode of a
 table-driven runner is not a wrong answer, it is a case that quietly stopped
 running:
 
-A real block, from `--target host` against the local stack on `8_overnight`
+A real block, from `--target host` against the local stack on `25_overnight`
 (abridged only in the id lists). It is red, because the host has no `/nic/*`
 yet — an invented green example here would be the first thing to rot:
 
 ```
 compat accounting (target=host):
-  cases in table             101
-  excluded by `targets:`       0  []
-  selected for this target   101
+  cases in table             114
+  excluded by `targets:`       4  ['checkip-post-is-405-with-an-html-body', ...]
+  selected for this target   110
   unmet preconditions          3  ['update-abuse-rate-limited', ...]
-  executable                  98
-  wire-only                   11  cases carrying `effects:` ... that this runner does NOT assert
-  ran this session           101  98 failed, 3 skipped
-  reachability probe        GET http://localhost:8153/nic/checkip -> HTTP 200
+  executable                 107
+  wire-only                   15  cases carrying `effects:` ... that this runner does NOT assert
+  ran this session           110  105 failed, 2 passed, 3 skipped
+  reachability probe        GET http://localhost:8125/nic/checkip -> HTTP 200
 ```
+
+**The two green ones are worth naming rather than rounding off.**
+`checkip-post-is-405-on-the-host` and `update-post-is-405-on-the-host` pass
+against a host that has no `/nic/*` routes at all, because a non-`GET` on an
+unmatched path meets the SPA catch-all — which also declares only `GET` — and
+gets the same 405. Nothing on the wire distinguishes "no route" from "GET-only
+route", so those two cases assert *POST is refused* and never *the endpoint
+exists*. The 105 red cases beside them are what says the endpoint does not
+exist yet — and the other 3 are skipped, not red, which is a third state and
+not a quieter kind of failure. (The earlier version of this block, taken on `8_overnight` with a
+101-case table, read `101 selected / 98 failed / 3 skipped` and `0 excluded`.)
 
 `selected` is what the table offers; `ran this session` is what pytest actually
 executed, counted from its own report objects. They are two numbers on purpose
@@ -298,16 +361,25 @@ and fail loudly rather than letting the run shrink:
 
 ### Collected-case readings
 
-Taken on `8_overnight`, not inherited. Two instruments, and the runner's own
+Taken on `25_overnight`, not inherited. Two instruments, and the runner's own
 collection is the second one:
 
 | instrument | `--target legacy` | `--target host` |
 |---|---|---|
-| `pytest --collect-only`, `test_case[...]` nodes | 98 | 101 |
-| PyYAML over `cases`, filtered on `targets` | 98 | 101 |
+| `pytest --collect-only`, `test_case[...]` nodes | 107 | 110 |
+| PyYAML over `cases`, filtered on `targets` | 107 | 110 |
 
-101 in the table, 3 host-only, 98 shared; 11 `deleted_cases`, 0 of them
-collected. `grep -c '^  - id:'` = 112 = 101 + 11.
+114 in the table: **103 shared, 4 legacy-only, 7 host-only**; 11
+`deleted_cases`, 0 of them collected. `grep -c '^  - id:'` = 125 = 114 + 11.
+
+`legacy`-only is new in #25 and the asymmetry is deliberate: four cases assert
+what Werkzeug renders (a 405 error page, a `HEAD` that runs the handler) and
+have `-on-the-host` counterparts asserting what the rewrite must do instead.
+Only the *status* is common to the two frameworks, so a single shared case
+would have had to assert one framework's rendering of the other.
+
+The `8_overnight` reading, against the 101-case table, was 98 / 101 by both
+instruments — 3 host-only, 0 legacy-only, `grep -c` = 112.
 
 ### No credential reaches this output that was not already committed
 
@@ -319,19 +391,20 @@ query-parameter cases *do* print their credentials in the request line, because
 the query string is the thing they assert; those values are synthetic and
 already committed a few hundred lines above.
 
-## The six divergences from the protocol document
+## The nine divergences from the protocol document
 
-§1 of the plan listed five. This issue found a sixth by reading the regex. All
-six are **preserve**.
+§1 of the plan listed five. #7 found a sixth by reading the regex. #9 swept §1
+of the document clause by clause and found three more, which #25 added. All
+nine are **preserve**.
 
-> **Six is what this table carries, not what the document diverges by.** #9 ran
-> the six against the live legacy service — all six confirmed, 17 cases, 17
-> agreeing — and then swept §1 of the document clause by clause and found
-> **three more that this table does not carry**: non-`GET` methods answer HTTP
-> 405 rather than `badagent`, `offline=YES` is ignored and `!donator` has no
-> writer anywhere, and `Client-IP` is not honoured for IP detection. See
-> `baseline.md` §4.2 — adding them is a change to this table and #9 did not own
-> the file.
+> **Nine is now both what this table carries and what the document diverges
+> by**, and it took three issues to make those the same number. #7 wrote six;
+> #9 confirmed all six against the live legacy service (17 cases, 17 agreeing)
+> and then found 7, 8 and 9 by reading the document rather than the table, but
+> did not own this file; #25 added them, with a case each, and re-ran the
+> whole table against the legacy service to confirm them. `baseline.md` §4.2
+> and §4.4 are the sweep; the sweep is a **negative result** — every clause of
+> §1 was walked, so nine is a count and not an anecdote.
 
 1. **`nohost {ip}` on update, bare `nohost` on delete.** The doc says bare
    `nohost` for both. Clients parse the first token.
@@ -363,11 +436,50 @@ six are **preserve**.
    found by this issue and added to the plan.
    Cases: `update-nohost-trailing-newline-in-label`,
    `delete-nohost-trailing-newline-in-label`.
+7. **Non-`GET` methods answer HTTP 405 with an HTML body**, not `badagent`
+   (§1.3). Flask's default `methods` are `GET`/`HEAD`/`OPTIONS`, no route
+   overrides them, and Werkzeug answers 405 with a 153-byte error page before
+   any handler runs. **This bounds divergence 4** — "everything is HTTP 200" is
+   true of every case in this table, all of which are `GET`, and false of the
+   endpoint. Cases: `update-post-is-405-with-an-html-body`,
+   `checkip-post-is-405-with-an-html-body` (legacy-only, exact Werkzeug bytes),
+   `update-post-is-405-on-the-host`, `checkip-post-is-405-on-the-host`.
+8. **`offline=YES` is inert and `!donator` has no writer** (§1.5, §1.6). The
+   record is updated normally. `wildcard`/`mx`/`backmx` being ignored is
+   *compliant* — the document marks those deprecated — and `offline` is not so
+   marked, which is what makes this a divergence rather than a courtesy.
+   Case: `update-offline-yes-is-inert-and-never-answers-donator`, which asserts
+   the parameter is inert rather than absent.
+9. **`Client-IP` is not honoured** (§1.7), though the document names it beside
+   `X-Forwarded-For`. `ProxyFix` reads only the latter.
+   Cases: `checkip-client-ip-header-is-not-honoured`,
+   `checkip-client-ip-does-not-shadow-x-forwarded-for`,
+   `update-client-ip-does-not-supply-a-missing-myip`.
 
 Divergence 6 is preserved for divergence 5's reason: both spellings already end
 at `nohost`, so preserving costs nothing, while "fixing" it would turn a
 per-hostname `nohost` line into a whole-request `notfqdn` — a behaviour change
 for a case nobody hits.
+
+## The one thing this table does not preserve, and why
+
+`HEAD /nic/update` performs the update. Flask adds `HEAD` to every `GET` route
+and serves it by running the handler and discarding the body, so a `HEAD` is a
+full DNS write with no body to say so — measured, `Content-Length: 18`, empty
+body, `last_ip_v4` moving. **The rewrite refuses it: 405 on `/nic/update` and
+`/nic/delete`, 200 preserved on `/nic/checkip`.** The reasoning is in plan §1,
+"`HEAD`: refused where the handler is not safe"; the short version is that
+preserving it is the *expensive* option (FastAPI's `APIRoute` does not add
+`HEAD`, so preserving means writing `methods=["GET", "HEAD"]` on purpose), that
+no DynDNS client sends `HEAD`, and that the realistic sender is an uptime
+monitor holding the router's credentials — which, measured with no `myip`,
+repointed the hostname at the prober's own address.
+
+This is the only wire behaviour in the table the rewrite changes for a reason
+other than removing query-parameter auth, and it is expressed with the
+mechanism already here: paired `targets: [legacy]` / `targets: [host]` cases,
+the legacy half carrying the write in `effects:` and the host half carrying
+`legacy_behaviour:`. No new schema, and nothing hidden in prose.
 
 ## Behaviours §1 did not state, encoded here
 
@@ -380,8 +492,10 @@ them. §1 has been corrected for the first two.
   bytes, not 0. (This read 91 until #9 measured it three ways: `curl` reports
   `Content-Length: 90`, `wc -c` agrees, and `len()` of the table's own
   `expect.body` is 90. The table was always right; only this count was wrong.
-  The same 91 survives in a `note:` in `protocol_cases.yaml`, which #9 did not
-  own.) Cases `checkip-unparseable-remote-addr-plain` and
+  The same 91 survived in a `note:` in `protocol_cases.yaml` and in plan §1's
+  own table, neither of which #9 owned; #25 corrected both, so the figure now
+  reads 90 in all three places and the readings that produced it are recorded
+  beside the case.) Cases `checkip-unparseable-remote-addr-plain` and
   `checkip-unparseable-remote-addr-html`.
 - **The response echoes the *normalised* IP, not the spelling the client sent.**
   The body carries `str(ipaddress.ip_address(...))`, so `myip=2001:0DB8:0000::1`
@@ -468,7 +582,8 @@ grep -c '^  - id:'     tests/compat/protocol_cases.yaml   # both; must equal the
 The grep instrument counts `expect:` and `reason:` rather than `id:` on purpose:
 a case that lost its expectation, or a deleted entry that grew one, shows up as
 a disagreement instead of being absorbed. Demonstrated, not assumed — five
-mutations, each reverted immediately, against the readings above:
+mutations, each reverted immediately, run by #7 against the 101-case table; the
+deltas are relative and the mechanism is unchanged at 114:
 
 | mutation | caught by |
 |---|---|
@@ -483,18 +598,31 @@ a case that quietly lost its expectation would have survived, and a table
 counting 101 cases while asserting 100 is exactly the silently-shrunken table
 this file exists to prevent.
 
-Readings taken when this file was written, on `7_overnight`:
+Readings, each taken on the branch that took them and none of them inherited:
 
-| instrument | live cases | deleted cases | ids |
-|---|---|---|---|
-| PyYAML `len()` | 101 | 11 | — |
-| `grep -c` | 101 | 11 | 112 |
+| instrument | live cases | deleted cases | ids | branch |
+|---|---|---|---|---|
+| PyYAML `len()` | 101 | 11 | — | `7_overnight` |
+| `grep -c` | 101 | 11 | 112 | `7_overnight` |
+| PyYAML `len()` | **114** | 11 | — | `25_overnight` |
+| `grep -c` | **114** | 11 | **125** | `25_overnight` |
 
-101 + 11 = 112. Coverage checked from the data: 32 `spec_rows`, **0 uncovered**,
+114 + 11 = 125. Coverage checked from the data: 37 `spec_rows`, **0 uncovered**,
 0 `covers` entries naming a row that does not exist, 0 duplicate ids, 0 cases
 without an `expect.body`, 0 `deleted_cases` carrying an `expect`.
 
-By endpoint: `/nic/update` 56, `/nic/delete` 37, `/nic/checkip` 8.
+By endpoint: `/nic/update` 62, `/nic/delete` 39, `/nic/checkip` 13. By method:
+`GET` 105, `HEAD` 5, `POST` 4 — the 9 non-`GET` cases are #25's, and before
+them the table's own divergence 4 ("everything is HTTP 200") was unfalsifiable
+from inside the table, because every case in it was a `GET`.
+
+**The delta from 101 is +13, and it is not "three divergences, three cases".**
+D7 takes 4 (a legacy/host pair per endpoint, because only the status is shared
+between Werkzeug's HTML page and FastAPI's JSON one), D8 takes 1, D9 takes 3
+(inert as a fallback, inert beside a parseable `X-Forwarded-For`, and inert on
+the endpoint that writes DNS), and the `HEAD` decision takes 5 (a legacy/host
+pair for `update` and for `delete`, plus one shared case pinning that `HEAD` on
+`checkip` is *kept*). #9's estimate was 2 + 1 + 0 = 3.
 
 ### Calibration against the legacy code
 
@@ -704,7 +832,7 @@ what was being run.
 The requirement now fires at **collection of the wire cases** instead. Without
 `--target`, `test_case` is collected as one skip named
 `NO-TARGET-GIVEN-WIRE-TABLE-NOT-RUN`, every service-free guard runs, and the
-session prints *"the wire table was NOT RUN (0 of 101 cases executed)"* rather
+session prints *"the wire table was NOT RUN (0 of 114 cases executed)"* rather
 than a zeroed accounting block that reads like a clean run. What did **not**
 change: no wire case can execute without an explicit target, and a `--base-url`
 with no `--target` is still refused outright with exit 4 — that one is not a
@@ -713,10 +841,11 @@ sibling suite being swept up, it is a service nobody named.
 subprocess, because a runner cannot assert its own exit code.
 
 Going the other way, `pytest tests/compat --target host` collects these 18
-alongside the wire runner's 108 and the 6 contract tests, for 132. The runner's
-own accounting block is unaffected — it still reports 101 selected cases, 3
-unmet preconditions, 11 wire-only — because it counts the table, not the
-session.
+alongside the wire runner's 117 (110 cases + 7 guards) and the 6 contract
+tests, for 141. The runner's own accounting block is unaffected — it reports
+114 cases, 110 selected, 3 unmet preconditions, 15 wire-only — because it
+counts the table, not the session. (The same numbers read 108 / 126 and
+101 / 11 at #10, and 108 / 132 at #23; the table grew to 114 in #25.)
 
 ## In the gate
 
@@ -726,7 +855,7 @@ half unconditionally, the wire table not at all.
 | | runs | how |
 |---|---|---|
 | model guards + runner guards + runner contract | every `make test-backend`, so every gate run | `tests/` is COPYed into the Dockerfile's `dev` stage at `/opt/compat_tests`; `make test-backend` runs a second pytest session over it |
-| the 101-case wire table | never automatically | `make test-compat TARGET=legacy\|host BASE_URL=<url>` — both required, neither defaulted |
+| the 114-case wire table | never automatically | `make test-compat TARGET=legacy\|host BASE_URL=<url>` — both required, neither defaulted |
 
 `make test-compat` is deliberately outside `make test` and outside the gate: it
 needs a live service, and which service it is has to be stated. Giving either
