@@ -5,6 +5,9 @@
 - ``GET /api/atrium_ddns/board`` — the device board and the resolution
   strips, gated by ``atrium_ddns.device.manage`` and scoped by
   :class:`~atrium_ddns.scope.DdnsScope`.
+- ``GET /api/atrium_ddns/events`` — the log search. Authenticated, and
+  scoped: a tenant sees their own rows and ``atrium_ddns.events.read.all``
+  widens that and nothing else. Every filter is an indexed query.
 
 Atrium mounts every JSON route under ``/api/...`` so the SPA owns
 un-prefixed URL space (atrium issue #89); host routes follow the same
@@ -41,12 +44,13 @@ from enum import Enum
 from typing import Any, Literal
 
 import sqlalchemy as sa
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_dirty
+from sqlalchemy.sql import Select
 
 from app.auth.rbac import require_perm
 from app.auth.users import current_user
@@ -64,8 +68,18 @@ from .models import (
     DomainBackend,
     Hostname,
 )
-from .providers import known_services, provider_class
-from .scope import DdnsScope, get_scope
+from .providers import PROVIDER_STATUSES, known_services, provider_class
+from .router_nic import (
+    EVENT_AUTH,
+    EVENT_DELETE,
+    EVENT_UPDATE,
+    STATUS_911,
+    STATUS_ABUSE,
+    STATUS_BADAUTH,
+    STATUS_NOHOST,
+    STATUS_NOTFQDN,
+)
+from .scope import EVENTS_CROSS_TENANT_PERMISSION, DdnsScope, get_scope
 from .worker_jobs import (
     SUCCESS_RESPONSE_CODES,
     DnsCheckStatus,
@@ -1950,3 +1964,647 @@ async def delete_device(
         diff={"name": name, "username": username},
     )
     await session.commit()
+
+
+# --------------------------------------------------------------------- #
+# Log search
+# --------------------------------------------------------------------- #
+#
+# The old UI had a scrolling event log with a 24-hour horizon. The
+# question people actually ask is *"which of my devices stopped
+# updating, and when"* — unanswerable by scrolling, and unanswerable at
+# 24 hours. Retention is now ~30 days (#17), so this is a **search**
+# surface: filters combinable, every one of them an indexed query.
+#
+# Three properties the rest of this section exists to hold:
+#
+# 1. **Every filter narrows the SQL.** Not one of them is applied in
+#    Python after a wide fetch, and not one of them is applied in the
+#    browser. ``(user_id, created_at)`` and ``(device_id, created_at)``
+#    exist for exactly this, and ``test_router_events.py`` reads the
+#    optimiser's own ``EXPLAIN`` rather than trusting the ORM's intent.
+#
+# 2. **Two reaches, two mechanisms.** A tenant reading their own rows
+#    needs nothing but a session; ``atrium_ddns.events.read.all`` opens
+#    the cross-tenant view and *nothing else*. #14 asserted those are
+#    different reaches, and a single ``require_perm`` on this endpoint
+#    would collapse them — either locking every ordinary tenant out of
+#    their own history, or turning a read-the-log grant into the only
+#    way to reach the surface at all. See :func:`get_events`.
+#
+# 3. **The denormalised name columns are what renders.** A row about a
+#    deleted device stays readable, which is precisely when the log is
+#    being read. The id travels beside the name so the UI can tell "you
+#    can filter on this" from "this device is gone", and those are two
+#    different sentences rather than one blank.
+
+
+#: What a ``backend_type`` filter says when it means ``IS NULL``.
+#:
+#: ``NULL`` in that column is a *meaning*, not a missing value:
+#: ``models.DnsEvent`` records it as "decided before any backend was
+#: contacted" — badauth, abuse, 911, notfqdn, nohost, and a hostname
+#: whose domain has zero backends. So *no filter*, *this provider* and
+#: *no provider was reached* are three states, and a query string that
+#: can only express two of them cannot ask the third question.
+#:
+#: Shipped to the client in :class:`EventVocabulary` rather than typed
+#: into the frontend, so there is one spelling of the sentinel and not
+#: two. A provider can never collide with it: ``known_services()`` are
+#: real service names and this is not a legal one.
+BACKEND_TYPE_NONE = "__none__"
+
+#: ``ddns_event.event_type`` values that have a **writer**.
+#:
+#: Three, and the count is the point. ``models.DnsEvent``'s own comment
+#: lists ``'update' | 'delete' | 'checkip' | 'auth' | 'healthcheck' |
+#: …``, but ``checkip`` and ``healthcheck`` are written by nothing in
+#: this codebase — a grep for ``event_type=`` reaches
+#: :mod:`atrium_ddns.router_nic` and nowhere else, and it passes exactly
+#: these three constants. Offering the other two as filter options would
+#: ship a dropdown entry that can never match a row: the
+#: artefact-with-no-writer defect wearing a select box's clothes, and
+#: indistinguishable to a user from "that has not happened lately".
+#:
+#: Imported from the writer rather than retyped, and
+#: ``test_router_events.py`` re-derives the set from every ``EVENT_*``
+#: constant in ``router_nic`` so a fourth one added there fails here
+#: rather than silently going unfilterable.
+EVENT_TYPES: tuple[str, ...] = tuple(sorted({EVENT_UPDATE, EVENT_DELETE, EVENT_AUTH}))
+
+#: Every ``response_code`` the wire can carry, from the two modules that
+#: own the halves: ``providers.PROVIDER_STATUSES`` is what an adapter
+#: returns, and the five below are decided by ``router_nic`` before or
+#: instead of a provider. Derived from both rather than restated, so a
+#: sixth refusal added to either half appears here.
+RESPONSE_CODES: tuple[str, ...] = tuple(
+    sorted(
+        PROVIDER_STATUSES
+        | {STATUS_BADAUTH, STATUS_ABUSE, STATUS_NOHOST, STATUS_NOTFQDN, STATUS_911}
+    )
+)
+
+#: Response codes on rows that carry **no tenant at all**, and are
+#: therefore invisible to every tenant-scoped query.
+#:
+#: Found by running real traffic through ``/nic/update`` and reading the
+#: result, not by reading the code. ``_admit`` writes the ``badauth``
+#: row *before* a device is resolved — it has to, because there is no
+#: device — so ``user_id``, ``device_id`` and every denormalised name on
+#: that row are ``NULL``. ``scope.py`` then documents the consequence in
+#: as many words: ``user_id == uid`` is never true for ``NULL``, so an
+#: orphan row "is invisible to every tenant", and widening that "looks
+#: like a kindness" and hands every tenant the deleted tenant's history.
+#:
+#: Both halves of that are right. The consequence for **this** surface
+#: is not: ``response_code=badauth`` is offered in the filter vocabulary,
+#: and for an ordinary tenant it returns zero rows *however many times
+#: their router failed to authenticate*. Zero rows is exactly what "my
+#: credentials are fine" looks like, so the single most common support
+#: question — *why is my router not updating* — gets a confidently wrong
+#: answer from the surface built to answer it.
+#:
+#: Naming it is what this constant is for. The query still runs; the
+#: response carries an :class:`UnmatchableFilter` saying the rows exist
+#: and are not attributable, which is a different sentence from "there
+#: were none". Fixing it properly means attributing the row to the
+#: username that was tried, and that is a decision about confirming
+#: which usernames exist — ``authenticate_device`` deliberately does not
+#: distinguish "no such user" from "wrong password". That belongs to
+#: #16's writer and to the milestone owner, not to a reader.
+UNATTRIBUTED_RESPONSE_CODES: frozenset[str] = frozenset({STATUS_BADAUTH})
+
+#: Page size. The default is a screenful and a half; the ceiling stops
+#: a hand-written query string turning a keyset scan into a full read of
+#: the retention window.
+EVENTS_DEFAULT_LIMIT = 100
+EVENTS_MAX_LIMIT = 500
+
+
+class EventRow(BaseModel):
+    """One line of the log, as it renders.
+
+    **The names are the display and the ids are the controls.** Both
+    halves of every pair are carried because they answer different
+    questions:
+
+    - ``device_name`` is captured at write time and survives the device
+      being deleted. It is what the row *says*.
+    - ``device_id`` is ``ON DELETE SET NULL``, so it is ``None`` exactly
+      when the device is gone. It is what the row can be *filtered by*.
+
+    A UI given only the id renders a wall of blanks for a deleted
+    device, which is the state the log is most often opened to
+    investigate. A UI given only the name cannot offer "show me
+    everything this device did". Given both, it renders the name and
+    offers the filter only when there is something to filter on — and
+    the difference between the two is visible to the reader rather than
+    inferred from an inert link.
+    """
+
+    id: int
+    created_at: str
+
+    user_id: int | None
+    user_email: str | None
+    device_id: int | None
+    device_name: str | None
+    domain_id: int | None
+    domain_name: str | None
+    hostname_id: int | None
+    hostname: str | None
+
+    event_type: str
+    response_code: str | None
+    client_ip: str | None
+    #: The address the request was *about* (``myip``, normalised). Not
+    #: the same fact as ``client_ip``, and the difference is the
+    #: interesting part of a NAT'd update (``router_nic.py:670``).
+    ip: str | None
+    backend_type: str | None
+    message: str | None
+
+
+class EventVocabulary(BaseModel):
+    """The filter values this installation can actually produce.
+
+    Shipped with every page so the frontend cannot invent an option.
+    Every list is derived — from the writer's own constants, from the
+    provider registry — so a provider deleted from ``_PROVIDERS`` takes
+    its filter option with it.
+    """
+
+    event_types: list[str]
+    response_codes: list[str]
+    backend_types: list[str]
+    #: The sentinel for ``backend_type IS NULL``. Transported rather
+    #: than duplicated: two spellings of a sentinel is a filter that
+    #: silently stops matching.
+    backend_type_none: str
+    #: ``worker_jobs.SUCCESS_RESPONSE_CODES``, verbatim.
+    #:
+    #: Carried because the log's one accented rendering keys off it —
+    #: ``ui-design.md`` §1.2 Rule 2: ``--ddns-diverge`` appears nowhere
+    #: except on a measured disagreement, and on this surface a
+    #: non-success response code *is* the measured disagreement. A
+    #: frontend holding its own ``['good', 'nochg']`` would be a second
+    #: implementation of a classification the health-check job already
+    #: owns, and the two would part company the first time a code was
+    #: reclassified — silently, because both renderings look correct.
+    success_response_codes: list[str]
+
+
+class EventFilters(BaseModel):
+    """The filters that were **applied**, echoed back.
+
+    Not the ones that were asked for — the ones the query ran with. An
+    empty result is only interpretable beside the filters that produced
+    it, and a UI that renders its own filter state next to a server's
+    rows is two sources of truth for one question.
+    """
+
+    user_id: int | None = None
+    device_id: int | None = None
+    domain_id: int | None = None
+    hostname_id: int | None = None
+    event_type: str | None = None
+    response_code: str | None = None
+    backend_type: str | None = None
+    client_ip: str | None = None
+    since: str | None = None
+    until: str | None = None
+
+
+class UnmatchableFilter(BaseModel):
+    """A filter that ran and structurally cannot have matched.
+
+    Both fields are needed. ``filter`` is the reader's own input, so
+    they can see which of several it was; ``reason`` is why, because
+    "no rows" has at least three causes on this surface and only one of
+    them means *nothing happened*.
+    """
+
+    #: ``key=value``, the reader's own input.
+    filter: str
+    #: One sentence, in the interface's voice.
+    reason: str
+
+
+class EventPage(BaseModel):
+    """One page of the log, and everything needed to read a zero."""
+
+    rows: list[EventRow]
+    #: Keyset cursor for the next page, or ``None`` when this is the
+    #: last one. Derived by fetching ``limit + 1`` rows and dropping the
+    #: extra — so "is there more" is answered without a ``COUNT(*)``
+    #: over the retention window.
+    next_cursor: str | None
+    limit: int
+    filters: EventFilters
+    vocabulary: EventVocabulary
+    #: ``DdnsConfig.event_retention_days``, read from the API so the
+    #: UI's "the log holds the last N days" sentence cannot go stale
+    #: when an operator changes it.
+    retention_days: int
+    #: Whether this caller is reading across tenants, and therefore
+    #: whether the user column means anything. The UI shows it only when
+    #: this is true — rendering an always-identical column is noise, and
+    #: deciding it client-side from a permission list is a second
+    #: implementation of a rule the server already applied.
+    cross_tenant: bool
+    #: **Three states, deliberately.** ``None`` means *not measured* —
+    #: the page had rows, so the question was never asked. ``True``
+    #: means the scope holds rows but none match these filters.
+    #: ``False`` means the scope holds no rows at all.
+    #:
+    #: Those are three different sentences on an empty panel — "narrow
+    #: your filters", against "nothing has ever been logged; add a
+    #: device" — and collapsing them into a boolean makes a working
+    #: filter look like an empty account.
+    any_rows_in_scope: bool | None
+    #: Filters that cannot match a row **for this caller**, each with
+    #: the reason. A typo'd ``backend_type`` otherwise returns zero rows
+    #: and reads exactly like "no traffic for that provider"; a
+    #: tenant-scoped ``badauth`` filter returns zero rows and reads
+    #: exactly like "my credentials are fine". Both are false negatives
+    #: carrying the authority of a measurement, and they are two
+    #: different sentences. Empty for the normal case.
+    unmatchable_filters: list[UnmatchableFilter] = Field(default_factory=list)
+
+
+def _parse_instant(raw: str | None, *, field: str) -> datetime | None:
+    """An ISO-8601 string to the naive-UTC shape every column here uses.
+
+    Refuses rather than guessing. A range endpoint that silently became
+    ``None`` on a parse failure would widen the query to the whole
+    retention window and report the result as if the range had been
+    applied — a filter that reads as applied and is not.
+    """
+    if raw is None or raw == "":
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{field} is not an ISO-8601 instant: {exc}",
+        ) from exc
+    if parsed.tzinfo is None:
+        return parsed
+    return parsed.astimezone(UTC).replace(tzinfo=None)
+
+
+def encode_cursor(created_at: datetime, row_id: int) -> str:
+    """``(created_at, id)`` as one opaque-but-legible string.
+
+    Legible on purpose: an opaque base64 blob costs a decode step every
+    time someone reads a request log, and there is nothing secret in a
+    timestamp the caller was just shown. ``id`` is in it because
+    ``created_at`` is not unique — a router bursting several hostnames
+    writes several rows inside one microsecond, and a cursor on the
+    timestamp alone either loses those rows or repeats them forever.
+    """
+    return f"{_iso(created_at)}|{row_id}"
+
+
+def decode_cursor(raw: str | None) -> tuple[datetime, int] | None:
+    """The inverse, refusing anything it cannot read."""
+    if raw is None or raw == "":
+        return None
+    head, _, tail = raw.rpartition("|")
+    if not head or not tail.isdigit():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="cursor is not a '<iso8601>|<id>' pair",
+        )
+    parsed = _parse_instant(head, field="cursor")
+    assert parsed is not None  # `head` is non-empty
+    return parsed, int(tail)
+
+
+def build_events_query(
+    *,
+    scope: DdnsScope,
+    filters: EventFilters,
+    cursor: tuple[datetime, int] | None,
+    limit: int,
+) -> Select:
+    """The whole search, as one statement. Pure — no IO.
+
+    Pure so the SQL can be compiled and read in a test without a
+    database, which is one of the two instruments on the acceptance
+    criterion *"filters are indexed queries, not client-side filtering
+    of a large fetch"*. The other is an ``EXPLAIN`` against a live
+    MySQL: this one reads our intent, that one reads the optimiser's
+    decision, and only the pair can catch a filter that is present in
+    the ``WHERE`` clause and unservable by an index.
+
+    Ordering and the cursor
+    -----------------------
+    ``ORDER BY created_at DESC, id DESC`` — newest first, which is the
+    only order a log is read in. The keyset predicate is written as::
+
+        created_at <= :c AND (created_at < :c OR id < :i)
+
+    rather than the equivalent single ``OR``, and the shape is the
+    point. The first conjunct is a plain range on the compound index's
+    trailing column, so ``(user_id, created_at)`` still serves the scan;
+    the second is a tie-break applied to the handful of rows sharing a
+    microsecond. Written as one ``OR`` across both columns it is not
+    sargable, the optimiser falls back to a scan, the rows are identical
+    — and ``EXPLAIN`` is the only thing that would tell you.
+
+    ``OFFSET`` is deliberately absent. ``LIMIT 100 OFFSET 5000`` reads
+    5100 rows to return 100, which is the "client-side filtering of a
+    large fetch" defect moved one layer down where it is harder to see.
+    """
+    stmt = scope.select(DnsEvent)
+
+    # Every one of these is a column with an index in front of it:
+    # `(user_id, created_at)`, `(device_id, created_at)`,
+    # `ix_ddns_event_domain_id`, `ix_ddns_event_hostname_id`,
+    # `ix_ddns_event_client_ip`.
+    if filters.user_id is not None:
+        stmt = stmt.where(DnsEvent.user_id == filters.user_id)
+    if filters.device_id is not None:
+        stmt = stmt.where(DnsEvent.device_id == filters.device_id)
+    if filters.domain_id is not None:
+        stmt = stmt.where(DnsEvent.domain_id == filters.domain_id)
+    if filters.hostname_id is not None:
+        stmt = stmt.where(DnsEvent.hostname_id == filters.hostname_id)
+    if filters.client_ip is not None:
+        stmt = stmt.where(DnsEvent.client_ip == filters.client_ip)
+    if filters.event_type is not None:
+        stmt = stmt.where(DnsEvent.event_type == filters.event_type)
+    if filters.response_code is not None:
+        stmt = stmt.where(DnsEvent.response_code == filters.response_code)
+    if filters.backend_type is not None:
+        # The third state. `IS NULL` is a question about a meaning, not
+        # a fallback for an absent parameter.
+        if filters.backend_type == BACKEND_TYPE_NONE:
+            stmt = stmt.where(DnsEvent.backend_type.is_(None))
+        else:
+            stmt = stmt.where(DnsEvent.backend_type == filters.backend_type)
+
+    since = _parse_instant(filters.since, field="since")
+    until = _parse_instant(filters.until, field="until")
+    if since is not None:
+        stmt = stmt.where(DnsEvent.created_at >= since)
+    if until is not None:
+        stmt = stmt.where(DnsEvent.created_at <= until)
+
+    if cursor is not None:
+        at, row_id = cursor
+        stmt = stmt.where(
+            DnsEvent.created_at <= at,
+            sa.or_(DnsEvent.created_at < at, DnsEvent.id < row_id),
+        )
+
+    return stmt.order_by(DnsEvent.created_at.desc(), DnsEvent.id.desc()).limit(limit)
+
+
+def _row_out(event: DnsEvent) -> EventRow:
+    """One ORM row to one wire row. No verdicts, no derivation."""
+    return EventRow(
+        id=event.id,
+        created_at=_iso(event.created_at) or "",
+        user_id=event.user_id,
+        user_email=event.user_email,
+        device_id=event.device_id,
+        device_name=event.device_name,
+        domain_id=event.domain_id,
+        domain_name=event.domain_name,
+        hostname_id=event.hostname_id,
+        hostname=event.hostname,
+        event_type=event.event_type,
+        response_code=event.response_code,
+        client_ip=event.client_ip,
+        ip=event.ip,
+        backend_type=event.backend_type,
+        message=event.message,
+    )
+
+
+def _vocabulary() -> EventVocabulary:
+    return EventVocabulary(
+        event_types=list(EVENT_TYPES),
+        response_codes=list(RESPONSE_CODES),
+        backend_types=list(known_services()),
+        backend_type_none=BACKEND_TYPE_NONE,
+        success_response_codes=sorted(SUCCESS_RESPONSE_CODES),
+    )
+
+
+def unmatchable(
+    filters: EventFilters,
+    vocabulary: EventVocabulary,
+    *,
+    cross_tenant: bool,
+) -> list[UnmatchableFilter]:
+    """Filters that ran and structurally cannot have matched.
+
+    A zero result is a measurement only when the question was askable.
+    Two ways it is not, and they are different sentences:
+
+    **The value does not exist here.** ``backend_type=rout53`` returns
+    zero rows and reads exactly like *no traffic for that provider* — a
+    false negative wearing a number, the defect family this repository
+    catalogues as "the probe that could not fail", pointed at a filter
+    instead of a metric. It is **named** rather than refused: V1M4
+    imports the legacy service's history, and a row carrying a service
+    name this build does not ship must stay findable.
+
+    **The rows exist and are not yours.** ``response_code=badauth`` in a
+    tenant-scoped query returns zero rows *however many times that
+    tenant's router failed to authenticate*, because the writer has no
+    device to attribute the row to and ``user_id IS NULL`` is invisible
+    to every tenant. See :data:`UNATTRIBUTED_RESPONSE_CODES`. This is
+    the one that matters, because zero is also what a healthy account
+    looks like.
+
+    ``cross_tenant`` is a keyword and required: the second reason is a
+    property of *this caller*, not of the installation, and a signature
+    that let it default would answer the wrong question by omission.
+    """
+    out: list[UnmatchableFilter] = []
+    if (
+        filters.event_type is not None
+        and filters.event_type not in vocabulary.event_types
+    ):
+        out.append(
+            UnmatchableFilter(
+                filter=f"event_type={filters.event_type}",
+                reason=(
+                    "no writer in this installation produces that event type, "
+                    "so no row can carry it"
+                ),
+            )
+        )
+    if filters.response_code is not None:
+        if filters.response_code not in vocabulary.response_codes:
+            out.append(
+                UnmatchableFilter(
+                    filter=f"response_code={filters.response_code}",
+                    reason="that is not a response code this service answers with",
+                )
+            )
+        elif (
+            not cross_tenant
+            and filters.response_code in UNATTRIBUTED_RESPONSE_CODES
+        ):
+            out.append(
+                UnmatchableFilter(
+                    filter=f"response_code={filters.response_code}",
+                    reason=(
+                        "these lines are written before any device is "
+                        "identified, so they belong to no account and cannot "
+                        "appear in your log. A zero here is not evidence that "
+                        "your credentials are working."
+                    ),
+                )
+            )
+    if (
+        filters.backend_type is not None
+        and filters.backend_type != vocabulary.backend_type_none
+        and filters.backend_type not in vocabulary.backend_types
+    ):
+        out.append(
+            UnmatchableFilter(
+                filter=f"backend_type={filters.backend_type}",
+                reason=(
+                    "that is not a provider this installation knows about, "
+                    "so no row can name it"
+                ),
+            )
+        )
+    return out
+
+
+@router.get("/events", response_model=EventPage)
+async def get_events(
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+    user_id: int | None = Query(default=None),
+    device_id: int | None = Query(default=None),
+    domain_id: int | None = Query(default=None),
+    hostname_id: int | None = Query(default=None),
+    event_type: str | None = Query(default=None),
+    response_code: str | None = Query(default=None),
+    backend_type: str | None = Query(default=None),
+    client_ip: str | None = Query(default=None),
+    since: str | None = Query(default=None),
+    until: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=EVENTS_DEFAULT_LIMIT, ge=1, le=EVENTS_MAX_LIMIT),
+) -> EventPage:
+    """The log, filtered, newest first.
+
+    Two reaches, two mechanisms, and keeping them apart is the whole
+    authorisation story
+    ------------------------------------------------------------------
+    **Reach one — your own rows.** Any authenticated caller. There is no
+    ``require_perm`` on this endpoint, and that is deliberate rather
+    than an omission. ``get_scope`` resolves through
+    ``current_principal``, which resolves through ``current_user``, so
+    an anonymous request is already 401 and atrium's TOTP gate is
+    already enforced; and ``DdnsScope.for_principal`` always carries the
+    caller's ``user_id``, so the predicate this statement runs with is
+    ``ddns_event.user_id = :me``. A tenant reading their own update
+    history needs no grant to do it — it is their data, and gating the
+    endpoint on ``atrium_ddns.events.read.all`` would lock every
+    ordinary tenant out of the surface built for them.
+
+    **Reach two — everybody's rows.** ``atrium_ddns.events.read.all``,
+    and it opens the audit log **and nothing else**: ``scope.py``
+    records it against ``DnsEvent``'s ``TenantPath`` alone, so the same
+    grant that widens this query leaves ``Domain``, ``Device``,
+    ``Hostname`` and ``DomainBackend`` scoped exactly as before. That is
+    #14's assertion, and it is what makes a support role possible — read
+    anyone's update history without being able to touch anyone's zones.
+
+    A single ``require_perm(EVENTS_CROSS_TENANT_PERMISSION)`` on this
+    handler would collapse the two into one check and be wrong in both
+    directions at once: it locks ordinary tenants out of their own log,
+    and it turns a read-the-log grant into the only way to reach the
+    surface at all.
+
+    The one place the two meet is ``?user_id=``. Filtering to *someone
+    else* is reach two; filtering to yourself is reach one, and it is
+    allowed because it is a no-op the scope already enforces. Asking for
+    another tenant without the grant is **403 naming the permission** —
+    not a silent narrowing to your own rows (which answers a question
+    nobody asked, in a shape indistinguishable from the answer to the
+    one they did ask) and not an empty list (which is a false negative
+    with the authority of a measurement).
+    """
+    config = await load_config(session)
+    cross_tenant = scope.reaches_all_tenants(DnsEvent)
+
+    if user_id is not None and not cross_tenant and user_id != scope.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"reading another tenant's log needs the "
+                f"{EVENTS_CROSS_TENANT_PERMISSION} permission. This is a "
+                f"refusal, not an empty log."
+            ),
+        )
+
+    filters = EventFilters(
+        user_id=user_id,
+        device_id=device_id,
+        domain_id=domain_id,
+        hostname_id=hostname_id,
+        event_type=event_type,
+        response_code=response_code,
+        backend_type=backend_type,
+        client_ip=client_ip,
+        since=since,
+        until=until,
+    )
+
+    # `limit + 1`: the extra row is how "is there another page" is
+    # answered. A `COUNT(*)` over the same predicate would read the
+    # whole matching set to produce a number nothing on this surface
+    # renders.
+    stmt = build_events_query(
+        scope=scope,
+        filters=filters,
+        cursor=decode_cursor(cursor),
+        limit=limit + 1,
+    )
+    fetched = list((await session.execute(stmt)).scalars().all())
+    has_more = len(fetched) > limit
+    events = fetched[:limit]
+
+    next_cursor = (
+        encode_cursor(events[-1].created_at, events[-1].id)
+        if has_more and events
+        else None
+    )
+
+    # Asked only when the page came back empty, and *only* about the
+    # scope — no filters. This is what separates "your filters matched
+    # nothing" from "nothing has ever been logged for you", which are
+    # two different empty panels with two different next actions. It is
+    # one indexed row read (`LIMIT 1` on the tenancy predicate), and it
+    # stays `None` — not `False` — on the path where it was never asked.
+    any_rows_in_scope: bool | None = None
+    if not events:
+        probe = scope.select(DnsEvent, DnsEvent.id).limit(1)
+        any_rows_in_scope = (await session.execute(probe)).first() is not None
+
+    vocabulary = _vocabulary()
+    return EventPage(
+        rows=[_row_out(event) for event in events],
+        next_cursor=next_cursor,
+        limit=limit,
+        filters=filters,
+        vocabulary=vocabulary,
+        retention_days=config.event_retention_days,
+        cross_tenant=cross_tenant,
+        any_rows_in_scope=any_rows_in_scope,
+        unmatchable_filters=unmatchable(
+            filters, vocabulary, cross_tenant=cross_tenant
+        ),
+    )

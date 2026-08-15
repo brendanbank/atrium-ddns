@@ -17,6 +17,7 @@
 import {
   IconHandStop,
   IconKey,
+  IconListSearch,
   IconRouter,
   IconWorld,
 } from '@tabler/icons-react';
@@ -32,6 +33,7 @@ import { AtriumDdnsWidget } from './AtriumDdnsWidget';
 import { DeviceBoardPage } from './DeviceBoardPage';
 import { DevicesPage } from './DevicesPage';
 import { DomainsPage } from './DomainsPage';
+import { LOG_PATH, LogSearchPage } from './LogSearchPage';
 
 /** The board's path. Exported so a test asserts the registered route
  *  against the same string the nav item points at, rather than against
@@ -41,6 +43,11 @@ export const BOARD_PATH = '/atrium-ddns/board';
 /** #45's two tenant surfaces, same rule. */
 export const DOMAINS_PATH = '/atrium-ddns/domains';
 export const DEVICES_PATH = '/atrium-ddns/devices';
+
+/** #46's log search. Defined in `LogSearchPage` because `logHref` needs
+ *  it too, and re-exported here so this file stays the one place a
+ *  reader looks for "what paths does this bundle own". */
+export { LOG_PATH };
 
 const reg = window.__ATRIUM_REGISTRY__ as AtriumRegistry | undefined;
 const AtriumReact = window.React;
@@ -106,6 +113,26 @@ if (!reg || !AtriumReact) {
     label: 'Devices',
     to: DEVICES_PATH,
     icon: AtriumReact.createElement(IconKey, { size: 18 }),
+  });
+  // #46's log search. Deliberately **not** permission-gated at the
+  // registry level and deliberately carrying no `perm` — but for a
+  // different reason from the three above, and the difference matters.
+  // Those render a refusal because they *are* gated. This one is not
+  // gated at all: any authenticated caller may read their own log,
+  // because it is their own data. `atrium_ddns.events.read.all` widens
+  // the query to every tenant and does nothing else — #14 asserted
+  // those are different reaches, and a `perm` here would collapse them
+  // by hiding the surface from the people it was built for.
+  reg.registerRoute({
+    key: 'atrium-ddns-logs',
+    path: LOG_PATH,
+    render: () => makeWrapperElement(<LogSearchPage />),
+  });
+  reg.registerNavItem({
+    key: 'atrium-ddns-logs-nav',
+    label: 'Log search',
+    to: LOG_PATH,
+    icon: AtriumReact.createElement(IconListSearch, { size: 18 }),
   });
   reg.registerAdminTab({
     key: 'atrium-ddns',

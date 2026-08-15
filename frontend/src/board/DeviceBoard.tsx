@@ -34,10 +34,27 @@
 import { useState } from 'react';
 
 import type { Board, BoardDevice, BoardHostname } from '../api/board';
+import { LogLink } from '../LogSearchPage';
 import { ResolutionStrip, StripSkeleton } from './ResolutionStrip';
 import { absoluteTitle, formatAge } from './format';
 
+/* The board answers *which* device stopped talking. The next question is
+   always *when, and what did it say* — and that is the log, filtered to
+   this row. #46's acceptance criterion is that the filters are
+   "reachable pre-applied from any device or hostname row"; these two
+   links are what makes that literal. The filter travels as the row's
+   id, so a device whose name was reused does not collect a predecessor's
+   history. */
+
 function HostnameBlock({ hostname }: { hostname: BoardHostname }) {
+  const logLink = (
+    <LogLink
+      params={{ hostname_id: hostname.id }}
+      data-testid={`hostname-${hostname.name}-log`}
+    >
+      log
+    </LogLink>
+  );
   if (hostname.strips.length === 0) {
     return (
       <div className="ddns-hostname__strips" data-testid={`hostname-${hostname.name}`}>
@@ -46,6 +63,7 @@ function HostnameBlock({ hostname }: { hostname: BoardHostname }) {
             `hostnames_never_written` rather than dropping it. Two empty
             rails would be the lie. */}
         <span className="ddns-label">nothing published yet — no strip to draw</span>
+        {logLink}
       </div>
     );
   }
@@ -58,6 +76,7 @@ function HostnameBlock({ hostname }: { hostname: BoardHostname }) {
           strip={strip}
         />
       ))}
+      {logLink}
     </div>
   );
 }
@@ -115,6 +134,12 @@ function DeviceBlock({
       </button>
       {expanded ? (
         <div className="ddns-device__hostnames">
+          <LogLink
+            params={{ device_id: device.id }}
+            data-testid={`device-${device.name}-log`}
+          >
+            log for this device
+          </LogLink>
           {device.hostnames.length === 0 ? (
             <span className="ddns-label">
               this device has no hostnames. Assign one to start tracking it.
