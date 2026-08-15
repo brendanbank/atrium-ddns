@@ -1,0 +1,1245 @@
+# Legacy MODEL behaviour that survives the rewrite.
+#
+# Data only. No Python, no expressions, no imports.
+#
+# `../protocol_cases.yaml` owns the WIRE: status strings, response bodies,
+# aggregation, byte-exact comparisons against a base URL. This file owns
+# everything the wire cannot see -- what is in the row after the request, how
+# many rows there are, which branch of a resolver ran, and what a limit
+# arithmetically means. The two files never assert the same thing; see
+# `../README.md` section "Model behaviour vs the wire table".
+#
+# Source of truth is the *behaviour* of `brendanbank/dyndns-route53` at `main`
+# (commit 5d1c941), read directly from `models.py`, `dyndns.py`,
+# `rate_limiter.py`, `health_checker.py`, `forms.py` and
+# `lib/account/hetzner.py` -- not from the old test suite's assertions, which
+# are a second source and frequently narrower than the code.
+#
+# 71 of the cases below were replayed against that implementation by
+# `calibrate_against_legacy.py`. The `calibrated` field records the result.
+
+version: 1
+
+# ---------------------------------------------------------------------------
+# What a disposition means. Every case has one, and `preserve` is not the
+# default -- three of these rules are defects and one is a planned change, and
+# recording them as such is the point of freezing them at all.
+# ---------------------------------------------------------------------------
+dispositions:
+  preserve: >-
+    the host must behave the same way. A change here is a compatibility
+    regression.
+  fix: >-
+    the legacy behaviour is a defect. `legacy` records what it does today and
+    `host` records what the rewrite must do instead. Nothing on the wire
+    depends on it, which is why it is safe to fix.
+  change: >-
+    a deliberate design change carried by `docs/ops/refactor-plan.md`. `legacy`
+    records what it does today so the change stays a decision rather than
+    becoming a drift.
+
+# ---------------------------------------------------------------------------
+# Subjects. A case belongs to exactly one.
+# ---------------------------------------------------------------------------
+subjects:
+  hostname: "the Hostname row: naming, uniqueness, ownership"
+  ttl: "where the TTL comes from, what validates it, where it goes"
+  backends: "Hostname.get_backends() -- which backends a request actually reaches"
+  rate_limit: "the arithmetic of the limiter and where its numbers come from"
+  event_log: "the shape of the rows the DDNS path writes to `events`"
+  ip_tracking: "last_ip_v4 / last_ip_v6 / last_updated_at as a data source"
+  provider: "the contract every DNS backend adapter must satisfy"
+  health_check: "how a resolver answer becomes a HealthCheck status"
+  storage: "domains, backends and their credentials at rest"
+  auth: "what the DDNS credential is, and what it is not"
+
+# ---------------------------------------------------------------------------
+# Case fields
+#
+#   id           unique, stable, referenced from legacy_inventory.yaml
+#   subject      one of `subjects`
+#   disposition  one of `dispositions`
+#   given        the situation
+#   then         what must be true. Never an HTTP status string or a response
+#                body -- those belong to protocol_cases.yaml
+#   evidence     where the rule was read from
+#   source       legacy test ids this rule was found in. `[]` means the rule
+#                was found by reading the code and no legacy test covers it
+#   calibrated   agree           replayed by calibrate_against_legacy.py, and
+#                                 the legacy implementation behaves as this
+#                                 case describes it. For a `preserve` case that
+#                                 is also the host requirement; for a `fix` or
+#                                 `change` case it confirms the `legacy` field
+#                derived         not replayed -- read off the schema, the form
+#                                 validator or the call site
+#                not-replayable  cannot be replayed at all, and why is in the note
+#   legacy/host  only on `fix` and `change` cases
+#   note         optional
+# ---------------------------------------------------------------------------
+cases:
+
+  # -------------------------------------------------------------------------
+  # hostname
+  # -------------------------------------------------------------------------
+  - id: hostname-fqdn-is-the-prefix-joined-to-the-domain
+    subject: hostname
+    disposition: preserve
+    given: "a hostname is registered as a prefix under a domain the user may use"
+    then: "the stored name is `{prefix}.{domain.name}` and the domain is not repeated in it"
+    evidence: "web_routes.py:492 / :572 build `fqdn` before constructing Hostname"
+    source:
+      - tests/test_app.py::TestHostnameManagement::test_admin_add_hostname
+      - tests/test_app.py::TestHostnameManagement::test_user_add_own_hostname
+    calibrated: derived
+
+  - id: hostname-name-is-globally-unique
+    subject: hostname
+    disposition: preserve
+    given: "a hostname `ok.example.com` exists, owned by user A"
+    then: "user B cannot register the same name; the constraint is on the name alone, not on (name, user)"
+    evidence: "models.py Hostname.name unique=True"
+    source:
+      - tests/test_app.py::TestHostnameManagement::test_duplicate_hostname_rejected
+    calibrated: agree
+    note: >-
+      Load-bearing under the multi-tenant design. Two tenants owning the same
+      FQDN would race each other's DNS records, so the uniqueness has to
+      survive tenancy rather than becoming per-tenant.
+
+  - id: hostname-belongs-to-exactly-one-user
+    subject: hostname
+    disposition: preserve
+    given: "a hostname row"
+    then: "it carries exactly one owning user, and destroying the user destroys the hostname"
+    evidence: "models.py Hostname.user_id, User.hostnames cascade='all, delete-orphan'"
+    source:
+      - tests/test_app.py::TestHostnameManagement::test_admin_add_hostname
+      - tests/test_app.py::TestHostnameManagement::test_user_add_own_hostname
+    calibrated: derived
+    note: >-
+      In the new design a Device sits between user and hostname (plan 3.1),
+      so the surviving rule is "exactly one owner", not "the owner is a user".
+
+  - id: hostname-names-must-be-stored-lowercase
+    subject: hostname
+    disposition: fix
+    given: "a hostname row whose name contains an uppercase letter"
+    then: "the host must fold the name to lower case on write, so every row is reachable"
+    legacy: >-
+      `find_hostname` lowercases the *query* (`hostname_str.lower()`) and
+      nothing lowercases the *row*. A row stored as `MiXeD.example.com` is
+      therefore unreachable from `/nic/update` under any spelling: the exact
+      spelling is lowercased before the lookup and misses, and the lowercase
+      spelling misses too. Replayed: both answer `nohost`.
+    host: "names are normalised to lower case on write; the lookup keeps lowercasing"
+    evidence: "dyndns.py:256 find_hostname; models.py has no normalisation"
+    source: []
+    calibrated: agree
+    note: >-
+      protocol_cases.yaml's `update-hostname-lookup-is-case-insensitive` proves
+      the *lookup* folds case. It cannot see this, because its fixture stores
+      lowercase names -- the failure needs a row the table does not create.
+
+  # -------------------------------------------------------------------------
+  # ttl
+  # -------------------------------------------------------------------------
+  - id: ttl-default-is-60
+    subject: ttl
+    disposition: preserve
+    given: "a hostname is created without an explicit TTL"
+    then: "hostname.ttl == 60"
+    evidence: "models.py Hostname.ttl default=60; production: 11 of 11 hostnames at 60"
+    source:
+      - tests/test_app.py::TestTTLManagement::test_hostname_default_ttl
+    calibrated: agree
+
+  - id: ttl-is-stored-per-hostname-not-per-domain
+    subject: ttl
+    disposition: preserve
+    given: "two hostnames under one domain"
+    then: "each carries its own TTL and changing one does not change the other"
+    evidence: "models.py Hostname.ttl; there is no Domain.ttl"
+    source:
+      - tests/test_app.py::TestTTLManagement::test_hostname_custom_ttl
+      - tests/test_app.py::TestTTLManagement::test_admin_create_hostname_with_ttl
+      - tests/test_app.py::TestTTLManagement::test_user_create_hostname_with_ttl
+      - tests/test_app.py::TestTTLManagement::test_update_ttl_via_backends_page
+    calibrated: derived
+
+  - id: ttl-below-30-is-rejected
+    subject: ttl
+    disposition: preserve
+    given: "a TTL of 29 or less is submitted"
+    then: "it is refused and the stored TTL does not change"
+    evidence: "forms.py NumberRange(min=30, max=86400)"
+    source:
+      - tests/test_app.py::TestTTLManagement::test_ttl_validation_too_low
+    calibrated: agree
+
+  - id: ttl-above-86400-is-rejected
+    subject: ttl
+    disposition: preserve
+    given: "a TTL of 86401 or more is submitted"
+    then: "it is refused and the stored TTL does not change"
+    evidence: "forms.py NumberRange(min=30, max=86400)"
+    source:
+      - tests/test_app.py::TestTTLManagement::test_ttl_validation_too_high
+    calibrated: agree
+
+  - id: ttl-30-and-86400-are-accepted
+    subject: ttl
+    disposition: preserve
+    given: "a TTL of exactly 30, or exactly 86400"
+    then: "it is accepted -- the bounds are inclusive"
+    evidence: "wtforms NumberRange is inclusive at both ends"
+    source: []
+    calibrated: agree
+    note: >-
+      The legacy suite probes 5 and 100000. Both are far outside the range, so
+      neither can tell 30 from 31 -- the boundary itself was never tested. Read
+      off the validator instead.
+
+  - id: ttl-reaches-the-create-call
+    subject: ttl
+    disposition: preserve
+    given: "a hostname with ttl=300 is updated"
+    then: "the provider's create is called with ttl=300"
+    evidence: "dyndns.py:392 createrecords(..., ttl=hn.ttl)"
+    source:
+      - tests/test_app.py::TestTTLManagement::test_ttl_passed_to_backend
+    calibrated: agree
+    note: >-
+      The legacy test wraps its assertion in `if mock_account.createrecords.called:`.
+      Replayed, the call does happen, so the assertion is not currently being
+      skipped -- but it is opt-in: were the call to stop happening the test
+      would keep passing while asserting nothing. The port drops the guard.
+
+  - id: ttl-is-absent-from-the-delete-call
+    subject: ttl
+    disposition: preserve
+    given: "a hostname with a non-default TTL is deleted"
+    then: "the provider's delete is called with no ttl argument at all"
+    evidence: "dyndns.py:527 deleterecords(hostname_zones, rtype=rtype)"
+    source: []
+    calibrated: agree
+
+  - id: ttl-is-not-validated-on-the-ddns-write-path
+    subject: ttl
+    disposition: preserve
+    given: "a hostname row carries a TTL outside 30..86400, written by something other than the form"
+    then: "the DDNS path sends it to the provider unchanged; the bounds live in the form only"
+    evidence: "dyndns.py reads hn.ttl and never range-checks it"
+    source: []
+    calibrated: derived
+    note: >-
+      Directly relevant to the importer: a migrated row is not a form
+      submission, so the bounds do not apply to it. Production is uniformly 60
+      so nothing is currently out of range, but the importer should assert the
+      range rather than assume the source data respected it.
+
+  # -------------------------------------------------------------------------
+  # backends -- get_backends() resolution
+  # -------------------------------------------------------------------------
+  - id: backends-explicit-selection-wins
+    subject: backends
+    disposition: preserve
+    given: "a hostname with a non-empty backend selection, on a domain carrying more backends than are selected"
+    then: "resolution returns exactly the selected backends"
+    evidence: "models.py Hostname.get_backends()"
+    source:
+      - tests/test_app.py::TestHostnameBackendSelection::test_get_backends_returns_specific_when_set
+      - tests/test_app.py::TestHostnameBackendSelection::test_select_specific_backend
+      - tests/test_app.py::TestHostnameBackendSelection::test_user_can_configure_own_hostname_backends
+    calibrated: agree
+
+  - id: backends-empty-selection-resolves-to-all-of-the-domains-backends
+    subject: backends
+    disposition: preserve
+    given: "a hostname with an empty backend selection"
+    then: "resolution returns every backend on its domain"
+    evidence: "models.py Hostname.get_backends() falls through to self.domain.backends"
+    source:
+      - tests/test_app.py::TestHostnameBackendSelection::test_get_backends_returns_all_domain_when_not_set
+      - tests/test_app.py::TestHostnameBackendSelection::test_clear_backend_selection
+    calibrated: agree
+    note: >-
+      This is the production branch. `hostname_backends` is empty for all 11
+      hostnames (plan 3.3.1), so every production request takes the fallback.
+
+  - id: backends-empty-selection-tracks-the-domain-live
+    subject: backends
+    disposition: preserve
+    given: "a backend is added to a domain"
+    then: >-
+      every hostname on that domain with an empty selection picks it up
+      immediately, with no per-hostname action; every hostname with a non-empty
+      selection does not
+    evidence: "models.py get_backends() reads the relationship at call time"
+    source: []
+    calibrated: agree
+    note: >-
+      The one place the two branches are behaviourally distinguishable in
+      production. With one domain and one backend today both branches return
+      the same list, so nothing observable separates them -- and the moment a
+      second backend is added to that domain, an empty selection silently
+      enables it for all 11 hostnames. That is the correct behaviour to
+      preserve, but it must be preserved deliberately.
+
+  - id: backends-a-domain-with-no-backends-resolves-to-none
+    subject: backends
+    disposition: preserve
+    given: "a registered hostname whose domain has no backends"
+    then: "resolution returns an empty list"
+    evidence: "models.py get_backends(); dyndns.py:355 branches on `if not backends`"
+    source:
+      - tests/test_app.py::TestDynDNSAPI::test_registered_hostname_no_backend_returns_911
+    calibrated: agree
+    note: >-
+      The wire half -- that this answers `911 {ip}` -- is
+      protocol_cases.yaml's `update-911-hostname-with-zero-backends` and
+      `delete-911-hostname-with-zero-backends`. This case owns the resolver
+      result, not the status.
+
+  - id: backends-resolution-order-decides-the-aggregate-error
+    subject: backends
+    disposition: preserve
+    given: "a hostname resolving to several backends whose statuses differ"
+    then: >-
+      resolution returns them in a stable order, and that order is what
+      "the first status that is neither good nor nochg" is first in
+    evidence: "models.py relationship order (primary key); dyndns.py:412 next(...)"
+    source: []
+    calibrated: agree
+    note: >-
+      protocol_cases.yaml's `firsterr.example.com` fixture is ordered
+      `nochg, 911, dnserr` and its aggregate cases fail if the wrong status
+      comes back. Those cases assume a stable resolution order and cannot
+      assert one; this case is that assumption made explicit.
+
+  - id: backends-selection-is-owner-scoped
+    subject: backends
+    disposition: preserve
+    given: "user B attempts to configure the backend selection of user A's hostname"
+    then: "it is refused"
+    evidence: "web_routes.py owner check before the backends form"
+    source:
+      - tests/test_app.py::TestHostnameBackendSelection::test_user_cannot_configure_others_hostname
+    calibrated: derived
+    note: >-
+      Atrium owns authentication and roles; it does not own row-level ownership
+      of host tables. This one stays the host's.
+
+  # -------------------------------------------------------------------------
+  # rate_limit
+  # -------------------------------------------------------------------------
+  - id: rate-limit-is-checked-before-the-request-is-recorded
+    subject: rate_limit
+    disposition: preserve
+    given: "a limit of N per minute and no events yet"
+    then: "requests 1..N are accepted and request N+1 is refused"
+    evidence: "dyndns.py:306-310 -- check_rate_limit, then record_request"
+    source:
+      - tests/test_app.py::TestRateLimiting::test_abuse_returned_on_rate_limit
+    calibrated: agree
+    note: >-
+      The order is what makes the limit mean "N allowed per minute" rather than
+      "N-1 allowed". Reversing the two lines changes every limit by one and
+      nothing on the wire distinguishes the two readings.
+
+  - id: rate-limit-triggers-at-greater-than-or-equal
+    subject: rate_limit
+    disposition: preserve
+    given: "exactly N events in the window and a limit of N"
+    then: "the next check refuses"
+    evidence: "rate_limiter.py:26 `if recent_minute >= per_minute`"
+    source:
+      - tests/test_app.py::TestRateLimiting::test_rate_limiter_blocks_after_limit
+      - tests/test_app.py::TestRateLimiting::test_rate_limiter_allows_requests
+    calibrated: agree
+
+  - id: rate-limit-per-minute-and-per-hour-are-independent
+    subject: rate_limit
+    disposition: preserve
+    given: "a per-minute limit with slack and a per-hour limit that is reached"
+    then: "the request is refused on the hour limit alone"
+    evidence: "rate_limiter.py:29-37 -- the hour check runs after the minute check passes"
+    source:
+      - tests/test_app.py::TestRateLimiting::test_rate_limiter_per_hour_limit
+    calibrated: agree
+
+  - id: rate-limit-counters-are-per-user
+    subject: rate_limit
+    disposition: preserve
+    given: "user A is at its limit"
+    then: "user B is unaffected"
+    evidence: "rate_limiter.py filters on user_id"
+    source:
+      - tests/test_app.py::TestRateLimiting::test_rate_limiter_independent_users
+    calibrated: agree
+    note: >-
+      Plan 2 re-keys this to the device. The invariant that survives is
+      "one principal's traffic cannot exhaust another's", with the principal
+      changing from user to device.
+
+  - id: rate-limit-window-boundary-is-exclusive
+    subject: rate_limit
+    disposition: preserve
+    given: "one event recorded exactly 60 seconds ago and a limit of 1 per minute"
+    then: "the request is accepted -- the event has left the window"
+    evidence: "rate_limiter.py:22-24 `created_at > minute_ago`, strict"
+    source: []
+    calibrated: agree
+
+  - id: rate-limit-a-refused-request-is-not-recorded
+    subject: rate_limit
+    disposition: preserve
+    given: "a client that keeps requesting after being refused"
+    then: >-
+      the refusals do not extend the block; the block lifts one window after
+      the last *accepted* request
+    evidence: "dyndns.py:306-310 -- the abuse branch returns before record_request"
+    source: []
+    calibrated: agree
+    note: >-
+      A misconfigured router retrying every second is refused for exactly one
+      minute, not indefinitely. Recording refusals would turn a transient
+      misconfiguration into a permanent outage for that device, and it is a
+      one-line change to get wrong.
+
+  - id: rate-limit-events-are-pruned-globally-at-one-hour-on-the-write-path
+    subject: rate_limit
+    disposition: change
+    given: "any user records a request"
+    then: "the host prunes rate-limit events on a schedule, not on the write path"
+    legacy: >-
+      every `record_request` deletes *all users'* rate-limit events older than
+      one hour, inline, inside the request. Replayed: user 77's two-hour-old
+      row disappears when user 88 records.
+    host: >-
+      pruning moves to a scheduled job (plan 3.4). The one-hour horizon itself
+      is still correct -- the per-hour limit cannot look back further.
+    evidence: "rate_limiter.py:12-14"
+    source: []
+    calibrated: agree
+
+  - id: rate-limit-config-precedence-is-user-then-global-then-hardcoded
+    subject: rate_limit
+    disposition: preserve
+    given: "a request from a user"
+    then: >-
+      the limits come from that user's own config row if it exists, otherwise
+      from the global row, otherwise from the hardcoded 30/500
+    evidence: "rate_limiter.py:45-64 check_rate_limit"
+    source:
+      - tests/test_app.py::TestRateLimiting::test_admin_create_user_rate_limit_override
+      - tests/test_app.py::TestRateLimiting::test_admin_delete_user_rate_limit_override
+      - tests/test_app.py::TestRateLimiting::test_admin_update_global_rate_limit
+    calibrated: agree
+    note: >-
+      The user lookup is `filter_by(user_id=...)` with no `is_global=False`
+      clause, so a row carrying both a user id and `is_global` would be picked
+      as that user's override. The host should make the two kinds of row
+      structurally exclusive rather than relying on the writer.
+
+  - id: rate-limit-seeded-default-is-30-per-minute-and-500-per-hour
+    subject: rate_limit
+    disposition: preserve
+    given: "a fresh install"
+    then: "a global config row exists at 30 requests per minute and 500 per hour"
+    evidence: "dyndns.py:150-154"
+    source:
+      - tests/test_app.py::TestHealthChecks::test_global_rate_limit_created_on_boot
+    calibrated: agree
+
+  - id: rate-limit-the-hardcoded-fallback-must-equal-the-seeded-default
+    subject: rate_limit
+    disposition: preserve
+    given: "no global config row exists"
+    then: "the fallback limits are the same numbers the seed would have written"
+    evidence: "dyndns.py:152 writes 30/500; rate_limiter.py:61-62 falls back to 30/500"
+    source: []
+    calibrated: derived
+    note: >-
+      The same pair of numbers is written in two files. Changing one leaves a
+      fresh install and a seeded install on different limits, and nothing in
+      the legacy suite compares them. The host should derive both from one
+      constant, and this case exists so that "they agree" is checkable rather
+      than assumed.
+
+  - id: rate-limit-checkip-is-neither-counted-nor-checked
+    subject: rate_limit
+    disposition: preserve
+    given: "any number of requests to /nic/checkip"
+    then: "no rate-limit event is recorded and no limit is consulted"
+    evidence: "dyndns.py:259-274 -- checkip does not call check_rate_limit or record_request"
+    source: []
+    calibrated: agree
+    note: >-
+      protocol_cases.yaml's `checkip-ignores-credentials-entirely` shows checkip
+      answers without credentials. It cannot see that the request left no row,
+      which is the half that decides whether a chatty client's checkip polling
+      eats its update budget. It does not.
+
+  # -------------------------------------------------------------------------
+  # event_log
+  # -------------------------------------------------------------------------
+  - id: event-one-row-per-backend-attempt
+    subject: event_log
+    disposition: preserve
+    given: "one hostname resolving to two backends, in one request"
+    then: "two event rows are written, not one"
+    evidence: "dyndns.py:364-396 -- log_event is inside the per-backend loop"
+    source:
+      - tests/test_app.py::TestEvents::test_api_call_creates_event
+    calibrated: agree
+    note: >-
+      The wire shows one line per *hostname*. The log holds one row per
+      *backend attempt*. Anyone sizing the events table from the response body
+      is out by the backend count -- and plan 3.4's retention estimate depends
+      on this number.
+
+  - id: event-response-is-the-per-backend-status-not-the-aggregate
+    subject: event_log
+    disposition: preserve
+    given: "backends returning nochg and then good, aggregating to good"
+    then: "the two rows carry nochg and good; no row carries the aggregate"
+    evidence: "dyndns.py:394 logs `status` from the individual backend"
+    source: []
+    calibrated: agree
+    note: >-
+      A log search for 'what did the client see' cannot be answered by
+      filtering `response` -- the aggregate is not stored anywhere. Worth
+      deciding deliberately in the rewrite rather than inheriting.
+
+  - id: event-type-is-dns_update-on-update-and-dns_delete-on-delete
+    subject: event_log
+    disposition: preserve
+    given: "a request to /nic/update, and a request to /nic/delete"
+    then: "their rows carry event_type dns_update and dns_delete respectively"
+    evidence: "dyndns.py log_event call sites"
+    source:
+      - tests/test_app.py::TestEvents::test_api_call_creates_event
+      - tests/test_app.py::TestDynDNSDeleteAPI::test_delete_creates_event
+    calibrated: agree
+
+  - id: event-a-rate-limited-delete-is-logged-as-dns_update
+    subject: event_log
+    disposition: fix
+    given: "a request to /nic/delete that is refused by the rate limiter"
+    then: "the host logs it as a delete"
+    legacy: >-
+      it is logged with event_type `dns_update`. Replayed: the delete handler's
+      own rate-limit branch passes the literal 'dns_update'. Every other row
+      the delete handler writes is `dns_delete`.
+    host: "event_type dns_delete, matching the endpoint that was called"
+    evidence: "dyndns.py:446 -- copied from the update handler and not adjusted"
+    source: []
+    calibrated: agree
+    note: >-
+      Invisible on the wire: both endpoints answer `abuse`, and
+      protocol_cases.yaml's `delete-abuse-rate-limited` passes either way. The
+      cost is that 'show me this device's refused deletes' silently returns
+      nothing, which is exactly the query plan 3.4 exists to make possible.
+
+  - id: event-badauth-writes-no-row
+    subject: event_log
+    disposition: change
+    given: "a request with missing or wrong credentials"
+    then: "the host records the failure somewhere an operator can find it"
+    legacy: "no row is written at all -- the handler returns before the first log_event"
+    host: >-
+      atrium's `audit_log` covers authentication (plan 2), so the DDNS event
+      table does not have to. But something must own it: a device secret being
+      brute-forced currently leaves no trace in either store.
+    evidence: "dyndns.py:300-303"
+    source: []
+    calibrated: agree
+    note: >-
+      Flagged as a seam. No V1M1 issue owns 'failed /nic/* authentication is
+      recorded', and this case is the record that it was noticed rather than
+      missed.
+
+  - id: event-911-and-notfqdn-write-no-row
+    subject: event_log
+    disposition: fix
+    given: "a request refused for a missing hostname, an unparseable myip, or a bad hostname syntax"
+    then: "the host records it"
+    legacy: >-
+      no row is written -- every one of those branches returns before the first
+      log_event. Replayed: a badauth, a 911 and a notfqdn against a seeded
+      database leave the events table at zero rows.
+    host: "a row is written, so a misconfigured client is diagnosable from the log"
+    evidence: "dyndns.py:319-339"
+    source: []
+    calibrated: agree
+    note: >-
+      This is the support case the old service could not answer: a router
+      sending a malformed hostname is refused on every attempt and appears in
+      the log as complete silence, indistinguishable from a router that stopped
+      calling.
+
+  - id: event-username-is-a-snapshot-not-a-join
+    subject: event_log
+    disposition: change
+    given: "an event row"
+    then: "the host can search the log by user, device and domain"
+    legacy: >-
+      `username` is copied into the row at write time and nothing else is.
+      Renaming a user leaves old rows naming the old username; there is no
+      device column and no domain column.
+    host: "indexed user / device / domain columns (plan 3.1, 3.4)"
+    evidence: "models.py Event; dyndns.py log_event"
+    source:
+      - tests/test_app.py::TestEvents::test_api_call_creates_event
+      - tests/test_app.py::TestDynDNSDeleteAPI::test_delete_creates_event
+    calibrated: agree
+
+  - id: event-ip-address-on-update-is-the-normalised-address
+    subject: event_log
+    disposition: preserve
+    given: "an update carrying myip=2001:0DB8:0000::1"
+    then: "the row's ip_address is 2001:db8::1"
+    evidence: "dyndns.py:348/358/368 log str(validated_ip)"
+    source: []
+    calibrated: agree
+
+  - id: event-ip-address-on-delete-is-the-raw-myip-parameter
+    subject: event_log
+    disposition: fix
+    given: "a delete carrying myip=2001:0DB8:0000::1, and a delete carrying no myip"
+    then: "the host logs the normalised address, and null only when there genuinely was none"
+    legacy: >-
+      the delete handler logs the raw query parameter: `2001:0DB8:0000::1`
+      verbatim in the first case and NULL in the second, even though it
+      validated and normalised the value two lines earlier. Replayed against
+      both handlers: update logs `2001:db8::1`, delete logs
+      `2001:0DB8:0000::1`.
+    host: "both handlers log the normalised address"
+    evidence: "dyndns.py:484/494/504 pass `ip_address=myip`, not `str(validated_ip)`"
+    source: []
+    calibrated: agree
+    note: >-
+      A log grouped by ip_address splits one address across every spelling a
+      client happens to use. Invisible on the wire, because
+      protocol_cases.yaml's delete responses carry no IP suffix at all
+      (divergence 1) -- the one endpoint where the normalisation cannot be
+      seen from outside is the one that skips it.
+
+  - id: event-backend-type-is-null-for-outcomes-decided-before-any-backend
+    subject: event_log
+    disposition: preserve
+    given: "a nohost, or a hostname whose domain has no backends"
+    then: "a row is still written, with backend_type null"
+    evidence: "dyndns.py:348-349 and :358-359"
+    source: []
+    calibrated: agree
+    note: >-
+      So `backend_type IS NULL` is a meaningful filter -- 'refused before any
+      provider was contacted' -- and not a data-quality problem.
+
+  - id: event-a-failed-event-write-never-fails-the-request
+    subject: event_log
+    disposition: preserve
+    given: "the event write raises"
+    then: "the exception is swallowed, the session rolled back, and the DDNS response is unaffected"
+    evidence: "dyndns.py:249-251"
+    source: []
+    calibrated: derived
+    note: >-
+      Deliberate: a full disk on the log store must not stop DNS updates. The
+      rewrite must keep the log write off the critical path, which under
+      async SQLAlchemy is a different shape from a try/except.
+
+  - id: event-detail-is-populated-only-for-rate-limit-refusals
+    subject: event_log
+    disposition: preserve
+    given: "any DDNS request"
+    then: "`detail` is set on exactly one kind of row: the rate-limit refusal"
+    evidence: "dyndns.py:308 / :446 are the only log_event calls passing detail"
+    source: []
+    calibrated: agree
+
+  - id: event-rows-are-pruned-at-24-hours-on-the-write-path
+    subject: event_log
+    disposition: change
+    given: "any event write"
+    then: "the host retains roughly 30 days and prunes on a schedule"
+    legacy: "every log_event deletes all events older than 24 hours, inline"
+    host: "~30-day retention, pruned by a scheduled job (plan 3.4)"
+    evidence: "dyndns.py:245-247"
+    source: []
+    calibrated: derived
+    note: >-
+      Two things move at once and both matter: the horizon (24h to ~30d) and
+      the trigger (write path to schedule). The horizon is the visible half;
+      the trigger is the one that made every DDNS request carry a DELETE.
+
+  # -------------------------------------------------------------------------
+  # ip_tracking
+  # -------------------------------------------------------------------------
+  - id: tracked-ip-moves-only-on-good-so-last-updated-at-is-not-a-liveness-signal
+    subject: ip_tracking
+    disposition: preserve
+    given: "a client updating every five minutes with an unchanged address"
+    then: >-
+      last_updated_at does not move, because every one of those updates
+      aggregates to nochg
+    evidence: "dyndns.py:399-406 -- the persist block is inside `if 'good' in results`"
+    source: []
+    calibrated: agree
+    note: >-
+      protocol_cases.yaml records `last_updated_at: unchanged` on the nochg
+      case, which is the same fact for one request. This case is what that
+      means over time: a perfectly healthy hostname's last_updated_at ages
+      without bound. Any future 'stale hostname' alert built on that column
+      fires for every healthy hostname in the estate.
+
+  - id: tracked-ip-is-never-cleared-by-a-delete
+    subject: ip_tracking
+    disposition: preserve
+    given: "a hostname whose record is deleted through /nic/delete"
+    then: "last_ip_v4 / last_ip_v6 keep their values"
+    evidence: "dyndns.py deleteDyndns writes no hostname columns"
+    source: []
+    calibrated: agree
+    note: >-
+      Consequence the wire table cannot reach: the health checker only examines
+      hostnames with a tracked address, so a deliberately deleted record is
+      reported `missing` on every run, forever. Preserved because the
+      alternative (clearing on delete) loses the record of what was there, but
+      the health checker needs a way to tell 'deleted on purpose' from 'gone'.
+
+  - id: tracked-ip-is-seeded-from-live-dns-at-boot
+    subject: ip_tracking
+    disposition: change
+    given: "a hostname with no tracked address at start-up"
+    then: "the host does not resolve it"
+    legacy: >-
+      start-up resolves A and AAAA for every untracked hostname and writes the
+      answers into last_ip_v4 / last_ip_v6, then stamps last_updated_at.
+    host: >-
+      no boot-time resolution. Tracking is what a client's update wrote, and an
+      untracked hostname stays untracked until one arrives.
+    evidence: "dyndns.py:162-181"
+    source: []
+    calibrated: not-replayable
+    note: >-
+      Bears directly on a premise this milestone is using. "Production is
+      IPv6-first -- 10 of 11 hostnames track a v6 address" is read from
+      `hostnames.last_ip_v6`, and this block writes that column from *live DNS
+      at boot*, not from client traffic. So the 10/11 figure counts hostnames
+      that have an AAAA record in the zone, which is not the same population as
+      hostnames whose clients send AAAA updates. The instrument for the traffic
+      claim is `events.ip_address` on dns_update rows, and it has not been read.
+      The conclusion -- exercise AAAA at least as hard as A -- is unaffected
+      and is if anything reinforced, since both readings would have to be wrong
+      in the same direction to overturn it.
+
+  # -------------------------------------------------------------------------
+  # provider -- the adapter contract
+  # -------------------------------------------------------------------------
+  - id: provider-status-vocabulary-is-good-nochg-dnserr
+    subject: provider
+    disposition: preserve
+    given: "any create or delete against any provider"
+    then: >-
+      the return is a map of hostname to one of exactly good, nochg, dnserr,
+      and a hostname absent from the map is treated as dnserr
+    evidence: "lib/account/*.py return values; dyndns.py:393 and :528 default to dnserr"
+    source:
+      - tests/test_hetzner.py::TestHetznerCreateRecords::test_create_new_record
+      - tests/test_hetzner.py::TestHetznerDeleteRecords::test_delete_existing
+    calibrated: agree
+    note: >-
+      This is the interface protocol_cases.yaml *stubs*. Its `stub` service and
+      its aggregate cases are written against this vocabulary and cannot verify
+      it -- a real adapter returning 'ok' instead of 'good' would pass every
+      case in that table and fail in production. The whole provider subject
+      exists to close that gap.
+
+  - id: provider-is-selected-by-the-stored-service-name
+    subject: provider
+    disposition: preserve
+    given: "a backend row whose service name is known to the factory, and one whose is not"
+    then: "the first resolves to an adapter and the second resolves to nothing"
+    evidence: "lib/accounts.py AccountFactory.get / match / known_services"
+    source:
+      - tests/test_hetzner.py::TestHetznerStatic::test_match_hetzner
+      - tests/test_hetzner.py::TestHetznerStatic::test_match_other
+      - tests/test_hetzner.py::TestHetznerStatic::test_known_services
+    calibrated: agree
+    note: >-
+      The wire half -- an unknown service contributing `911` -- is
+      protocol_cases.yaml's `update-911-backend-service-unknown-to-factory`.
+
+  - id: provider-credentials-come-from-the-stored-row
+    subject: provider
+    disposition: preserve
+    given: "a backend row carrying credentials"
+    then: "the adapter uses them"
+    evidence: "lib/account/hetzner.py _get_credentials reads the account dict first"
+    source:
+      - tests/test_hetzner.py::TestHetznerCredentials::test_credentials_from_account
+    calibrated: agree
+
+  - id: provider-must-not-fall-back-to-environment-credentials
+    subject: provider
+    disposition: fix
+    given: "a backend row with no stored credentials, on a host where the provider's env var is set"
+    then: "the adapter must not use the environment; it contributes dnserr / 911 as if nothing were configured"
+    legacy: >-
+      it falls back to the environment. Replayed: with an empty credentials
+      dict and HETZNER_API_TOKEN set, `_get_credentials()` returns the env
+      value.
+    host: "stored credentials only (plan 2: 'stripped of Flask and of env-var credential fallbacks')"
+    evidence: "lib/account/hetzner.py; the same shape in the aws and nsupdate adapters"
+    source:
+      - tests/test_hetzner.py::TestHetznerCredentials::test_credentials_env_fallback
+    calibrated: agree
+    note: >-
+      The legacy test asserts the fallback works. Ported inverted -- the plan
+      removes it, so the surviving assertion is that it does *not* happen.
+      Under multi-tenancy the fallback is a cross-tenant credential leak: one
+      operator-set env var would serve every tenant whose row happens to be
+      empty. protocol_cases.yaml's
+      `update-911-backend-without-stored-credentials` asserts the wire result
+      for an empty row, and would keep passing if the env happened to be unset
+      on the machine running it.
+
+  - id: provider-create-returns-good-for-a-new-record
+    subject: provider
+    disposition: preserve
+    given: "the record does not exist"
+    then: "it is created and the status is good"
+    evidence: "lib/account/hetzner.py createrecords"
+    source:
+      - tests/test_hetzner.py::TestHetznerCreateRecords::test_create_new_record
+    calibrated: agree
+
+  - id: provider-create-returns-good-for-a-changed-record
+    subject: provider
+    disposition: preserve
+    given: "the record exists with a different value"
+    then: "it is replaced and the status is good"
+    evidence: "lib/account/hetzner.py createrecords, set_records path"
+    source:
+      - tests/test_hetzner.py::TestHetznerCreateRecords::test_update_existing_record
+    calibrated: agree
+
+  - id: provider-create-returns-nochg-when-the-record-already-matches
+    subject: provider
+    disposition: preserve
+    given: "the record already carries the requested address"
+    then: "nothing is written and the status is nochg"
+    evidence: "lib/account/hetzner.py createrecords, check_hostnameon_server short-circuit"
+    source:
+      - tests/test_hetzner.py::TestHetznerCreateRecords::test_create_nochg
+    calibrated: agree
+    note: >-
+      This is what makes a five-minute client cheap: production's 11 hostnames
+      mostly answer nochg, and nochg must not write.
+
+  - id: provider-delete-returns-good-when-the-record-existed
+    subject: provider
+    disposition: preserve
+    given: "the record exists"
+    then: "it is removed and the status is good"
+    evidence: "lib/account/hetzner.py deleterecords"
+    source:
+      - tests/test_hetzner.py::TestHetznerDeleteRecords::test_delete_existing
+    calibrated: agree
+
+  - id: provider-delete-returns-nochg-when-the-record-was-absent
+    subject: provider
+    disposition: preserve
+    given: "the record does not exist"
+    then: "the status is nochg, not an error"
+    evidence: "lib/account/hetzner.py deleterecords treats 404 as nochg"
+    source:
+      - tests/test_hetzner.py::TestHetznerDeleteRecords::test_delete_not_found
+    calibrated: agree
+    note: "Deleting twice is idempotent, which is what makes a retrying client safe."
+
+  - id: provider-delete-without-a-record-type-covers-both-families
+    subject: provider
+    disposition: preserve
+    given: "a delete with no record type"
+    then: "both A and AAAA are attempted -- two provider calls, one status"
+    evidence: "lib/account/hetzner.py deleterecords, rtype=None branch"
+    source:
+      - tests/test_hetzner.py::TestHetznerDeleteRecords::test_delete_both_types
+    calibrated: agree
+    note: >-
+      protocol_cases.yaml's `delete-myip-absent-deletes-both-families` asserts
+      the wire result and records the DNS operations in `effects`. This case
+      asserts the adapter makes two calls, which the table's stub cannot.
+
+  - id: provider-delete-of-both-families-is-good-if-either-existed
+    subject: provider
+    disposition: preserve
+    given: "a two-family delete where A existed and AAAA did not"
+    then: "the status is good, not nochg and not an error"
+    evidence: "lib/account/hetzner.py deleterecords aggregates the two families"
+    source:
+      - tests/test_hetzner.py::TestHetznerDeleteRecords::test_delete_one_exists_one_not
+    calibrated: agree
+    note: >-
+      Directly load-bearing for production's shape: 10 of 11 hostnames track
+      v6 and only 4 track v4, so the mixed case is the *common* one and a
+      naive implementation returning nochg would report a successful delete as
+      a no-op for most of the estate.
+
+  - id: provider-any-api-failure-is-dnserr-never-an-exception
+    subject: provider
+    disposition: preserve
+    given: "the provider API raises, times out, or returns an error status"
+    then: "the adapter returns dnserr for the affected hostname and does not propagate"
+    evidence: "lib/account/hetzner.py wraps every request; dyndns.py has no try/except around the call"
+    source:
+      - tests/test_hetzner.py::TestHetznerCreateRecords::test_create_api_error
+      - tests/test_hetzner.py::TestHetznerDeleteRecords::test_delete_api_error
+    calibrated: agree
+    note: >-
+      protocol_cases.yaml's `update-dnserr-single-backend` gets dnserr from a
+      stub that chooses to return it. Nothing in that table proves a *real*
+      adapter converts a raised exception into dnserr rather than a 500 -- and
+      a 500 breaks every client that parses the body.
+
+  - id: provider-missing-credentials-is-dnserr
+    subject: provider
+    disposition: preserve
+    given: "an adapter constructed with no credentials"
+    then: "create and delete both return dnserr rather than raising"
+    evidence: "lib/account/hetzner.py credential guard"
+    source:
+      - tests/test_hetzner.py::TestHetznerCreateRecords::test_create_no_credentials
+      - tests/test_hetzner.py::TestHetznerDeleteRecords::test_delete_no_credentials
+      - tests/test_hetzner.py::TestHetznerZones::test_gethostedzones_no_credentials
+    calibrated: agree
+
+  - id: provider-zone-is-the-closest-enclosing-hosted-zone
+    subject: provider
+    disposition: preserve
+    given: "a configured domain `dyn.example.com` where the provider hosts `example.com`"
+    then: "the domain maps to the `example.com` zone"
+    evidence: "lib/account/hetzner.py zone discovery and _api_zone_names"
+    source:
+      - tests/test_hetzner.py::TestParentZoneMapping::test_parent_zone_maps_domain_to_api_zone_id
+      - tests/test_hetzner.py::TestHetznerZones::test_gethostedzones
+    calibrated: agree
+
+  - id: provider-relative-name-is-computed-against-the-hosted-zone
+    subject: provider
+    disposition: preserve
+    given: "`a.b.example.com` inside the hosted zone `example.com`"
+    then: "the relative name is `a.b` -- computed against the zone, not against the configured domain"
+    evidence: "lib/account/hetzner.py _get_relative_name"
+    source:
+      - tests/test_hetzner.py::TestRelativeName::test_subdomain
+      - tests/test_hetzner.py::TestRelativeName::test_multi_level_subdomain
+      - tests/test_hetzner.py::TestParentZoneMapping::test_create_uses_correct_relative_name_for_parent_zone
+      - tests/test_hetzner.py::TestParentZoneMapping::test_delete_uses_correct_relative_name_for_parent_zone
+    calibrated: agree
+    note: >-
+      The distinction only bites when the configured domain is a strict
+      subdomain of the hosted zone. Computing against the configured domain
+      instead writes the record one level too shallow, which is a silently
+      wrong record rather than an error.
+
+  - id: provider-zone-apex-relative-name-is-at
+    subject: provider
+    disposition: preserve
+    given: "the hostname equals the hosted zone"
+    then: "the relative name is `@`, not the empty string"
+    evidence: "lib/account/hetzner.py _get_relative_name"
+    source:
+      - tests/test_hetzner.py::TestRelativeName::test_zone_apex
+    calibrated: agree
+
+  - id: provider-reverse-zones-are-never-zone-candidates
+    subject: provider
+    disposition: preserve
+    given: "the provider hosts in-addr.arpa and ip6.arpa zones alongside forward zones"
+    then: "reverse zones are excluded from the candidate set"
+    evidence: "lib/account/hetzner.py zone discovery filter"
+    source:
+      - tests/test_hetzner.py::TestHetznerZones::test_gethostedzones_skips_reverse
+    calibrated: agree
+
+  - id: provider-zone-candidates-are-limited-to-the-configured-domains
+    subject: provider
+    disposition: preserve
+    given: "the provider account hosts zones the row does not name"
+    then: "they are not mapped, so a credential with broad access cannot write outside the configured domains"
+    evidence: "lib/account/hetzner.py maps only account['domains']"
+    source:
+      - tests/test_hetzner.py::TestHetznerZones::test_gethostedzones
+    calibrated: agree
+    note: >-
+      A containment property, not an optimisation. Under multi-tenancy it is
+      what stops one tenant's provider credential reaching another tenant's
+      zone hosted on the same provider account.
+
+  - id: provider-zone-discovery-failure-is-not-fatal
+    subject: provider
+    disposition: preserve
+    given: "zone discovery raises at construction time"
+    then: "the adapter still constructs, with the configured domains as its zones"
+    evidence: "lib/account/hetzner.py wraps discovery"
+    source:
+      - tests/test_hetzner.py::TestHetznerZones::test_gethostedzones_api_error
+      - tests/test_hetzner.py::TestHetznerZones::test_gethostedzones_no_credentials
+    calibrated: agree
+    note: >-
+      So a provider outage degrades to dnserr per hostname rather than to a
+      construction failure that would take the whole request to 911.
+
+  # -------------------------------------------------------------------------
+  # health_check
+  # -------------------------------------------------------------------------
+  - id: health-check-is-disabled-by-default
+    subject: health_check
+    disposition: preserve
+    given: "a fresh install"
+    then: "the health check config exists, is disabled, and its interval is 15 minutes"
+    evidence: "dyndns.py:156-160"
+    source:
+      - tests/test_app.py::TestHealthChecks::test_health_check_config_created_on_boot
+    calibrated: agree
+    note: >-
+      Off by default matters: enabled by default, a fresh install starts
+      resolving every hostname it holds against public DNS before anyone has
+      configured anything.
+
+  - id: health-check-a-disabled-config-makes-the-run-a-no-op
+    subject: health_check
+    disposition: preserve
+    given: "the config is disabled and a run is triggered anyway"
+    then: "no results are written and no previous results are destroyed"
+    evidence: "health_checker.py run_health_checks returns before the delete"
+    source: []
+    calibrated: agree
+    note: >-
+      The early return sits *above* `HealthCheck.query.delete()`. Moving the
+      enabled check below it would silently wipe the last good run every time
+      a disabled scheduler ticked.
+
+  - id: health-check-only-examines-hostnames-with-a-tracked-address
+    subject: health_check
+    disposition: preserve
+    given: "hostnames that have never been updated"
+    then: "they are not resolved and produce no result rows"
+    evidence: "health_checker.py filters on last_ip_v4 or last_ip_v6 not null"
+    source: []
+    calibrated: agree
+
+  - id: health-check-examines-each-tracked-family-separately
+    subject: health_check
+    disposition: preserve
+    given: "a hostname tracking both an A and an AAAA address"
+    then: "two result rows are written, one per family, each with its own status"
+    evidence: "health_checker.py loops over [(last_ip_v4, A), (last_ip_v6, AAAA)]"
+    source: []
+    calibrated: agree
+    note: >-
+      Production has 10 hostnames tracking v6 and 4 tracking v4, so at least
+      three produce two rows. An implementation that checks 'the' address per
+      hostname silently drops one family, and on this estate the family most
+      likely to be dropped is v6.
+
+  - id: health-check-ok-requires-the-first-answer-to-equal-the-tracked-address
+    subject: health_check
+    disposition: preserve
+    given: "the resolver returns answers for the hostname"
+    then: "the first answer is compared to the tracked address; equal is ok, unequal is mismatch"
+    evidence: "health_checker.py answers[0].address"
+    source:
+      - tests/test_app.py::TestHealthChecks::test_run_health_checks_manually
+    calibrated: agree
+    note: >-
+      Only the first answer is examined. A round-robin RRset containing the
+      tracked address at position 2 reads as a mismatch. Preserved because the
+      service writes single-value RRsets, but it is a real edge that no legacy
+      test covers.
+
+  - id: health-check-mismatch-records-both-addresses
+    subject: health_check
+    disposition: preserve
+    given: "the resolved address differs from the tracked one"
+    then: "the row carries both addresses and a detail naming both"
+    evidence: "health_checker.py mismatch branch"
+    source:
+      - tests/test_app.py::TestHealthChecks::test_health_check_detects_mismatch
+    calibrated: agree
+    note: >-
+      A mismatch row that named only one of the two would be the
+      uninformative-guard failure mode: 'this hostname is wrong' with no way to
+      tell which side moved.
+
+  - id: health-check-nxdomain-and-noanswer-are-missing
+    subject: health_check
+    disposition: preserve
+    given: "the resolver raises NXDOMAIN, or raises NoAnswer"
+    then: "the status is missing in both cases, with a detail distinguishing them"
+    evidence: "health_checker.py exception ladder"
+    source:
+      - tests/test_app.py::TestHealthChecks::test_health_check_detects_missing
+    calibrated: agree
+    note: >-
+      The legacy test covers NXDOMAIN only. NoAnswer -- the zone exists but the
+      family does not -- is the case an IPv6-first estate actually hits, and it
+      was never tested.
+
+  - id: health-check-nonameservers-and-any-other-exception-are-error
+    subject: health_check
+    disposition: preserve
+    given: "the resolver raises NoNameservers, or anything else"
+    then: "the status is error, distinct from missing, with the exception text as detail"
+    evidence: "health_checker.py exception ladder"
+    source: []
+    calibrated: agree
+    note: >-
+      error and missing must not be merged. 'we could not ask' and 'we asked
+      and it is not there' are different incidents, and only one of them is
+      about the DNS record.
+
+  - id: health-check-a-run-replaces-every-previous-result
+    subject: health_check
+    disposition: preserve
+    given: "two consecutive runs"
+    then: "the table holds only the second run's rows -- results are a snapshot, not a history"
+    evidence: "health_checker.py HealthCheck.query.delete() at the top of an enabled run"
+    source: []
+    calibrated: agree
+    note: >-
+      Worth stating because it is the opposite of what the table's name
+      suggests, and because any 'how long has this been failing' question is
+      unanswerable from it by construction.
+
+  # -------------------------------------------------------------------------
+  # storage
+  # -------------------------------------------------------------------------
+  - id: domain-name-is-globally-unique
+    subject: storage
+    disposition: preserve
+    given: "a domain `example.com` exists"
+    then: "a second row with that name is refused"
+    evidence: "models.py Domain.name unique=True"
+    source:
+      - tests/test_app.py::TestDomainManagement::test_duplicate_domain_rejected
+    calibrated: agree
+    note: >-
+      Survives tenancy for the same reason hostname uniqueness does: a zone has
+      one authoritative owner. Making it per-tenant would let two tenants
+      configure the same zone with different provider credentials.
+
+  - id: domain-backend-is-unique-per-domain-and-service
+    subject: storage
+    disposition: preserve
+    given: "a domain already carrying an aws backend"
+    then: "a second aws backend on that domain is refused"
+    evidence: "models.py DomainBackend UniqueConstraint(domain_id, backend_type)"
+    source:
+      - tests/test_app.py::TestDomainManagement::test_duplicate_backend_rejected
+    calibrated: agree
+    note: >-
+      Also the reason a domain's backend list has no duplicates, which
+      `backends-resolution-order-decides-the-aggregate-error` relies on.
+
+  - id: domain-delete-cascades-to-its-backends-and-hostnames
+    subject: storage
+    disposition: preserve
+    given: "a domain carrying backends and hostnames is deleted"
+    then: "both go with it, leaving no orphans"
+    evidence: "models.py Domain.backends / Domain.hostnames cascade='all, delete-orphan'"
+    source:
+      - tests/test_app.py::TestDomainManagement::test_delete_domain
+    calibrated: agree
+    note: >-
+      Production has 0 orphan hostnames (plan 3.3.1), which is this cascade
+      having held. The importer should assert the same after loading.
+
+  - id: backend-credentials-are-stored-as-one-encrypted-row-per-key
+    subject: storage
+    disposition: change
+    given: "an aws backend configured with an access key id and a secret"
+    then: "the host stores them encrypted, scoped to the owning tenant"
+    legacy: >-
+      two BackendConfig rows, one per key, each value Fernet-encrypted with an
+      application-wide key. Replayed: two rows, and neither stored value equals
+      its plaintext.
+    host: >-
+      SecretBlob + UserSecret at user scope (atrium 0.28, plan 3.1.1). The
+      surviving invariant is that no credential is ever at rest in plaintext
+      and that the key is not shared across tenants.
+    evidence: "models.py BackendConfig, encrypt_value; plan 2 and 3.1.1"
+    source:
+      - tests/test_app.py::TestDomainManagement::test_save_backend_credentials
+    calibrated: agree
+
+  - id: backend-credentials-are-never-redisplayed
+    subject: storage
+    disposition: preserve
+    given: "credentials have been saved and the config screen is opened again"
+    then: "the stored secret does not appear in the response in any form"
+    evidence: "web_routes.py renders empty password inputs rather than the stored value"
+    source:
+      - tests/test_app.py::TestDomainManagement::test_backend_config_does_not_leak_credentials
+    calibrated: derived
+    note: >-
+      Ported as a host rule rather than dropped as UI. Under the new design the
+      screen is a host bundle calling a host API, so 'the API response does not
+      carry the secret' is the assertion that survives -- the markup is
+      atrium's, the payload is ours.
+
+  - id: domains-are-tenant-owned-not-admin-only
+    subject: storage
+    disposition: change
+    given: "a non-admin user"
+    then: "the user can see and manage their own domains"
+    legacy: "domain management is admin-only; a regular user is redirected away"
+    host: "users own their domains and their provider credentials (plan 6)"
+    evidence: "web_routes.py admin_required on the domain routes; plan 6 decision"
+    source:
+      - tests/test_app.py::TestAuthorization::test_regular_user_cannot_access_domains
+    calibrated: derived
+    note: >-
+      Kept as a case rather than dropped as `atrium-owns` because atrium owns
+      *roles*, not this policy. The legacy test asserts the exact opposite of
+      the design, so dropping it silently would have removed the only written
+      record that the inversion was deliberate.
+
+  # -------------------------------------------------------------------------
+  # auth
+  # -------------------------------------------------------------------------
+  - id: auth-the-ddns-credential-is-independent-of-any-web-login
+    subject: auth
+    disposition: preserve
+    given: "a principal that cannot log in to the web UI at all"
+    then: "/nic/update authenticates it and serves the request"
+    evidence: "auth.py authenticate_dyndns_user does not consult web_login"
+    source:
+      - tests/test_app.py::TestAuthentication::test_web_login_disabled_user_can_use_api
+    calibrated: agree
+    note: >-
+      This is the production shape, not an edge case: all six non-admin users
+      have web_login=0 (plan 3.3.1), so the DDNS credential is the only thing
+      they have. In the new design it becomes the device secret, and the rule
+      is that a device authenticates /nic/* without its owner having an atrium
+      login.
+
+  - id: auth-the-ddns-path-never-consults-a-second-factor
+    subject: auth
+    disposition: preserve
+    given: "a principal with TOTP enrolled"
+    then: "/nic/update still succeeds on HTTP Basic alone"
+    evidence: "dyndns.py:300 calls authenticate_dyndns_user and nothing else"
+    source:
+      - tests/test_app.py::TestDynDNSAPI::test_no_totp_required_for_api
+    calibrated: agree
+    note: >-
+      protocol_cases.yaml's fixture users have no second factor enrolled, so
+      every case in that table passes whether or not the endpoint would demand
+      one. The failure this guards against -- routing /nic/* through atrium's
+      session auth, which does enforce TOTP -- is invisible to the table and
+      would break every router in the field at once.
