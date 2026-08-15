@@ -76,6 +76,14 @@ the run is *slower* in parallel — ten worker processes each import the app —
 which is the honest shape of the trade and the reason the number is recorded
 against 800 rather than against today's suite.
 
+**Parallel agents need distinct host ports.** Compose isolation now covers the
+image tag and the volume, but `API_HOST_PORT` / `MYSQL_HOST_PORT` come from
+`.env`, which each worktree copies from the same example. Two agents on the
+defaults collide. Docker fails loudly on the bind (`port is already allocated`),
+so this is a stall rather than a silent corruption — but pick your own pair and
+set `COMPOSE_PROJECT_NAME` too. If you find a stack you did not create, stop and
+report it; do not reuse it and do not tear it down.
+
 **CI does not run on milestone branches — by design, and the gate is why.**
 The workflow fires only for `master` (PRs into it, and pushes to it). A
 per-issue PR into the milestone branch gets **no** GitHub CI at all, so the
@@ -141,10 +149,16 @@ was replaced by the file's `0` and the stop condition committed unsigned
 instead of stopping.
 
 **Smoke-testing a deployed stack needs no credential.** Run
-`scripts/smoke.sh --base <url> --no-login` — 9 of the 11 checks need no
-authentication, and the two that do would otherwise require an admin password
-the run has no unattended way to obtain. Do not put that password anywhere the
-run can read it just to get two more checks.
+`scripts/smoke.sh --base <url> --no-login`. Measured, because the first version
+of this paragraph guessed: **8 checks locally** (`make smoke`), **6 against a
+remote `--base`** — the three login checks drop, and against a remote target the
+two migration checks drop as well. The credentialed checks would need an admin
+password the run has no unattended way to obtain; do not put one where the run
+can read it just to get three more checks.
+
+Numbers in this file are measurable. Do not write one you have not run — #8's
+agent caught the guessed "9 of 11" above, which is exactly the class of error
+this contract keeps telling agents not to make.
 
 ---
 
