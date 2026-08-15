@@ -311,6 +311,35 @@ deletion is auditable and the table cannot shrink silently. Three replacement
 cases run against the **host only** and assert the input is inert rather than
 merely absent.
 
+### What the wire table structurally cannot see
+
+Measured in #29 by mutation, and confirmed by reading `dyndns.py`: **the DNS
+record type never reaches the response body.** `/nic/update` echoes the
+normalised *address* (`good 2001:db8::1`); `/nic/delete` echoes neither address
+nor type. `rtype` reaches `createrecords()` / `deleterecords()` and stops there.
+
+The demonstration is blunt: mutating `getiptype` to answer `A` for **every**
+address — v4 and v6 alike — runs the whole table **121 executed, 0 failed**.
+
+So a suite built entirely at the wire cannot tell an `A` write from an `AAAA`
+one, and no number of added cases changes that. It is a property of the
+protocol, not a gap in the table.
+
+**Consequence, and it is V1M2's to carry:** record-type correctness has to be
+proven *below* the wire — in the provider plugins' own tests, where the call
+into boto3 / the Hetzner client / dnspython is observable, and in the router's
+unit tests where `getiptype`'s dispatch is visible. An agent that adds
+address-family cases to the wire table and calls record-type dispatch covered
+has tested nothing.
+
+This is also why #29 declined to weight the table to production's 68% IPv6.
+Replaying every executable case twice — once as spelled, once with every IPv4
+literal swapped for IPv6 — showed only **36 of 104** could change a byte of the
+reply. Coverage is stated per mechanism instead: IPv6 went 1→5 of 5 update
+status tokens, 1→2 of 2 checkip formats, 0→3 of 3 family-specific parse
+refusals. Padding the table to fix a ratio would have bought nothing and read
+as coverage.
+
 ### How the suite is built — two instruments
 
 One table, two targets. `tests/compat/protocol_cases.yaml` holds every case as
