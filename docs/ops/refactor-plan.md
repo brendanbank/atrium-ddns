@@ -27,7 +27,17 @@ body, and a 401 would break them.
 |---|---|
 | default | `<html><head><title>Current IP Check</title></head><body>Current IP Address: {ip}</body></html>`, `text/html`, IP HTML-escaped |
 | `?format=plain` | bare `{ip}`, `text/plain` |
-| `remote_addr` not parseable as an IP | empty string |
+| `remote_addr` not parseable as an IP, `?format=plain` | empty string |
+| `remote_addr` not parseable as an IP, default format | the same HTML wrapper with an empty IP — 91 bytes, **not** an empty body |
+
+`format` is compared for exact equality with `plain`; every other value,
+including `PLAIN`, falls back to HTML.
+
+The IP is `str(ipaddress.ip_address(...))`, so it is **normalised**:
+`2001:0db8:0000::1` comes back as `2001:db8::1`. The `html.escape` on it is
+structurally unreachable — every string that constructor can produce is drawn
+from `[0-9a-f.:%]` — so the compat suite documents it rather than asserting it.
+See `tests/compat/README.md`.
 
 ### `GET /nic/update`
 
@@ -51,20 +61,39 @@ is one line per requested hostname, newline-joined, **in request order**.
 | **aggregate**: all `nochg` | `nochg {ip}` |
 | **aggregate**: otherwise | `{first non-good/nochg status} {ip}` |
 
-`myip` defaults to `request.remote_addr` when omitted. `updatetype` is accepted,
-warned about, and ignored.
+`myip` defaults to `request.remote_addr` when omitted, and an empty `myip=`
+takes the same path as an omitted one. `updatetype` is accepted, warned about,
+and ignored; unrecognised parameters are ignored outright (the protocol doc says
+they may trigger `abuse`).
+
+Three orderings the table above does not show, and which the compat suite
+asserts because getting them wrong is invisible in the common case:
+
+- `hostname=` present-and-empty is `911`, not `notfqdn` — `not hostnames` fires
+  before the regex runs. A *trailing comma* is `notfqdn`, because the empty
+  element is inside the list.
+- `myip` is validated before hostname syntax, so a request wrong in both ways
+  answers `911`.
+- the response echoes the **normalised** IP, not the spelling the client sent.
 
 ### `GET /nic/delete`
 
 Same auth, same rate limit, same hostname resolution. **Response codes carry no
-IP suffix** — `good`, `nochg`, `nohost`, `911`. `myip` present ⇒ delete only the
-matching family; absent ⇒ delete both A and AAAA.
+IP suffix** — `good`, `nochg`, `nohost`, `911`, `dnserr`. `myip` present ⇒ delete
+only the matching family; absent (or empty) ⇒ delete both A and AAAA.
+
+**One real asymmetry with update:** delete does *not* substitute `remote_addr`
+for a missing `myip`. On update, `myip` absent and no parseable client address
+gives `911` even for a valid registered hostname; on delete the same request
+succeeds. Delete also persists nothing — `last_ip_v4`/`last_ip_v6` are untouched.
 
 ### Deliberate divergences from the protocol doc
 
 `docs/DYNDNS-PROTOCOL.md` in the old repo documents the de-facto standard. The
-implementation diverges from it in five places. Each is a **preserve-or-fix
-decision**, and the compat suite must encode the decision, not the doc:
+implementation diverges from it in six places — five listed when this plan was
+written, and a sixth found by issue #7 while reading the regex rather than the
+summary of it. Each is a **preserve-or-fix decision**, and the compat suite must
+encode the decision, not the doc:
 
 1. `nohost {ip}` on update, bare `nohost` on delete. The doc says bare `nohost`.
    *Preserve* — clients parse the first token.
@@ -76,10 +105,20 @@ decision**, and the compat suite must encode the decision, not the doc:
 5. A single label with no dot (`foo`) passes the hostname regex and falls
    through to `nohost`. *Preserve* — it is unreachable in practice and changing
    it moves a `nohost` to a `notfqdn`.
+6. A **trailing newline** in a label passes the regex too. The pattern ends in
+   `$`, which in Python matches before a trailing newline, so `foo\n` validates;
+   `isvalidhostname` then returns the *unstripped* element, the lookup misses,
+   and the answer is `nohost`. *Preserve*, for divergence 5's reason — both
+   spellings already end at `nohost`, so preserving costs nothing, while a "fix"
+   would turn a per-hostname `nohost` line into a whole-request `notfqdn`.
+   Added by issue #7; verified by executing `BaseAccount.isvalidhostname` from
+   the legacy checkout, not by reading it.
 
-**These five are exactly the cases where a "fix" looks like an improvement and
+**These six are exactly the cases where a "fix" looks like an improvement and
 is a regression.** They are the reason the suite is written against the old
-implementation first.
+implementation first — and divergence 6 is the reason it is written against the
+old *implementation* rather than against this document: five of them were
+visible in a careful reading and the sixth was not.
 
 ### Removed: query-parameter auth — decided
 
@@ -96,6 +135,12 @@ was the guard.
 The compat table must **delete** those cases rather than mark them expected-fail,
 and record the deletion. HTTP Basic is the only accepted transport for
 `/nic/*` credentials.
+
+Done in issue #7: **11 cases deleted**, kept as data in the table's
+`deleted_cases` block — id, legacy behaviour and reason, no `expect` — so the
+deletion is auditable and the table cannot shrink silently. Three replacement
+cases run against the **host only** and assert the input is inert rather than
+merely absent.
 
 ### How the suite is built — two instruments
 
