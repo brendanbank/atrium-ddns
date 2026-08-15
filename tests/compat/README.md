@@ -65,6 +65,115 @@ regresses and a stripped comparison cannot see it.
   Run `--target legacy` first and treat failures as calibration findings against
   this table, not as compat requirements.
 
+## Standing the legacy service up
+
+*Added by #9, which ran the table against it. The result is `baseline.md`.*
+
+**The legacy service you test against is a local throwaway instance. Never the
+deployed one.** The table registers hostnames, exercises `badauth` paths and, if
+you close the rate-limit gap below, deliberately exhausts a user's limit.
+Pointing it at the live service writes real state and trips the limiter for real
+clients. No DNS credentials are needed and none should be present: every case
+stops at `nohost` / `911` / `badauth` / `notfqdn`, or reaches a backend that is
+deliberately unconfigured.
+
+### Six things that are not obvious
+
+**1. It needs its own directory, because `config.py` hardcodes its database
+path.** `SQLALCHEMY_DATABASE_URI` is `sqlite:///<dir of config.py>/instance/…`,
+and `.env` is loaded from the same `basedir`. A copy of the checkout is
+therefore the unit of isolation: own directory, own `instance/`, own `.env` with
+a throwaway `FERNET_KEY`, `SECRET_KEY` and `ADMIN_PASSWORD`.
+
+**Check the copy by digest, not by eye.** The one thing that invalidates every
+number a calibration run produces is testing a *modified* legacy service without
+noticing, and a sha256 comparison against the checkout is the only instrument
+that sees it. Print the digests, and print the checkout's HEAD and porcelain
+status beside them.
+
+**2. The fixture needs a DNS provider that does not talk to DNS.** The table's
+`fixture:` block asks for `service: stub`, "a provider the account factory knows
+and whose result is scripted by `result`". The legacy service ships aws, hetzner
+and nsupdate, all of which reach a real nameserver. One ~60-line module in
+`lib/account/` supplies it; `AccountFactory._register` globs that directory, so
+it is picked up with no other change.
+
+Carry the scripted result in the **service name**, not the credentials:
+`DomainBackend` is unique on `(domain_id, backend_type)` and the fixture needs
+four differently-scripted stubs on one domain. Keep the module strictly below
+`hostnameperzone` — the zone check, the credential check, the factory lookup,
+the aggregation and the response formatting must stay unmodified legacy code, or
+the table is calibrating against you.
+
+**3. Three of the fixture's conditions are not spelled the way the table spells
+them.** The mapping is not one-to-one and getting it wrong produces plausible
+wrong answers rather than errors:
+
+| the table says | the legacy schema needs |
+|---|---|
+| `backends[].zone` | the **hostname's domain** — `dyndns.py` passes `hn.domain.name` to the provider. So `wrong-zone` is a hostname whose domain is not a suffix of it |
+| `backends: []` | a domain with **no `DomainBackend` rows**. It cannot be "no hostname-specific backends": `Hostname.get_backends()` falls back to *all* of the domain's backends |
+| `credentials: absent` | a `DomainBackend` with no `BackendConfig` rows, so `get_credentials()` returns `{}` |
+| `service: no-such-service` | a `backend_type` no provider matches |
+
+**Backend order is load-bearing and the schema does not carry it.**
+`hostname_backends` has no ordering column, so `hn.backends` comes back in
+`domain_backends.id` order. `update-aggregate-first-non-good-nochg-status`
+expects `911` from `[nochg, 911, dnserr]`, and would expect `dnserr` from the
+same set in a different order. Create the backend rows in the order the fixture
+lists them, and print `hn.get_backends()` per hostname after seeding so the
+order is a reading rather than an assumption.
+
+**4. A stock instance answers `abuse` from about case 31.** The legacy default
+is 30 requests/minute and the table is ~95 requests in 13 seconds. The table's
+`rate_limited: false` default is a **precondition** — "the user is not over its
+limit" — so raising the fixture users' limits is what makes the default true,
+not a way of dodging a failure. The three `rate_limited: true` cases are skipped
+by the runner and are unaffected; `baseline.md` §2 measures them separately by
+dropping the limit back to 1.
+
+**5. Seed before the service starts, and seed hostnames with a `last_ip_v4`.**
+`create_app` resolves A and AAAA from real DNS for every hostname with no
+tracked IP, at every boot — 24 lookups against names that do not exist. Any
+non-null `last_ip_v4` skips it; nothing on the wire reads the column.
+
+Re-seeding a populated file fails: `Hostname.query.delete()` is a bulk delete
+and does not cascade into the `hostname_backends` secondary, so the association
+rows survive and the next insert hits their unique constraint. Delete the
+database files instead. A throwaway database has no reason to be incremental.
+
+**6. Restarting the service is where a run goes quietly wrong.** #9 lost a run
+to this and it is worth the paragraph:
+
+- `pkill -f 'legacy/run.py'` **does not match** a process started as
+  `cd legacy && python run.py` — argv carries the bare `run.py`. The kill
+  matched nothing, silently.
+- The old process kept the port and kept reading a **deleted** SQLite inode, in
+  a half-seeded state left by a re-seed that had aborted mid-way.
+- **The reachability probe was green throughout.** `/nic/checkip` touches no
+  database at all, so `GET /nic/checkip -> HTTP 200` says the service is up and
+  nothing about whether the fixture exists.
+- The result was 40 failed, 62 passed, all coherent, all wrong.
+  `ok.example.com` answering `nohost` with authentication succeeding reads
+  exactly like a real compatibility finding.
+
+Start it with an absolute path so `pkill -f` can find it, check the listener's
+`ps` start time against when you seeded, and if a run comes back red, confirm
+the fixture is there — `GET /nic/update?hostname=ok.example.com&myip=…` should
+answer `good`, not `nohost` — before writing up a single divergence.
+
+**Pick a port, and not 5000 on macOS.** `Control Centre` listens on 5000 for
+AirPlay, so the worked invocation below will connect to something that is not
+the legacy service. #9 used 5109. Two agents calibrating at once need two ports,
+same as the compose stack.
+
+### The result
+
+`baseline.md`. Short version: 98 cases selected for `--target legacy`, 95
+executed and 3 measured out of band, **98 agree and 0 diverge** — but three
+divergences from `docs/DYNDNS-PROTOCOL.md` that this table does **not** carry
+were found by sweeping §1 of the document, and they are the actual finding.
+
 ## Running the table
 
 `conftest.py` + `test_protocol.py` are the runner. One test per case, named
@@ -212,6 +321,15 @@ already committed a few hundred lines above.
 §1 of the plan listed five. This issue found a sixth by reading the regex. All
 six are **preserve**.
 
+> **Six is what this table carries, not what the document diverges by.** #9 ran
+> the six against the live legacy service — all six confirmed, 17 cases, 17
+> agreeing — and then swept §1 of the document clause by clause and found
+> **three more that this table does not carry**: non-`GET` methods answer HTTP
+> 405 rather than `badagent`, `offline=YES` is ignored and `!donator` has no
+> writer anywhere, and `Client-IP` is not honoured for IP detection. See
+> `baseline.md` §4.2 — adding them is a change to this table and #9 did not own
+> the file.
+
 1. **`nohost {ip}` on update, bare `nohost` on delete.** The doc says bare
    `nohost` for both. Clients parse the first token.
    Cases: `update-nohost-unregistered-hostname`,
@@ -255,8 +373,12 @@ them. §1 has been corrected for the first two.
 
 - **`/nic/checkip` with an unparseable client address returns an empty body only
   in `?format=plain`.** §1 said "empty string" without qualifying the format. In
-  the default HTML mode the wrapper is still emitted with an empty IP — 91
-  bytes, not 0. Cases `checkip-unparseable-remote-addr-plain` and
+  the default HTML mode the wrapper is still emitted with an empty IP — 90
+  bytes, not 0. (This read 91 until #9 measured it three ways: `curl` reports
+  `Content-Length: 90`, `wc -c` agrees, and `len()` of the table's own
+  `expect.body` is 90. The table was always right; only this count was wrong.
+  The same 91 survives in a `note:` in `protocol_cases.yaml`, which #9 did not
+  own.) Cases `checkip-unparseable-remote-addr-plain` and
   `checkip-unparseable-remote-addr-html`.
 - **The response echoes the *normalised* IP, not the spelling the client sent.**
   The body carries `str(ipaddress.ip_address(...))`, so `myip=2001:0DB8:0000::1`
