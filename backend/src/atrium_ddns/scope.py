@@ -52,6 +52,16 @@ Fail-closed, three ways
    nothing.** :func:`sqlalchemy.false`, not an absent ``WHERE``. A bug
    that loses the user id returns zero rows rather than every row.
 3. **"Unrestricted" is spelled in the SQL**, as a literal ``true``,
+
+    Caveat, measured rather than assumed (#17): ``sa.true()`` survives
+    compilation only as a **lone** predicate. Once ANDed with anything
+    else SQLAlchemy elides it, and the emitted SQL carries no trace —
+    ``SELECT ... WHERE ddns_domain.id > %s`` and nothing more. So a
+    query log distinguishes "deliberately unrestricted" from "never
+    scoped at all" for a bare unrestricted read, and *not* for a
+    composed one. The retention prune's DELETE reached MySQL with the
+    scope invisible for exactly this reason. Do not rely on the literal
+    as an audit signal on composed statements.
    rather than being the absence of a clause. An unscoped query and a
    deliberately cross-tenant one are otherwise indistinguishable to
    anyone reading a slow-query log.
