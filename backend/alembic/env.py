@@ -30,7 +30,13 @@ from app.settings import get_settings
 # ``atrium_ddns.models`` also runs the package's ``__init__``, which
 # registers every model class on ``HostBase.metadata`` before
 # autogenerate inspects it.
-from atrium_ddns.models import HostBase
+#
+# ``include_object`` comes from the same module rather than being
+# defined here. This file runs migrations at import time, so nothing
+# can import it — a filter defined here is a filter no test can
+# exercise, and the failure it guards against (a ``drop_table`` for
+# every atrium table) looks like an ordinary diff.
+from atrium_ddns.models import HostBase, include_object as _include_object
 
 VERSION_TABLE = "alembic_version_app"
 
@@ -45,25 +51,6 @@ if not config.get_main_option("sqlalchemy.url") or config.get_main_option(
     config.set_main_option("sqlalchemy.url", get_settings().database_url)
 
 target_metadata = HostBase.metadata
-
-
-def _include_object(obj, name, type_, reflected, compare_to):
-    """Filter atrium tables out of autogenerate.
-
-    Both atrium and the host write to the same MySQL database. With
-    ``target_metadata = HostBase.metadata`` alembic sees atrium's
-    tables as "in the DB but not in the model" and would emit
-    ``drop_table`` ops for every one of them on the first
-    autogenerate. Only emit ops for tables (and child objects) that
-    live in ``HostBase.metadata``.
-    """
-    if type_ == "table":
-        return name in target_metadata.tables
-    if reflected:
-        parent = getattr(obj, "table", None)
-        if parent is not None and parent.name not in target_metadata.tables:
-            return False
-    return True
 
 
 def run_migrations_offline() -> None:
