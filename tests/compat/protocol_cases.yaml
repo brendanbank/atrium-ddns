@@ -9,7 +9,77 @@
 # `docs/DYNDNS-PROTOCOL.md`. Where the two disagree the implementation wins and
 # the case carries a `divergence` tag. See README.md.
 
-version: 1
+# ---------------------------------------------------------------------------
+# FROZEN. Issue #11, 2026-08-15, closing V1M1.
+#
+# V1M2 is measured against this file, so changing it is a deliberate act with a
+# PR and not a tidy-up. To change it:
+#
+#   1. change the cases,
+#   2. bump `frozen.version`,
+#   3. recompute `frozen.cases` / `frozen.deleted_cases` / `frozen.spec_rows` /
+#      `frozen.content_digest`,
+#   4. re-run the table against a throwaway legacy instance and record the
+#      reading in `baseline.md`.
+#
+# Steps 2 and 3 are not optional and not on the honour system:
+# `test_the_table_is_frozen_at_its_recorded_shape` in `test_protocol.py`
+# recomputes all four every gate run and fails naming both values. `version: 1`
+# was written by #7 against a 101-case table and was still reading 1 when #25
+# left the table at 114, which is the reason the guard exists rather than a
+# note asking politely.
+#
+# `content_digest` is sha256 over the *parsed* `cases` and `deleted_cases`
+# lists, canonicalised as JSON -- so reflowing a comment or a block scalar does
+# not trip it, and changing a single expected byte does. It is a freeze on the
+# data, which is what a runner iterates.
+# ---------------------------------------------------------------------------
+version: 2
+
+frozen:
+  issue: 11
+  date: 2026-08-15
+  milestone: V1M1
+  version: 2
+  cases: 114
+  deleted_cases: 11
+  spec_rows: 37
+  content_digest: d46d789a71fa20d0d493670be0b6c6843f5e326541aff833715ff40467569bda
+  # What the frozen table is known NOT to cover. Recorded here rather than in
+  # prose somewhere, because a frozen table that overstates its own coverage is
+  # worse than one that is honestly narrow.
+  known_gaps:
+    - >-
+      effects: is data, not an assertion. 15 cases carry a DNS operation or a
+      persisted column and no runner asserts either; the accounting block
+      prints the count every run so the gap stays a number.
+    - >-
+      3 cases carry `rate_limited: true`. That is fixture state, not a request,
+      so the runner skips them with the precondition named and they are
+      measured out of band -- see baseline.md.
+    - >-
+      2 host-only cases (`checkip-post-is-405-on-the-host`,
+      `update-post-is-405-on-the-host`) pass against a host with NO /nic/*
+      routes at all, because a non-GET on an unmatched path meets atrium's
+      SPA catch-all, which also declares only GET. They assert "POST is
+      refused", never "the endpoint exists". Measured again by #11 against a
+      host whose route table contains zero /nic paths: 2 passed, 105 failed.
+    - >-
+      the two host-only HEAD cases (`update-head-is-refused-by-the-host`,
+      `delete-head-is-refused-by-the-host`) freeze `status: 405`, and #11
+      measured that the natural implementation does not produce it behind
+      atrium's SPA catch-all. Bare FastAPI, GET-only route: HEAD -> 405. The
+      same route behind a GET-only catch-all mount: HEAD -> 200. Atrium's own
+      stack today, no /nic route at all: HEAD -> 404. The decision (405) is
+      kept and the cases stay as frozen; what changes is that V1M2 has to
+      write a deliberate HEAD handler, because the framework's refusal does
+      not survive the mount. Same mechanism as the two vacuous passes above.
+    - >-
+      address family. 104 of 114 cases are IPv4-only and 4 touch IPv6, against
+      production traffic measured at 143 IPv4 / 305 IPv6 events (plan §3.3.1).
+      The table is weighted the opposite way from the population it protects.
+      This is a real coverage gap, named at freeze time rather than discovered
+      in V1M2.
 
 # ---------------------------------------------------------------------------
 # Spec rows. Every row of refactor-plan.md §1's three tables, given an id so
