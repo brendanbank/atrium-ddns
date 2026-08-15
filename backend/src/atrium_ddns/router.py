@@ -35,23 +35,36 @@ against. This module adds no sixth reading of the columns.
 """
 from __future__ import annotations
 
+import secrets as secrets_module
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 import sqlalchemy as sa
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_dirty
 
 from app.auth.rbac import require_perm
 from app.auth.users import current_user
 from app.db import get_session
+from app.host_sdk.crypto import apply_secret_update, unlock_user_secrets
 from app.models.auth import User
 from app.services.audit import record as record_audit
 
-from .models import AtriumDdnsState, Device, DnsEvent, Domain, Hostname
+from .auth_device import hash_password
+from .models import (
+    AtriumDdnsState,
+    Device,
+    DnsEvent,
+    Domain,
+    DomainBackend,
+    Hostname,
+)
+from .providers import known_services, provider_class
 from .scope import DdnsScope, get_scope
 from .worker_jobs import (
     SUCCESS_RESPONSE_CODES,
@@ -741,3 +754,1199 @@ async def get_board(
         devices=out,
         unassigned_hostnames=unassigned,
     )
+
+
+# ===================================================================== #
+# The tenant CRUD surface — domains, provider credentials, devices
+#
+# Everything below is #45. Three resources, one rule each that is not
+# obvious from the code and each of which has a plausible-looking
+# implementation that leaks:
+#
+# **A credential is never returned.** Not masked, not truncated, not
+# "first four characters". ``providers/base.py`` already says why in one
+# line — *"a prefix of an API token is still a disclosure and it is the
+# shape people reach for first"* — and the response models below carry
+# ``credentials_set``, a boolean, and nothing else. The listing endpoints
+# do not decrypt at all: ``credentials_set`` is
+# ``credentials_ct IS NOT NULL``, read off the column, so there is no
+# code path from a GET to a plaintext. ``tests/test_router_tenant.py``
+# proves that structurally (a sweep over the router's own route table)
+# and behaviourally (the listing still answers 200 for a tenant whose
+# encryption key has been *shredded* — an endpoint that decrypted would
+# raise).
+#
+# **A device secret exists in cleartext at exactly two moments.** It is
+# hashed, not encrypted (plan §3.2), so create and rotate are the only
+# times it can be shown and there is no "show it to me again". A device
+# whose row was migrated from the old service carries a **bcrypt** hash
+# whose plaintext we never had, so it can never display one at all —
+# :func:`credential_origin` is how the interface learns that, and the
+# frontend says so rather than rendering an empty field that reads as a
+# bug.
+#
+# **Credential updates use the blank-preserves rule**, through
+# ``app.host_sdk.crypto.apply_secret_update`` and never by assigning:
+# ``null`` clears, ``""`` preserves, anything else replaces. The failure
+# mode of getting it wrong is the one worth restating — editing an
+# unrelated field on the same form silently blanks a working provider
+# credential, and it surfaces much later as a DNS failure with no
+# obvious cause.
+# ===================================================================== #
+
+#: Manage your own zones and their provider bindings. Held by ``user``
+#: and by ``admin``; seeded by the ``0002`` migration from
+#: :data:`atrium_ddns.models.PERMISSIONS`.
+DOMAIN_MANAGE_PERMISSION = "atrium_ddns.domain.manage"
+
+#: Manage your own devices. Deliberately *the same string* as
+#: :data:`BOARD_READ_PERMISSION` rather than a second constant with the
+#: same value: the board renders devices and this surface edits them,
+#: and a reader who can see a device must be able to find the page that
+#: created it.
+DEVICE_MANAGE_PERMISSION = BOARD_READ_PERMISSION
+
+#: The wire value that means *preserve the stored secret*. Named because
+#: it is the one value on this surface whose meaning is not what it
+#: looks like: an empty string here is not "empty", it is "unchanged".
+#: The frontend must never send it as the result of a user clearing a
+#: text box — ``frontend/src/api/credentials.ts`` is the other half of
+#: that contract and asserts it.
+PRESERVE = ""
+
+#: How long a freshly issued device secret is, in bytes of entropy.
+#: ``token_urlsafe(32)`` renders 43 characters, comfortably under
+#: bcrypt's 72-**byte** ceiling (``auth_device._BCRYPT_MAX_BYTES``) so a
+#: secret issued today still verifies if a future row is ever stored
+#: under bcrypt rather than argon2id.
+SECRET_ENTROPY_BYTES = 32
+
+#: Bytes of entropy in a generated device username. See
+#: :func:`_generate_username` for why the client does not get to pick.
+USERNAME_ENTROPY_BYTES = 6
+
+#: 422, spelled as the number.
+#:
+#: Starlette renamed ``HTTP_422_UNPROCESSABLE_ENTITY`` to
+#: ``HTTP_422_UNPROCESSABLE_CONTENT`` and deprecated the old name; this
+#: image emits a ``StarletteDeprecationWarning`` for every use of it and
+#: a future one will remove it, while an older Starlette does not have
+#: the new name at all. The status code is the stable thing — it is what
+#: the wire carries and what the tests assert on — so it is written
+#: here once rather than being a dependency-version question at eight
+#: call sites.
+UNPROCESSABLE = 422
+
+
+class CredentialOrigin(str, Enum):
+    """Where a device's stored hash came from — and therefore whether a
+    plaintext ever existed on our side.
+
+    This is the *only* thing a read tells a caller about a device
+    secret, and it exists because the alternative is worse. A migrated
+    device's secret was hashed by the old service with bcrypt; we have
+    never held its plaintext and never will. An interface that rendered
+    an empty "secret" field for it would be saying *something is missing
+    here*, when the truth is *nothing was ever here and rotating is the
+    only way to get one*.
+    """
+
+    #: Hashed by us, by the hasher this build issues with. The plaintext
+    #: existed once, at create or at rotate, and was shown once.
+    ISSUED = "issued"
+    #: Recognised by one of the verifying hashers, but not the issuing
+    #: one — i.e. bcrypt, i.e. a row migrated from the old service.
+    #: There is no plaintext to show and there never was.
+    MIGRATED = "migrated"
+    #: No hasher recognises the stored value. A truncated column, or a
+    #: row written by something else. It cannot authenticate either —
+    #: ``auth_device._verify_sync`` answers ``badauth`` for it — so the
+    #: interface says so rather than implying the device works.
+    UNRECOGNISED = "unrecognised"
+
+
+def credential_origin(password_hash: str | None) -> CredentialOrigin:
+    """Classify a stored hash, by asking the hashers that verify it.
+
+    Derived rather than pattern-matched. The obvious implementation is
+    ``hash.startswith("$argon2")``, and it is the identical defect the
+    moment ``auth_device._PASSWORD_HASH`` gains a hasher or reorders —
+    the tuple's *first* element is what
+    :meth:`~pwdlib.PasswordHash.verify_and_update` re-hashes into, so
+    "issued by us" is by definition "identified by the current hasher"
+    and nothing else. Reordering that tuple therefore moves this
+    classification with it, which is the property a prefix test cannot
+    have.
+
+    Reading ``auth_device``'s module-level tuple directly (rather than
+    building a second ``PasswordHash``) is deliberate for the same
+    reason: two instances configured separately are two sources of truth
+    about which hasher issues.
+    """
+    from .auth_device import _PASSWORD_HASH
+
+    if not password_hash:
+        return CredentialOrigin.UNRECOGNISED
+    if _PASSWORD_HASH.current_hasher.identify(password_hash):
+        return CredentialOrigin.ISSUED
+    for hasher in _PASSWORD_HASH.hashers:
+        if hasher.identify(password_hash):
+            return CredentialOrigin.MIGRATED
+    return CredentialOrigin.UNRECOGNISED
+
+
+# --------------------------------------------------------------------- #
+# The provider catalogue — what a credential form is allowed to ask for
+# --------------------------------------------------------------------- #
+
+
+class ProviderOut(BaseModel):
+    """One DNS provider this build ships, and its field list.
+
+    Shipped to the browser so the credential form is **derived from the
+    provider classes** rather than from a field list retyped in
+    TypeScript. A provider deleted from ``providers._PROVIDERS`` takes
+    its form with it; one whose ``REQUIRED_CREDENTIALS`` gains a key
+    grows the field the next time the page loads. A hardcoded field list
+    in the frontend is the same defect one release later.
+    """
+
+    #: The canonical ``backend_type`` a new row should store. Aliases
+    #: (``aws`` for route53) are resolvable but are not offered — a new
+    #: row minted under an alias would be a second spelling of one
+    #: provider inside a ``UNIQUE(domain_id, backend_type)`` constraint.
+    service: str
+    #: ``BaseProvider.REQUIRED_CREDENTIALS`` — every key that must be
+    #: present and non-empty before the adapter will talk to the
+    #: provider at all. These go in the **encrypted** column.
+    credential_keys: list[str]
+
+
+class ProviderCatalogueOut(BaseModel):
+    providers: list[ProviderOut]
+
+
+def _credential_keys(backend_type: str) -> tuple[str, ...]:
+    """``REQUIRED_CREDENTIALS`` for a stored ``backend_type``, or ``()``.
+
+    ``()`` for a service nobody claims. That is a real state — the
+    compat table's ``unknownsvc`` row is exactly it — and it means
+    "no opinion", not "no secrets": the guards below that consume this
+    are therefore written so an empty tuple *relaxes* nothing that
+    matters. See :func:`_reject_secrets_in_config`.
+    """
+    cls = provider_class(backend_type)
+    return () if cls is None else tuple(cls.REQUIRED_CREDENTIALS)
+
+
+def _all_secret_keys() -> frozenset[str]:
+    """Every key any shipped provider treats as a secret.
+
+    The union across providers, so a value that is secret *somewhere*
+    cannot be written into the plaintext ``config`` column *anywhere*.
+
+    Computed at call time rather than snapshotted at import:
+    ``providers.register`` is a supported seam (#16's scripted stubs use
+    it), and a constant taken at import would miss anything registered
+    afterwards — a guard that silently stops covering the thing it was
+    written for.
+    """
+    return frozenset(
+        key for service in known_services() for key in _credential_keys(service)
+    )
+
+
+def _reject_secrets_in_config(config: dict[str, Any] | None) -> None:
+    """Refuse a plaintext ``config`` that carries a credential key.
+
+    ``ddns_domain_backend.config`` is a plain JSON column with no
+    encryption on it, and ``nsupdate`` already logs
+    ``provider.secret_in_plaintext_config`` when it finds
+    ``nsupdate_secret`` there — i.e. the shape is known to happen and
+    the current handling is to notice it *after* it has been stored.
+    This refuses it at the door instead.
+
+    Checked against the union across every provider rather than against
+    this row's own provider: a form that posts ``aws_secret_access_key``
+    into an ``nsupdate`` row's config has still written an AWS key into
+    a plaintext column, and "wrong provider" is not a reason to keep it.
+    """
+    if not config:
+        return
+    offending = sorted(set(config) & _all_secret_keys())
+    if offending:
+        raise HTTPException(
+            status_code=UNPROCESSABLE,
+            # Names the keys, never the values. A refusal that echoed
+            # the value would put the credential in the response body,
+            # in the browser's network tab, and in any log that keeps
+            # response bodies — which is the disclosure this guard
+            # exists to prevent, committed by the guard itself.
+            detail=(
+                f"config carries credential key(s) {offending}; `config` is a "
+                f"plaintext column. Send these under `credentials`, which is "
+                f"encrypted per-user."
+            ),
+        )
+
+
+def _require_complete_credentials(
+    backend_type: str, credentials: dict[str, str]
+) -> None:
+    """Every ``REQUIRED_CREDENTIALS`` key present, when replacing.
+
+    Enforced only on a *replacement*, never on a preserve: the whole
+    point of blank-preserves is that a form editing ``config`` does not
+    have to resend the secret, so demanding a complete set on every
+    PATCH would defeat it.
+
+    The rule is the provider's own — ``BaseProvider.has_credentials``
+    returns False unless every key is present and truthy, and a backend
+    that fails it answers ``dnserr`` per hostname. Storing a partial set
+    is therefore storing a row that cannot work, which is worth a 422
+    now rather than a DNS failure later.
+    """
+    required = set(_credential_keys(backend_type))
+    if not required:
+        return
+    missing = sorted(required - set(credentials))
+    if missing:
+        raise HTTPException(
+            status_code=UNPROCESSABLE,
+            detail=(
+                f"{backend_type} needs {sorted(required)}; missing {missing}. "
+                f"A partial credential set stores a backend that answers "
+                f"dnserr on every update."
+            ),
+        )
+
+
+@router.get("/providers", response_model=ProviderCatalogueOut)
+async def list_providers(
+    _user: User = Depends(require_perm(DOMAIN_MANAGE_PERMISSION)),
+) -> ProviderCatalogueOut:
+    """The services a new backend row may name, and their field lists.
+
+    No database and no tenancy: this is a property of the build, not of
+    a tenant. It is still gated, because the set of providers an
+    installation ships is not something an unauthenticated caller needs.
+    """
+    return ProviderCatalogueOut(
+        providers=[
+            ProviderOut(
+                service=service, credential_keys=list(_credential_keys(service))
+            )
+            for service in known_services()
+        ]
+    )
+
+
+# --------------------------------------------------------------------- #
+# Wire models
+# --------------------------------------------------------------------- #
+
+#: The three states an inbound secret may be in, *after* validation.
+#: Spelled as a type so the *absence* of the field and the value ``""``
+#: are the same thing — which is the shape ``apply_secret_update``'s
+#: docstring names.
+CredentialsIn = dict[str, str] | Literal[""] | None
+
+
+class _CredentialsField(BaseModel):
+    """Mixin carrying the one field with the blank-preserves rule.
+
+    **The field is typed ``Any``, and that is a security decision rather
+    than laziness.** It was found by writing the obvious version first
+    (``dict[str, str] | Literal[""] | None`` with a
+    ``@field_validator``) and reading what the refusal actually
+    returned:
+
+        POST … {"credentials": {"aws_access_key_id": "AKIA…",
+                                "aws_secret_access_key": ""}}
+        422 {"detail":[{…,"input":{"aws_access_key_id":"AKIA…",
+                                   "aws_secret_access_key":""}}]}
+
+    FastAPI's ``RequestValidationError`` handler serialises
+    ``exc.errors()``, and every entry carries ``input`` — **the value
+    that failed**. So any Pydantic-level rejection of this field puts
+    the submitted credential in the response body, in the browser's
+    network tab, and in anything that logs response bodies. A guard
+    committing the disclosure it exists to prevent, which is the exact
+    shape ``docs/ops/overnight-template.md`` catalogues under
+    *assertions on the report*.
+
+    Typing the field ``Any`` means **no request-validation path can
+    reject it**, so there is no Pydantic error carrying it. Every
+    content rule moves into :func:`_coerce_credentials`, which raises an
+    ``HTTPException`` whose detail names **keys** and never values.
+    ``tests/test_router_tenant.py`` asserts that across every malformed
+    shape, including the three that used to echo.
+    """
+
+    #: ``null`` clears · ``""`` (and absent) preserves · an object
+    #: replaces. Defaulting to :data:`PRESERVE` is what makes "absent"
+    #: mean "preserve" without the handler having to inspect
+    #: ``model_fields_set``. Validated by :func:`_coerce_credentials`,
+    #: never by Pydantic — see the class docstring.
+    credentials: Any = PRESERVE
+
+
+def _coerce_credentials(value: Any) -> CredentialsIn:
+    """Validate an inbound ``credentials`` value without ever echoing it.
+
+    Four refusals, and every message names keys or types only:
+
+    - a value that is neither an object, ``""`` nor ``null`` — the wire
+      has exactly three spellings and inventing a fourth is a client
+      bug;
+    - ``{}``, which is ambiguous between *clear* and *preserve* when the
+      wire already has an unambiguous spelling for each. Refusing beats
+      picking one;
+    - a non-string value inside the object;
+    - a blank string inside the object — a text box the user cleared.
+      Stored, it replaces a working credential with a blank one: the
+      exact failure blank-preserves exists to prevent, arriving one
+      level below the field that guards it.
+    """
+    if value is None or value == PRESERVE:
+        return None if value is None else PRESERVE
+    if not isinstance(value, dict):
+        raise HTTPException(
+            status_code=UNPROCESSABLE,
+            detail=(
+                f"credentials must be an object, \"\" (preserve) or null "
+                f"(clear); got {type(value).__name__}"
+            ),
+        )
+    if not value:
+        raise HTTPException(
+            status_code=UNPROCESSABLE,
+            detail=(
+                "credentials: {} is ambiguous. Send null to clear the stored "
+                'credential, or "" (or omit the field) to preserve it.'
+            ),
+        )
+    non_string = sorted(k for k, v in value.items() if not isinstance(v, str))
+    if non_string:
+        raise HTTPException(
+            status_code=UNPROCESSABLE,
+            detail=f"credentials: non-string value for {non_string}",
+        )
+    blank = sorted(key for key, item in value.items() if not item.strip())
+    if blank:
+        raise HTTPException(
+            status_code=UNPROCESSABLE,
+            detail=(
+                f"credentials: blank value for {blank}. A cleared text box is "
+                f'not a credential — omit the field or send "" to preserve the '
+                f"stored one, or send null to clear it."
+            ),
+        )
+    return dict(value)
+
+
+class DomainBackendOut(BaseModel):
+    """One provider binding, with **no credential material on it**.
+
+    ``credentials_set`` is the only thing this says about the secret,
+    and it is read off ``credentials_ct IS NOT NULL`` without
+    decrypting. Not a mask, not a length, not a prefix: a boolean, which
+    is the largest amount of information about a stored credential that
+    is safe to publish and is also all a form needs in order to say
+    *"leave blank to keep the stored one"*.
+    """
+
+    id: int
+    domain_id: int
+    backend_type: str
+    #: Non-secret provider settings — hosted-zone id, TTL, nameserver.
+    #: :func:`_reject_secrets_in_config` is what keeps that true.
+    config: dict[str, Any]
+    #: Ciphertext present. **Never** the ciphertext, and never anything
+    #: derived from the plaintext.
+    credentials_set: bool
+    #: Whether ``backend_type`` resolves to an adapter in this build. A
+    #: migrated row may name a service this build does not ship, and the
+    #: interface should say *"this build has no adapter for it"* rather
+    #: than rendering it as though it worked. The wire half is ``911``.
+    known_service: bool
+    #: This provider's credential keys, so a form can render the right
+    #: fields for an existing row without a second request. Empty for an
+    #: unknown service, which is the same "no opinion" state.
+    credential_keys: list[str]
+
+
+class DomainOut(BaseModel):
+    id: int
+    name: str
+    created_at: str
+    backends: list[DomainBackendOut]
+    #: The count, not the names. The board is where hostnames are read;
+    #: this surface is about the zone and its provider bindings, and a
+    #: nested list here would be a second rendering of the board's data
+    #: that could disagree with it.
+    hostname_count: int
+
+
+class DomainCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=253)
+
+
+class DomainBackendCreateIn(_CredentialsField):
+    backend_type: str = Field(min_length=1, max_length=64)
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class DomainBackendUpdateIn(_CredentialsField):
+    """``config`` absent means *leave it alone*; ``credentials`` absent
+    means *preserve*.
+
+    Two different spellings of "unchanged" for two fields, and that is
+    deliberate rather than untidy: ``config`` is plaintext and can be
+    read back, so ``None`` can safely mean "not supplied". A secret
+    cannot be read back, so its "not supplied" needs a value that is not
+    ``None`` — because ``None`` is the only unambiguous way to say
+    *clear it*.
+    """
+
+    config: dict[str, Any] | None = None
+
+
+class DeviceSummaryOut(BaseModel):
+    """A device, as a *read* can describe it.
+
+    There is no secret on this model and there is no field that could
+    hold one. That is asserted structurally in
+    ``tests/test_router_tenant.py`` by sweeping the router's own route
+    table, so an endpoint added later that returns the wrong model fails
+    the sweep rather than a review.
+    """
+
+    id: int
+    name: str
+    #: The HTTP Basic username the router sends. Not a secret — it is
+    #: half of a credential pair and is useless without the other half,
+    #: and the owner has to be able to read it back to configure a
+    #: replacement router.
+    username: str
+    created_at: str
+    last_seen_at: str | None
+    #: ``NULL`` means *inherit the namespace default*, which is not the
+    #: same as ``0`` (may never call). Two states, carried as two.
+    rate_limit_per_minute: int | None
+    #: :class:`CredentialOrigin`. The one thing a read says about the
+    #: secret, and the reason a migrated device can be described
+    #: honestly instead of rendered as an empty field.
+    credential_origin: CredentialOrigin
+    hostname_count: int
+
+
+class DeviceCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    rate_limit_per_minute: int | None = Field(default=None, ge=0)
+
+
+class DeviceSecretOut(BaseModel):
+    """A device **and its secret** — the only model on this surface that
+    carries one, returned by exactly two routes.
+
+    The secret is here once. It is hashed on the way into the database
+    (argon2id) and there is no endpoint, no admin screen and no support
+    procedure that can produce it again; rotating issues a *new* one and
+    invalidates this. ``tests/test_router_tenant.py`` proves the second
+    read does not carry it, and proves it non-vacuously by checking that
+    the new secret verifies against the stored hash and the old one does
+    not — otherwise "rotate returns a random string" would pass.
+    """
+
+    device: DeviceSummaryOut
+    #: Cleartext, once. Never logged, never audited, never re-derivable.
+    secret: str
+
+
+# --------------------------------------------------------------------- #
+# Shared helpers
+# --------------------------------------------------------------------- #
+
+
+def _normalise_zone(name: str) -> str:
+    """Lower-cased, no trailing dot — the shape ``models.Domain`` stores.
+
+    Done here rather than left to the caller because the UNIQUE index on
+    ``ddns_domain.name`` is the only thing stopping ``Example.com`` and
+    ``example.com`` becoming two zones, and an index cannot normalise.
+    """
+    return name.strip().rstrip(".").lower()
+
+
+def _conflict(detail: str) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+
+
+def _not_found(what: str) -> HTTPException:
+    """404 for both *no such row* and *not yours*.
+
+    :meth:`DdnsScope.get` already collapses the two, on purpose:
+    distinguishing them tells a caller which ids exist. This helper
+    exists so every handler spells the refusal the same way.
+    """
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND, detail=f"no such {what}"
+    )
+
+
+async def _hostname_counts(
+    session: AsyncSession, scope: DdnsScope
+) -> tuple[dict[int, int], dict[int, int]]:
+    """``(by_domain_id, by_device_id)`` — one scoped query, not N.
+
+    Both counts come off the same scoped read of ``ddns_hostname``, so
+    a hostname the scope hides is missing from both totals rather than
+    from one of them. Counting them separately is how a domain's count
+    and a device's count end up describing different populations.
+    """
+    rows = (
+        await session.execute(
+            scope.select(Hostname, Hostname.domain_id, Hostname.device_id)
+        )
+    ).all()
+    by_domain: dict[int, int] = {}
+    by_device: dict[int, int] = {}
+    for domain_id, device_id in rows:
+        by_domain[domain_id] = by_domain.get(domain_id, 0) + 1
+        if device_id is not None:
+            by_device[device_id] = by_device.get(device_id, 0) + 1
+    return by_domain, by_device
+
+
+def _render_backend(backend: DomainBackend) -> DomainBackendOut:
+    """A backend row for the wire. **Touches no plaintext.**
+
+    ``credentials_ct is not None`` and not ``backend.credentials is not
+    None``: the second reads the ``UserSecret`` descriptor, which
+    decrypts, which needs an unlocked key, which would make this
+    function raise for a locked tenant *and* would put the plaintext one
+    attribute access away from a response model. The column is the
+    right instrument for the question "is one stored".
+    """
+    return DomainBackendOut(
+        id=backend.id,
+        domain_id=backend.domain_id,
+        backend_type=backend.backend_type,
+        config=dict(backend.config or {}),
+        credentials_set=backend.credentials_ct is not None,
+        known_service=provider_class(backend.backend_type) is not None,
+        credential_keys=list(_credential_keys(backend.backend_type)),
+    )
+
+
+def _render_device(device: Device, hostname_count: int) -> DeviceSummaryOut:
+    return DeviceSummaryOut(
+        id=device.id,
+        name=device.name,
+        username=device.username,
+        created_at=_iso(device.created_at) or "",
+        last_seen_at=_iso(device.last_seen_at),
+        rate_limit_per_minute=device.rate_limit_per_minute,
+        credential_origin=credential_origin(device.password_hash),
+        hostname_count=hostname_count,
+    )
+
+
+# --------------------------------------------------------------------- #
+# Domains
+# --------------------------------------------------------------------- #
+
+
+@router.get("/domains", response_model=list[DomainOut])
+async def list_domains(
+    _user: User = Depends(require_perm(DOMAIN_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> list[DomainOut]:
+    """A tenant's zones, their provider bindings, and their name counts.
+
+    Three scoped reads and no per-row query. Nothing here decrypts:
+    see :func:`_render_backend`.
+    """
+    domains = list(
+        (await session.execute(scope.select(Domain).order_by(Domain.name)))
+        .scalars()
+        .all()
+    )
+    backends = list(
+        (
+            await session.execute(
+                scope.select(DomainBackend).order_by(DomainBackend.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_domain_hostnames, _ = await _hostname_counts(session, scope)
+
+    grouped: dict[int, list[DomainBackendOut]] = {}
+    for backend in backends:
+        grouped.setdefault(backend.domain_id, []).append(_render_backend(backend))
+
+    return [
+        DomainOut(
+            id=domain.id,
+            name=domain.name,
+            created_at=_iso(domain.created_at) or "",
+            backends=grouped.get(domain.id, []),
+            hostname_count=by_domain_hostnames.get(domain.id, 0),
+        )
+        for domain in domains
+    ]
+
+
+@router.post("/domains", response_model=DomainOut, status_code=201)
+async def create_domain(
+    body: DomainCreateIn,
+    user: User = Depends(require_perm(DOMAIN_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> DomainOut:
+    """Claim a zone for the calling tenant.
+
+    **The owner is the caller, never a parameter.** A ``user_id`` in the
+    body would be a way to write rows into another tenant's account
+    through an endpoint whose *read* side is correctly scoped, which is
+    the asymmetry a scope cannot see.
+
+    ``ddns_domain.name`` is globally unique — DNS is global, and two
+    tenants claiming one zone is a conflict the database refuses rather
+    than a state the UI has to explain. The 409 below is therefore
+    reachable for a name *another* tenant owns, and it deliberately says
+    nothing about who. "Already claimed" and "already claimed by you"
+    are the same sentence here on purpose.
+    """
+    if scope.user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="this caller has no tenant identity and cannot own a zone",
+        )
+    name = _normalise_zone(body.name)
+    if not name:
+        raise HTTPException(
+            status_code=UNPROCESSABLE,
+            detail="a zone name cannot be empty once normalised",
+        )
+
+    domain = Domain(user_id=scope.user_id, name=name)
+    session.add(domain)
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise _conflict(f"the zone {name} is already claimed") from exc
+
+    # `created_at` is a server default, so the INSERT does not bring it
+    # back and reading it would be a lazy load — which in an async
+    # session is a `MissingGreenlet`, not a slow query. Awaited here,
+    # where it is an ordinary read, rather than at attribute access.
+    await session.refresh(domain)
+
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity="ddns_domain",
+        entity_id=domain.id,
+        action="create",
+        diff={"name": name},
+    )
+    await session.commit()
+    return DomainOut(
+        id=domain.id,
+        name=domain.name,
+        created_at=_iso(domain.created_at) or "",
+        backends=[],
+        hostname_count=0,
+    )
+
+
+@router.delete("/domains/{domain_id}", status_code=204)
+async def delete_domain(
+    domain_id: int,
+    user: User = Depends(require_perm(DOMAIN_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> None:
+    """Destroy a zone, its provider bindings and its hostnames.
+
+    ``scope.get`` and not ``session.get``: the latter consults the
+    identity map, takes no ``WHERE`` clause and would happily delete
+    another tenant's zone.
+
+    The cascade is the ORM's (``cascade="all, delete-orphan"``), so the
+    encrypted credential rows go with it. The tenant's *key* is not
+    shredded — that belongs to account deletion, not to dropping one
+    zone, and shredding here would destroy every other zone's
+    credentials as a side effect.
+    """
+    domain = await scope.get(session, Domain, domain_id)
+    if domain is None:
+        raise _not_found("domain")
+    name = domain.name
+    await session.delete(domain)
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity="ddns_domain",
+        entity_id=domain_id,
+        action="delete",
+        diff={"name": name},
+    )
+    await session.commit()
+
+
+# --------------------------------------------------------------------- #
+# Provider credentials
+# --------------------------------------------------------------------- #
+
+
+async def _apply_credentials(
+    session: AsyncSession,
+    backend: DomainBackend,
+    incoming: CredentialsIn,
+) -> bool:
+    """The blank-preserves rule, applied through atrium's own helper.
+
+    ``apply_secret_update(obj, field, incoming)`` and **not** an
+    assignment. The three directions are its three branches — ``None``
+    clears, ``""`` preserves, anything else replaces — and it returns
+    whether the attribute was touched.
+
+    The unlock is conditional on there being something to encrypt.
+    Unwrapping a per-user key is a database read; doing it on a preserve
+    would be IO for a no-op, and doing it on a clear would mint a key
+    for a tenant who has just told us they store nothing.
+    ``create=True`` is correct on the replace path and only there: this
+    may be the tenant's first encrypted value, and refusing to mint
+    their key would make "add a credential" fail for every new account.
+
+    Why ``flag_dirty`` — an upstream defect, measured
+    -------------------------------------------------
+    ``UserSecret.__set__`` writes the plaintext into a private slot in
+    ``instance.__dict__`` and returns; the mapped column is untouched
+    until the ``before_flush`` hook (``_encrypt_pending_user_secrets``)
+    runs. But that hook iterates ``session.new`` and ``session.dirty``,
+    and a write to ``instance.__dict__`` **does not make the row
+    dirty**. So setting a credential on a persistent row that is not
+    otherwise modified is a *silent no-op*: the commit succeeds, the
+    response is 200, and the stored ciphertext is the old one.
+
+    Measured against atrium 0.28 in this image, three cases, one
+    throwaway table::
+
+        A. set on a NEW object            -> STORED
+        B. set on a CLEAN persistent row  -> 'set-on-new'   (discarded)
+        C. set alongside a column change  -> stored
+
+    Case B is precisely "the user changed only the credential", which is
+    the most common reason to open a credential form at all. It is also
+    the mirror image of the blank-preserves hazard: instead of blanking
+    a credential nobody meant to touch, it fails to replace one somebody
+    did, and the router keeps authenticating with the old provider key
+    until someone notices. Nothing in the response can tell you.
+
+    ``flag_dirty`` is the fix, and it is the primitive SQLAlchemy
+    documents for exactly this: *"mark an instance as dirty without any
+    specific attribute mentioned … to allow the object to travel through
+    the flush process for interception by events such as
+    before_flush"*. It emits no SQL of its own — the hook then sets
+    ``credentials_ct`` for real, which is what makes the UPDATE happen.
+
+    ``flag_modified(backend, "credentials_ct")`` was the first attempt
+    and it is **wrong**: on a freshly inserted row the column was never
+    assigned, so it is absent from the instance state and SQLAlchemy
+    raises *"Can't flag attribute 'credentials_ct' modified; it's not
+    present in the object state"*. Loading it first would be a lazy read
+    on an async session, i.e. a ``MissingGreenlet``.
+
+    Applied only when ``apply_secret_update`` reports a touch, so a
+    preserve still writes nothing at all — which is the property
+    ``test_blank_preserves_in_all_three_directions`` checks by
+    comparing raw ciphertext bytes.
+    """
+    if isinstance(incoming, dict):
+        await unlock_user_secrets(session, backend.user_id, create=True)
+    touched = apply_secret_update(backend, "credentials", incoming)
+    if touched:
+        flag_dirty(backend)
+    return touched
+
+
+def _credential_audit(incoming: CredentialsIn, touched: bool) -> str:
+    """What the audit row says happened to the secret. Never the secret.
+
+    Three words for three outcomes, and ``preserved`` is the one worth
+    having: an audit trail that recorded nothing for an untouched
+    credential is indistinguishable from one written by a build that
+    forgot to preserve it.
+    """
+    if incoming is None:
+        return "cleared"
+    if not touched:
+        return "preserved"
+    return "replaced"
+
+
+@router.post(
+    "/domains/{domain_id}/backends",
+    response_model=DomainBackendOut,
+    status_code=201,
+)
+async def create_backend(
+    domain_id: int,
+    body: DomainBackendCreateIn,
+    user: User = Depends(require_perm(DOMAIN_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> DomainBackendOut:
+    """Bind a provider to a zone, optionally with its credentials.
+
+    **The row's ``user_id`` is the domain's, never the caller's**, and
+    that is the single most consequential line in this handler. A caller
+    holding ``atrium_ddns.admin`` reaches every tenant's zones, so
+    taking the owner from the scope would encrypt the credential under
+    the *administrator's* key: ``/nic/update`` unlocks the device
+    owner's key and would fail to decrypt it, and
+    :class:`~atrium_ddns.scope.DdnsScope` would hide the row from the
+    tenant who owns the zone it hangs under. Two silent failures from
+    one plausible line.
+
+    ``backend_type`` is refused unless it names an adapter this build
+    ships. The *column* stays a free string — migrated rows may carry a
+    service nobody claims, and ``models.py`` says so — but a row minted
+    through this endpoint could only ever answer ``911``, so refusing is
+    the kinder answer.
+    """
+    domain = await scope.get(session, Domain, domain_id)
+    if domain is None:
+        raise _not_found("domain")
+
+    if provider_class(body.backend_type) is None:
+        raise HTTPException(
+            status_code=UNPROCESSABLE,
+            detail=(
+                f"no adapter for {body.backend_type!r}; this build ships "
+                f"{list(known_services())}"
+            ),
+        )
+    _reject_secrets_in_config(body.config)
+    credentials = _coerce_credentials(body.credentials)
+    if isinstance(credentials, dict):
+        _require_complete_credentials(body.backend_type, credentials)
+
+    backend = DomainBackend(
+        domain_id=domain.id,
+        # From the row above, not from `scope.user_id`. See the docstring.
+        user_id=domain.user_id,
+        backend_type=body.backend_type,
+        config=dict(body.config),
+    )
+    session.add(backend)
+
+    # Flushed *before* the credential is applied, and deliberately so.
+    # `unlock_user_secrets` is a database read that may itself flush, so
+    # applying first would let the INSERT happen inside the unlock —
+    # where this `except` cannot see the unique-constraint violation and
+    # the 409 becomes a 500.
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise _conflict(
+            f"{domain.name} already has a {body.backend_type} backend"
+        ) from exc
+
+    touched = await _apply_credentials(session, backend, credentials)
+    await session.flush()
+
+    # `created_at` is a server default, so the INSERT does not bring it
+    # back and reading it would be a lazy load — a `MissingGreenlet` in
+    # an async session, not a slow query.
+    await session.refresh(backend)
+
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity="ddns_domain_backend",
+        entity_id=backend.id,
+        action="create",
+        # Key names, never values, and never the plaintext. The audit
+        # helper redacts a `MaskedSecret` to `***` for exactly this
+        # reason, but a raw `str` would sail straight through it into a
+        # durable table — so the value never reaches the call.
+        diff={
+            "backend_type": body.backend_type,
+            "config_keys": sorted(body.config),
+            "credentials": _credential_audit(credentials, touched),
+        },
+    )
+    await session.commit()
+    return _render_backend(backend)
+
+
+@router.patch("/backends/{backend_id}", response_model=DomainBackendOut)
+async def update_backend(
+    backend_id: int,
+    body: DomainBackendUpdateIn,
+    user: User = Depends(require_perm(DOMAIN_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> DomainBackendOut:
+    """Edit a binding's settings, its credential, or one without the other.
+
+    This is the endpoint the blank-preserves rule exists for. A form
+    that changes a TTL posts ``{"config": {...}}`` and no
+    ``credentials`` key; the default :data:`PRESERVE` makes that a
+    no-op on the secret, and :func:`_apply_credentials` returns
+    ``False`` so the ciphertext is not even re-encrypted. Re-encrypting
+    the same plaintext would change the stored bytes — a new nonce every
+    time — which is both a needless write and a misleading audit diff,
+    and it would make "did this request touch the credential"
+    unanswerable from the database.
+    """
+    backend = await scope.get(session, DomainBackend, backend_id)
+    if backend is None:
+        raise _not_found("backend")
+
+    if body.config is not None:
+        _reject_secrets_in_config(body.config)
+    credentials = _coerce_credentials(body.credentials)
+    if isinstance(credentials, dict):
+        _require_complete_credentials(backend.backend_type, credentials)
+
+    before_config = dict(backend.config or {})
+    if body.config is not None:
+        backend.config = dict(body.config)
+
+    touched = await _apply_credentials(session, backend, credentials)
+
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity="ddns_domain_backend",
+        entity_id=backend.id,
+        action="update",
+        diff={
+            "config_keys": {
+                "before": sorted(before_config),
+                "after": sorted(backend.config or {}),
+            },
+            "credentials": _credential_audit(credentials, touched),
+        },
+    )
+    await session.commit()
+    await session.refresh(backend)
+    return _render_backend(backend)
+
+
+@router.delete("/backends/{backend_id}", status_code=204)
+async def delete_backend(
+    backend_id: int,
+    user: User = Depends(require_perm(DOMAIN_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> None:
+    backend = await scope.get(session, DomainBackend, backend_id)
+    if backend is None:
+        raise _not_found("backend")
+    backend_type = backend.backend_type
+    domain_id = backend.domain_id
+    await session.delete(backend)
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity="ddns_domain_backend",
+        entity_id=backend_id,
+        action="delete",
+        diff={"backend_type": backend_type, "domain_id": domain_id},
+    )
+    await session.commit()
+
+
+# --------------------------------------------------------------------- #
+# Devices
+# --------------------------------------------------------------------- #
+
+
+def _generate_secret() -> str:
+    return secrets_module.token_urlsafe(SECRET_ENTROPY_BYTES)
+
+
+def _generate_username() -> str:
+    """A device's HTTP Basic username, minted here rather than chosen.
+
+    ``ddns_device.username`` is **globally unique** — it has to be, the
+    lookup happens before there is any tenant to scope by
+    (``auth_device`` says so). A client-chosen username on a globally
+    unique column is an enumeration oracle: post a candidate, read the
+    409, learn that some other tenant's router uses it. No scope can
+    close that, because the global uniqueness *is* the point.
+
+    So the API generates it. The ergonomic cost is nil — the username
+    and the secret are handed over in the same response, at the one
+    moment the user is configuring the router anyway — and the migration
+    path (V1M4) writes legacy usernames directly to the table rather
+    than through this endpoint.
+    """
+    return f"ddns-{secrets_module.token_hex(USERNAME_ENTROPY_BYTES)}"
+
+
+@router.get("/devices", response_model=list[DeviceSummaryOut])
+async def list_devices(
+    _user: User = Depends(require_perm(DEVICE_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> list[DeviceSummaryOut]:
+    """A tenant's devices. No secret, and no field that could hold one."""
+    devices = list(
+        (await session.execute(scope.select(Device).order_by(Device.name)))
+        .scalars()
+        .all()
+    )
+    _, by_device = await _hostname_counts(session, scope)
+    return [
+        _render_device(device, by_device.get(device.id, 0)) for device in devices
+    ]
+
+
+@router.post("/devices", response_model=DeviceSecretOut, status_code=201)
+async def create_device(
+    body: DeviceCreateIn,
+    user: User = Depends(require_perm(DEVICE_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> DeviceSecretOut:
+    """Issue a device, and show its secret — once.
+
+    The plaintext exists in this function and in this response and
+    nowhere else. It is argon2id-hashed before the row is flushed, it is
+    not logged, it is not audited, and there is no endpoint that can
+    produce it again. The interface is responsible for saying so at the
+    moment it is shown; the API is responsible for making that true.
+    """
+    if scope.user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="this caller has no tenant identity and cannot own a device",
+        )
+
+    secret = _generate_secret()
+    device = Device(
+        user_id=scope.user_id,
+        username=_generate_username(),
+        password_hash=await hash_password(secret),
+        name=body.name.strip(),
+        rate_limit_per_minute=body.rate_limit_per_minute,
+    )
+    session.add(device)
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise _conflict(
+            f"you already have a device called {body.name.strip()!r}"
+        ) from exc
+
+    await session.refresh(device)
+
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity="ddns_device",
+        entity_id=device.id,
+        action="create",
+        # `credential` records the *kind*, never the value. The
+        # plaintext is not passed to this call in any form.
+        diff={
+            "name": device.name,
+            "username": device.username,
+            "credential": credential_origin(device.password_hash).value,
+        },
+    )
+    await session.commit()
+    return DeviceSecretOut(device=_render_device(device, 0), secret=secret)
+
+
+@router.post("/devices/{device_id}/rotate", response_model=DeviceSecretOut)
+async def rotate_device_secret(
+    device_id: int,
+    user: User = Depends(require_perm(DEVICE_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> DeviceSecretOut:
+    """Issue a new secret for an existing device, and show it once.
+
+    The only route by which a *migrated* device ever acquires a secret
+    anyone knows — its bcrypt hash came from the old service and its
+    plaintext was never ours. Rotating one also upgrades it to argon2id,
+    so :func:`credential_origin` moves from ``migrated`` to ``issued``
+    and the interface stops saying "we cannot show you this".
+
+    The old secret stops working the moment this commits. That is the
+    whole point and it is also the sharp edge: a router still configured
+    with it starts answering ``badauth``, and the interface has to say
+    so *before* the button is pressed rather than after.
+    """
+    device = await scope.get(session, Device, device_id)
+    if device is None:
+        raise _not_found("device")
+
+    before = credential_origin(device.password_hash)
+    secret = _generate_secret()
+    device.password_hash = await hash_password(secret)
+
+    _, by_device = await _hostname_counts(session, scope)
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity="ddns_device",
+        entity_id=device.id,
+        action="rotate_secret",
+        diff={
+            "credential": {
+                "before": before.value,
+                "after": credential_origin(device.password_hash).value,
+            }
+        },
+    )
+    await session.commit()
+    return DeviceSecretOut(
+        device=_render_device(device, by_device.get(device.id, 0)),
+        secret=secret,
+    )
+
+
+@router.delete("/devices/{device_id}", status_code=204)
+async def delete_device(
+    device_id: int,
+    user: User = Depends(require_perm(DEVICE_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> None:
+    """Delete a device. Its hostnames survive, orphaned.
+
+    ``ddns_hostname.device_id`` is ``ON DELETE SET NULL`` by design —
+    deleting a router must not destroy the names it was maintaining, and
+    the board lists an unassigned hostname rather than dropping it.
+    """
+    device = await scope.get(session, Device, device_id)
+    if device is None:
+        raise _not_found("device")
+    name = device.name
+    username = device.username
+    await session.delete(device)
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity="ddns_device",
+        entity_id=device_id,
+        action="delete",
+        diff={"name": name, "username": username},
+    )
+    await session.commit()

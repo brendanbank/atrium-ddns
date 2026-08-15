@@ -14,7 +14,12 @@
  * #46 add their registrations here in the same shape; nothing new should
  * spell the provider stack out again.
  */
-import { IconHandStop, IconRouter } from '@tabler/icons-react';
+import {
+  IconHandStop,
+  IconKey,
+  IconRouter,
+  IconWorld,
+} from '@tabler/icons-react';
 import {
   type AtriumRegistry,
   makeWrapperElement,
@@ -25,11 +30,17 @@ import { AtriumDdnsPage } from './AtriumDdnsPage';
 import { AtriumDdnsProfileItem } from './AtriumDdnsProfileItem';
 import { AtriumDdnsWidget } from './AtriumDdnsWidget';
 import { DeviceBoardPage } from './DeviceBoardPage';
+import { DevicesPage } from './DevicesPage';
+import { DomainsPage } from './DomainsPage';
 
 /** The board's path. Exported so a test asserts the registered route
  *  against the same string the nav item points at, rather than against
  *  a literal typed twice. */
 export const BOARD_PATH = '/atrium-ddns/board';
+
+/** #45's two tenant surfaces, same rule. */
+export const DOMAINS_PATH = '/atrium-ddns/domains';
+export const DEVICES_PATH = '/atrium-ddns/devices';
 
 const reg = window.__ATRIUM_REGISTRY__ as AtriumRegistry | undefined;
 const AtriumReact = window.React;
@@ -69,6 +80,32 @@ if (!reg || !AtriumReact) {
     label: 'Devices and names',
     to: BOARD_PATH,
     icon: AtriumReact.createElement(IconRouter, { size: 18 }),
+  });
+  // #45's tenant CRUD, registered in the same shape and gated the same
+  // way: no `perm` on the nav item, because each page's own gate
+  // renders a *refusal* rather than an empty list. Hiding the nav item
+  // would turn "you may not manage these" into "these do not exist".
+  reg.registerRoute({
+    key: 'atrium-ddns-domains',
+    path: DOMAINS_PATH,
+    render: () => makeWrapperElement(<DomainsPage />),
+  });
+  reg.registerNavItem({
+    key: 'atrium-ddns-domains-nav',
+    label: 'Zones and providers',
+    to: DOMAINS_PATH,
+    icon: AtriumReact.createElement(IconWorld, { size: 18 }),
+  });
+  reg.registerRoute({
+    key: 'atrium-ddns-devices',
+    path: DEVICES_PATH,
+    render: () => makeWrapperElement(<DevicesPage />),
+  });
+  reg.registerNavItem({
+    key: 'atrium-ddns-devices-nav',
+    label: 'Devices',
+    to: DEVICES_PATH,
+    icon: AtriumReact.createElement(IconKey, { size: 18 }),
   });
   reg.registerAdminTab({
     key: 'atrium-ddns',
