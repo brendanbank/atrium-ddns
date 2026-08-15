@@ -963,7 +963,7 @@ copy. Small enough that the whole migration is a single transaction:
 | domains | 1 |
 | domain_backends | 1 (`aws`) |
 | backend_configs | 2 (`aws_access_key_id`, `aws_secret_access_key`, Fernet) |
-| hostname_backends | empty — every hostname uses all of its domain's backends |
+| hostname_backends | **11 rows**, not empty as first recorded — but degenerate (each hostname lists exactly its domain's backends), so the meaning is unchanged. #49 measured it on the live copy; the original reading came from the stale snapshot. A strict subset would be a different model and the importer refuses one. |
 | ttl | uniformly 60 |
 | orphan hostnames | 0 |
 
