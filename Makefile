@@ -9,14 +9,47 @@ COMPOSE := docker compose
 # the repo layout, so `/opt/compat_tests/compat/...` is `tests/compat/...`.
 COMPAT_TESTS := /opt/compat_tests
 
+# Where the Dockerfile COPYs `backend/`. `make test-backend` runs
+# `$(HOST_APP)/tests`, and `make migrate` runs `$(HOST_APP)/alembic.ini`.
+HOST_APP := /opt/host_app
+
+# The host package as the *interpreter* names it. NOT a path: `backend/` is
+# pip-installed as well as copied, `$(HOST_APP)/src` is not on sys.path, and
+# what `import atrium_ddns` resolves to is site-packages. See
+# check-host-pkg-fresh for why the distinction is the whole issue.
+HOST_PKG := atrium_ddns
+
 # Content digest of a directory tree: every file's path and bytes, in sorted
-# order. Run against the worktree and against the container (see
-# check-compat-fresh) — one script, so the two readings cannot differ by
+# order. Run against the worktree and against the container (see the
+# check-*-fresh targets) — one script, so the two readings cannot differ by
 # method. Exported rather than inlined because the recipe would otherwise be
 # unreadable through two layers of quoting.
-define COMPAT_DIGEST_PY
-import hashlib, pathlib, sys
-root = pathlib.Path(sys.argv[1])
+#
+# The argument is a path, or `pkg:<name>` to resolve an importable package by
+# the import system rather than by a path someone typed. Both spellings feed
+# the same digest, so a path reading and an import reading are comparable.
+#
+# Prints three tab-separated fields — digest, file count, resolved root — so a
+# refusal names the values and where they were read from. "no match found" is
+# the shape of guard that gets deleted rather than investigated; and for
+# `pkg:` the root is not knowable in advance, so printing it is the only way
+# the reader learns which copy was measured.
+define TREE_DIGEST_PY
+import hashlib, importlib.util, pathlib, sys
+
+arg = sys.argv[1]
+if arg.startswith("pkg:"):
+    # find_spec, not a path: this is the same machinery the tests' own
+    # `import atrium_ddns` goes through, so it cannot resolve to a copy the
+    # tests do not use. find_spec does not execute the module.
+    name = arg[4:]
+    spec = importlib.util.find_spec(name)
+    if spec is None or not spec.origin:
+        sys.exit("cannot resolve package " + name + " on this interpreter")
+    root = pathlib.Path(spec.origin).parent
+else:
+    root = pathlib.Path(arg)
+
 digest = hashlib.sha256()
 def tracked(path):
     # Byte-compiled output and pytest's own cache appear on one side and not
@@ -31,17 +64,42 @@ for path in files:
     digest.update(path.relative_to(root).as_posix().encode())
     digest.update(b"\0")
     digest.update(path.read_bytes())
-print(digest.hexdigest())
+print(digest.hexdigest(), len(files), root, sep="\t")
 endef
-export COMPAT_DIGEST_PY
+export TREE_DIGEST_PY
+
+# One freshness comparison. $(1) target name for the message, $(2) worktree
+# path, $(3) container path or `pkg:<name>`, $(4) what to call the tree.
+#
+# No commas in any argument — $(call) splits on them.
+define CHECK_FRESH
+	@host=$$(python3 -c "$$TREE_DIGEST_PY" '$(2)' | tr -d '\r'); \
+	img=$$($(COMPOSE) exec -T api /opt/venv/bin/python -c "$$TREE_DIGEST_PY" '$(3)' | tr -d '\r'); \
+	hd=$$(printf '%s\n' "$$host" | cut -f1); \
+	id=$$(printf '%s\n' "$$img" | cut -f1); \
+	if [ -z "$$hd" ] || [ -z "$$id" ]; then \
+		echo "$(1): could not read both digests (worktree='$$host' container='$$img')"; \
+		exit 1; \
+	fi; \
+	if [ "$$hd" != "$$id" ]; then \
+		echo "$(1): the api container is running a STALE copy of $(4)."; \
+		echo "  worktree  $$host"; \
+		echo "  container $$img"; \
+		echo "  (digest / files / root)"; \
+		echo "  $(4) is baked into the image at build time and"; \
+		echo "  \`make up\` does not rebuild. Run: make build && make up"; \
+		exit 1; \
+	fi; \
+	echo "$(1): container matches worktree ($$hd)"
+endef
 
 .PHONY: help dev-bootstrap up down build logs ps migrate \
 	seed-admin seed-bundle test test-frontend test-backend test-compat \
-	check-compat-fresh \
+	check-fresh check-compat-fresh check-backend-fresh check-host-pkg-fresh \
 	test-backend-serial test-backend-file typecheck smoke
 
 help:  ## show this help
-	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-18s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-21s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 dev-bootstrap: build up migrate  ## build, start, migrate; run me first
 	@echo
@@ -100,36 +158,57 @@ test-frontend:  ## frontend unit tests via vitest
 # `--target`, and the wire table is reported as NOT RUN rather than as nought
 # failures. The table itself is `make test-compat`, which is not in the gate
 # because it needs a live service named on the command line.
-test-backend: check-compat-fresh  ## backend tests + service-free compat guards, in the api container
-	$(COMPOSE) exec -T api /opt/venv/bin/python -m pytest /opt/host_app/tests $(PYTEST_ARGS)
+test-backend: check-fresh  ## backend tests + service-free compat guards, in the api container
+	$(COMPOSE) exec -T api /opt/venv/bin/python -m pytest $(HOST_APP)/tests $(PYTEST_ARGS)
 	$(COMPOSE) exec -T api /opt/venv/bin/python -m pytest $(COMPAT_TESTS) -ra $(PYTEST_ARGS)
 
-# `tests/` is baked into the image, and `make up` does not rebuild. So editing
-# a compat file and re-running the gate reads the *old* copy and reports green
-# for it — the same defect compose.yaml's `image:` comment records for a shared
-# tag, one layer along, and the one this whole issue is about.
+# Everything the gate reads out of the image is this worktree's. Three trees,
+# three named targets, because "which one is stale" is the first thing anyone
+# asks and an aggregate that only says "stale" makes them go and find out.
+check-fresh: check-compat-fresh check-backend-fresh check-host-pkg-fresh  ## all three freshness guards
+
+# Each tree is baked into the image, and `make up` does not rebuild. So editing
+# a file and re-running the gate reads the *old* copy and reports green for it
+# — the same defect compose.yaml's `image:` comment records for a shared tag,
+# one layer along.
 #
 # Two readings of one tree, and they must agree. `docker compose exec` is the
 # only instrument that can see what the running container actually holds;
 # anything derived from the Dockerfile or from a build log is a statement about
 # what should be there.
 check-compat-fresh:  ## fail if the container's copy of tests/ is not this worktree's
-	@host=$$(python3 -c "$$COMPAT_DIGEST_PY" tests | tr -d '\r'); \
-	img=$$($(COMPOSE) exec -T api /opt/venv/bin/python -c "$$COMPAT_DIGEST_PY" \
-		$(COMPAT_TESTS) | tr -d '\r'); \
-	if [ -z "$$host" ] || [ -z "$$img" ]; then \
-		echo "check-compat-fresh: could not read both digests (worktree=$$host container=$$img)"; \
-		exit 1; \
-	fi; \
-	if [ "$$host" != "$$img" ]; then \
-		echo "check-compat-fresh: the api container is running a STALE copy of tests/."; \
-		echo "  worktree  $$host"; \
-		echo "  container $$img"; \
-		echo "  tests/ is COPYed into the image (Dockerfile, dev stage) and"; \
-		echo "  \`make up\` does not rebuild. Run: make build && make up"; \
-		exit 1; \
-	fi; \
-	echo "check-compat-fresh: container matches worktree ($$host)"
+	$(call CHECK_FRESH,check-compat-fresh,tests,$(COMPAT_TESTS),tests/)
+
+# `backend/` as a whole. This is the tree `make test-backend` collects its test
+# files from ($(HOST_APP)/tests) and the tree `make migrate` reads the host
+# alembic chain from ($(HOST_APP)/alembic). #36's reproduction lives here: a
+# `def test_x(): assert False` written into backend/tests/ without a rebuild
+# was never *collected*, and the run reported 358 passed.
+check-backend-fresh:  ## fail if the container's copy of backend/ is not this worktree's
+	$(call CHECK_FRESH,check-backend-fresh,backend,$(HOST_APP),backend/)
+
+# The copy the tests actually IMPORT — and it is not the one above.
+#
+# The Dockerfile does `COPY backend /opt/host_app` and then
+# `pip install /opt/host_app`, so there are two copies of the source in the
+# image. `$(HOST_APP)/src` is not on sys.path; `import atrium_ddns` inside the
+# container resolves to /opt/venv/lib/python3.13/site-packages/atrium_ddns.
+# Guarding $(HOST_APP) alone is an assertion about a tree nothing imports —
+# true, checkable, and not about the code under test.
+#
+# Today the two agree byte-for-byte (12 files, same digest) because the pip
+# install is a build layer chained to the COPY. They stop agreeing the moment
+# anything reaches $(HOST_APP) at run time rather than at build time — a bind
+# mount of ./backend being the obvious one, and the obvious "fix" for the
+# rebuild cost. Under that mount $(HOST_APP) matches the worktree *by
+# construction*, on every run, forever: a guard that can only ever pass. The
+# site-packages reading is the one that still bites.
+#
+# Resolved with importlib.find_spec rather than by a hardcoded
+# site-packages path, so a python minor-version bump in the atrium base image
+# does not turn this into a guard reading an empty directory.
+check-host-pkg-fresh:  ## fail if the INSTALLED atrium_ddns is not this worktree's
+	$(call CHECK_FRESH,check-host-pkg-fresh,backend/src/$(HOST_PKG),pkg:$(HOST_PKG),the installed $(HOST_PKG) package)
 
 # The wire table. NOT part of `make test` and NOT part of the gate: it replays
 # 114 cases against a running service, and which service that is has to be
@@ -143,6 +222,16 @@ check-compat-fresh:  ## fail if the container's copy of tests/ is not this workt
 # verbatim and prints the reachability probe it got back, and the three
 # host-only cases carry the legacy body so a mis-paired target is caught by the
 # response rather than by the URL.
+#
+# Freshness-gated too, for the same reason the gate is: the 131-case table is
+# read out of the image, and replaying a frozen table from a previous revision
+# against a live service is a worse lie than not running it. NOT gated on the
+# two backend guards — the target may legitimately be the legacy service,
+# which has nothing to do with this worktree's backend/.
+#
+# Invoked inside the recipe rather than as a prerequisite so the usage message
+# still prints without a running stack. A prerequisite would answer "cannot
+# reach the api container" to someone who typed the target with no arguments.
 test-compat:  ## wire table vs a live service (TARGET=legacy|host BASE_URL=http://...)
 	@if [ -z "$(TARGET)" ] || [ -z "$(BASE_URL)" ]; then \
 		echo "usage: make test-compat TARGET=legacy|host BASE_URL=http://host:port"; \
@@ -156,14 +245,21 @@ test-compat:  ## wire table vs a live service (TARGET=legacy|host BASE_URL=http:
 		echo "See tests/compat/README.md for worked invocations."; \
 		exit 2; \
 	fi
+	@$(MAKE) --no-print-directory check-compat-fresh
 	$(COMPOSE) exec -T api /opt/venv/bin/python -m pytest $(COMPAT_TESTS)/compat \
 		--target "$(TARGET)" --base-url "$(BASE_URL)" -ra $(PYTEST_ARGS)
 
-test-backend-serial:  ## same, one worker — for bisecting a failing test
-	$(COMPOSE) exec -T api /opt/venv/bin/python -m pytest /opt/host_app/tests -n 0
+# Gated: this reports the same "the backend suite passed" claim as
+# test-backend, one worker at a time, and a stale image lies the same way.
+test-backend-serial: check-fresh  ## same, one worker — for bisecting a failing test
+	$(COMPOSE) exec -T api /opt/venv/bin/python -m pytest $(HOST_APP)/tests -n 0
 
+# Deliberately NOT gated. This is the hang diagnostic: you reach for it when
+# something is wrong, sometimes with a container you rebuilt by hand, and a
+# guard that refuses to run it is a guard standing in front of the diagnosis.
+# It makes no suite-wide claim, so there is nothing for staleness to falsify.
 test-backend-file:  ## one file, verbose — the way to diagnose a hang (FILE=tests/x.py)
-	$(COMPOSE) exec -T api /opt/venv/bin/python -m pytest /opt/host_app/$(FILE) -n 0 -v
+	$(COMPOSE) exec -T api /opt/venv/bin/python -m pytest $(HOST_APP)/$(FILE) -n 0 -v
 
 typecheck:  ## tsc --noEmit on the host bundle
 	cd frontend && pnpm typecheck
