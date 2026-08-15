@@ -65,6 +65,148 @@ regresses and a stripped comparison cannot see it.
   Run `--target legacy` first and treat failures as calibration findings against
   this table, not as compat requirements.
 
+## Running the table
+
+`conftest.py` + `test_protocol.py` are the runner. One test per case, named
+after the case, so a failure names the behaviour rather than an index.
+
+```bash
+python -m venv .venv && .venv/bin/pip install pytest pyyaml
+
+.venv/bin/python -m pytest tests/compat --target legacy --base-url http://127.0.0.1:5000
+.venv/bin/python -m pytest tests/compat --target host   --base-url http://localhost:8153
+```
+
+`pytest` and `PyYAML` are the only dependencies. The wire is spoken with
+stdlib `http.client`, not requests/httpx, because this suite asserts exact
+bytes and exact headers: `http.client` adds only `Host` and
+`Accept-Encoding: identity`, so every other header on the wire is one the
+runner put there and `omit_headers: [user-agent]` genuinely omits it.
+
+### The two options, and why neither has a default
+
+| option | required | notes |
+|---|---|---|
+| `--target legacy\|host` | **always** | decides which cases run. No default: a runner that picks one will be pointed at the wrong service eventually |
+| `--base-url` | except with `--collect-only` | used **verbatim**. Nothing reads its shape |
+| `--compat-timeout` | no | seconds, default 10 |
+| `--compat-insecure` | no | skip TLS verification for an `https` base URL |
+
+**Nothing infers "local" from a URL.** `scripts/smoke.sh` made exactly that
+mistake — an ssh tunnel produces a `localhost` URL for a remote host, and the
+check read the wrong stack while reporting green. `grep -n
+'localhost\|127\.0\.0\.1' tests/compat/conftest.py` returns nothing, and that
+is the check that keeps it true.
+
+What *does* catch a mis-paired `--target` is the response, not the URL: the
+three host-only cases carry `legacy_behaviour`, and when the actual body equals
+it the failure report says so in as many words — *"the actual body is exactly
+this case's documented `legacy_behaviour` … check that <url> is not the legacy
+service"*. Derived from what came back, so an ssh tunnel cannot hide it.
+
+`--target` also decides **collection**, so `--collect-only` needs it too; that
+is the only place a mode changes what is required, and it is pytest's mode, not
+the target's.
+
+### What the runner does and does not assert
+
+Asserted, per case: `status`, `content_type` (exact, no normalisation — a
+charset or whitespace difference is a finding, not noise), `line_count`,
+`body_ends_with_newline`, and `body` as **exact bytes**. Every mismatching
+field is reported, not just the first.
+
+Not asserted: `effects` (DNS operations and persisted columns). Eleven cases
+carry one. They are invisible on the wire, and the runner prints the count
+every run so the gap is a number rather than an assumption.
+
+Not runnable: the three `rate_limited: true` cases. Getting a user over its
+limit is fixture state, not a request, and hammering the endpoint to find the
+limit would poison every case after it. They are **skipped with the
+precondition named** — never quietly passed — and counted in the accounting
+block.
+
+The runner does **not** build the `fixture:` world. It assumes the world in the
+table already exists behind `--base-url`, and one reachability probe at session
+start turns an unreachable service into one clear message instead of ninety-odd
+identical stack traces. *Reachable is not implemented*: pointed at the host
+stack today, `/nic/checkip` answers **HTTP 200** with atrium's SPA
+`index.html`, because the SPA catch-all serves any unmatched path. A runner
+checking status alone would have called that green.
+
+### `client_ip` is arranged with `X-Forwarded-For`
+
+One header, same spelling for both targets — the legacy service reads it
+through `ProxyFix(x_for=1)`, and the host must honour it too or the two are not
+compatible. A per-target spelling here would be the branch this runner refuses
+to have.
+
+`client_ip: null` cannot be arranged by *omitting* the header:
+`ProxyFix._get_real_value` ignores an absent or empty value and leaves
+`REMOTE_ADDR` as the socket address, which is perfectly parseable. The runner
+sends the literal `not-an-ip` instead, which no IP parser accepts.
+
+### Reading the accounting block
+
+Every run ends with its own arithmetic, because the failure mode of a
+table-driven runner is not a wrong answer, it is a case that quietly stopped
+running:
+
+A real block, from `--target host` against the local stack on `8_overnight`
+(abridged only in the id lists). It is red, because the host has no `/nic/*`
+yet — an invented green example here would be the first thing to rot:
+
+```
+compat accounting (target=host):
+  cases in table             101
+  excluded by `targets:`       0  []
+  selected for this target   101
+  unmet preconditions          3  ['update-abuse-rate-limited', ...]
+  executable                  98
+  wire-only                   11  cases carrying `effects:` ... that this runner does NOT assert
+  ran this session           101  98 failed, 3 skipped
+  reachability probe        GET http://localhost:8153/nic/checkip -> HTTP 200
+```
+
+`selected` is what the table offers; `ran this session` is what pytest actually
+executed, counted from its own report objects. They are two numbers on purpose
+— a `-k` filter or a collection that stopped early shows up as a `NOT RUN`
+line rather than as a run that says 98 and did twelve.
+
+Six guards (seven tests — the partition one runs per target) need no service
+and fail loudly rather than letting the run shrink:
+
+| guard | fails when |
+|---|---|
+| `test_every_case_declares_known_targets` | a `targets:` typo removes a case from every run without removing it from the table |
+| `test_target_selection_partitions_the_table` | selected + excluded stops equalling the table |
+| `test_deleted_cases_are_never_executed` | a `deleted_cases` entry grows an `expect`, or an id appears in both lists |
+| `test_no_url_shape_inference` | a loopback literal appears in `conftest.py` — comments included |
+| `test_request_building_cannot_depend_on_the_target` | `build_request` grows a `target` parameter, i.e. a per-target request |
+| `test_every_case_builds_a_request` | any case in the table, either target, stops turning into a request |
+
+### Collected-case readings
+
+Taken on `8_overnight`, not inherited. Two instruments, and the runner's own
+collection is the second one:
+
+| instrument | `--target legacy` | `--target host` |
+|---|---|---|
+| `pytest --collect-only`, `test_case[...]` nodes | 98 | 101 |
+| PyYAML over `cases`, filtered on `targets` | 98 | 101 |
+
+101 in the table, 3 host-only, 98 shared; 11 `deleted_cases`, 0 of them
+collected. `grep -c '^  - id:'` = 112 = 101 + 11.
+
+### No credential reaches this output that was not already committed
+
+The runner has exactly one credential source: the `fixture:` block of the case
+table — no environment variable, no file, no prompt. Basic passwords are
+withheld twice over in the failure report, once in the `auth:` line and once in
+the `Authorization:` header (base64 is not encryption). The three
+query-parameter cases *do* print their credentials in the request line, because
+the query string is the thing they assert; those values are synthetic and
+already committed a few hundred lines above.
+
 ## The six divergences from the protocol document
 
 §1 of the plan listed five. This issue found a sixth by reading the regex. All
