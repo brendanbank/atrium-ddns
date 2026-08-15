@@ -50,9 +50,40 @@ from .worker_jobs import register_jobs
 
 
 def init_app(app: FastAPI) -> None:
+    """Mount the host's routes. Called once, before the SPA catch-all.
+
+    Order matters and atrium's ``create_app`` already gets it right:
+    ``init_app`` runs before ``app.mount("/", SPAStaticFiles(...))``,
+    and Starlette matches routes in registration order — so ``/nic/*``
+    is reached rather than being swallowed by a catch-all that matches
+    every path *and every method*. That last part is why
+    :mod:`atrium_ddns.router_nic` declares its ``HEAD`` refusals by
+    hand: a ``Mount`` full-matches a ``HEAD`` the ``GET`` route only
+    partially matched, so the 405 the framework would have produced
+    never reaches the wire (measured on ``atrium:0.28``: 405 bare,
+    404 behind the mount — see
+    ``tests/test_router_nic.py::test_the_head_refusal_does_not_fall_out_of_the_framework``).
+
+    ``/nic/*`` is deliberately **not** under ``/api``. Atrium's rule is
+    that host JSON routes live there so the SPA owns the un-prefixed
+    space (atrium #89); these three are not JSON routes and not ours to
+    move — the path is the compatibility contract, configured into
+    every router in the field.
+    """
     from .router import router
+    from .router_nic import router as nic_router
 
     app.include_router(router)
+    app.include_router(nic_router)
+
+    # Fixture-only, refused in production, and gated twice. Imported
+    # here rather than at module top level so the api process pays for
+    # it and the worker does not; registering a provider is a
+    # process-global dict write and the worker resolves providers too
+    # (#17's health check), so this is the narrower of the two.
+    from .compat_stub import register_stub_providers
+
+    register_stub_providers()
 
 
 def init_worker(host: HostWorkerCtx) -> None:
