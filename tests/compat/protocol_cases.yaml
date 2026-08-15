@@ -10,7 +10,8 @@
 # the case carries a `divergence` tag. See README.md.
 
 # ---------------------------------------------------------------------------
-# FROZEN. Issue #11, 2026-08-15, closing V1M1.
+# FROZEN at version 3. Issue #29, 2026-08-15, in V1M2.
+# Previously: version 2, issue #11, closing V1M1, at 114 cases.
 #
 # V1M2 is measured against this file, so changing it is a deliberate act with a
 # PR and not a tidy-up. To change it:
@@ -29,30 +30,69 @@
 # left the table at 114, which is the reason the guard exists rather than a
 # note asking politely.
 #
+# Step 2 got its own guard in #29, because at v2 it did not have one. Mutating
+# the table AND recomputing all four readings, leaving `version` alone, passed:
+# the four readings say "these numbers describe this table", which stays true
+# however often the table changes, so `version` was still on the honour system
+# one level up from where #11 found it. `frozen.previous` is the outgoing
+# freeze recorded as DATA rather than as the prose comment it was first written
+# as -- prose cannot be read by a test -- and
+# `test_the_version_advances_exactly_when_the_data_does` reads it.
+#
+# What that guard does NOT do, measured rather than assumed: it cannot see a
+# change made at the CURRENT version, because `previous` is the last recorded
+# freeze and not the file's last state. Mutating a byte, recomputing the four
+# readings and leaving `version: 3` alone still passes. The evasion is
+# available exactly once -- the moment anyone bumps the version afterwards,
+# `previous` no longer matches and the guard fires. So the freeze is enforced
+# at the boundary between versions, not between edits, and the thing that
+# closes the remaining gap is a reviewer reading the diff, which is why
+# changing this file is a PR.
+#
 # `content_digest` is sha256 over the *parsed* `cases` and `deleted_cases`
 # lists, canonicalised as JSON -- so reflowing a comment or a block scalar does
 # not trip it, and changing a single expected byte does. It is a freeze on the
 # data, which is what a runner iterates.
 # ---------------------------------------------------------------------------
-version: 2
+version: 3
 
 frozen:
-  issue: 11
+  issue: 29
   date: 2026-08-15
-  milestone: V1M1
-  version: 2
-  cases: 114
+  milestone: V1M2
+  version: 3
+  cases: 131
   deleted_cases: 11
   spec_rows: 37
-  content_digest: d46d789a71fa20d0d493670be0b6c6843f5e326541aff833715ff40467569bda
+  content_digest: 2add2f37f3b5a41e82bd247353d633c99cdd00b2509de283f1d4ea748d93b83f
+  # The freeze this one supersedes, as DATA so a test can read it. v3 adds 17
+  # cases for address-family coverage and changes none of the 114: checked case
+  # by case on the parsed lists, 0 removed and 0 modified. See baseline.md §7.
+  previous:
+    issue: 11
+    milestone: V1M1
+    version: 2
+    cases: 114
+    deleted_cases: 11
+    spec_rows: 37
+    content_digest: d46d789a71fa20d0d493670be0b6c6843f5e326541aff833715ff40467569bda
   # What the frozen table is known NOT to cover. Recorded here rather than in
   # prose somewhere, because a frozen table that overstates its own coverage is
   # worse than one that is honestly narrow.
   known_gaps:
     - >-
-      effects: is data, not an assertion. 15 cases carry a DNS operation or a
-      persisted column and no runner asserts either; the accounting block
-      prints the count every run so the gap stays a number.
+      effects: is data, not an assertion. 25 cases carry a DNS operation or a
+      persisted column and no runner asserts either (15 at v2; the accounting
+      block prints the selected count every run so the gap stays a number).
+      #29 measured how big the hole is instead of describing it: `getiptype`
+      was mutated on a throwaway legacy instance to answer "A" for every
+      address, so every AAAA in the service became an A, and the whole v3 table
+      was run against it. 121 executed, **0 failed**. The record type is
+      invisible on the wire on BOTH endpoints -- update's replies carry the
+      normalised ADDRESS, never the rtype, and delete's carry neither -- so no
+      number of cases in this file can detect it. Closing this needs an
+      `effects:` assertion, and it is the single largest thing the table does
+      not check.
     - >-
       3 cases carry `rate_limited: true`. That is fixture state, not a request,
       so the runner skips them with the precondition named and they are
@@ -64,22 +104,91 @@ frozen:
       SPA catch-all, which also declares only GET. They assert "POST is
       refused", never "the endpoint exists". Measured again by #11 against a
       host whose route table contains zero /nic paths: 2 passed, 105 failed.
+      Re-measured by #29 at v3 against the same shape of host: **still exactly
+      2** passed, 122 failed, 3 skipped of 127 selected. The overstatement did
+      not grow with the table, which is the reading that says it is these two
+      cases and not a property of adding cases.
     - >-
       the two host-only HEAD cases (`update-head-is-refused-by-the-host`,
-      `delete-head-is-refused-by-the-host`) freeze `status: 405`, and #11
-      measured that the natural implementation does not produce it behind
-      atrium's SPA catch-all. Bare FastAPI, GET-only route: HEAD -> 405. The
-      same route behind a GET-only catch-all mount: HEAD -> 200. Atrium's own
-      stack today, no /nic route at all: HEAD -> 404. The decision (405) is
-      kept and the cases stay as frozen; what changes is that V1M2 has to
-      write a deliberate HEAD handler, because the framework's refusal does
-      not survive the mount. Same mechanism as the two vacuous passes above.
+      `delete-head-is-refused-by-the-host`) freeze `status: 405`, and the
+      natural implementation does not produce it behind atrium's SPA
+      catch-all. Bare FastAPI, GET-only route: HEAD -> 405. The same route
+      behind atrium's catch-all mount: HEAD -> **404**. The mount alone, no
+      /nic route at all: HEAD -> 404. Decided in V1M2 that this entry keeps
+      the 405 and that V1M2 writes a deliberate HEAD handler, which #16 did.
+      **The middle reading used to say 200 -- "the catch-all serves it" --
+      and that reason was wrong.** #16 measured 404 against
+      `app.static.SPAStaticFiles` as shipped in atrium:0.28 and #18
+      re-measured it four ways at close-out: the SPA fallback to index.html
+      is guarded by `scope["method"] == "GET"`, so a HEAD miss re-raises the
+      404 rather than being served the shell; a stock
+      `StaticFiles(html=True)` answers 404 too, for the different reason that
+      it has no arbitrary-path fallback at all; and over the wire this
+      stack answers HEAD 404 / GET 200 / POST 405 on any unrouted path. The
+      *decision* and the code are unaffected -- 404 is no more the frozen 405
+      than 200 was -- but the wrong reason pointed at a fix that does not
+      work: if the catch-all "serves" HEAD, making it decline non-GET reads
+      as the remedy, and it already declines non-GET. A Mount is a FULL route
+      match whatever it then answers, so the route's own 405 never runs. The
+      only thing that produces the frozen 405 is the hand-written HEAD
+      handler. Same shadowing mechanism as the two vacuous passes above,
+      different status.
     - >-
-      address family. 104 of 114 cases are IPv4-only and 4 touch IPv6, against
-      production traffic measured at 143 IPv4 / 305 IPv6 events (plan §3.3.1).
-      The table is weighted the opposite way from the population it protects.
-      This is a real coverage gap, named at freeze time rather than discovered
-      in V1M2.
+      this `known_gaps` list is NOT covered by `frozen.content_digest`, which
+      is sha256 over the parsed `cases` and `deleted_cases` only. Correcting
+      an entry here is therefore not a re-freeze and must NOT be spelled as
+      a version bump: #18 tried it and
+      `test_the_version_advances_exactly_when_the_data_does` refuses in its
+      own words -- *"the data did not move, so there is nothing to
+      re-freeze: either the change was lost, or the bump was reflexive"* --
+      because `previous.content_digest` would equal `frozen.content_digest`.
+      #16 declined to correct the HEAD entry above on the stated grounds
+      that "`known_gaps` is inside the digest, so correcting it is a version
+      bump"; that premise is false in both halves and it is the reason the
+      wrong reason survived an extra issue. What guards this list instead is
+      a PR review plus, for any entry making a claim that can be executed, a
+      test: the HEAD readings above are now asserted by
+      `test_the_head_refusal_does_not_fall_out_of_the_framework` in
+      `backend/tests/test_router_nic.py`. Prose that can be measured belongs
+      in a guard, not in a digest.
+    - >-
+      address family, v3. The v6 share of the table is 20 of 131 cases (15.3%):
+      18 carry a parseable IPv6 literal and 2 more carry an IPv6-SHAPED literal
+      the service must refuse. 107 are IPv4-only and 4 carry no address at all.
+      At v2 the same instrument read 4 of 114 (3.5%), so the v6 share is 4.4x
+      what it was. It is NOT 68%, and it is deliberately not: see the next entry
+      for why the table's ratio is not the traffic's ratio, and baseline.md §7
+      for the measurement.
+    - >-
+      why 15.3% and not §3.3.1's 68%. Production traffic is 143 IPv4 / 305 IPv6
+      events, but a case table is not a traffic sample -- 36 near-identical
+      IPv4 update cases do not cover IPv4 thirty-six times, they cover one
+      mechanism thirty-six times. #29 measured which cases the family can reach
+      at all, by replaying every legacy-selected executable case twice against a
+      throwaway legacy instance, once as spelled and once with every IPv4
+      literal swapped for an IPv6 one: at v2, of 104 executable cases 36 changed
+      their reply, 63 were swapped and answered identically, and 5 carried no
+      IPv4 literal to swap. Coverage is therefore stated per MECHANISM, and the mechanisms
+      are enumerable. `/nic/update` interpolates the address after five status
+      tokens: IPv6 covered 1 of 5 (`good` only) at v2 and covers 5 of 5 at v3.
+      `/nic/checkip` echoes it in two formats: 1 of 2 at v2, 2 of 2 at v3.
+      Family-specific parse REFUSALS: 3 IPv4-shaped and 0 IPv6-shaped at v2, 3
+      and 3 at v3. Chasing 68% would have meant adding ~30 more cases that
+      repeat mechanisms already covered in both families, and padding a table to
+      fix a ratio is worse than the imbalance.
+    - >-
+      `/nic/delete` is family-blind on the wire ENTIRELY, which is why it got 2
+      of the 17 new cases and not a proportional share. Delete's replies carry
+      no IP suffix at all (divergence 1), so of its 36 executable cases at v2
+      the IPv4-to-IPv6 swap above changed exactly ZERO replies -- while the DNS
+      operation underneath changed rtype from A to AAAA, read from the stub
+      provider's own call log. Update is blind to the record TYPE too (see the
+      first gap) but not to the ADDRESS, which it interpolates into every line;
+      delete is blind to both, so its family cases can only ever assert the
+      parse. The 2 added are one for the v6 parse branch -- delete reaches it
+      through its own `if myip:` block, which update's cases never execute --
+      and `delete-myip-ipv4-mapped-ipv6-deletes-aaaa-only`, whose own `note:`
+      says it cannot fail on the wire. Adding more would have been padding.
 
 # ---------------------------------------------------------------------------
 # Spec rows. Every row of refactor-plan.md §1's three tables, given an id so
@@ -285,6 +394,40 @@ cases:
     covers: [checkip/format-plain]
     expect:
       body: "2001:db8::1"
+
+  - id: checkip-ipv6-default-is-html
+    note: >-
+      The v6 half of `checkip-default-is-html`. Before issue #29 the only v6
+      checkip case was ?format=plain, so the HTML wrapper -- the DEFAULT mode,
+      and the one an unmodified router hits -- was asserted for IPv4 only. 106
+      bytes against the v4 case's 102; the wrapper is byte-identical and only
+      the address differs.
+    path: /nic/checkip
+    auth: {type: none}
+    client_ip: "2001:db8:113::20"
+    query: {}
+    covers: [checkip/default]
+    expect:
+      status: 200
+      content_type: "text/html; charset=utf-8"
+      body: "<html><head><title>Current IP Check</title></head><body>Current IP Address: 2001:db8:113::20</body></html>"
+
+  - id: checkip-ipv4-mapped-ipv6-is-not-unwrapped
+    note: >-
+      ::ffff:192.0.2.1 is an IPv6Address whose str() keeps the dotted tail, so
+      the body carries the mapped spelling and NOT the 192.0.2.1 it wraps.
+      Measured against the legacy service, not reasoned from the standard: an
+      implementation calling .ipv4_mapped, or dispatching on "does it contain a
+      dot", answers 192.0.2.1 here and fails. Paired with
+      update-myip-ipv4-mapped-ipv6-stays-an-aaaa-record, which is the same
+      literal on the endpoint where it also picks the record type.
+    path: /nic/checkip
+    auth: {type: none}
+    client_ip: "::ffff:192.0.2.1"
+    query: {format: plain}
+    covers: [checkip/format-plain]
+    expect:
+      body: "::ffff:192.0.2.1"
 
   - id: checkip-ignores-credentials-entirely
     note: Unauthenticated endpoint -- wrong credentials are neither consulted nor rejected.
@@ -522,6 +665,30 @@ cases:
     expect:
       body: "911"
 
+  - id: update-911-myip-ipv6-with-prefix-length
+    note: >-
+      The v6 half of update-911-myip-with-prefix-length. Same answer, different
+      code path in any implementation that parses the two families separately:
+      a host whose v4 parser rejects /32 while its v6 parser falls back to
+      ip_network passes the v4 case and fails this one. The v4 case cannot see
+      that, which is why this is coverage rather than a duplicate.
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: "2001:db8::1/64"}
+    covers: [update/myip-unparseable-911]
+    expect:
+      body: "911"
+
+  - id: update-911-myip-ipv6-shaped-but-unparseable
+    note: >-
+      Three colons in a row. `notanip` is refused by any parser at all; this one
+      is refused only by a parser that actually understands v6 grouping, so it
+      is the case that bites an over-permissive one.
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: "2001:db8:::1"}
+    covers: [update/myip-unparseable-911]
+    expect:
+      body: "911"
+
   - id: update-911-myip-checked-before-hostname-syntax
     note: IP validation runs before isvalidhostname, so 911 beats notfqdn.
     path: /nic/update
@@ -622,6 +789,18 @@ cases:
     expect:
       body: "nohost 203.0.113.10"
 
+  - id: update-nohost-unregistered-hostname-ipv6
+    note: >-
+      Divergence 1 with a v6 suffix. The suffix is str(validated_ip), so this is
+      the `nohost` half of the five status tokens the update handler can
+      interpolate an address into; before #29 only `good` had ever been
+      asserted with a v6 address.
+    path: /nic/update
+    query: {hostname: never-registered.example.com, myip: "2001:db8:113::20"}
+    covers: [update/nohost, divergence/1-nohost-ip-suffix]
+    expect:
+      body: "nohost 2001:db8:113::20"
+
   - id: update-nohost-hostname-owned-by-another-user
     note: find_hostname filters by user_id, so another tenant's hostname is invisible.
     path: /nic/update
@@ -683,6 +862,14 @@ cases:
     expect:
       body: "911 203.0.113.10"
 
+  - id: update-911-hostname-with-zero-backends-ipv6
+    note: The `911` half of the five interpolated status tokens.
+    path: /nic/update
+    query: {hostname: nobackend.example.com, myip: "2001:db8:113::20"}
+    covers: [update/no-backends-911]
+    expect:
+      body: "911 2001:db8:113::20"
+
   - id: update-911-backend-without-stored-credentials
     path: /nic/update
     query: {hostname: nocreds.example.com, myip: 203.0.113.10}
@@ -727,12 +914,34 @@ cases:
     expect:
       body: "nochg 203.0.113.10"
 
+  - id: update-nochg-single-backend-ipv6
+    note: >-
+      The `nochg` half of the five interpolated status tokens, and the v6 half
+      of the "nochg persists nothing" rule -- measured, last_ip_v6 does not move
+      on a nochg, exactly as last_ip_v4 does not. The `effects:` block mirrors
+      its v4 twin so the pair reads as a pair.
+    path: /nic/update
+    query: {hostname: nochg.example.com, myip: "2001:db8:113::20"}
+    covers: [update/backend-status, update/aggregate-nochg]
+    effects:
+      persist: {hostname: nochg.example.com, last_ip_v6: unchanged, last_updated_at: unchanged}
+    expect:
+      body: "nochg 2001:db8:113::20"
+
   - id: update-dnserr-single-backend
     path: /nic/update
     query: {hostname: dnserr.example.com, myip: 203.0.113.10}
     covers: [update/backend-status, update/aggregate-other]
     expect:
       body: "dnserr 203.0.113.10"
+
+  - id: update-dnserr-single-backend-ipv6
+    note: The `dnserr` half of the five interpolated status tokens.
+    path: /nic/update
+    query: {hostname: dnserr.example.com, myip: "2001:db8:113::20"}
+    covers: [update/backend-status, update/aggregate-other]
+    expect:
+      body: "dnserr 2001:db8:113::20"
 
   - id: update-aggregate-any-good-wins
     note: results are [dnserr, good]; `'good' in results` short-circuits the error.
@@ -743,6 +952,24 @@ cases:
       persist: {hostname: mixed.example.com, last_ip_v4: 203.0.113.10, last_updated_at: set}
     expect:
       body: "good 203.0.113.10"
+
+  - id: update-aggregate-any-good-wins-ipv6
+    note: >-
+      The aggregation itself is family-blind -- it reads status strings -- but
+      the write-back it triggers is not, and this is the case that says a v6
+      request over a MIXED backend set still lands in last_ip_v6. Both stub
+      calls were measured carrying rtype AAAA, including the one that answers
+      dnserr.
+    path: /nic/update
+    query: {hostname: mixed.example.com, myip: "2001:db8:113::20"}
+    covers: [update/aggregate-good]
+    effects:
+      dns:
+        - {backend: dnserr, op: create, rtype: AAAA, hostname: mixed.example.com, ip: "2001:db8:113::20"}
+        - {backend: good, op: create, rtype: AAAA, hostname: mixed.example.com, ip: "2001:db8:113::20"}
+      persist: {hostname: mixed.example.com, last_ip_v6: "2001:db8:113::20", last_updated_at: set}
+    expect:
+      body: "good 2001:db8:113::20"
 
   - id: update-aggregate-all-nochg
     path: /nic/update
@@ -783,6 +1010,24 @@ cases:
     expect:
       body: "good 203.0.113.77"
 
+  - id: update-myip-defaults-to-a-v6-client-ip
+    note: >-
+      The v6 half of update-myip-defaults-to-client-ip, and the case closest to
+      the shape of real traffic: §3.3.1 measured production at 143 IPv4 / 305
+      IPv6 events, and a router behind a v6-only path that omits `myip` is
+      exactly how those events are produced. The fallback has to pick AAAA from
+      the client address alone -- there is no `myip` to read a family off --
+      which is a different decision from the one every other v6 case here makes.
+    path: /nic/update
+    client_ip: "2001:db8:113::77"
+    query: {hostname: ok.example.com}
+    covers: [update/myip-defaults-remote-addr, update/aggregate-good]
+    effects:
+      dns: [{backend: good, op: create, rtype: AAAA, hostname: ok.example.com, ip: "2001:db8:113::77"}]
+      persist: {hostname: ok.example.com, last_ip_v6: "2001:db8:113::77", last_ip_v4: unchanged, last_updated_at: set}
+    expect:
+      body: "good 2001:db8:113::77"
+
   - id: update-myip-ipv6-is-normalised-in-the-response
     note: >-
       The body echoes str(validated_ip), not the spelling the client sent. A
@@ -807,6 +1052,76 @@ cases:
       persist: {hostname: ok.example.com, last_ip_v6: "2001:db8::2", last_ip_v4: unchanged, last_updated_at: set}
     expect:
       body: "good 2001:db8::2"
+
+  - id: update-ipv4-persists-last-ip-v4-not-v6
+    note: >-
+      The mirror of update-ipv6-persists-last-ip-v6-not-v4, and the one case
+      added by #29 that is deliberately IPv4. The v6 case asserted
+      `last_ip_v4: unchanged`; nothing asserted the other direction, so a host
+      that wrote BOTH columns on every update passed the frozen table. Measured
+      on a hostname carrying a v6 address first: last_ip_v4 moved,
+      last_ip_v6 did not. Balancing the families means pairing them, not
+      counting them.
+    path: /nic/update
+    query: {hostname: zz-ok.example.com, myip: 203.0.113.10}
+    covers: [update/aggregate-good]
+    effects:
+      dns: [{backend: good, op: create, rtype: A, hostname: zz-ok.example.com, ip: 203.0.113.10}]
+      persist: {hostname: zz-ok.example.com, last_ip_v4: 203.0.113.10, last_ip_v6: unchanged, last_updated_at: set}
+    expect:
+      body: "good 203.0.113.10"
+
+  - id: update-myip-ipv4-mapped-ipv6-stays-an-aaaa-record
+    note: >-
+      ::ffff:192.0.2.1 parses as an IPv6Address, so getiptype answers AAAA and
+      str() keeps the mapped spelling -- the body is `good ::ffff:192.0.2.1`,
+      not `good 192.0.2.1`. Two ways to get this wrong are both plausible and
+      both caught here: unwrapping via .ipv4_mapped changes the body, and
+      dispatching on "contains a dot" changes the record type. Measured, both
+      halves: body and rtype.
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: "::ffff:192.0.2.1"}
+    covers: [update/backend-status, update/aggregate-good]
+    effects:
+      dns: [{backend: good, op: create, rtype: AAAA, hostname: ok.example.com, ip: "::ffff:192.0.2.1"}]
+      persist: {hostname: ok.example.com, last_ip_v6: "::ffff:192.0.2.1", last_updated_at: set}
+    expect:
+      body: "good ::ffff:192.0.2.1"
+
+  - id: update-myip-ipv6-with-embedded-ipv4-is-renormalised
+    note: >-
+      A NAT64 literal. 64:ff9b::192.0.2.33 is accepted and comes back as
+      64:ff9b::c000:221 -- the dotted tail is re-rendered in hex, because only
+      the ::ffff:0:0/96 mapped form keeps it. This is the strongest available
+      case for "echo str(validated_ip), never the request spelling": the
+      existing normalisation case (2001:0DB8:0000::1) can be passed by a naive
+      lowercase-and-compress; this one cannot.
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: "64:ff9b::192.0.2.33"}
+    covers: [update/aggregate-good]
+    effects:
+      dns: [{backend: good, op: create, rtype: AAAA, hostname: ok.example.com, ip: "64:ff9b::c000:221"}]
+      persist: {hostname: ok.example.com, last_ip_v6: "64:ff9b::c000:221", last_updated_at: set}
+    expect:
+      body: "good 64:ff9b::c000:221"
+
+  - id: update-myip-ipv6-scope-id-round-trips
+    note: >-
+      A link-local address with a zone index. ipaddress.ip_address has accepted
+      scoped v6 since Python 3.9 and str() keeps the zone, so the legacy service
+      answers `good fe80::1%eth0` and writes an AAAA. There is no IPv4 analogue
+      of this at all -- it is a v6-only parse path that the frozen table left
+      entirely unasserted. It is here because the rewrite is the moment it would
+      silently change: a stricter validator answers 911 and no other case
+      notices. On the wire the runner sends myip=fe80::1%25eth0.
+    path: /nic/update
+    query: {hostname: ok.example.com, myip: "fe80::1%eth0"}
+    covers: [update/backend-status, update/aggregate-good]
+    effects:
+      dns: [{backend: good, op: create, rtype: AAAA, hostname: ok.example.com, ip: "fe80::1%eth0"}]
+      persist: {hostname: ok.example.com, last_ip_v6: "fe80::1%eth0", last_updated_at: set}
+    expect:
+      body: "good fe80::1%eth0"
 
   - id: update-updatetype-is-accepted-and-ignored
     path: /nic/update
@@ -860,6 +1175,24 @@ cases:
         911 203.0.113.10
         good 203.0.113.10
         nohost 203.0.113.10
+
+  - id: update-multi-hostname-mixed-statuses-in-order-ipv6
+    note: >-
+      The same four hostnames in the same order as its v4 twin, so the two
+      bodies differ in the address and in nothing else. This is the one case
+      that puts all four statuses and a v6 suffix in a single reply: an
+      implementation that resolved the family per hostname rather than once per
+      request -- from a per-hostname last_ip column, say -- produces a mixed
+      body here and passes every single-hostname case.
+    path: /nic/update
+    query: {hostname: "nochg.example.com,nobackend.example.com,ok.example.com,outofzone.example.com", myip: "2001:db8:113::20"}
+    covers: [update/request-order, update/aggregate-nochg, update/no-backends-911, update/aggregate-good, update/backend-out-of-zone-nohost]
+    expect:
+      body: |-
+        nochg 2001:db8:113::20
+        911 2001:db8:113::20
+        good 2001:db8:113::20
+        nohost 2001:db8:113::20
 
   - id: update-multi-hostname-body-has-no-trailing-newline
     note: >-
@@ -1189,6 +1522,18 @@ cases:
     expect:
       body: "911"
 
+  - id: delete-911-myip-ipv6-shaped-but-unparseable
+    note: >-
+      The v6 half of delete-911-unparseable-myip. Delete parses `myip` in its
+      own `if myip:` branch, not in update's, so update's v6 parse cases do not
+      reach this code at all -- which is why the pair exists on both endpoints
+      rather than once.
+    path: /nic/delete
+    query: {hostname: ok.example.com, myip: "2001:db8:::1"}
+    covers: [delete/hostname-resolution, delete/myip-selects-family]
+    expect:
+      body: "911"
+
   - id: delete-911-myip-checked-before-hostname-syntax
     path: /nic/delete
     query: {hostname: "_dmarc.example.com", myip: notanip}
@@ -1361,6 +1706,27 @@ cases:
   - id: delete-myip-v6-deletes-aaaa-only
     path: /nic/delete
     query: {hostname: ok.example.com, myip: "2001:db8::1"}
+    covers: [delete/myip-selects-family]
+    effects:
+      dns: [{backend: good, op: delete, rtype: AAAA, hostname: ok.example.com}]
+    expect:
+      body: "good"
+
+  - id: delete-myip-ipv4-mapped-ipv6-deletes-aaaa-only
+    note: >-
+      **This case cannot fail on the wire, and that is the finding, not an
+      oversight.** #29 measured every legacy-selected case twice -- once as the
+      table spells it and once with every IPv4 literal swapped for an IPv6 one
+      -- and all 36 executable `/nic/delete` cases answered byte-identically.
+      Delete's replies carry no IP suffix (divergence 1), so a host deleting the
+      wrong record type passes every delete case in this table, in either
+      family. The asymmetry lives entirely in `effects.rtype`, which no runner
+      asserts. ::ffff:192.0.2.1 is the literal most likely to be mis-dispatched
+      -- measured, it selects AAAA -- so the case is here for the assertion
+      V1M2 has to add, and is labelled rather than counted as coverage it is
+      not. See `frozen.known_gaps`.
+    path: /nic/delete
+    query: {hostname: ok.example.com, myip: "::ffff:192.0.2.1"}
     covers: [delete/myip-selects-family]
     effects:
       dns: [{backend: good, op: delete, rtype: AAAA, hostname: ok.example.com}]

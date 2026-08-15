@@ -54,6 +54,15 @@ services:
       MAIL_BACKEND: ${MAIL_BACKEND:-console}
       MAIL_FROM: ${MAIL_FROM:-no-reply@example.com}
       ATRIUM_HOST_MODULE: atrium_ddns.bootstrap
+      # The frozen compat table's scripted DNS backends. Unset by
+      # default and unset in .env.example, so a stack that has not been
+      # told to run the table does not resolve them. Passed through
+      # rather than hardcoded because the value is the whole control:
+      # `atrium_ddns.compat_stub` registers nothing unless this reads
+      # exactly "1", and refuses even then when ENVIRONMENT=prod — the
+      # stub answers `good` without contacting a nameserver, which on a
+      # real tenant is a green update over an unchanged zone.
+      ATRIUM_DDNS_COMPAT_STUB: ${ATRIUM_DDNS_COMPAT_STUB:-}
       # Host alembic runs with cwd=/opt/host_app (via -c
       # /opt/host_app/alembic.ini) and its env.py imports from
       # atrium's `app` package. Atrium's source lives at /app — put

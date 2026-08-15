@@ -27,15 +27,19 @@ them.
 
 - **`Content-Type` is not always `text/plain`.** `/nic/checkip` in its default
   mode answers `text/html; charset=utf-8`, which the very next table in this
-  section says and the sentence above it contradicted. 13 of the frozen table's
-  114 cases are `checkip` cases and 5 of them assert `text/html`.
+  section says and the sentence above it contradicted. 15 of the frozen table's
+  131 cases are `checkip` cases and **7** of them assert `text/html`. (This row
+  read "13 of 114 … and 5" at v2. 13 was right; 5 was not — counted from the
+  data, v2 had 6, the sixth being `checkip-post-is-405-with-an-html-body`,
+  whose HTML is Werkzeug's error page rather than the service's own. #29
+  re-derived both numbers and corrected the second.)
 - **Not every response is 200.** A non-`GET` request answers 405 before any
   handler runs (divergence 7 below). Measured against a throwaway legacy
   instance: `POST`, `PUT`, `DELETE` and `PATCH` on `/nic/update` and `POST` on
   `/nic/checkip` all answer `405`, `text/html; charset=utf-8`, 153 bytes.
 
 The claim that survives is the load-bearing one: **on the `GET` path the status
-is always 200**, `badauth` included. 105 of the table's 114 cases are `GET` and
+is always 200**, `badauth` included. 122 of the table's 131 cases are `GET` and
 every one of them expects 200; the other 9 exist to assert the 405 and the
 `HEAD` decision, and before they were written the "always 200" claim was
 unfalsifiable from inside the table.
@@ -229,22 +233,46 @@ Four things decided it:
 
   **But "refusing is free" is only true of a bare FastAPI app, and this is not
   one.** #11 measured it three ways and the readings do not agree with each
-  other, which is the finding:
+  other, which is the finding. **The middle reading below said `200` until
+  V1M2; it is `404`, corrected by #16 and re-measured five ways by #18 at
+  close-out.** Every row here is a live reading against
+  `app.static.SPAStaticFiles` as shipped in `atrium:0.28`, not a description
+  of one:
 
-  | stack | `HEAD` on a `GET`-only route |
-  |---|---|
-  | bare FastAPI, no catch-all (in-process `TestClient`) | **405** — what the table freezes |
-  | the same route behind a `GET`-only SPA catch-all mount | **200** — the catch-all serves it |
-  | this repository's own stack today, over the wire | **404** |
+  | stack | `HEAD` | `GET` | `POST` |
+  |---|---|---|---|
+  | bare FastAPI, `GET`-only route, no catch-all | **405** — what the table freezes | 200 | 405 |
+  | the same route behind atrium's SPA catch-all mount | **404** | 200 | 405 |
+  | the same route behind a stock `StaticFiles(html=True)` | **404** | 200 | 405 |
+  | the mount alone, no `/nic` route at all | 404 | 200 | 405 |
+  | this repository's stack over the wire, `/api/healthz` | 404 | 200 | 405 |
+  | this repository's stack over the wire, `/nic/update` (#16's handler) | **405** | 200 | 405 |
 
-  Atrium mounts a catch-all at the root, and a `Mount` matches every method, so
-  the 405 the route would have produced never reaches the wire. `POST` still
-  answers 405 through the same mount, which is why the two `-post-is-405-on-the-host`
-  cases pass. **The decision stands and the cases stay frozen at 405** — what
-  changes is the cost line: V1M2 has to write a deliberate `HEAD` handler (or
-  stop the SPA mount shadowing `/nic/*`), because the framework's own refusal
-  does not survive the mount. Recorded in the table's `frozen.known_gaps`.
-- **Nothing in the field sends it.** 105 of the 114 cases in the table are
+  Atrium mounts a catch-all at the root, and a `Mount` is a **full** route
+  match for every method, so the 405 the `GET`-only route would have produced
+  never runs. What the mount then answers is `SPAStaticFiles`' business, and it
+  answers `404`: the fallback to `index.html` is guarded by
+  `scope["method"] == "GET"`, so a `HEAD` miss re-raises the underlying 404
+  instead of being served the shell. A stock `StaticFiles(html=True)` reaches
+  the same 404 by a different road — it has no arbitrary-path fallback at all,
+  only a directory index and a `404.html`. `POST` answers 405 on every row,
+  which is why the two `-post-is-405-on-the-host` cases pass vacuously.
+
+  **The decision stands and the cases stay frozen at 405.** What changes is the
+  cost line: V1M2 had to write a deliberate `HEAD` handler, and #16 did.
+
+  **Why the old reason mattered even though the decision did not move.** "The
+  catch-all serves it" reads as though the remedy were to make the mount
+  decline non-`GET` — and it already declines non-`GET`. Un-shadowing `/nic/*`
+  is the only *other* thing the old wording suggests, and that is a change to
+  atrium's mount order to fix a two-case problem in the host. The reading that
+  is actually actionable is the one on the last row: declare the method.
+  Recorded in the table's `frozen.known_gaps`, corrected there at v3 — **not**
+  as a version bump, because `frozen.content_digest` covers `cases` and
+  `deleted_cases` only, and
+  `test_the_version_advances_exactly_when_the_data_does` refuses a bump over
+  unmoved data.
+- **Nothing in the field sends it.** 122 of the 131 cases in the table are
   `GET`; the other 9 — 5 `HEAD`, 4 `POST` — exist to assert this decision and
   divergence 7. ddclient, inadyn, OPNsense and Fritz!Box send `GET`.
 - **The realistic sender is a monitor, and the failure is worse than "an extra
@@ -307,6 +335,35 @@ deletion is auditable and the table cannot shrink silently. Three replacement
 cases run against the **host only** and assert the input is inert rather than
 merely absent.
 
+### What the wire table structurally cannot see
+
+Measured in #29 by mutation, and confirmed by reading `dyndns.py`: **the DNS
+record type never reaches the response body.** `/nic/update` echoes the
+normalised *address* (`good 2001:db8::1`); `/nic/delete` echoes neither address
+nor type. `rtype` reaches `createrecords()` / `deleterecords()` and stops there.
+
+The demonstration is blunt: mutating `getiptype` to answer `A` for **every**
+address — v4 and v6 alike — runs the whole table **121 executed, 0 failed**.
+
+So a suite built entirely at the wire cannot tell an `A` write from an `AAAA`
+one, and no number of added cases changes that. It is a property of the
+protocol, not a gap in the table.
+
+**Consequence, and it is V1M2's to carry:** record-type correctness has to be
+proven *below* the wire — in the provider plugins' own tests, where the call
+into boto3 / the Hetzner client / dnspython is observable, and in the router's
+unit tests where `getiptype`'s dispatch is visible. An agent that adds
+address-family cases to the wire table and calls record-type dispatch covered
+has tested nothing.
+
+This is also why #29 declined to weight the table to production's 68% IPv6.
+Replaying every executable case twice — once as spelled, once with every IPv4
+literal swapped for IPv6 — showed only **36 of 104** could change a byte of the
+reply. Coverage is stated per mechanism instead: IPv6 went 1→5 of 5 update
+status tokens, 1→2 of 2 checkip formats, 0→3 of 3 family-specific parse
+refusals. Padding the table to fix a ratio would have bought nothing and read
+as coverage.
+
 ### How the suite is built — two instruments
 
 One table, two targets. `tests/compat/protocol_cases.yaml` holds every case as
@@ -336,9 +393,14 @@ rather than quoting one:
 
 `tests/compat/baseline.md` is the reading, with both instruments, the five
 mutations that produced the predicted red sets, and what is still not measured.
-The table is **frozen at version 2** (`frozen:` block, guarded by
-`test_the_table_is_frozen_at_its_recorded_shape`), so V1M2 is measured against
-a file that cannot change without a PR that says so.
+The table is **frozen at version 3, 131 cases** (`frozen:` block, guarded by
+`test_the_table_is_frozen_at_its_recorded_shape` and, since #29, by
+`test_the_version_advances_exactly_when_the_data_does`), so V1M2 is measured
+against a file that cannot change without a PR that says so. Version 2 was
+#11's 114-case freeze; #29 took it to 131 for address-family coverage, before
+the router work (#16) is measured against it rather than after, and changed
+none of the 114 — 0 removed and 0 modified, checked case by case on the parsed
+lists.
 
 The old repo's **147** pytest tests are a second source — 121 in `test_app.py`
 plus 26 in `test_hetzner.py`, agreed exactly by `pytest --collect-only` and by
@@ -350,12 +412,14 @@ contents, or Bootstrap markup — atrium owns that surface now.
 ### What the frozen table does not cover — named at freeze time
 
 A contract that overstates its own reach is worse than a narrow one, so the
-gaps are part of §1 rather than a footnote in the test directory. All four are
-in the table's own `frozen.known_gaps`, and all four were measured by #11:
+gaps are part of §1 rather than a footnote in the test directory. All of them
+are in the table's own `frozen.known_gaps`; the first four were measured by
+#11 at v2, and #29 re-measured them at v3 and added two.
 
-- **`effects:` is data, not an assertion.** 15 cases carry a DNS operation or a
-  persisted column; no runner asserts either. The runner prints the count every
-  run so the gap stays a number rather than an assumption.
+- **`effects:` is data, not an assertion.** 25 cases carry a DNS operation or a
+  persisted column (15 at v2); no runner asserts either. The runner prints the
+  selected count every run so the gap stays a number rather than an assumption.
+  #29 measured how big it is: see the last row of this list.
 - **3 cases are not executable over the wire.** `rate_limited: true` is a
   precondition, not a request. They are skipped with the precondition named and
   measured separately — and the measurement is only worth having because the
@@ -371,14 +435,31 @@ in the table's own `frozen.known_gaps`, and all four were measured by #11:
   yet, and the 2 greens are not coverage. The two host `HEAD` cases do **not**
   pass vacuously (they expect 405 and the catch-all answers 404), so the
   overstatement is exactly 2 and not 4.
-- **The table is weighted against the traffic it protects.** 104 of 114 cases
-  are IPv4-only and 4 touch IPv6, measured from the table's `myip`, `client_ip`
-  and expected bodies. §3.3.1 measured production at **143 IPv4 / 305 IPv6**
-  events and concluded, before anyone checked, that "a table exercising `A`
-  thoroughly and `AAAA` once is testing the wrong record type". It was
-  describing this table. The divergence count is unaffected — the document says
-  nothing family-specific — but the *coverage* claim is, and V1M2 inherits it
-  as a known gap rather than discovering it.
+- **The table was weighted against the traffic it protects — closed by #29,
+  which took the table to v3 at 131 cases.** At v2, 4 of 114 cases touched
+  IPv6 against production traffic measured at **143 IPv4 / 305 IPv6** events
+  (§3.3.1), and §3.3.1 had already concluded, before anyone checked, that "a
+  table exercising `A` thoroughly and `AAAA` once is testing the wrong record
+  type". It was describing this table. At v3, 20 of 131 cases touch IPv6 —
+  **15.3%, not 68%, and deliberately not**: #29 replayed every legacy-selected
+  executable case against a throwaway legacy instance twice, once as spelled
+  and once with every IPv4 literal swapped for an IPv6 one, and found that only
+  36 of 104 could change a byte of the reply. Coverage is therefore stated per
+  *mechanism* rather than as a share of the table: IPv6 now covers **5 of 5**
+  update status tokens (1 of 5 at v2), **2 of 2** `checkip` formats (1 of 2),
+  and **3 of 3** family-specific parse refusals (0 of 3). The divergence count
+  is unaffected either way — the document says nothing family-specific — and
+  the spec-row count is unchanged at 37, which is the same fact seen from the
+  data: the gap was never a missing row of §1.
+- **The record type is invisible on the wire, and no case table can fix that.**
+  Found by #29 while closing the row above. `getiptype` was mutated on a
+  throwaway instance to answer `A` for every address — every `AAAA` the service
+  would write became an `A` — and the whole 131-case table ran **121 executed,
+  0 failed**. `/nic/update` echoes the normalised *address*, never the record
+  type; `/nic/delete` echoes neither (divergence 1), so all 36 of its cases are
+  byte-identical between families. V1M2's router work is measured on the
+  address, not the record — asserting the record needs the `effects:`
+  assertion the first gap in this list names.
 
 ---
 
@@ -434,6 +515,20 @@ The old service is single-tenant with admin-owned global domains. The rewrite is
 **multi-tenant**, and it introduces the object the old model was missing: the
 **device**.
 
+### §3 was reconciled against the built code by issue #18
+
+§3.1, §3.2 and §3.4 were written before any host code existed, and V1M2
+overturned parts of them. The corrections are in place below rather than
+appended, and each names what it corrects. Five, in the order they appear:
+**every table carries a `ddns_` prefix** (`dns_event` in §3.4 is `ddns_event`);
+**the permissions are seeded in `0002`, not `0001`**; **§3.1.1's worked example
+put a `UserSecret` on `Device`, which §3.2 then decided against** — the only
+user-scope column that exists is `ddns_domain_backend.credentials_ct`;
+**`sa.true()` is elided once ANDed**, so §3.1's "unrestricted is spelled in the
+SQL" holds for a bare read and not for a composed one; and **§3.3's migration
+invariant was retired by its own §3.3.1** and is marked as history rather than
+as a live requirement.
+
 ### 3.1 The model
 
 ```
@@ -442,6 +537,16 @@ atrium User ──1:N── Domain ──1:N── DomainBackend ──1:1──
      │                 └─────1:N── Hostname ──N:1── Device
      └──1:N── Device ──────────────────┘
 ```
+
+**Table names, as built.** The classes are `Domain`, `DomainBackend`, `Device`,
+`Hostname`, `DnsEvent`, `RateLimitEvent`; the tables are `ddns_domain`,
+`ddns_domain_backend`, `ddns_device`, `ddns_hostname`, `ddns_event` and
+`ddns_rate_limit_event`. The prefix is not decoration: the host's tables share
+one MySQL schema with atrium's own (`users`, `audit_log`, `app_settings`,
+`user_secret_keys`, …), and an unprefixed `device` or `event` is one upstream
+release away from a collision that alembic reports as a table it did not expect.
+Anything in this document naming an unprefixed table is a pre-implementation
+sketch; the class names are the ones that survived.
 
 - **Domain** — a zone, **owned by a user**, not global. The owner supplies their
   own provider credentials, so one installation serves tenants who share nothing.
@@ -467,10 +572,46 @@ need row-level filtering to define their own scope class plus a `get_scope`
 dependency. Every host query goes through it — none of them filter by
 `user_id` by hand, because the one that forgets is the leak.
 
-Permissions to seed in `0001`: `atrium_ddns.domain.manage`,
-`atrium_ddns.device.manage`, `atrium_ddns.hostname.manage` (own rows), and
-`atrium_ddns.admin` + `atrium_ddns.events.read.all` for cross-tenant access.
-`super_admin` is auto-granted; unknown role codes warn and skip.
+**As built (#14, #17, #18): `atrium_ddns/scope.py`.** `DdnsScope` plus a
+`get_scope` FastAPI dependency, constructed three ways — `for_principal` (an
+authenticated atrium caller), `for_user_id` (the `/nic/*` shape: a device on
+HTTP Basic, no session anywhere) and `cross_tenant(reason=…)` (a worker sweep,
+and the reason is required and read back by a test). Four entry points:
+`select`, `apply`, `get`, `predicate`. `DdnsScope.get` exists because
+`session.get` consults the identity map, takes no `WHERE`, and therefore cannot
+be scoped at all.
+
+Fail-closed three ways, and the third needed correcting by measurement:
+
+1. **An unclassified model raises**, rather than returning everything. Every
+   host model is either in `TENANT_PATHS` with a path to its owner or in
+   `UNSCOPED` with a written reason, and the test suite fails until one of the
+   two is true — including for a model added by a future issue.
+2. **No tenant and no cross-tenant grant matches nothing** — `sqlalchemy.false()`,
+   not an absent `WHERE`.
+3. **"Unrestricted" is spelled in the SQL as a literal `true`** — *for a bare
+   read only.* #17 measured that SQLAlchemy **elides `sa.true()` the moment it
+   is ANDed with anything else**, so a composed statement reaches MySQL with no
+   trace of the scope: the retention prune's `DELETE` is the worked example. A
+   query log therefore distinguishes "deliberately unrestricted" from "never
+   scoped at all" on a bare statement and **not** on a composed one. Do not use
+   the literal as an audit signal on composed SQL; the guard that does work is
+   the read-path census in `backend/tests/test_tenant_isolation.py`, which
+   counts every query call site in the package and fails on one that reaches
+   neither the scope nor a written exemption.
+
+**Permissions are seeded in `0002`, not `0001`** — this line read `0001` and
+was wrong from the moment `0001_init` merged. `0001_init` is the scaffold's
+own revision and is stamped in every database that has ever run
+`make migrate`, the deploy host's included; amending it in place would seed on
+a fresh database and seed nothing anywhere alembic already reads `0001_init`.
+The five codes are `atrium_ddns.domain.manage`, `atrium_ddns.device.manage`,
+`atrium_ddns.hostname.manage` (own rows), and `atrium_ddns.admin` +
+`atrium_ddns.events.read.all` for cross-tenant access. `admin` holds all five,
+`user` holds the three `.manage` codes, `super_admin` is auto-granted, and
+unknown role codes warn and skip. The two cross-tenant codes are not equivalent:
+`atrium_ddns.events.read.all` opens the audit log **and nothing else**, which is
+why `TENANT_PATHS` carries the permission set per model rather than globally.
 
 #### 3.1.1 Per-user credentials — resolved upstream
 
@@ -513,26 +654,50 @@ delivers it. `EncryptedText(scope="user")` still refuses — permanently now —
 and points at the replacement.
 
 **The API.** Two lines in the model, not one, because a SQLAlchemy column type
-never sees the row it belongs to and the row is where the owner lives:
+never sees the row it belongs to and the row is where the owner lives.
+
+**The example below used to be a `Device.secret`, and that model was never
+built.** §3.2 decided device secrets are *hashed*, not encrypted, and atrium
+0.28's release notes offering a device password as the example use of
+`UserSecret` is exactly what this project declined. Corrected by #18 to the one
+user-scope column that actually exists — `ddns_domain_backend.credentials_ct`
+— so the snippet no longer reads as a sanction for the shape §3.2 rejects:
 
 ```python
 from app.host_sdk.crypto import SecretBlob, UserSecret, unlock_user_secrets
 
-class Device(HostBase):
-    __tablename__ = "device"
+class DomainBackend(HostBase):
+    __tablename__ = "ddns_domain_backend"
     user_id: Mapped[int] = mapped_column(HostForeignKey("users.id"))
-    secret_ct: Mapped[bytes | None] = mapped_column(SecretBlob(), nullable=True)
+    credentials_ct: Mapped[bytes | None] = mapped_column(
+        # `.with_variant(MEDIUMBLOB)` is load-bearing, not decoration:
+        # `SecretBlob` is a plain LargeBinary subclass, so its documented
+        # widening on MySQL never fires and the column compiles to a
+        # 64 KB `BLOB`. Measured, and reported upstream (#14).
+        SecretBlob().with_variant(mysql.MEDIUMBLOB(), "mysql"), nullable=True
+    )
 
-    secret = UserSecret(
-        purpose="device.secret", owner_attr="user_id", column="secret_ct"
+    credentials = UserSecret(
+        purpose="domain_backend.credentials",
+        owner_attr="user_id",
+        column="credentials_ct",
+        json=True,
     )
 ```
 
 ```python
-row = await session.get(Domain, domain_id)
+row = await session.get(DomainBackend, backend_id)
 await unlock_user_secrets(session, row.user_id)   # owner from the ROW
-row.provider_credentials.reveal()
+row.credentials.reveal()
 ```
+
+`ddns_domain_backend.user_id` is denormalised from `ddns_domain.user_id` and is
+the one place the host duplicates ownership. That is deliberate: `UserSecret`
+reads the owner off the row holding the ciphertext, and reaching it through a
+relationship would be a lazy load — IO inside attribute access — which is the
+whole thing the two-declaration shape exists to avoid. The scope filters
+`DomainBackend` on that column for the same reason, so the crypto and the
+query cannot disagree about which rows are visible.
 
 **One `await` before you touch the value.** Unlocking is a database read, and
 there is no honest way to hide a database read behind a plain attribute access
@@ -682,7 +847,9 @@ this record" ambiguous, and that is the question the UI is built around.
 ### 3.2 Credentials
 
 **The device is the credential.** `/nic/update` and `/nic/delete` authenticate a
-*device*, not a user: HTTP Basic, username and password from the `devices` row.
+*device*, not a user: HTTP Basic, username and password from the `ddns_device`
+row. (This line read `devices`; the table is `ddns_device`, singular and
+prefixed like the other five.)
 
 **Storage: hashed, not encrypted — decided.** `password_hash` is argon2id for
 newly issued secrets, with **bcrypt verification retained** so migrated rows
@@ -713,6 +880,20 @@ Re-hash to argon2id opportunistically on a successful bcrypt verify, the way
 `pwdlib.verify_and_update` does — the fleet migrates itself as routers check in,
 with no operator action and no client reconfiguration.
 
+**`PasswordHash.recommended()` cannot be used for this, and the failure is
+silent on the wire.** Measured by #16 against pwdlib 0.3.0 in this image: it
+returns `[Argon2Hasher]` alone. `verify_and_update` identifies a stored hash by
+its prefix and raises `UnknownHashError` for one no configured hasher claims —
+so every migrated bcrypt row would have raised, been caught, and answered
+`badauth`, which is byte-identical to a wrong password. The whole fleet stops
+at cutover and the log says the routers have the wrong credentials. As built:
+`PasswordHash((Argon2Hasher(), BcryptHasher()))`, argon2id first so
+`verify_and_update` re-hashes on a successful bcrypt verify. The compat fixture
+seeds `alice` as bcrypt on purpose and she sends most of the frozen table's
+requests, so a full table run exercises the legacy verify path and the upgrade
+for real (`make verify-compat-rehash` prints the shape of each stored hash, and
+never the hash).
+
 **Note:** hashing takes the device secret out of the encrypted set entirely, so
 `app.host_sdk.crypto` is used only for *provider credentials*. Atrium 0.28's
 release notes name a device password as an example use of `UserSecret`; we
@@ -741,23 +922,33 @@ deliberately does not hold it. "Never" is offered only while
 the option and the API caps the request. Plaintext appears once and there is no
 re-emit route — recovery is revoke plus recreate.
 
-### 3.3 The migration invariant that will bite
+### 3.3 The migration invariant that will bite — retired by §3.3.1, kept as history
 
-Legacy hostnames are owned by a *user*; `/nic/update` returns `nohost` for a
-hostname the caller does not own. After the migration the check is against the
-*device*. So:
+**Read §3.3.1 first.** This section was written from the legacy *schema*; §3.3.1
+was written from the legacy *data*, and it dissolves the invariant rather than
+satisfying it. The clause below is kept because the failure mode it names is
+real and still reachable by hand after cutover, but it is **not** a live
+requirement on the importer: a legacy row *is* a device, so there is no user
+whose hostnames could be split.
 
-> Every legacy user migrates to **exactly one** device, carrying that user's
+> ~~Every legacy user migrates to **exactly one** device, carrying that user's
 > username and bcrypt hash verbatim, and **all** of that user's hostnames are
-> assigned to it.
+> assigned to it.~~ Superseded: each of the six legacy rows becomes one device
+> and brings its own hostnames with it. What survives unchanged is that the
+> **bcrypt hash is carried verbatim** — that hash is the credential a router in
+> the field is configured with.
 
-Split a legacy user's hostnames across two devices and its router starts getting
-`nohost` for half of them, with a 200 and no error anywhere. The importer must
-assert the invariant and the compat suite must cover it: same credentials, same
-hostname set, same responses.
+Split one device's hostnames across two devices and its router starts getting
+`nohost` for half of them, with a 200 and no error anywhere. That is now a
+post-cutover hazard rather than an import hazard, and the host asserts it where
+it can be asserted: `ddns_hostname.device_id` is the ownership check on
+`/nic/update`, and `test_router_nic.py`'s `otherdevice` fixture is one tenant's
+hostname on a *second* device of hers, which her main router must be told
+`nohost` for. The tenant matches and the device does not, which is the whole
+point of the model change.
 
-Splitting one migrated device into several is then a **post-cutover** operation
-the owner performs deliberately, per hostname, in the UI — not something the
+Splitting one migrated device into several is a **post-cutover** operation the
+owner performs deliberately, per hostname, in the UI — not something the
 importer guesses at.
 
 #### 3.3.1 The actual production population, measured 2026-08-15
@@ -786,19 +977,42 @@ before a deploy is silently a different schema. The importer reads the live
 file out of the `dyndns-route53_dyndns-data` volume, and asserts the column set
 before it starts.
 
-**Three consequences for the migration.**
+**The six non-admin rows are not people. They are devices.**
 
-1. **Legacy users have no email address.** The `users` table is keyed by
-   `username`; atrium's is keyed by email and requires one. Six accounts need an
-   address that does not exist anywhere in the source data. That is an operator
-   decision, not something an importer should invent — see §6.
-2. **The one-device-per-user invariant is cheap here.** Six devices, the largest
-   carrying four hostnames. The admin has none and needs no device — it becomes
-   an atrium super_admin and nothing else.
-3. **`web_login=0` for every non-admin user.** None of them can use the legacy
-   web UI today, so nothing is lost by them not having atrium logins on day one.
-   It also means the DDNS credential is the *only* thing they have, which is
-   exactly what makes carrying the bcrypt hashes verbatim non-negotiable.
+Confirmed by the operator, 2026-08-15, and it is the most important fact about
+this migration. The legacy service had no device concept, so it used the
+`users` table for one: each of those six rows is a router with a username and a
+password that updates DNS, not a person with an account.
+
+Everything the data shows agrees. All six have `web_login=0` — none of them can
+log into the legacy web UI, and never could. Each owns a disjoint set of
+hostnames. None has an email address, because none was ever going to receive
+mail.
+
+**So the migration is:**
+
+| legacy | becomes |
+|---|---|
+| 1 `admin` row (`web_login=1`, 0 hostnames) | **1 atrium user** — a real person |
+| 6 non-admin rows | **6 `ddns_device` rows**, owned by that user |
+| 11 hostnames | assigned to the device that already owns them |
+| 1 domain | owned by that user |
+
+**This dissolves the email problem entirely.** Devices have no email address and
+need none; only the one real account does. The question of what to synthesise
+for six unreachable mailboxes does not arise — it was an artefact of reading the
+legacy schema literally instead of reading what it was being used for.
+
+**And it retires the invariant in §3.3.** There is no risk of splitting a
+legacy user's hostnames across devices, because a legacy row *is* a device and
+its hostnames come with it. Carrying the bcrypt hash verbatim stays
+non-negotiable for the same reason as before: that hash is the credential a
+router in the field is configured with.
+
+**A design note worth keeping.** The legacy data was already device-shaped; it
+just lacked a table to say so. That is corroboration for the model in §3.1
+rather than a coincidence — the concept was there, unnamed, being carried by a
+table that did not fit it.
 
 **The traffic is IPv6-first — but measure it with the right instrument.**
 
@@ -831,23 +1045,46 @@ everything older than 24 hours. Neither survives multi-tenancy: "which of my
 devices stopped updating, and when" is unanswerable at 24 hours' depth, and
 per-tenant filtering has nothing to filter on.
 
-`dns_event` gets indexed, nullable FKs to **user, device, domain, and hostname**,
-each `ON DELETE SET NULL`, alongside **denormalised name columns** captured at
-write time (`user_email`, `device_name`, `domain_name`, `hostname`). Both halves
-are needed and for different reasons: the FKs are what the filters index on, and
-the denormalised strings are what keeps a log entry readable after the device it
+**`ddns_event`** — this paragraph said `dns_event` and no such table exists —
+gets indexed, nullable FKs to **user, device, domain, and hostname**, each
+`ON DELETE SET NULL`, alongside **denormalised name columns** captured at write
+time (`user_email`, `device_name`, `domain_name`, `hostname`). Both halves are
+needed and for different reasons: the FKs are what the filters index on, and the
+denormalised strings are what keeps a log entry readable after the device it
 describes has been deleted — which is precisely when the log is being read.
 
 Query surface, all combinable, all scope-filtered before they reach the
 database: user (admin only), device, domain, hostname, event type, response
 code, client IP, time range. Compound index on `(user_id, created_at)` and
-`(device_id, created_at)`; those two carry the common views.
+`(device_id, created_at)`; those two carry the common views. `created_at` alone
+gets its own index for the prune, which constrains none of the leading columns,
+and `client_ip` gets one because "which device is this address" is otherwise a
+full scan of the retention window.
+
+**As built, three columns this section did not name.** `ip` — the address the
+request was *about* (`myip`, normalised) as distinct from `client_ip`, the
+address it came *from*; the difference is the interesting part of a NAT'd
+update. `message`, set on exactly one kind of row, the rate-limit refusal
+(`event-detail-is-populated-only-for-rate-limit-refusals`, `preserve`). And
+`backend_type`, added by #18's `0003`: one row is written per **backend
+attempt**, carrying that backend's own status rather than the aggregate the wire
+saw, and `backend_type IS NULL` is the filter for an outcome decided before any
+provider was contacted — `badauth`, `abuse`, `911`, `notfqdn`, `nohost`, and a
+hostname whose domain has zero backends. That NULL is a meaning and not a
+missing value (`event-backend-type-is-null-for-outcomes-decided-before-any-backend`,
+`preserve`). It is deliberately not folded into `message`: a free-text column
+that sometimes carries a provider name and sometimes a refusal reason is not
+something a filter can index.
 
 **Retention becomes a setting, not a constant.** The 24-hour prune was sized for
 a dashboard, not for search. Move it into a `register_namespace` config value
 with a sane default (30 days), and run the prune as a scheduled job through
 `init_worker` rather than on the write path — the old code prunes inside
-`log_event`, so every DNS update pays for it.
+`log_event`, so every DNS update pays for it. Built in #17, and with one
+consequence for §3.1's third fail-closed property: the prune's `DELETE` is a
+composed statement, so its `cross_tenant` scope is elided out of the emitted SQL
+and is invisible in a query log. That is the reading that turned "unrestricted
+is spelled in the SQL" from a rule into a rule with a boundary.
 
 **`n/a` is not `0`.** A device that has never called, a device whose last call
 failed, and a device with zero updates in the window are three different states.
@@ -1010,6 +1247,38 @@ than letting it size itself against the whole box.
 
 ---
 
+## 5c. Behaviour changes accepted at cutover
+
+Settled by the operator 2026-08-15. Each is a deliberate difference from the old
+service, approved rather than inherited.
+
+**The three Route 53 defects #15 fixed stay fixed.** The old adapter mapped
+*every* zone in the AWS account rather than only the tenant's; its zone listing
+ignored `IsTruncated`, so anything past the first page was invisible; and both
+adapters bound a hostname to the **first** enclosing zone rather than the
+closest. The frozen table says "closest", and its `agree` reading was calibrated
+against a one-candidate fixture where first and closest cannot differ — so the
+table never had an opinion here. Fixing was the right call and the divergence is
+recorded rather than silent.
+
+**`HEAD` on the write endpoints is refused.** Confirmed. The old service
+performs the update on a `HEAD`; #25 measured a record moving to the *prober's*
+address. Note this needs a **deliberate handler** in #16: the framework will not
+produce a 405 on its own behind atrium's SPA catch-all — bare FastAPI gives 405,
+the same route behind the mount gives 200, and today's stack with no route at
+all gives 404.
+
+**Dependencies track latest.** All three Dependabot PRs merged, including the
+node builder image 25 → 26-alpine. Gate re-run on the new base: green.
+
+**The borrowed TLS certificate is accepted as-is** until atrium-ddns replaces
+the old service. No refresh automation. It goes stale around **24 Aug** when the
+old Traefik renews; from then the site serves an expired certificate until
+someone re-extracts. That is a known, accepted cost of a temporary measure —
+see §5b.
+
+---
+
 ## 6. Open decisions
 
 These are the operator's, and a run should not start without them.
@@ -1052,12 +1321,9 @@ These are the operator's, and a run should not start without them.
    host's config namespace. Affordable now the store is MySQL rather than the
    old SQLite file, and pruned by a scheduled job rather than on the write path
    (§3.4).
-11. **What email address do the six legacy users get?** Their accounts are keyed
-   by username; atrium requires an email and there is none in the source data
-   (§3.3.1). Synthesised (`<username>@<domain>`) leaves six addresses that
-   cannot receive mail — password reset and verification both dead-end.
-   Real addresses need collecting from the people. Deferred to V1M4, but it
-   gates the importer.
+11. ~~What email address do the six legacy users get?~~ — **dissolved, not
+   decided.** They are not users; they are devices (§3.3.1). Devices need no
+   email. Only the single real admin account does.
 12. ~~Deploy host and cutover policy~~ — **decided: run beside the existing
    service on port 8443.** Both stacks live on the host during the development
    phase; the old one keeps serving until the exit criterion is demonstrated.

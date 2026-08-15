@@ -8,10 +8,33 @@ version = "0.1.0"
 description = "Atrium Ddns host extension for Atrium"
 requires-python = ">=3.12"
 
-# All runtime deps come from the atrium image (FastAPI, SQLAlchemy,
-# Alembic, structlog). Listing them here would just shadow atrium's
-# pinned versions. The package is installed via `pip install ./backend`
-# inside the image so `atrium_ddns` is importable on PYTHONPATH.
+# Almost all runtime deps come from the atrium image (FastAPI,
+# SQLAlchemy, Alembic, structlog, httpx, dnspython). Listing those here
+# would just shadow atrium's pinned versions. The package is installed
+# via `pip install ./backend` inside the image so `atrium_ddns` is
+# importable on PYTHONPATH.
+#
+# The exception is below, and it is the only one. Measured against
+# `ghcr.io/brendanbank/atrium:0.28` rather than assumed:
+#
+#   httpx      0.28.1   present   -> the Hetzner adapter uses it
+#   dnspython  2.8.0    present   -> nsupdate, and every `nochg` check
+#   requests   —        ABSENT    -> so the legacy Hetzner adapter's
+#                                    import was ported to httpx rather
+#                                    than adding a second HTTP client
+#   boto3      —        ABSENT    -> declared here
+#
+# Route 53's API is SigV4-signed XML; there is no honest way to speak it
+# without botocore, so #15 declares boto3 rather than shipping a
+# `route53` backend type that raises on first use. Resolved clean into
+# atrium's venv (botocore, jmespath, s3transfer, python-dateutil, six,
+# urllib3 — none of which atrium already pins, so nothing is upgraded
+# underneath it).
+dependencies = [
+    # Floor is the version this was resolved and tested against; the
+    # ceiling is boto3's own major, which it has never bumped.
+    "boto3>=1.43,<2",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/atrium_ddns"]

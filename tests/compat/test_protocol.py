@@ -326,6 +326,62 @@ def test_the_table_is_frozen_at_its_recorded_shape() -> None:
     )
 
 
+def test_the_version_advances_exactly_when_the_data_does() -> None:
+    """The four readings above cannot see an un-bumped version. This can.
+
+    Issue #29 mutated an expected byte, recomputed all four readings, left
+    `version` alone — and the guard above passed, because "these numbers
+    describe this table" stays true however often the table changes. That is
+    the same defect one level up from the one #11 wrote the freeze for: a
+    version field nothing checks is a version field nobody bumps, and updating
+    the readings is exactly what an agent changing the table will do.
+
+    `frozen.previous` is the preceding freeze, recorded as data rather than as
+    the prose comment it was first written as — prose cannot be read by a test,
+    which is why the first version of this record did not close the hole. Two
+    directions, because either one alone can be satisfied by accident:
+
+    * the digest moved, so the version must have advanced;
+    * the version advanced, so the digest must have moved — a bump over an
+      unchanged table is a freeze that claims a review nobody did.
+
+    **What this does not catch, stated because it was measured and not
+    assumed.** `previous` is the last recorded *freeze*, not the file's last
+    *state*, so a change made at the current version — mutate a byte, recompute
+    all four readings, leave `version` alone — still passes. #29 ran that
+    mutation and reported it surviving rather than describing this guard as
+    closing the hole. The evasion is available exactly once: the next version
+    bump copies the current block into `previous`, and a digest that moved
+    without a bump then fails here. The freeze is enforced at the boundary
+    between versions; between edits within one version, the enforcement is the
+    PR review, which is why changing this file is a PR.
+    """
+    table = load_table()
+    frozen = table["frozen"]
+    previous = frozen.get("previous")
+    assert previous, (
+        "`frozen.previous` is missing. It records the freeze this one "
+        "supersedes, and without it nothing can tell a version bump from a "
+        "version left alone — see this test's docstring for the mutation that "
+        "survived when it was absent."
+    )
+
+    assert previous["content_digest"] != frozen["content_digest"], (
+        f"`frozen.version: {frozen['version']}` claims a new freeze, but its "
+        f"content_digest is identical to version {previous['version']}'s. The "
+        "data did not move, so there is nothing to re-freeze: either the "
+        "change was lost, or the bump was reflexive."
+    )
+    assert frozen["version"] == previous["version"] + 1, (
+        f"`frozen.version` is {frozen['version']} and "
+        f"`frozen.previous.version` is {previous['version']}; the digest has "
+        f"moved, so this must be {previous['version'] + 1}. When re-freezing, "
+        "copy the whole outgoing `frozen:` block into `frozen.previous` and "
+        "then bump — the previous reading is what makes the bump checkable "
+        "instead of asserted."
+    )
+
+
 def _content_digest(table: Mapping[str, Any]) -> str:
     """sha256 over the parsed `cases` and `deleted_cases`, canonicalised.
 
