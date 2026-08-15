@@ -132,7 +132,7 @@ check-compat-fresh:  ## fail if the container's copy of tests/ is not this workt
 	echo "check-compat-fresh: container matches worktree ($$host)"
 
 # The wire table. NOT part of `make test` and NOT part of the gate: it replays
-# 101 cases against a running service, and which service that is has to be
+# 114 cases against a running service, and which service that is has to be
 # stated, not guessed. Defaulting either option to make this target "work" is
 # the bug #8 was written about.
 #
