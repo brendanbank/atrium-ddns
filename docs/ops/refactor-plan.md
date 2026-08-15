@@ -102,6 +102,9 @@ encode the decision, not the doc:
 3. No `numhost`. There is no 20-hostname cap. *Preserve*, and add a cap only
    behind a config knob defaulting to off.
 4. Everything is HTTP 200, `badauth` included. *Preserve* — load-bearing.
+   **Bounded by D7 below:** that is true of every case in the table, all of
+   which are `GET`. It is not true of the *endpoint* — a non-`GET` request gets
+   Werkzeug's 405 and an HTML body.
 5. A single label with no dot (`foo`) passes the hostname regex and falls
    through to `nohost`. *Preserve* — it is unreachable in practice and changing
    it moves a `nohost` to a `notfqdn`.

@@ -69,5 +69,5 @@ test-backend-file:  ## one file, verbose — the way to diagnose a hang (FILE=te
 typecheck:  ## tsc --noEmit on the host bundle
 	cd frontend && pnpm typecheck
 
-smoke:  ## local smoke test against the running stack (PASS=... for login checks)
-	./scripts/smoke.sh $(if $(PASS),--pass '$(PASS)',--no-login)
+smoke:  ## local smoke test (PASS=... [EMAIL=...] for the login checks)
+	./scripts/smoke.sh $(if $(EMAIL),--user '$(EMAIL)',) $(if $(PASS),--pass '$(PASS)',--no-login)
