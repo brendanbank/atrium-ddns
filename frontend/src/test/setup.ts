@@ -12,6 +12,13 @@ import '@testing-library/jest-dom/vitest';
 // A no-op is the right stub: nothing in this bundle's tests asserts on a
 // resize, and a stub that fired callbacks would be inventing layout
 // events jsdom has no geometry to produce.
+//
+// Two issues found this independently and described the same fault from
+// two angles — #45 through `Modal`, #46 through `Select`. Worth noting
+// because the symptom is the misleading part: #46 saw only "An error
+// occurred in the <Scrollbar> component" on stderr and an empty
+// `<body>`, so every query in the file failed with "unable to find an
+// element" and none of them said why.
 if (typeof globalThis.ResizeObserver === 'undefined') {
   class NoopResizeObserver implements ResizeObserver {
     observe() {}
@@ -19,6 +26,19 @@ if (typeof globalThis.ResizeObserver === 'undefined') {
     disconnect() {}
   }
   globalThis.ResizeObserver = NoopResizeObserver;
+}
+
+// Same shape, second element: Mantine's combobox scrolls the active
+// option into view when the dropdown opens, and jsdom's Element has no
+// `scrollIntoView`. Needed by #46's filter selects; harmless otherwise.
+if (
+  typeof Element !== 'undefined' &&
+  !(Element.prototype as { scrollIntoView?: unknown }).scrollIntoView
+) {
+  Object.defineProperty(Element.prototype, 'scrollIntoView', {
+    writable: true,
+    value: () => {},
+  });
 }
 
 if (typeof window !== 'undefined' && !window.matchMedia) {

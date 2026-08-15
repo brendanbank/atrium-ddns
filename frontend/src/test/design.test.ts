@@ -128,6 +128,46 @@ describe('the palette', () => {
     expect(foreign).toEqual([]);
   });
 
+  test('the accent never lands on a control — §1.2 Rule 2', () => {
+    // > atrium's primary colour means *you can do this*.
+    // > `--ddns-diverge` means *this is true and it is wrong*.
+    // > Nothing is ever both.
+    //
+    // The design states the rule as a list of places the accent may not
+    // appear — "not on a button, not on a heading, not on a nav item,
+    // not on a focus ring, not on a link" — and a list is not
+    // checkable. `cursor: pointer` is: it is what every control in this
+    // stylesheet declares and what nothing else does, so "no rule block
+    // carries both" is the rule expressed as a property.
+    //
+    // Added by #46, which introduced the first accented rows that sit
+    // beside clickable filter controls. Before that the two never met
+    // in one file and the rule held by accident.
+    const blocks = CSS.replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('}')
+      .map((chunk: string) => {
+        const [selector, body = ''] = chunk.split('{');
+        return { selector: selector.trim(), body };
+      })
+      .filter((block) => block.body.length > 0);
+
+    const both = blocks.filter(
+      (block) =>
+        /cursor:\s*pointer/.test(block.body) &&
+        /--ddns-diverge/.test(block.body),
+    );
+    expect(both.map((block) => block.selector)).toEqual([]);
+
+    // Vacuity, twice: the sweep must have found blocks of each kind, or
+    // "no block has both" is true because no block has either.
+    expect(
+      blocks.filter((block) => /cursor:\s*pointer/.test(block.body)).length,
+    ).toBeGreaterThan(0);
+    expect(
+      blocks.filter((block) => /--ddns-diverge/.test(block.body)).length,
+    ).toBeGreaterThan(0);
+  });
+
   test('every selector is scoped to the host subtree', () => {
     // The bundle's CSS reaches the page as a runtime <style> tag, so an
     // unscoped selector applies to atrium's shell.

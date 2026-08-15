@@ -428,10 +428,157 @@
 }
 
 /* --------------------------------------------------------------------- *
+ * 4b. The log search — a ledger of two-line entries.
+ *
+ * ARRANGEMENT, decided by §2.5's own width budget rather than by taste,
+ * and the argument is §3.1's applied one level along.
+ *
+ * A log line carries TWO addresses: `client_ip` (where the call came
+ * from) and `ip` (what it was about). One address cell is budgeted at
+ * 380px — the widest real IPv6 in this estate is 39 characters and never
+ * `::`-compressed (M2), and the column ceiling is 45. A one-row table
+ * with both as columns needs 2 x 380 + 90 time + 140 device + 260 name +
+ * 80 result + 90 backend = ~1420px. Atrium's AppShell leaves 1168px at a
+ * 1440px viewport and 1008px on a 1280px laptop, so it does not fit —
+ * and the overflow behaviour of an address column is "silently show a
+ * different address", which §3.1 disqualified an entire arrangement for.
+ *
+ * So the entry is two lines: a fielded head line carrying the short
+ * columns, and an address line spanning the full width beneath it. One
+ * address then has 380px with room to spare and two have 760px inside
+ * 1168px. Minimum ~780px, which is one-up at tablet width.
+ *
+ * M3 pays for it twice: 94.5% of updates are `nochg` with no `myip`, so
+ * the second address is usually absent and the address line is short.
+ * --------------------------------------------------------------------- */
+
+[data-ddns-root] .ddns-log {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mantine-spacing-sm);
+}
+
+[data-ddns-root] .ddns-log__head {
+  display: grid;
+  /* when | device | name | event | result | via | user
+     `minmax(0, …)` on the two name columns so a long hostname shrinks
+     rather than pushing the result column off the edge. */
+  grid-template-columns:
+    10ch minmax(0, 1.2fr) minmax(0, 2fr) 8ch 10ch 10ch minmax(0, 1fr);
+  align-items: baseline;
+  column-gap: var(--mantine-spacing-sm);
+  width: 100%;
+  text-align: left;
+}
+
+[data-ddns-root] .ddns-log__columns {
+  border-bottom: 1px solid var(--ddns-edge);
+  padding-bottom: var(--mantine-spacing-xs);
+}
+
+[data-ddns-root] .ddns-log__entry {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-bottom: var(--mantine-spacing-xs);
+  border-bottom: 1px solid var(--ddns-edge);
+}
+
+/* §1.2 Rule 1 — agreement has no colour. A `good` or `nochg` line is
+   plain ink on the page background: not tinted, not badged, not filled.
+   M3 is why — 94.5% of real updates change nothing, so painting the
+   healthy state paints almost the whole log and the accent that carries
+   the product has to compete with it.
+
+   The wash appears only on a refused line. Same value, same meaning and
+   same threshold as the strip's: this is true and it is wrong. */
+[data-ddns-root] .ddns-log__entry[data-tone='diverge'] {
+  background: var(--ddns-diverge-wash);
+}
+
+[data-ddns-root] .ddns-log__result[data-tone='diverge'] {
+  color: var(--ddns-diverge);
+  font-weight: 700;
+}
+
+/* §1.2 Rule 3 — colour is never the only channel. In dark the accent
+   and the ink differ in luminance by 1.42:1, so a greyscale render shows
+   a refused line and an accepted one as the same tone. The glyph is the
+   second channel and `.ddns-sr` carries the third. */
+[data-ddns-root] .ddns-log__glyph {
+  font-family: var(--ddns-font-data);
+  font-weight: 700;
+}
+
+/* The address line. Full width by construction — it is a sibling of the
+   grid, not a cell in it — so §2.5's 380px is available without the
+   short columns having to give any of theirs up. */
+[data-ddns-root] .ddns-log__addresses {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--mantine-spacing-xs) var(--mantine-spacing-sm);
+  padding-left: 10ch;
+  min-width: 0;
+}
+
+[data-ddns-root] .ddns-log__message {
+  font-family: var(--ddns-font-data);
+  font-size: var(--mantine-font-size-xs);
+  color: var(--ddns-quiet);
+  padding-left: 10ch;
+}
+
+/* A deleted device keeps its name and loses its link. Quiet, not
+   accented: §4.1 already ruled that an unassigned hostname "is a
+   configuration state, not a fault, and must not be marked", and a
+   device somebody deleted is the same kind of fact. */
+[data-ddns-root] .ddns-log__gone {
+  font-family: var(--ddns-font-data);
+  font-size: var(--mantine-font-size-xs);
+  color: var(--ddns-quiet);
+}
+
+/* The pre-apply control. Interactive chrome belongs to
+   `--mantine-primary-color-*`, which the operator owns — §1.2 Rule 2
+   bans `--ddns-diverge` from anything that means "you can do this",
+   including a link and including a focus ring. The data face is kept
+   because the *content* is machine data even though the element is a
+   control (§2.2's boundary rule is about the string, not the tag). */
+[data-ddns-root] .ddns-log__filter {
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+  font-family: var(--ddns-font-data);
+  font-size: var(--mantine-font-size-sm);
+  line-height: var(--mantine-line-height-sm);
+  color: var(--mantine-primary-color-filled);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* §4.5 at ledger scale: a static grey block, no shimmer. */
+[data-ddns-root] .ddns-log__skeleton {
+  height: 44px;
+  border-radius: var(--mantine-radius-sm);
+  background: var(--ddns-edge);
+}
+
+/* --------------------------------------------------------------------- *
  * 5. Motion — §3.7. One transition and nothing else. No page-load
  * sequence, no scroll reveal, no hover animation, no skeleton shimmer.
  * An operations board that animates is a board people stop trusting, and
  * the restraint is the point of spending the boldness on the rail.
+ *
+ * The log adds none. It was tempting to fade a row in as a page loads;
+ * §3.7's rule is "one transition", not "one transition per surface", and
+ * a second one here would make the count a per-file convention rather
+ * than a design decision. `design.test.ts` counts them off the shipped
+ * stylesheet, so adding one fails there rather than in a review.
  * --------------------------------------------------------------------- */
 
 [data-ddns-root] .ddns-rail__seg {
@@ -485,6 +632,29 @@
   [data-ddns-root] .ddns-board__head,
   [data-ddns-root] .ddns-device__line {
     grid-template-columns: 3ch minmax(0, 1fr);
+  }
+}
+
+/* The log's own breakpoint. Below 900px the seven-column head line
+   cannot hold a hostname and two names at legible widths, so it stacks:
+   the fields wrap and the column head is dropped entirely rather than
+   left pointing at columns that no longer line up. A header whose
+   columns have stopped being columns is worse than no header — it is a
+   label attached to the wrong value. */
+@media (max-width: 900px) {
+  [data-ddns-root] .ddns-log__head {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--mantine-spacing-xs) var(--mantine-spacing-sm);
+  }
+
+  [data-ddns-root] .ddns-log__columns {
+    display: none;
+  }
+
+  [data-ddns-root] .ddns-log__addresses,
+  [data-ddns-root] .ddns-log__message {
+    padding-left: 0;
   }
 }
 
