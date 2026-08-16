@@ -182,6 +182,135 @@ describe('the palette', () => {
   });
 });
 
+/** Every rule block in the shipped stylesheet, comments stripped.
+ *
+ * The accent sweep below already built this inline; Part III needs it
+ * three more times, so it is one function rather than four copies of a
+ * split that has to agree with itself.
+ */
+function ruleBlocks(): Array<{ selector: string; body: string }> {
+  return CSS.replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('}')
+    .map((chunk: string) => {
+      const [selector, body = ''] = chunk.split('{');
+      return { selector: selector.trim(), body };
+    })
+    .filter((block) => block.body.length > 0);
+}
+
+describe('an interactive .ddns-data — Part III §16.1', () => {
+  // The operator said *"I still cannot edit the zone"* about a zone
+  // name that **was** an `<Anchor href>` and **did** navigate.
+  // `.ddns-data` sets `color: var(--ddns-ink)`, which cancels Mantine's
+  // link colour and underline, and nothing else on the element said it
+  // was a destination.
+  //
+  // These four guards are the "visual rule with a test" the issue asks
+  // for. Each is written so that undoing the fix the obvious way —
+  // deleting the block, moving it behind `:hover`, colouring it instead,
+  // or dropping `.ddns-data` from the anchors — fails here rather than
+  // in a review six weeks later.
+
+  test('carries a text-decoration affordance, and it is not colour', () => {
+    const interactive = ruleBlocks().filter(
+      (block) =>
+        /\ba\.ddns-data\b/.test(block.selector) ||
+        /\bbutton\.ddns-data\b/.test(block.selector),
+    );
+    // Vacuity: the sweep must have found the rule at all. Every
+    // assertion below is over this list, and an empty list passes them
+    // all — the exact shape the file's own header warns about.
+    expect(
+      interactive.length,
+      'no rule in ddns.css selects an interactive .ddns-data. §16.1 requires ' +
+        'one: the anchors are the destination and nothing else on them says so.',
+    ).toBeGreaterThan(0);
+
+    const underlining = interactive.filter((block) =>
+      /text-decoration:\s*underline/.test(block.body),
+    );
+    expect(
+      underlining.map((block) => block.selector),
+      'an interactive .ddns-data must carry an affordance that is not colour',
+    ).not.toEqual([]);
+
+    // "not colour" is the half that is easy to regress by *adding*
+    // something rather than by removing it. §1.2 Rule 2 gives
+    // interactive chrome to atrium's primary colour, which the operator
+    // owns and can rebrand to the ink; an affordance that leaned on it
+    // would be one theme change from invisible again.
+    for (const block of interactive) {
+      expect(
+        /(^|[;{\s])color:/.test(block.body),
+        `${block.selector} sets a colour. Colour is spoken for (§2.3 gives it ` +
+          'to the ink, §1.2 Rule 2 gives the accent to nothing clickable), so ' +
+          'the affordance has to be something else.',
+      ).toBe(false);
+    }
+  });
+
+  test('the affordance is at rest, not behind :hover', () => {
+    // Hover-only "fails the same operator on the same page, and fails
+    // entirely on touch". Stated as a property of the stylesheet: no
+    // rule in this file may make a `.ddns-data` decoration conditional
+    // on the pointer being over it.
+    const hoverGated = ruleBlocks().filter(
+      (block) =>
+        /\.ddns-data/.test(block.selector) &&
+        /:hover|:focus-visible|:focus\b/.test(block.selector),
+    );
+    expect(
+      hoverGated.map((block) => block.selector),
+      'a .ddns-data affordance behind a pointer state is not an affordance for ' +
+        'the reader who has not moved the pointer, and is none at all on touch.',
+    ).toEqual([]);
+  });
+
+  test('§2.3 is not retracted — .ddns-data still sets the ink', () => {
+    // The fix that was explicitly ruled out: dropping `.ddns-data` from
+    // the anchors so Mantine's link colour comes back. That would break
+    // the type idea on the most important string on the page. So the
+    // base rule must still declare the data face and the ink, and this
+    // fails if a later change "fixes" the affordance by deleting them.
+    const base = ruleBlocks().find(
+      (block) => block.selector === '[data-ddns-root] .ddns-data',
+    );
+    expect(base, 'the base .ddns-data rule is gone').toBeDefined();
+    expect((base as { body: string }).body).toMatch(
+      /color:\s*var\(--ddns-ink\)/,
+    );
+    expect((base as { body: string }).body).toMatch(
+      /font-family:\s*var\(--ddns-font-data\)/,
+    );
+  });
+
+  test('the link underline and the differing-hextet underline are told apart', () => {
+    // Two underlines with two meanings now live in one stylesheet: a
+    // destination, and the groups of an address that differ from the
+    // one above it (§1.2 Rule 3's third channel). On a greyscale
+    // screenshot the only thing separating them is the stroke, so they
+    // may not share a thickness.
+    const thickness = (predicate: (selector: string) => boolean) =>
+      ruleBlocks()
+        .filter((block) => predicate(block.selector))
+        .map((block) => block.body.match(/text-decoration-thickness:\s*([^;]+)/))
+        .filter((match): match is RegExpMatchArray => match !== null)
+        .map((match) => match[1].trim());
+
+    const link = thickness((selector) => /\.ddns-data\b/.test(selector));
+    const differs = thickness((selector) =>
+      /\.ddns-group\[data-differs='true'\]/.test(selector),
+    );
+    expect(link, 'the interactive .ddns-data underline has no thickness').not.toEqual(
+      [],
+    );
+    expect(differs, 'the differing-group underline has no thickness').not.toEqual(
+      [],
+    );
+    expect(new Set([...link, ...differs]).size).toBe(2);
+  });
+});
+
 describe('the redundant channels', () => {
   test('every non-agreed verdict carries a glyph and a word', () => {
     // §1.2 Rule 3: colour is never the only channel. In dark the accent

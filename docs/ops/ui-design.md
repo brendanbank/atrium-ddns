@@ -1114,3 +1114,108 @@ line that shows what composition did.
 5. Suffix composition in the UI, validation only on the server, paste-tolerant
    (§13.1).
 6. No new palette value, no new typeface, no new signature element.
+
+---
+
+# Part III — the affordance, and the operator's reversal of §12
+
+*Added after the second operator session. Part II built the destinations. This
+part is about the fact that **nothing on screen said they were there**, and
+about a design decision the operator overruled.*
+
+## 16. "I still cannot edit the zone" — three facts, one appearance
+
+Two screenshots, two surfaces, and the same complaint. They have three different
+causes, which is why fixing one would have left the report standing.
+
+| surface | what the name actually is | why it reads as inert |
+|---|---|---|
+| the **board** (`DeviceBoard`) | a bare `<span class="ddns-data">` inside an expand toggle | it is **not a link at all** |
+| the **zones list** (`DomainList`) | `<Anchor href={zoneHref(id)} class="ddns-data">` | `.ddns-data` sets `color: var(--ddns-ink)` — Mantine's link colour and underline are cancelled |
+| the **devices list** (`DeviceList`) | `<Anchor href={deviceHref(id)} class="ddns-data">` | same cancellation |
+
+The zones and devices lists **do** navigate when clicked. The pixels never said
+so. On the same rows, `log for this device` renders blue and the device name
+does not — one surface teaching two different lessons about what is clickable.
+
+### 16.1 This is §2.3 colliding with itself
+
+`.ddns-data` exists to make the *type idea* work: data outranks its label, so
+values get the data face, the sm size, and `--ddns-ink`. That is right, and
+§2.3 is not being retracted.
+
+But `--ddns-ink` on an `<a>` is a **statement that the element is not
+interactive**, and the class was applied to anchors without anyone noticing it
+carried that second meaning. A rule written to say *this is a value* was reused
+where it also had to say *this is a destination*, and the two are in direct
+conflict.
+
+The fix is not to drop `.ddns-data` from the anchors — that would break the type
+idea on the most important string on the page. It is that **an interactive
+`.ddns-data` needs an affordance that is not colour**, because colour is spoken
+for. Underline on the data face, carried at rest rather than only on hover:
+hover-only affordance fails the same operator on the same page, and fails
+entirely on touch.
+
+## 17. §12 is overruled by the operator, and the reason it lost is not the reason I argued
+
+§12 chose a **route** over a drawer and a split pane, on a width budget: a strip
+needs 592px, atrium's shell gives 1168px, a 360/800 split leaves 790px, and
+Mantine's `lg` drawer is 620px — below the one-strip minimum.
+
+**The operator has asked twice for a modal that pops up.** That is the decision.
+
+Recording honestly what that does and does not overturn, because "the operator
+overruled me" is not the same as "I was wrong":
+
+- The **width argument was never an argument against a modal.** It was measured
+  against a `lg` drawer and a conventional split. A Mantine `Modal` takes an
+  arbitrary `size`, so it can carry 592px comfortably and the strip is not
+  threatened. §12 rejected two shapes and never evaluated the third.
+- The two arguments that **did** survive on their own merits are linkability
+  and Back. So the routes stay. They are not removed in favour of the modal;
+  the modal becomes how the destination is normally reached, and the route
+  stays as the thing you can paste into a ticket.
+
+So: **click a row → a modal opens. The deep-link route still resolves, and
+opens the same card.** One card component, two entrances. Anything else grows
+a second editor.
+
+The modal must be sized to hold a strip at the width §3.1 measured. A modal that
+wraps the signature element reintroduces exactly the failure §12 was written to
+avoid, and would be the worst of both decisions.
+
+## 18. What Part III inherits
+
+1. Interactive `.ddns-data` carries an affordance that is not colour, at rest,
+   not hover-only (§16.1).
+2. The board's device name becomes a way in. It is currently an expand toggle
+   and a name; those are two jobs on one target and it does neither visibly.
+3. One card component behind both the modal and the route (§17).
+4. The modal is sized for a strip at §3.1's 592px.
+5. No new palette value, no new typeface, no new signature element. Still.
+6. **A portal leaves this design behind, and #97 found it by measuring.**
+   Every selector in `ddns.css` is scoped by `[data-ddns-root]` — §5's rule, and
+   a correct one: the bundle's CSS arrives as a runtime `<style>` tag, so an
+   unscoped rule would restyle atrium's shell. The six palette values are custom
+   properties declared on that same attribute. A Mantine `Modal` renders through
+   a `<Portal>` into `document.body`, which is **outside** it. So the card §17
+   asks for, put in a modal and nothing else done, renders in the body face at
+   the body colour, `.ddns-label` loses its `;`, and **the strip has no rail**.
+
+   Measured rather than reasoned: the zone name in the list resolved to
+   `rgb(33, 37, 41)` (`--ddns-ink`) and the same class inside the card modal
+   resolved to `rgb(0, 0, 0)`. The assertion that caught it was written to catch
+   `.ddns-data` being dropped from an anchor.
+
+   The remedy is `DdnsPortalScope`, which re-establishes the attribute inside
+   the portal. Stated here as an inheritance because it applies to **any**
+   future portalled surface, not only to these two cards — and because it is the
+   sharper form of §17's own condition. A modal wide enough for the signature
+   element that draws it without its rail is worse than one that wraps it: it
+   looks finished.
+
+   The bundle's other modals — the create-zone form, the publishing modal —
+   still have this gap. They carry Mantine components and short `.ddns-data`
+   strings rather than a strip, so nothing in them is *wrong*, only unstyled.
+   Recorded rather than fixed inside #97's scope.

@@ -108,9 +108,20 @@ test.describe('the §3.3.1 walk, through the UI', () => {
     );
 
     // --- 2. the provider ------------------------------------------
-    // On the zone's own route since #88 — §12's linkable destination,
-    // reached the way an operator reaches it, by clicking the zone.
-    await page.getByTestId(`open-domain-${zone}`).click();
+    // On the zone's own route since #88 — §12's linkable destination.
+    //
+    // **Adjusted by #97.** A plain click on the row now opens the card
+    // in a modal (Part III §17), and the block below opens a *second*
+    // modal on top of it to read the provider catalogue. Two dialogs
+    // would make `getByRole('dialog')` ambiguous and would leave the
+    // outer one open after the two Escapes, so this step follows the
+    // row's own `href` — which §17 kept precisely so it could be
+    // followed. `card-affordance.spec.ts` covers the modal entrance.
+    const zoneHrefFromRow = (await page
+      .getByTestId(`open-domain-${zone}`)
+      .getAttribute('href')) as string;
+    expect(zoneHrefFromRow).toMatch(/\/atrium-ddns\/zones\/\d+$/);
+    await page.goto(zoneHrefFromRow);
     await expect(page.getByTestId(`zone-${zone}`)).toBeVisible();
     await expect(page.getByTestId('zone-no-providers')).toBeVisible();
 
@@ -242,7 +253,13 @@ test.describe('the §3.3.1 walk, through the UI', () => {
     // publish this device was auto-expanded (a hostname with no strip
     // counts as something wrong); after it, it is short and shut, and
     // the strip is not in the DOM at all until the line is clicked.
-    const deviceLine = deviceSection.locator('button.ddns-device__line');
+    // The disclosure, not the row. #97 split the board line into two
+    // controls — the name opens the device's card, the disclosure at
+    // the end of the line expands its names (Part III §18.2) — so
+    // `aria-expanded` now lives on the second of those rather than on
+    // the whole row, which used to be one `<button>` doing both jobs
+    // and doing neither visibly.
+    const deviceLine = deviceSection.locator('.ddns-device__expand');
     if ((await deviceLine.getAttribute('aria-expanded')) === 'false') {
       await deviceLine.click();
     }
