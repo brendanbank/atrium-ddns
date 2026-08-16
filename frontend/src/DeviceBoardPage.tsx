@@ -20,12 +20,14 @@
  * the permission — so a user without it does not generate a 403 on every
  * page load.
  */
-import { Alert, Stack, Text, Title } from '@mantine/core';
+import { Alert, Anchor, Group, Stack, Text, Title } from '@mantine/core';
 import { useQuery } from '@tanstack/react-query';
 import { usePerm } from '@brendanbank/atrium-host-bundle-utils/react';
 
 import { BOARD_PERMISSION, boardQuery } from './api/board';
+import { HOSTNAME_PERMISSION } from './api/hostnames';
 import { BoardSkeleton, DeviceBoard } from './board/DeviceBoard';
+import { NAMES_PATH } from './HostnamesPage';
 import { DdnsRoot } from './host/DdnsRoot';
 
 export function DeviceBoardInner() {
@@ -35,7 +37,25 @@ export function DeviceBoardInner() {
 
   return (
     <Stack gap="md">
-      <Title order={3}>Devices and names</Title>
+      <Group justify="space-between" align="baseline">
+        <Title order={3}>Devices and names</Title>
+        {/* The way out of an empty board. #69 found that the board, the
+            zones page and the log all *describe* hostnames and none of
+            them could create one — so the object this page renders was
+            unreachable from the page that renders it. Gated on the
+            hostname permission rather than the board's: a link to a page
+            that answers a refusal is worse than no link.
+
+            A plain anchor for the reason `LogLink` gives — this tree is
+            mounted inside atrium's React, so react-router's `Link` is
+            not reachable and a bare `pushState` would move the address
+            bar without telling the router. */}
+        {hasPerm(HOSTNAME_PERMISSION) ? (
+          <Anchor href={NAMES_PATH} size="sm" data-testid="board-names-link">
+            Manage names
+          </Anchor>
+        ) : null}
+      </Group>
       {!canRead ? (
         <Alert
           color="gray"

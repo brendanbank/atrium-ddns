@@ -47,9 +47,9 @@ test('every registered surface still mounts through the wrapper element', async 
   await import('../main');
 
   // Vacuity guard: the sweep has to be over a non-empty population.
-  // Eight — the scaffold's four (home widget, demo page, admin tab,
-  // profile item), the board's one (#44), #45's two tenant pages, and
-  // #46's log search.
+  // Nine — the scaffold's four (home widget, demo page, admin tab,
+  // profile item), the board's one (#44), #45's two tenant pages, #46's
+  // log search, and #69's names page.
   //
   // An exact count rather than a floor, on purpose (#45's argument,
   // kept): a registration added without going through
@@ -61,18 +61,20 @@ test('every registered surface still mounts through the wrapper element', async 
   // a list", on the template's own rule, and was wrong to. The rule is
   // about numbers *nothing else checks*; this one is the only thing
   // holding the sweep's population to the registry's. The cost is a
-  // one-line edit per new surface and a failure that reads "expected 8
-  // to be 7", so the comment above names what the number is made of —
+  // one-line edit per new surface and a failure that reads "expected 9
+  // to be 8", so the comment above names what the number is made of —
   // which is what turns that message from a puzzle into an instruction.
+  // (#69 was the fourth issue to append here and the message did read as
+  // an instruction, which is the evidence for keeping it.)
   const rendered = [
     ...handles.homeWidgets,
     ...handles.routes,
     ...handles.adminTabs,
     ...handles.profileItems,
   ];
-  expect(rendered.length).toBe(8);
+  expect(rendered.length).toBe(9);
   // Keys are the registry's primary key: two registrations sharing one
-  // silently replace each other, so the count above would still read 8
+  // silently replace each other, so the count above would still read 9
   // while one surface never mounts. Added by #46 because three issues
   // have now appended to this file and the fourth will not have read
   // the other three.

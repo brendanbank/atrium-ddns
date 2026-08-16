@@ -15,3 +15,4 @@ export * from './board';
 export * from './credentials';
 export * from './domains';
 export * from './devices';
+export * from './hostnames';

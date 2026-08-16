@@ -19,6 +19,7 @@ import {
   IconKey,
   IconListSearch,
   IconRouter,
+  IconTag,
   IconWorld,
 } from '@tabler/icons-react';
 import {
@@ -33,6 +34,7 @@ import { AtriumDdnsWidget } from './AtriumDdnsWidget';
 import { DeviceBoardPage } from './DeviceBoardPage';
 import { DevicesPage } from './DevicesPage';
 import { DomainsPage } from './DomainsPage';
+import { NAMES_PATH, HostnamesPage } from './HostnamesPage';
 import { LOG_PATH, LogSearchPage } from './LogSearchPage';
 
 /** The board's path. Exported so a test asserts the registered route
@@ -48,6 +50,12 @@ export const DEVICES_PATH = '/atrium-ddns/devices';
  *  it too, and re-exported here so this file stays the one place a
  *  reader looks for "what paths does this bundle own". */
 export { LOG_PATH };
+
+/** #69's hostname lifecycle — the legacy `/admin/hostnames`. Defined in
+ *  `HostnamesPage` because the board and the zones page link to it, and
+ *  importing it from here would be a cycle. Re-exported for the same
+ *  reason `LOG_PATH` is. */
+export { NAMES_PATH };
 
 const reg = window.__ATRIUM_REGISTRY__ as AtriumRegistry | undefined;
 const AtriumReact = window.React;
@@ -113,6 +121,23 @@ if (!reg || !AtriumReact) {
     label: 'Devices',
     to: DEVICES_PATH,
     icon: AtriumReact.createElement(IconKey, { size: 18 }),
+  });
+  // #69's hostname lifecycle — the legacy `/admin/hostnames`, and the
+  // registration whose absence made the resolution strip unreachable:
+  // the board, the zones page and the log all describe an object nothing
+  // in the bundle could create. Gated the same way as its neighbours —
+  // no `perm` on the nav item, because the page's own gate renders a
+  // refusal rather than an empty list.
+  reg.registerRoute({
+    key: 'atrium-ddns-names',
+    path: NAMES_PATH,
+    render: () => makeWrapperElement(<HostnamesPage />),
+  });
+  reg.registerNavItem({
+    key: 'atrium-ddns-names-nav',
+    label: 'Names',
+    to: NAMES_PATH,
+    icon: AtriumReact.createElement(IconTag, { size: 18 }),
   });
   // #46's log search. Deliberately **not** permission-gated at the
   // registry level and deliberately carrying no `perm` — but for a

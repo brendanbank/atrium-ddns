@@ -3,14 +3,51 @@
 > **every legacy page either exists as a registration or is deleted because
 > atrium covers it — demonstrated against the deployed stack**
 
-**Verdict: exit 2. 15 of 39 legacy routes are in neither column**, in five
-capability groups. One of them — the hostname lifecycle — makes the product
-unusable end to end, and it is not a UI omission: `Hostname` has no writer
-anywhere in the shipped application.
+**Verdict: exit 2. ~~15~~ 11 of 39 legacy routes are in neither column**, in
+five capability groups.
 
 This file is the route-by-route walk. Everything in it was measured against a
 running stack on 2026-08-16, not read out of a prior PR body. Reproduction
 commands are inline so the table can be re-run rather than believed.
+
+## Re-run 2026-08-16 (#69) — G1 closed from 6 routes to 2
+
+The original reading is left standing above and below with the changed cells
+struck through, per the rule that a verdict is amended visibly rather than
+replaced. **Only G1's rows were re-measured**; every other verdict in this file
+is the 2026-08-16 (#47) reading, untouched.
+
+The blocking finding — *"`Hostname` has no writer anywhere in the shipped
+application"* — is **resolved**. `POST /api/atrium_ddns/hostnames` and three
+sibling routes exist, gated on `atrium_ddns.hostname.manage`, and a tenant
+holding only the `user` role reaches a rendered resolution strip from an empty
+account. Measured against a stack this run stood up itself
+(`COMPOSE_PROJECT_NAME=ddns69`, API on `:8069`), migrated on both chains, host
+bundle promoted with `make seed-bundle`.
+
+| | before (#47) | after (#69) |
+|---|---|---|
+| deleted — atrium covers it | 13 (33.3%) | 13 (33.3%) |
+| registered | 11 (28.2%) | **15 (38.5%)** |
+| **neither — the finding** | **15 (38.5%)** | **11 (28.2%)** |
+| gaps restricted to the 22 *pages* | 9 (40.9%) | **7 (31.8%)** |
+
+Both denominators were re-derived at re-run time and are unchanged: the legacy
+tree is still pinned at `5d1c941`, so 39 routes and 22 pages still stand. The
+four routes that moved are named in §3.2 and struck through in §3.3.
+
+**A stricter reading gives 13, not 11**, and it is worth stating because the
+choice changes the headline. Two of the four closed routes are the *admin
+acting on another tenant's names* pair, and they are served by the **same**
+endpoints under a widened scope (`atrium_ddns.admin`) rather than by a distinct
+per-user page — demonstrated below, but with one real difference from the legacy
+surface: the admin sees a single merged list with no tenant column and no tenant
+filter, so "whose name is this" is answerable only from the zone. A reader who
+requires the admin variant to be its own surface should count those two as still
+open, giving **13 of 39 (33.3%)** and **8 of 22 pages (36.4%)**. The looser
+count is the one in the table because the criterion's own word is *capability*
+("either exists as a registration"), and the capability is reachable; the
+stricter count is here so that choice is visible rather than assumed.
 
 ---
 
@@ -169,7 +206,7 @@ Atrium's audit log (`GET /api/admin/audit -> 200, 7 items`) and notifications
 surfaces with no legacy counterpart. They are not in the table because the
 criterion runs legacy→atrium, not the reverse.
 
-### 3.2 Registered — name the registration (11 routes)
+### 3.2 Registered — name the registration (~~11~~ 15 routes)
 
 All 13 registrations were confirmed **in the bundle the running stack serves**
 (`GET /host/main.js`, 738,655 bytes), not in `frontend/src/`.
@@ -187,6 +224,38 @@ All 13 registrations were confirmed **in the bundle the running stack serves**
 | `GET /nic/checkip` | `router_nic.py`, frozen compat table | `200` (excluded from OpenAPI by design) |
 | `GET /nic/update` | `router_nic.py` | `200` |
 | `GET /nic/delete` | `router_nic.py` | `200` |
+| **`GET,POST /admin/hostnames`** (#69) | `registerRoute atrium-ddns-names` `/atrium-ddns/names` + `registerNavItem atrium-ddns-names-nav` ("Names"), plus a *Manage names* link on the board and on the zones page | `GET`/`POST /api/atrium_ddns/hostnames` |
+| **`POST /admin/hostnames/<id>/delete`** (#69) | same page | `DELETE /api/atrium_ddns/hostnames/{hostname_id}` |
+| **`GET,POST /admin/users/<uid>/hostnames`** (#69) | same page, under `atrium_ddns.admin` — see the stricter-reading caveat above | same endpoints, scope widened |
+| **`POST /admin/users/<uid>/hostnames/<hn>/delete`** (#69) | same | same |
+
+The four #69 rows were confirmed **in the bundle the running stack serves**
+(`GET /host/main.js`, 748,893 bytes) and against the stack's own API, as an
+ordinary `user`-role tenant holding exactly the three permissions `0002` grants
+that role:
+
+```
+roles: ['user']
+atrium_ddns perms: ['atrium_ddns.device.manage', 'atrium_ddns.domain.manage',
+                    'atrium_ddns.hostname.manage']
+
+GET /host/main.js -> 748893 bytes
+  PRESENT  atrium-ddns-names
+  PRESENT  /atrium-ddns/names
+  PRESENT  atrium_ddns.hostname.manage
+  PRESENT  atrium_ddns/hostnames
+```
+
+The admin pair, demonstrated rather than assumed — the same two endpoints, as a
+caller holding `atrium_ddns.admin`, against a zone owned by a *different*
+tenant:
+
+```
+admin POST into tenant A zone -> 201 {"id":478,"name":"byadmin.…","domain_id":1294,…}
+   tenant A now sees: ['byadmin.…', 'home.…', 'note2e69b.…']
+admin DELETE another tenant name -> 204
+   tenant A now sees: ['home.…', 'note2e69b.…']
+```
 
 Two registrations are real and have **no legacy counterpart**, so they appear
 nowhere above: `registerRoute atrium-ddns-devices` (`/atrium-ddns/devices`) and
@@ -201,20 +270,41 @@ counted as registrations because they *are* registrations and the criterion asks
 for a registration — but a reader should know that the dashboard row above rests
 on the board and the log page, not on the home widget.
 
-### 3.3 In neither column — the finding (15 routes, 5 groups)
+### 3.3 In neither column — the finding (~~15~~ 11 routes, 5 groups)
 
 Counted apart, never averaged.
 
-#### G1 — the hostname lifecycle (6 routes) · severity: blocking
+#### G1 — the hostname lifecycle (~~6~~ 2 routes) · severity: ~~blocking~~ medium
 
-| legacy route | what it did |
-|---|---|
-| `GET,POST /admin/hostnames` | list my hostnames **and create one** (prefix + domain + TTL) |
-| `POST /admin/hostnames/<id>/delete` | remove a hostname |
-| `GET,POST /admin/hostnames/<id>/backends` | choose which provider backends a hostname publishes to; edit its TTL; trigger a manual DNS update |
-| `GET,POST /admin/users/<uid>/hostnames` | the same, for another tenant, as an admin |
-| `POST /admin/users/<uid>/hostnames/<hn>/delete` | " |
-| `GET,POST /admin/users/<uid>/hostnames/<hn>/backends` | " |
+| legacy route | what it did | 2026-08-16 |
+|---|---|---|
+| ~~`GET,POST /admin/hostnames`~~ | list my hostnames **and create one** (prefix + domain + TTL) | **closed by #69** — §3.2 |
+| ~~`POST /admin/hostnames/<id>/delete`~~ | remove a hostname | **closed by #69** |
+| `GET,POST /admin/hostnames/<id>/backends` | choose which provider backends a hostname publishes to; edit its TTL; trigger a manual DNS update | **still open** |
+| ~~`GET,POST /admin/users/<uid>/hostnames`~~ | the same, for another tenant, as an admin | **closed by #69** (scope-widened; see the stricter reading) |
+| ~~`POST /admin/users/<uid>/hostnames/<hn>/delete`~~ | " | **closed by #69** |
+| `GET,POST /admin/users/<uid>/hostnames/<hn>/backends` | " | **still open** |
+
+**What is left, and why it is not a UI omission either.** The two surviving
+routes are the per-hostname *backend* screen, and the rewrite has no data model
+for two of the three things it did:
+
+- **Which backends a hostname publishes to** is not a choice under this schema.
+  A hostname publishes to every backend bound to its domain — `router_nic`
+  iterates `Domain.backends` and aggregates — so there is no column to edit and
+  no join table to populate. Closing this is a schema change, not a page.
+- **Per-hostname TTL** has no column either. TTL lives in
+  `ddns_domain_backend.config`, i.e. per binding, not per name.
+- **A manual DNS update trigger** has no endpoint; the health check is
+  scheduled only, which is the same gap G3 records for
+  `POST /admin/health-checks/run`.
+
+Counted as open on the criterion's literal wording, at medium rather than
+blocking severity: the product is now usable end to end without them, which is
+the change from the reading below.
+
+<details>
+<summary>the original finding, for the record (#47, 2026-08-16)</summary>
 
 This is not "the UI was not built yet". **Nothing in the shipped application
 ever constructs a `Hostname`.** The only call site in the whole package is
@@ -226,12 +316,6 @@ endpoint.
 Demonstrated as a super_admin holding that permission:
 
 ```
-== 1. Can this admin create a DOMAIN? ==
-   POST /api/atrium_ddns/domains -> 201 {'id': 1, 'name': 'example47.test', ... 'hostname_count': 0}
-
-== 2. Can this admin create a DEVICE? ==
-   POST /api/atrium_ddns/devices -> 201 {'device': {'id': 1, 'name': 'router47', ...}}
-
 == 3. Can this admin create a HOSTNAME? ==
    POST /api/atrium_ddns/hostnames                       -> 405 {'detail': 'Method Not Allowed'}
    POST /api/atrium_ddns/devices/1/hostnames             -> 405 {'detail': 'Method Not Allowed'}
@@ -254,6 +338,50 @@ correct, tested, deployed, and unreachable from a standing start. Nothing in
 V1M3's per-issue reviews could have seen this — #44 built the board against
 seeded rows, #45 built domains and devices, #46 built the log, and each was
 right on its own terms.
+
+</details>
+
+**The strip, reached from an empty account** — the closing half of the finding
+above, driven entirely over HTTP as a `user`-role tenant, with the device
+authenticating on `/nic/update` by HTTP Basic exactly as a router does:
+
+```
+== 1. the account is empty ==
+   GET /api/atrium_ddns/domains -> 200 []
+   GET /api/atrium_ddns/devices -> 200 []
+   GET /api/atrium_ddns/hostnames -> 200 []
+   GET /api/atrium_ddns/board -> devices=0 unassigned=0
+…
+== 6. create the hostname ==
+   POST /api/atrium_ddns/hostnames -> 201 {"id":464,"name":"home.e2e69b.example.invalid",…}
+
+== 8. the board, BEFORE the device has published anything ==
+   home.e2e69b.example.invalid      strips=0  <- correct: nothing published yet
+
+== 9. the device calls in, over HTTP Basic — exactly as a router does ==
+   GET /nic/update -> 200  body: good 203.0.113.69
+
+== 10. THE STRIP ==
+   device e2e69b-router  liveness=active
+     home.e2e69b.example.invalid  strips=1
+       family        : A
+       published     : 203.0.113.69 at 2026-08-16T08:01:21.804296Z
+       answered      : never_checked None
+       called from   : 203.0.113.69 (evaluated)
+       upper joint   : not_measured_never
+       lower joint   : agreed
+       joints agreed : 1 of 1 compared (n/a 0, unmeasured 1)
+```
+
+**Step 8 is the correction #69 made to its own acceptance criterion.** The issue
+asked for "create a domain, a device and a hostname, and see a resolution strip
+render" — three steps. Three steps produce a hostname on the board with **zero**
+strips, and that is the right answer: `_strips_for` renders a family only when
+the name has been published or answered in it, which is #44's argued-for reading
+of `ui-design.md` §3.4 (the alternative gives every v6-only hostname a permanent
+blank `A` rail). The board says so in words rather than drawing nothing —
+*"nothing published yet — no strip to draw"*. The strip needs a fourth step, and
+the fourth step is the device doing the thing the device exists for.
 
 #### G2 — operator configuration has no UI (4 routes) · severity: high
 
@@ -340,19 +468,27 @@ exactly zero help surfaces in the deployed system.
 
 ## 4. Tally
 
-| column | routes | share of 39 |
-|---|---|---|
-| deleted — atrium covers it | 13 | 33.3% |
-| registered | 11 | 28.2% |
-| **neither — the finding** | **15** | **38.5%** |
+| column | routes (#47) | share | routes (#69 re-run) | share |
+|---|---|---|---|---|
+| deleted — atrium covers it | 13 | 33.3% | 13 | 33.3% |
+| registered | 11 | 28.2% | **15** | **38.5%** |
+| **neither — the finding** | **15** | **38.5%** | **11** | **28.2%** |
 
-Restricted to the 22 *pages* (the criterion's own word), the gaps are
+Restricted to the 22 *pages* (the criterion's own word), the gaps were
 `/admin/hostnames`, `/admin/hostnames/<id>/backends`,
 `/admin/users/<uid>/hostnames`, `/admin/users/<uid>/hostnames/<hn>/backends`,
 `/admin/rate-limits`, `/admin/rate-limits/user/<id>`,
 `/admin/health-checks/config`, `/admin/domains/<id>` and `/admin/help` — **9 of
-22, 40.9%**. The narrower denominator does not flatter the result, which is why
-both are given.
+22, 40.9%**. #69 closed the first and the third, leaving **7 of 22, 31.8%**.
+The narrower denominator does not flatter the result, which is why both are
+given.
+
+Both denominators were re-derived at re-run time rather than carried forward:
+the legacy tree is still pinned at `5d1c941` and `git diff --stat 5d1c941 HEAD`
+is still empty across `web_routes.py`, `dyndns.py` and `templates/`, so 39 and
+22 both stand. **The counts moved; the divisors did not**, which is worth
+saying explicitly because a shrinking gap over a shrinking denominator would
+not be the same result.
 
 **Both denominators were re-derived at write time rather than carried forward,
 and the shares are printed beside the counts they came from.**
@@ -373,6 +509,10 @@ Stated so a later reader does not take the table for more than it is.
   that is the frozen 131-case compat table's job, not this file's.
 - `/admin/events/clear`, `/admin/health-checks/run|clear` and the domain rename
   are counted as gaps on the criterion's literal wording. A milestone owner may
-  reasonably strike them, which would give **11 gaps in 3 groups**. That is the
-  owner's call to record, not a reader's to assume — the original count stands
-  above either way.
+  reasonably strike them, which would give ~~**11 gaps in 3 groups**~~ **7 gaps
+  in 3 groups** after #69's re-run. That is the owner's call to record, not a
+  reader's to assume — the counts stand above either way.
+- **The #69 re-run measured G1 only.** Every verdict in G2–G5 is #47's reading,
+  carried forward without being re-taken. They are unlikely to have moved — no
+  issue since has touched those surfaces — but "unlikely to have moved" is not
+  a measurement, and the next re-run should not treat them as one.
