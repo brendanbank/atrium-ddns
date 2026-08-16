@@ -8,6 +8,12 @@
 - ``GET /api/atrium_ddns/events`` — the log search. Authenticated, and
   scoped: a tenant sees their own rows and ``atrium_ddns.events.read.all``
   widens that and nothing else. Every filter is an indexed query.
+- ``GET|POST /api/atrium_ddns/hostnames``,
+  ``PATCH|DELETE /api/atrium_ddns/hostnames/{id}`` — the hostname
+  lifecycle, gated by ``atrium_ddns.hostname.manage`` and scoped. The
+  writer the board and the wire protocol were both missing; see the
+  Hostnames section for why its two validators are *imported* rather
+  than written.
 
 Atrium mounts every JSON route under ``/api/...`` so the SPA owns
 un-prefixed URL space (atrium issue #89); host routes follow the same
@@ -69,6 +75,12 @@ from .models import (
     Hostname,
 )
 from .providers import PROVIDER_STATUSES, known_services, provider_class
+
+# The zone-containment rule, imported rather than re-derived. This is the
+# same function object ``BaseProvider.domaininhostname`` calls, which is
+# how ``POST /hostnames`` and ``/nic/update`` are guaranteed to agree
+# about what "inside its zone" means. See its docstring.
+from .providers.base import zone_contains
 from .router_nic import (
     EVENT_AUTH,
     EVENT_DELETE,
@@ -78,6 +90,9 @@ from .router_nic import (
     STATUS_BADAUTH,
     STATUS_NOHOST,
     STATUS_NOTFQDN,
+    # The syntax rule, likewise: `/nic/update` calls this exact function
+    # to decide `notfqdn`, and so does `POST /hostnames`.
+    split_hostnames,
 )
 from .scope import EVENTS_CROSS_TENANT_PERMISSION, DdnsScope, get_scope
 from .worker_jobs import (
@@ -1962,6 +1977,435 @@ async def delete_device(
         entity_id=device_id,
         action="delete",
         diff={"name": name, "username": username},
+    )
+    await session.commit()
+
+
+# --------------------------------------------------------------------- #
+# Hostnames
+# --------------------------------------------------------------------- #
+#
+# The object #69 found nothing could create. `Hostname` had a table, a
+# tenancy path, a board that renders it and a wire protocol that updates
+# it — and the only construction of one in the whole package was a test
+# fixture seeder refused under `ENVIRONMENT=prod`. So the resolution
+# strip, which is this milestone's signature element, could not be made
+# to render by a tenant starting from an empty account.
+#
+# **The one rule this section exists to hold: a row created here is a row
+# `/nic/update` can find and write.** There are exactly two things that
+# can make a hostname permanently un-updatable, and both are decided
+# before the row is written, by the same two functions the wire calls:
+#
+# 1. **Syntax** — `split_hostnames`, i.e. `BaseProvider.isvalidhostname`.
+#    The wire answers `notfqdn` when it refuses.
+# 2. **Zone containment** — `zone_contains`, which is what
+#    `BaseProvider.domaininhostname` calls for each configured zone. The
+#    wire answers `nohost` when it refuses.
+#
+# Neither is re-implemented here. A second validator would agree on the
+# day it was written and diverge the first time either copy was edited,
+# and the divergence is silent in both directions: a name this endpoint
+# accepts and the wire rejects is un-updatable forever and reads to the
+# owner as a broken router; a name this endpoint rejects and the wire
+# would have accepted reads as the interface lying. Nothing raises.
+#
+# That includes the **preserved legacy divergences**, which are preserved
+# here too because they are the same code:
+#
+# - `"foo\n"` passes the label regex (Python's `$` matches before a final
+#   newline) — and is then refused by containment, exactly as the wire
+#   refuses it with `nohost`.
+# - a dotless label passes the regex — and is refused by containment
+#   unless the zone is itself dotless, again matching the wire.
+# - `notexample.com` **is** inside zone `example.com`, because the
+#   containment test has no label-boundary check. This endpoint accepts
+#   it, because the wire accepts it. Refusing it here would be the
+#   asymmetry this section is built to prevent, not a fix.
+#
+# The model deliberately allows an out-of-zone row to *exist*
+# (`models.Hostname` says so: the compat fixture seeds
+# `outofzone.example.com` so the frozen table can assert `nohost`). The
+# database holding one and this endpoint minting one are different
+# questions, and only the second is answered "no".
+
+#: Manage your own hostnames. Seeded by ``0002_ddns_core`` and — until
+#: this section existed — referenced by no endpoint at all, which is
+#: worse than a permission that does not exist because it reads as
+#: coverage. Held by ``user`` and by ``admin`` in the same migration, so
+#: every ordinary tenant already has it and no migration is needed here.
+HOSTNAME_MANAGE_PERMISSION = "atrium_ddns.hostname.manage"
+
+
+class HostnameRowOut(BaseModel):
+    """A hostname as the CRUD surface describes it.
+
+    Deliberately **not** :class:`HostnameOut`, which is the board's
+    model and carries the resolution strips. Two surfaces, two shapes:
+    this one is about the row's identity and its assignment, the board's
+    is about what DNS currently says. Merging them would put the strip
+    arithmetic on an editing screen and the editing fields on the board.
+    """
+
+    id: int
+    name: str
+    domain_id: int
+    domain_name: str
+    #: ``None`` is a real and supported state — a name registered before
+    #: any device was assigned to it, or one whose device was deleted
+    #: (``ON DELETE SET NULL``). It is not "unknown" and it is not an
+    #: error; ``/nic/update`` simply has nothing authenticating as its
+    #: owner yet.
+    device_id: int | None
+    #: ``None`` whenever ``device_id`` is, and also when the referenced
+    #: device is outside this caller's scope — see :func:`list_hostnames`
+    #: for why that is resolved through a scoped read rather than a join.
+    device_name: str | None
+    created_at: str
+    #: What we last successfully published, and when. All three stay
+    #: ``NULL`` until a `good` aggregate lands — a `nochg` leaves them
+    #: untouched — so ``None`` here means *nothing has ever been
+    #: published for this name*, not *the address is zero*.
+    last_ip_v4: str | None
+    last_ip_v6: str | None
+    last_updated_at: str | None
+
+
+class HostnameCreateIn(BaseModel):
+    #: 253 is the FQDN limit the column is sized for. The *validator*
+    #: applies the legacy service's own (over-generous) 255 against the
+    #: whole comma element; this bound is the narrower of the two and is
+    #: about what the column can store, not about what is a legal name.
+    name: str = Field(min_length=1, max_length=253)
+    domain_id: int
+    #: Optional, and ``None`` is not "unset" — it is *register the name
+    #: now, assign it later*, which the model exists to allow.
+    device_id: int | None = None
+
+
+class HostnameAssignIn(BaseModel):
+    """The body of ``PATCH /hostnames/{id}``.
+
+    ``device_id`` has **no default**, so it is required and ``null`` is
+    an explicit value rather than an omission. That is the whole reason
+    this model has one field: the operation is *set the device*, and
+    unassigning is the same operation with ``null``. A model where
+    ``null`` and *absent* were both spellable would need a sentinel to
+    tell them apart (see :class:`DomainBackendUpdateIn`, which does need
+    one), and there is nothing here to preserve.
+
+    The name is deliberately **not** editable. A hostname *is* the DNS
+    name — it is what ``/nic/update`` looks the row up by and what a
+    provider has already published a record under. Renaming the row
+    would leave the old record in the zone with nothing pointing at it
+    and no way to reach it again; delete-and-create is the honest
+    spelling of that operation, and it is one the owner can see the
+    consequences of.
+    """
+
+    device_id: int | None
+
+
+def _validated_hostname(raw: str, zone: str) -> str:
+    """The name to store, or the refusal — through the wire's own rules.
+
+    Returns the string to write to ``ddns_hostname.name``. Raises 422
+    naming the wire status the same input would have produced, so a
+    reader who has seen `notfqdn` or `nohost` in the log recognises the
+    refusal rather than meeting a second vocabulary.
+
+    **Exactly one transformation happens before the shared validators,
+    and it is the one the wire itself applies.** ``router_nic`` looks the
+    row up as ``requested.lower()`` against the stored column, so an
+    upper-cased row is unreachable; lower-casing here is not a
+    convenience, it is what makes the row findable at all. It is also
+    verdict-preserving *by construction* rather than by luck: ``_LABEL``
+    carries ``re.IGNORECASE`` and :func:`zone_contains` lower-cases both
+    sides, so no case-only edit can move either answer.
+
+    **Nothing else is normalised, and ``.strip()`` in particular is
+    not.** It is tempting — a pasted trailing space becomes a confusing
+    422 without it — and it is the one change that would break the
+    property this whole section exists for. Stripping makes the endpoint
+    accept a string the wire refuses (``"foo.example.com\\n"`` is
+    ``notfqdn`` on the wire and would have become a stored
+    ``foo.example.com`` here), so the two would no longer be answering
+    the same question about the same bytes. Trimming is a *form*
+    concern: the frontend trims before it submits, where the user can
+    see what is being sent. The API answers about what it was given.
+    """
+    candidate = raw.lower()
+
+    parts = split_hostnames(candidate)
+    if parts is None:
+        raise HTTPException(
+            status_code=UNPROCESSABLE,
+            detail=(
+                f"{candidate!r} is not a valid hostname. /nic/update answers "
+                f"notfqdn for this name, so the row could be created and never "
+                f"updated. Labels are 1–63 characters of letters, digits and "
+                f"hyphens, and may not start or end with a hyphen."
+            ),
+        )
+    if len(parts) != 1:
+        # A comma is how the *wire* spells "several hostnames in one
+        # request"; it is split before any lookup happens, so a stored
+        # row containing one could never be found. Refusing it here
+        # refuses only names the wire could not reach anyway.
+        raise HTTPException(
+            status_code=UNPROCESSABLE,
+            detail=(
+                "a hostname cannot contain a comma — /nic/update reads a comma "
+                "as a separator between several hostnames, so a stored name "
+                "containing one can never be looked up. Create them one at a "
+                "time."
+            ),
+        )
+
+    name = parts[0]
+    if not zone_contains(zone, name):
+        raise HTTPException(
+            status_code=UNPROCESSABLE,
+            detail=(
+                f"{name!r} is not inside the zone {zone!r}. /nic/update answers "
+                f"nohost for a hostname outside its domain's zone, so the row "
+                f"could be created and never updated."
+            ),
+        )
+    return name
+
+
+def _render_hostname(
+    hostname: Hostname, domain_name: str, device_name: str | None
+) -> HostnameRowOut:
+    return HostnameRowOut(
+        id=hostname.id,
+        name=hostname.name,
+        domain_id=hostname.domain_id,
+        domain_name=domain_name,
+        device_id=hostname.device_id,
+        device_name=device_name,
+        created_at=_iso(hostname.created_at) or "",
+        last_ip_v4=hostname.last_ip_v4,
+        last_ip_v6=hostname.last_ip_v6,
+        last_updated_at=_iso(hostname.last_updated_at),
+    )
+
+
+@router.get("/hostnames", response_model=list[HostnameRowOut])
+async def list_hostnames(
+    _user: User = Depends(require_perm(HOSTNAME_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> list[HostnameRowOut]:
+    """A tenant's hostnames, with their zone and their device.
+
+    Two scoped reads and no per-row query. The device name comes from a
+    separate ``scope.select(Device)`` rather than from an outer join,
+    which is not a style preference: a join would render whatever name
+    sits on the referenced row, and ``Hostname``'s tenancy predicate
+    reaches through ``domain_id`` only. A row pointing at a device
+    outside the caller's scope — which this endpoint cannot create, but
+    a direct write could — renders ``device_name: null`` instead of
+    another tenant's device name.
+    """
+    rows: list[tuple[Hostname, str]] = [
+        (row[0], row[1])
+        for row in (
+            await session.execute(
+                scope.select(Hostname, Hostname, Domain.name)
+                .join(Domain, Domain.id == Hostname.domain_id)
+                .order_by(Hostname.name)
+            )
+        ).all()
+    ]
+    device_names = {
+        device.id: device.name
+        for device in (await session.execute(scope.select(Device))).scalars().all()
+    }
+    return [
+        _render_hostname(
+            hostname,
+            domain_name,
+            device_names.get(hostname.device_id)
+            if hostname.device_id is not None
+            else None,
+        )
+        for hostname, domain_name in rows
+    ]
+
+
+@router.post("/hostnames", response_model=HostnameRowOut, status_code=201)
+async def create_hostname(
+    body: HostnameCreateIn,
+    user: User = Depends(require_perm(HOSTNAME_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> HostnameRowOut:
+    """Register a name under one of the caller's zones.
+
+    **The owner is never a parameter.** It is not even a column — a
+    hostname's owner is ``domain.user_id``, so ownership follows from
+    which domain the caller was able to reach, and the caller can only
+    reach their own. ``scope.get`` answering ``None`` for another
+    tenant's ``domain_id`` is what makes a cross-tenant create a **404**
+    rather than a 403: distinguishing *no such zone* from *not your
+    zone* would tell a caller which ids exist.
+
+    ``device_id`` is optional and ``null`` is a supported value, not a
+    missing one — the model allows a name to be registered before
+    anything is assigned to it.
+
+    ``ddns_hostname.name`` is globally unique, and it has to be:
+    ``/nic/update?hostname=…`` looks it up with no tenant context, so
+    two tenants owning one name would make the lookup ambiguous at the
+    exact moment there is nobody to ask. The 409 below is therefore
+    reachable for a name another tenant holds, and it says nothing about
+    who holds it — same rule, and same sentence, as
+    :func:`create_domain`.
+    """
+    domain = await scope.get(session, Domain, body.domain_id)
+    if domain is None:
+        raise _not_found("domain")
+
+    device: Device | None = None
+    if body.device_id is not None:
+        device = await scope.get(session, Device, body.device_id)
+        if device is None:
+            raise _not_found("device")
+
+    name = _validated_hostname(body.name, domain.name)
+
+    hostname = Hostname(
+        domain_id=domain.id,
+        device_id=device.id if device is not None else None,
+        name=name,
+    )
+    session.add(hostname)
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        # The UNIQUE index, surfaced as a 409 with a sentence someone can
+        # act on. Without this the same collision is a 500 and an
+        # unhandled `IntegrityError` in the log, which tells the owner
+        # nothing and tells the operator that the service is broken.
+        await session.rollback()
+        raise _conflict(f"the hostname {name} is already registered") from exc
+
+    # Server-default `created_at` does not come back from the INSERT, and
+    # reading it lazily in an async session is a `MissingGreenlet` rather
+    # than a slow query. Awaited here, where it is an ordinary read.
+    await session.refresh(hostname)
+
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity="ddns_hostname",
+        entity_id=hostname.id,
+        action="create",
+        diff={
+            "name": name,
+            "domain": domain.name,
+            "device_id": hostname.device_id,
+        },
+    )
+    await session.commit()
+    return _render_hostname(
+        hostname, domain.name, device.name if device is not None else None
+    )
+
+
+@router.patch("/hostnames/{hostname_id}", response_model=HostnameRowOut)
+async def assign_hostname(
+    hostname_id: int,
+    body: HostnameAssignIn,
+    user: User = Depends(require_perm(HOSTNAME_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> HostnameRowOut:
+    """Assign, reassign, or unassign a hostname's device.
+
+    Three operations, one endpoint, because they are one operation with
+    three arguments: ``null`` -> unassigned, an id -> that device,
+    a *different* id -> moved. The model was built for this — ``one
+    device per hostname``, ``device_id`` nullable, ``ON DELETE SET
+    NULL`` — and delete-and-recreate would be a poor substitute because
+    it destroys the published-address history the board renders.
+
+    Both lookups are scoped, so a hostname belonging to another tenant
+    and a device belonging to another tenant are each a 404. The device
+    check matters as much as the hostname one: without it this endpoint
+    would be a way to point your own hostname at somebody else's device,
+    through a handler whose *read* side is correctly scoped.
+    """
+    hostname = await scope.get(session, Hostname, hostname_id)
+    if hostname is None:
+        raise _not_found("hostname")
+
+    device: Device | None = None
+    if body.device_id is not None:
+        device = await scope.get(session, Device, body.device_id)
+        if device is None:
+            raise _not_found("device")
+
+    domain = await scope.get(session, Domain, hostname.domain_id)
+    if domain is None:  # pragma: no cover — the scope reached the hostname
+        raise _not_found("domain")
+
+    before = hostname.device_id
+    hostname.device_id = device.id if device is not None else None
+
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity="ddns_hostname",
+        entity_id=hostname.id,
+        action="assign_device",
+        # Both ends recorded, and `None` stays `None` rather than
+        # becoming 0 — "was unassigned" and "was device 0" are different
+        # sentences and only one of them is true.
+        diff={"device_id": {"before": before, "after": hostname.device_id}},
+    )
+    await session.commit()
+    return _render_hostname(
+        hostname, domain.name, device.name if device is not None else None
+    )
+
+
+@router.delete("/hostnames/{hostname_id}", status_code=204)
+async def delete_hostname(
+    hostname_id: int,
+    user: User = Depends(require_perm(HOSTNAME_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> None:
+    """Forget a name.
+
+    **This deletes the row, not the DNS record.** Whatever the provider
+    last published stays published until something removes it —
+    ``/nic/delete`` is the operation that withdraws a record, and it
+    needs the row in order to find the backend. Deleting here first
+    leaves an orphaned record in the zone, which is a real consequence
+    and one the interface has to state before the button is pressed
+    rather than after.
+
+    Left as a documented consequence rather than a cascade: withdrawing
+    records is a network operation against a third party, it can fail
+    partway, and doing it inside a DELETE handler would make "forget
+    this name" depend on a provider being reachable.
+    """
+    hostname = await scope.get(session, Hostname, hostname_id)
+    if hostname is None:
+        raise _not_found("hostname")
+    name = hostname.name
+    await session.delete(hostname)
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity="ddns_hostname",
+        entity_id=hostname_id,
+        action="delete",
+        diff={"name": name},
     )
     await session.commit()
 

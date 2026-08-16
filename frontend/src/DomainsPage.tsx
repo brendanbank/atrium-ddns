@@ -18,11 +18,13 @@
  * The refusal branch does not fire either query, so a user without the
  * permission does not generate a 403 on every page load.
  */
-import { Alert, Stack, Text, Title } from '@mantine/core';
+import { Alert, Anchor, Group, Stack, Text, Title } from '@mantine/core';
 import { useQuery } from '@tanstack/react-query';
 import { usePerm } from '@brendanbank/atrium-host-bundle-utils/react';
 
 import { DOMAIN_PERMISSION, domainsQuery, providersQuery } from './api/domains';
+import { HOSTNAME_PERMISSION } from './api/hostnames';
+import { NAMES_PATH } from './HostnamesPage';
 import { DdnsRoot } from './host/DdnsRoot';
 import { DomainList } from './tenant/DomainList';
 
@@ -34,7 +36,18 @@ export function DomainsInner() {
 
   return (
     <Stack gap="md">
-      <Title order={3}>Zones and providers</Title>
+      <Group justify="space-between" align="baseline">
+        <Title order={3}>Zones and providers</Title>
+        {/* The other half of #69's "reachable from the device board and
+            the domain page". A zone with no names in it is the state
+            this page leaves you in, and until now there was nowhere to
+            go from there. */}
+        {hasPerm(HOSTNAME_PERMISSION) ? (
+          <Anchor href={NAMES_PATH} size="sm" data-testid="domains-names-link">
+            Manage names
+          </Anchor>
+        ) : null}
+      </Group>
       {!canRead ? (
         <Alert
           color="gray"
