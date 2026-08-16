@@ -1210,7 +1210,7 @@ clause §4 never wrote" is kept because the *lesson* outlived the defect.
 | *"The signature element: the resolution strip"* | **holds, with the arrangement corrected** | three rows on a vertical rail, not three columns; already recorded above by #43 |
 | *"Domains are a tenant surface, not an admin one. A user manages their own domains and provider credentials on their own page"* | **holds** | `registerRoute atrium-ddns-domains` `/atrium-ddns/domains`; `GET/POST /api/atrium_ddns/domains`, `POST …/backends`, `PATCH/DELETE /backends/{id}` |
 | *"Cross-tenant views live behind `atrium_ddns.admin` as an admin tab"* | **does not hold** | the admin tab is registered — key `atrium-ddns`, not `atrium-ddns-admin-tab` — and is still the scaffold's counter widget. `atrium_ddns.admin` *does* widen the scope on every model (`scope.py:97,152`), so a holder silently sees every tenant's rows merged into their own board with **no owner column and no way to tell them apart**. **Re-measured 2026-08-16 and now demonstrated rather than described:** an `atrium_ddns.admin` holder created and deleted a name inside another tenant's zone (201 / 204), and its own list endpoint returns rows whose keys contain no `owner` or `user` field at all. #69's hostname surface inherited the same shape. The permission works; the view §4 promised does not exist. The one place cross-tenant was built properly is the log (#46), which uses a *different*, narrower permission and renders a `user` column |
-| *"Configuration collapses. Rate limits, health-check config, retention become one nested group via `registerSettingsGroup`"* | **unbuilt** | `registerSettingsGroup` appears nowhere in the shipped bundle. All 11 settings exist and are served at `GET /api/admin/app-config`; atrium has no generic namespace editor, so they are reachable only by `curl`. §5 opened no issue for this clause. **Re-taken 2026-08-16 against the *served shell bundle* rather than atrium's source, and it holds:** one bundle, no lazy chunks, `atrium_ddns` appears 0 times in it, and the namespace-parameterised `PUT /admin/app-config/${e}` hook has exactly four call sites, every one a literal (`auth`, `brand`, `system`, `i18n`). Nothing derives a namespace from the admin API's own response, so a namespace no screen names is unreachable |
+| *"Configuration collapses. Rate limits, health-check config, retention become one nested group via `registerSettingsGroup`"* | ~~**unbuilt**~~ **holds — built by #73** | ~~`registerSettingsGroup` appears nowhere in the shipped bundle. All 11 settings exist and are served at `GET /api/admin/app-config`; atrium has no generic namespace editor, so they are reachable only by `curl`. §5 opened no issue for this clause. **Re-taken 2026-08-16 against the *served shell bundle* rather than atrium's source, and it holds:** one bundle, no lazy chunks, `atrium_ddns` appears 0 times in it, and the namespace-parameterised `PUT /admin/app-config/${e}` hook has exactly four call sites, every one a literal (`auth`, `brand`, `system`, `i18n`). Nothing derives a namespace from the admin API's own response, so a namespace no screen names is unreachable~~ **#73 (2026-08-16)**: one `registerSettingsGroup atrium-ddns-settings`, `section: 'admin'`, gated on atrium's own `app_setting.manage`, with three children — rate limits, health checks, retention — each a `registerRoute` this bundle serves, all present in the bundle the stack serves. The clause said "one nested group" and got one; it did not say the fields should be *derived*, and they are: the form's types, bounds, defaults and help text come from `DdnsConfig`'s JSON schema over `GET /api/atrium_ddns/config/schema`, so every field is on a page by construction rather than by a list — demonstrated by the merge rather than by argument: #75 added a twelfth field on a parallel branch and it appeared on the Health checks page with its bounds, default and help text, with no page, form or fixture edited. One line of grouping had to change, and the guard named it rather than a reviewer. The observation that made this clause worth writing is unchanged and still true — the shell names no namespace, and `atrium_ddns` still appears **0** times in it. What changed is that the host names it. `ui-parity.md` §3.3 G2 carries the walk, including what it does *not* claim: nobody clicked the sidebar |
 | *"Logs are a first-class search surface… filter by device, domain, hostname, response code, and time range… Admins get a user filter on top"* | **holds in full** | `registerRoute atrium-ddns-logs`; every named filter is implemented (#46), and the admin filter is gated on `atrium_ddns.events.read.all` with an explicit 403 rather than a silent narrowing |
 | *"Users are atrium's, not ours. The old user-management pages disappear"* | **holds** | all 13 legacy auth/user/profile routes are covered by atrium surfaces that answer on the running stack |
 
@@ -1265,13 +1265,30 @@ prune (`atrium_ddns-retention-prune`, registered on the deployed worker,
 `event_retention_days = 30`). That is a *host* feature, not atrium's, so it does
 not fit "deleted because atrium covers it" literally and is not filed there.
 
-**What §4 still owes is one clause and one page.** The unbuilt
+**What §4 still owes is ~~one clause and one page~~ one page.** ~~The unbuilt
 `registerSettingsGroup` clause is 4 of the 10 remaining routes and is the
 largest single block; §5 opened no issue for it and this re-run did not build
-it. The other honest remainder is the per-hostname *backend* screen (2 routes),
-which needs a schema change rather than a page: no per-hostname backend
-selection, no per-hostname TTL, no manual-update endpoint. Both are reported,
-neither is designed around.
+it.~~ The `registerSettingsGroup` clause was 4 of the 10 remaining routes and
+the largest single block; §5 opened no issue for it, #73 was opened for it, and
+**#73 built it** — the table moves to **6 of 39 in neither column, 4 of 22
+pages**. The remaining honest remainder is the per-hostname *backend* screen (2
+routes), which needs a schema change rather than a page: no per-hostname backend
+selection, no per-hostname TTL, no manual-update endpoint. Reported, not
+designed around, and now carried by #74.
+
+**One thing #73 added that §4 did not ask for, and the reason is worth
+keeping.** §4 says configuration collapses into a group; it says nothing about
+where the *shape* of a setting comes from. Atrium's
+`PUT /admin/app-config/{namespace}` takes a bare `dict`, so a namespace's types
+and bounds appear nowhere in the OpenAPI document, and a form has to get them
+from somewhere. Hardcoding them in the browser is a second copy of the model
+that drifts in the direction that matters — a form offering `0` for
+`health_check_batch_size` against a model requiring `ge=1` produces a 400 the
+operator cannot act on, and one offering `min=1` against a model that later
+allows `0` quietly stops offering a legal value. So the host serves the model's
+own JSON schema and the browser holds no field list at all. Any future host
+settings surface in this codebase should do the same; the alternative is not
+visible in review.
 
 ---
 

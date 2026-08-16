@@ -37,6 +37,7 @@ import { Anchor, List, Stack, Text, Title } from '@mantine/core';
 import { BOARD_PATH, DEVICES_PATH, DOMAINS_PATH } from './paths';
 import { NAMES_PATH } from './HostnamesPage';
 import { LOG_PATH } from './LogSearchPage';
+import { SETTINGS_ROUTES } from './settings/settingsRoutes';
 import { DdnsRoot } from './host/DdnsRoot';
 
 /** Where this bundle's own path lives. Exported for the same reason
@@ -121,6 +122,32 @@ export const SURFACES: { to: string; label: string; blurb: string }[] = [
     label: 'Log search',
     blurb:
       'Every update, delete and authentication attempt, filterable by device, zone, name and address.',
+  },
+  // #73's three settings pages. They are administrator surfaces rather
+  // than tenant ones — behind atrium's `app_setting.manage`, in the
+  // Admin sidebar rather than the main one — and they are listed here
+  // anyway, because the sweep in `HelpPage.test.tsx` is over *every*
+  // route this bundle registers and a help page that quietly omitted the
+  // ones a reader is least likely to find on their own would be the
+  // wrong omission to make. #75's guard caught them at the merge; the
+  // list below is the answer to it, not a workaround for it.
+  {
+    to: SETTINGS_ROUTES['rate-limits'],
+    label: 'Rate limits (administrators)',
+    blurb:
+      'How many updates a device may make per minute, installation-wide, and how long the limiter’s own rows are kept. A device can carry its own limit that overrides this; set one on the Devices page.',
+  },
+  {
+    to: SETTINGS_ROUTES['health-checks'],
+    label: 'Health checks (administrators)',
+    blurb:
+      'The scheduled resolution that fills the board’s “answered” station — how often a name becomes due, how many are checked per tick, the DNS timeout, and the debounce on the “Check now” button.',
+  },
+  {
+    to: SETTINGS_ROUTES.retention,
+    label: 'Retention (administrators)',
+    blurb:
+      'How long the log is kept, how hard the scheduled prune may work in one tick, and the window the board counts “updates / N d” over.',
   },
 ];
 
