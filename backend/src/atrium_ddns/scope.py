@@ -87,6 +87,7 @@ from .models import (
     Domain,
     DomainBackend,
     Hostname,
+    HostnameBackend,
     HostBase,
     RateLimitEvent,
 )
@@ -154,6 +155,37 @@ class TenantPath:
     )
 
 
+def _owns_via_two_hops(
+    child: Any, child_fk: Any, middle: Any, middle_fk: Any, owner: Any, owner_fk: Any
+) -> Callable[[int], ColumnElement[bool]]:
+    """``EXISTS (SELECT 1 FROM middle JOIN owner … WHERE middle.pk = child.fk)``.
+
+    :func:`_owns_via_exists` reaches the owner in one hop. The hostname
+    → backend selection needs two: ``ddns_hostname_backend`` has no
+    ``user_id``, its hostname has none either, and the owner is the
+    hostname's *domain's* ``user_id``.
+
+    Written as a two-table ``EXISTS`` rather than as a nested one
+    because MySQL 8 flattens it into a pair of semi-joins, and because
+    a nested ``EXISTS`` correlating twice is the shape that quietly
+    stops correlating when an outer statement joins one of the tables
+    for its own reasons — the same failure :func:`_owns_via_exists`'s
+    explicit ``.correlate()`` exists to prevent, one level deeper.
+    """
+
+    def clause(uid: int) -> ColumnElement[bool]:
+        return (
+            sa.select(sa.literal_column("1"))
+            .select_from(middle)
+            .join(owner, owner_fk == middle_fk)
+            .where(middle.id == child_fk, owner.user_id == uid)
+            .correlate(child)
+            .exists()
+        )
+
+    return clause
+
+
 def _owns_via_exists(
     owner: Any, owner_fk: Any, child_fk: Any, child: Any
 ) -> Callable[[int], ColumnElement[bool]]:
@@ -217,6 +249,25 @@ TENANT_PATHS: dict[type[Any], TenantPath] = {
         owner_table=Domain.__tablename__,
         through="domain_id",
         clause=_owns_via_exists(Domain, Domain.id, Hostname.domain_id, Hostname),
+    ),
+    # Two hops to the owner: selection -> hostname -> domain.user_id.
+    # Scoped on the *hostname* side rather than on the backend side
+    # deliberately — both ends belong to the same tenant by
+    # construction, and the hostname is the row the endpoint is about,
+    # so a bug that lost this predicate would still be caught by the
+    # scoped `Hostname` fetch the handler does first. `backends-
+    # selection-is-owner-scoped` is the frozen case behind it.
+    HostnameBackend: TenantPath(
+        owner_table=Domain.__tablename__,
+        through="hostname_id",
+        clause=_owns_via_two_hops(
+            HostnameBackend,
+            HostnameBackend.hostname_id,
+            Hostname,
+            Hostname.domain_id,
+            Domain,
+            Domain.id,
+        ),
     ),
     # `user_id` is nullable and `ON DELETE SET NULL`, so a deleted
     # tenant leaves events owned by nobody. `== uid` is NULL-safe in the
