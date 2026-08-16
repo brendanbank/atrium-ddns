@@ -88,6 +88,7 @@ ISOLATION_FIXTURE: dict[type[Any], str] = {
     m.DomainBackend: "backend_id",
     m.Device: "device_id",
     m.Hostname: "hostname_id",
+    m.HostnameBackend: "hostname_backend_id",
     m.DnsEvent: "event_id",
     m.RateLimitEvent: "rate_limit_event_id",
 }
@@ -168,7 +169,15 @@ async def tenants():
                 ip="192.0.2.1",
             )
             rate_limit_event = m.RateLimitEvent(device_id=device.id)
-            s.add_all([event, rate_limit_event])
+            # #74's selection row. Two hops from its owner — this row has
+            # no `user_id`, and neither does the hostname it hangs off;
+            # the tenant is the hostname's *domain's* `user_id`. It is in
+            # the fixture so the parameterised cases below cover it like
+            # every other model rather than special-casing it.
+            selection = m.HostnameBackend(
+                hostname_id=hostname.id, backend_id=backend.id
+            )
+            s.add_all([event, rate_limit_event, selection])
             await s.flush()
             built[tag] = {
                 "user_id": uid,
@@ -177,6 +186,7 @@ async def tenants():
                 "backend_id": backend.id,
                 "device_id": device.id,
                 "hostname_id": hostname.id,
+                "hostname_backend_id": selection.id,
                 "event_id": event.id,
                 "rate_limit_event_id": rate_limit_event.id,
             }
@@ -862,6 +872,19 @@ READ_PATHS_NOT_SCOPED: dict[str, str] = {
         "ENVIRONMENT=prod, and mounted on no route. Its whole purpose is to "
         "read back every fixture tenant's rows as the second instrument on "
         "what it has just written."
+    ),
+    "import_legacy.py:assert_target_is_empty": (
+        "The one-shot cutover importer's refuse-to-run-twice check, and it "
+        "has to be cross-tenant to be correct. ddns_device.username, "
+        "ddns_domain.name and ddns_hostname.name are all GLOBALLY unique "
+        "(DNS is global, and the device username is read before there is a "
+        "tenant to scope by). Scoped to the importing owner it would miss a "
+        "collision held by another tenant, report the database empty, and "
+        "then fail on the UNIQUE constraint halfway through a transaction "
+        "that is supposed to be all-or-nothing. It selects only the three "
+        "name columns — never a row, never any other tenant's data — and "
+        "reports counts with the names withheld. It is a CLI, mounted on no "
+        "route, and it refuses to run at all once those rows exist."
     ),
     "seed_compat_fixture.py:verify_rehash": (
         "Same module and same two gates. It reports the SHAPE of every "

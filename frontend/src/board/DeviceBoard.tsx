@@ -36,7 +36,7 @@ import { useState } from 'react';
 import type { Board, BoardDevice, BoardHostname } from '../api/board';
 import { LogLink } from '../LogSearchPage';
 import { ResolutionStrip, StripSkeleton } from './ResolutionStrip';
-import { absoluteTitle, formatAge } from './format';
+import { absoluteTitle, formatAge, rateLimitSummary } from './format';
 
 /* The board answers *which* device stopped talking. The next question is
    always *when, and what did it say* — and that is the log, filtered to
@@ -46,7 +46,15 @@ import { absoluteTitle, formatAge } from './format';
    id, so a device whose name was reused does not collect a predecessor's
    history. */
 
-function HostnameBlock({ hostname }: { hostname: BoardHostname }) {
+/** One name and its strips.
+ *
+ * Exported for #89's device detail route, which renders the same block
+ * at full width under `; names this device updates`. Reused rather than
+ * reimplemented for `api/board.ts`'s own reason — the shapes may be
+ * restated, the verdicts may not — and a second renderer of the
+ * signature element is precisely where a sixth `DnsCheckStatus` would
+ * get a default branch. */
+export function HostnameBlock({ hostname }: { hostname: BoardHostname }) {
   const logLink = (
     <LogLink
       params={{ hostname_id: hostname.id }}
@@ -140,6 +148,19 @@ function DeviceBlock({
           >
             log for this device
           </LogLink>
+          {/* #73's AC 4 — the stored limit is displayed wherever a
+              device is shown. In the *detail*, not in the line: the
+              board's four columns are a status grid and §4 spends its
+              boldness on the strip. This is configuration sitting
+              quietly beside the log link, which is where a reader who
+              has already asked "what is wrong with this device" looks
+              next. */}
+          <span
+            className="ddns-label"
+            data-testid={`device-${device.name}-limit`}
+          >
+            rate limit {rateLimitSummary(device)}
+          </span>
           {device.hostnames.length === 0 ? (
             <span className="ddns-label">
               this device has no hostnames. Assign one to start tracking it.

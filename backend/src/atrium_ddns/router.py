@@ -5,6 +5,11 @@
 - ``GET /api/atrium_ddns/board`` — the device board and the resolution
   strips, gated by ``atrium_ddns.device.manage`` and scoped by
   :class:`~atrium_ddns.scope.DdnsScope`.
+- ``POST /api/atrium_ddns/health-checks/run`` and ``…/clear`` — the
+  board's two on-demand operator actions (#75, ui-parity §3.3 G3), same
+  permission and same scope. ``run`` **is** the scheduled job, called
+  with ``due_only=False``; it is debounced per actor because it fans out
+  to real nameservers.
 - ``GET /api/atrium_ddns/events`` — the log search. Authenticated, and
   scoped: a tenant sees their own rows and ``atrium_ddns.events.read.all``
   widens that and nothing else. Every filter is an indexed query.
@@ -14,6 +19,11 @@
   writer the board and the wire protocol were both missing; see the
   Hostnames section for why its two validators are *imported* rather
   than written.
+- ``PATCH /api/atrium_ddns/domains/{id}`` — the zone rename (#75,
+  ui-parity §3.3 G4). Refuses a rename that would leave a hostname
+  outside its zone rather than rewriting the names; see
+  :func:`rename_domain` for the argument, which is one the model had
+  already made about :class:`HostnameAssignIn`.
 
 Atrium mounts every JSON route under ``/api/...`` so the SPA owns
 un-prefixed URL space (atrium issue #89); host routes follow the same
@@ -44,17 +54,20 @@ against. This module adds no sixth reading of the columns.
 """
 from __future__ import annotations
 
+import functools
 import secrets as secrets_module
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
+import anyio
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.attributes import flag_dirty
 from sqlalchemy.sql import Select
 
@@ -63,18 +76,53 @@ from app.auth.users import current_user
 from app.db import get_session
 from app.host_sdk.crypto import apply_secret_update, unlock_user_secrets
 from app.models.auth import User
+
+# atrium's own audit table, read (never written) directly by the
+# health-check debounce. `record_audit` is the writer; this is the same
+# rows read back, and it is the only place host code reads an atrium
+# model. See `_last_manual_run` for why the debounce lives here rather
+# than in a table of its own.
+from app.models.ops import AuditLog
 from app.services.audit import record as record_audit
 
-from .auth_device import hash_password
+from .auth_device import (
+    DeviceAuth,
+    check_rate_limit,
+    effective_rate_limit,
+    hash_password,
+    normalise_address,
+)
 from .models import (
+    IPV6_LEN,
+    TTL_MAX,
+    TTL_MIN,
     AtriumDdnsState,
     Device,
     DnsEvent,
     Domain,
     DomainBackend,
     Hostname,
+    HostnameBackend,
+    # The one resolver. `/nic/update` calls this exact object, which is
+    # what stops the editor and the wire disagreeing about which
+    # backends a name publishes to — the `zone_contains` lesson applied
+    # to #74's join table.
+    resolve_backends,
+    resolve_ttl,
 )
-from .providers import PROVIDER_STATUSES, known_services, provider_class
+from .providers import (
+    DEFAULT_TTL,
+    PROVIDER_STATUSES,
+    STATUS_GOOD,
+    BaseProvider,
+    known_services,
+    provider_class,
+)
+from .settings_schema import (
+    APP_CONFIG_MANAGE_PERMISSION,
+    SettingsSchemaOut,
+    settings_schema,
+)
 
 # The zone-containment rule, imported rather than re-derived. This is the
 # same function object ``BaseProvider.domaininhostname`` calls, which is
@@ -84,12 +132,25 @@ from .providers.base import zone_contains
 from .router_nic import (
     EVENT_AUTH,
     EVENT_DELETE,
+    EVENT_MANUAL_UPDATE,
     EVENT_UPDATE,
     STATUS_911,
     STATUS_ABUSE,
     STATUS_BADAUTH,
     STATUS_NOHOST,
     STATUS_NOTFQDN,
+    # The publish path itself, whole. The manual update is the same
+    # operation `/nic/update` performs, so it runs the same code — a
+    # second implementation would be a second answer to "which backends,
+    # what did they say, what does that aggregate to, and which column
+    # moves", and the wire's is the one with 124 frozen cases behind it.
+    HostnamePlan,
+    commit_after_dns,
+    load_plans,
+    persist_updates,
+    record_event,
+    record_hostname_events,
+    run_dns_phase,
     # The syntax rule, likewise: `/nic/update` calls this exact function
     # to decide `notfqdn`, and so does `POST /hostnames`.
     split_hostnames,
@@ -99,8 +160,13 @@ from .worker_jobs import (
     SUCCESS_RESPONSE_CODES,
     DnsCheckStatus,
     Liveness,
+    clear_health_check_results,
     device_statuses,
     load_config,
+    # The scheduled job's own function object. `POST /health-checks/run`
+    # calls *this*, with `due_only=False` — see #75's section below for
+    # why a second sweep in this module was not an option.
+    run_health_checks,
     stored_dns_status,
 )
 
@@ -365,6 +431,15 @@ class DeviceOut(BaseModel):
     #: The denominator, beside the numerator, so a caller cannot render
     #: the count without being able to render what it is out of.
     window_days: int
+    #: ``NULL`` means *inherit*. Carried beside the resolved value below
+    #: rather than instead of it: "30/min" and "30/min because nobody
+    #: set one" are different facts and the board is allowed to say
+    #: which. #73's AC 4 — the stored value is displayed wherever a
+    #: device is shown, not only accepted at creation.
+    rate_limit_per_minute: int | None
+    #: :func:`~atrium_ddns.auth_device.effective_rate_limit`, the
+    #: limiter's own function. See ``DeviceSummaryOut``.
+    effective_rate_limit_per_minute: int
     hostnames: list[HostnameOut]
 
 
@@ -754,6 +829,10 @@ async def get_board(
                 updates_in_window=status.updates_in_window,
                 updates_display=status.render_updates(),
                 window_days=status.window_days,
+                rate_limit_per_minute=device.rate_limit_per_minute,
+                effective_rate_limit_per_minute=effective_rate_limit(
+                    device, config.rate_limit_per_minute
+                ),
                 hostnames=nested[device.id],
             )
         )
@@ -783,6 +862,295 @@ async def get_board(
         devices=out,
         unassigned_hostnames=unassigned,
     )
+
+
+# ===================================================================== #
+# On-demand health-check actions — the legacy `/admin/health-checks/*`
+#
+# ui-parity §3.3 G3, closed by #75. Two routes, and the reason they are
+# worth having is a wait rather than a capability: the check is
+# scheduled, so an operator who has just fixed a provider outage watches
+# a stale board for up to `health_check_interval_minutes` (default 15)
+# with no way to say "look again". The board is the surface this
+# milestone is built around, and it was the one surface with no refresh.
+#
+# **Neither of these is a second implementation, and that is the design
+# constraint rather than a tidiness preference.** `run` is
+# `worker_jobs.run_health_checks` — the scheduled job's own function
+# object — called with `due_only=False` and the caller's scope, so the
+# batch ceiling, the concurrency semaphore, the timeout, the canonical
+# address comparison, the five-state classification and the accounting
+# assertion are reached by exactly one path. A hand-rolled "check these
+# names now" in this module would be a sixth reading of the columns and
+# the first thing it would lose is the ERROR/MISSING distinction.
+#
+# **The third disposition next door is not extended to these.**
+# `POST /admin/events/clear` was struck by operator decision (ui-parity
+# §3.4) and named that route and only that route. `clear` here resets
+# *health-check results* — four columns on `ddns_hostname` — and touches
+# no `ddns_event` row. Clearing a result and clearing a log are different
+# operations on different tables; the legacy service had them as two
+# routes for that reason, and inventing a disposition by analogy is the
+# one thing the parity table is not allowed to do.
+# ===================================================================== #
+
+
+class HealthCheckRunOut(BaseModel):
+    """What one manual run did, with every denominator named.
+
+    Mirrors :class:`~atrium_ddns.worker_jobs.HealthCheckSummary` rather
+    than summarising it: an operator who pressed the button is owed the
+    same accounting the scheduled tick logs, including the slices that
+    were **not** checked. ``hostnames_considered`` is the population,
+    ``hostnames_never_written`` is the slice with nothing to compare
+    against, ``hostnames_checked`` is what was resolved, and the four
+    record counters sum to ``records_checked`` — asserted server-side by
+    ``HealthCheckSummary.assert_consistent`` before this is built.
+    """
+
+    #: ``False`` when ``health_check_enabled`` is off. The run then
+    #: resolves nothing and every count below is zero — which is a
+    #: refusal, not a clean sweep, and the flag is what tells them apart.
+    enabled: bool
+    #: Always ``True`` on this route: a manual run is by definition not
+    #: the scheduled one. Carried so a client rendering the summary does
+    #: not have to know which endpoint produced it.
+    forced: bool
+    hostnames_considered: int
+    hostnames_never_written: int
+    hostnames_checked: int
+    records_checked: int
+    ok: int
+    mismatch: int
+    missing: int
+    error: int
+    #: Names whose aggregate verdict *changed* on this run. The number an
+    #: operator who just fixed something is actually looking for.
+    transitions: int
+    #: ``True`` when there was more in reach than ``batch_size`` allowed.
+    #: A summary that cannot say so reads identically whether it swept
+    #: everything or one percent.
+    truncated: bool
+    batch_size: int
+
+
+class HealthCheckClearOut(BaseModel):
+    """What one clear reset, over the population it could have reached.
+
+    ``cleared`` on its own reads identically whether it reset the right
+    rows or every row in the installation. ``in_scope`` is read back
+    after the write and printed beside it, so a zero is a measurement.
+    """
+
+    cleared: int
+    in_scope: int
+
+
+def _cooldown_remaining(
+    last_run: datetime | None, cooldown_seconds: int, now: datetime
+) -> int:
+    """Whole seconds left on the debounce, or ``0``.
+
+    Separate from the handler and pure, so the arithmetic is testable
+    without a database and without a clock. ``last_run is None`` — never
+    run — is the state that must not collapse into "ran a long time
+    ago"; both permit the run, and only one of them is a measurement.
+    """
+    if cooldown_seconds <= 0 or last_run is None:
+        return 0
+    elapsed = (now - last_run).total_seconds()
+    remaining = cooldown_seconds - elapsed
+    # `ceil`, not `round`: reporting 0 while still refusing would send a
+    # client straight back into another 429.
+    return max(0, -int(-remaining // 1))
+
+
+async def _last_manual_run(session: AsyncSession, actor_user_id: int) -> datetime | None:
+    """When this actor last triggered a manual run, or ``None``.
+
+    Read out of **atrium's ``audit_log``**, which is where the trigger
+    already writes: the manual run is an operator action and gets an
+    audit row whether or not anything debounces it, so the debounce
+    reads a row that exists rather than needing a table of its own.
+    Three properties that a module-level dict would not have, and
+    ``models.RateLimitEvent``'s docstring is the local precedent for
+    caring: api and worker are separate containers and api may be
+    several processes, so an in-memory window is per-process, resets on
+    every deploy, and lets a caller multiply its allowance by the number
+    of workers.
+
+    It is also deliberately not a new table. This chain admits one
+    revision author at a time and a debounce is not worth the slot;
+    ``audit_log`` indexes ``entity`` and ``actor_user_id``, and the
+    query is bounded by ``created_at`` on top of those.
+
+    Per **actor**, not per tenant and not installation-wide. An admin
+    holding ``atrium_ddns.admin`` reaches every tenant's names, so a
+    per-tenant key would let one admin fan out once per tenant per
+    cooldown; and an installation-wide key would let one operator's
+    press block every other tenant's own board.
+    """
+    return (
+        await session.execute(
+            select(sa.func.max(AuditLog.created_at)).where(
+                AuditLog.entity == AUDIT_ENTITY_HEALTH_CHECK,
+                AuditLog.action == AUDIT_ACTION_RUN,
+                AuditLog.actor_user_id == actor_user_id,
+            )
+        )
+    ).scalar_one_or_none()
+
+
+#: The ``audit_log.entity`` these two routes write. Not ``ddns_hostname``
+#: — the action is about the check, not about one row — and not
+#: ``ddns_domain``, which would put operator actions in a zone's history.
+AUDIT_ENTITY_HEALTH_CHECK = "ddns_health_check"
+AUDIT_ACTION_RUN = "run"
+AUDIT_ACTION_CLEAR = "clear"
+
+# `audit_log.entity_id` is NOT NULL and these two actions name no row.
+# The actor's own id is written instead of a magic `0`: it is true, it is
+# the thing the debounce keys on, and a sentinel in a
+# foreign-key-shaped column is how a later reader joins it to the wrong
+# table.
+
+#: Spelled through ``fastapi.status`` rather than as a literal, the same
+#: way :data:`UNPROCESSABLE`'s neighbours are.
+TOO_MANY_REQUESTS = status.HTTP_429_TOO_MANY_REQUESTS
+
+
+@router.post("/health-checks/run", response_model=HealthCheckRunOut)
+async def run_health_checks_now(
+    user: User = Depends(require_perm(BOARD_READ_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> HealthCheckRunOut:
+    """Re-check every name this caller can see, now. Debounced per actor.
+
+    Reach is the **scope's**, not a parameter: a tenant re-checks their
+    own names and a holder of ``atrium_ddns.admin`` re-checks every
+    tenant's, because that is what the scope already means everywhere
+    else on this surface. Gated on ``atrium_ddns.device.manage`` — the
+    board's own permission — rather than on ``atrium_ddns.admin``, for
+    the reason #14 recorded about the log: *reading your own* and
+    *reading everyone's* are different reaches, and collapsing them into
+    one permission takes the surface away from the people it was built
+    for. A caller with no tenant identity gets the scope's third state,
+    a literal ``false``, and checks nothing.
+
+    **Bounded by the scheduled path's own settings.** ``batch_size``,
+    ``concurrency`` and ``timeout`` come from the same ``atrium_ddns``
+    namespace the worker reads on every tick; nothing here is a second
+    knob. The honest consequence, stated rather than discovered: this is
+    a synchronous request that resolves up to ``health_check_batch_size``
+    names × two record types at ``health_check_concurrency``, so on a
+    large estate whose nameservers are all timing out it is a long
+    request, and ``truncated`` in the response says when the ceiling was
+    the thing that stopped it.
+
+    The debounce, and why the claim is committed first
+    --------------------------------------------------
+    The audit row is written **and committed before the fan-out starts**,
+    not after it. A debounce that records the run on the way out is not a
+    debounce: two requests that arrive together both read "nothing
+    recent", both start, and the limit is enforced only against a caller
+    slow enough to wait. Claim first, then work.
+
+    A consequence worth naming: a run that then fails still consumed its
+    cooldown. That is the correct direction for a control whose purpose
+    is to bound outbound DNS traffic — the queries were sent either way.
+    """
+    config = await load_config(session)
+    now = datetime.now(UTC).replace(tzinfo=None)
+
+    remaining = _cooldown_remaining(
+        await _last_manual_run(session, user.id),
+        config.health_check_manual_cooldown_seconds,
+        now,
+    )
+    if remaining:
+        raise HTTPException(
+            status_code=TOO_MANY_REQUESTS,
+            detail=(
+                f"a manual health check was run less than "
+                f"{config.health_check_manual_cooldown_seconds}s ago; "
+                f"{remaining}s remaining. This button resolves every name in "
+                f"reach against real nameservers, so it is debounced per "
+                f"operator. The scheduled check keeps running regardless."
+            ),
+            headers={"Retry-After": str(remaining)},
+        )
+
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity=AUDIT_ENTITY_HEALTH_CHECK,
+        entity_id=user.id,
+        action=AUDIT_ACTION_RUN,
+        diff={"cross_tenant": scope.reaches_all_tenants(Hostname)},
+    )
+    await session.commit()
+
+    summary = await run_health_checks(scope=scope, due_only=False)
+    return HealthCheckRunOut(
+        enabled=summary.enabled,
+        forced=summary.forced,
+        hostnames_considered=summary.hostnames_considered,
+        hostnames_never_written=summary.hostnames_never_written,
+        hostnames_checked=summary.hostnames_checked,
+        records_checked=summary.records_checked,
+        ok=summary.ok,
+        mismatch=summary.mismatch,
+        missing=summary.missing,
+        error=summary.error,
+        transitions=summary.transitions,
+        truncated=summary.truncated,
+        batch_size=summary.batch_size,
+    )
+
+
+@router.post("/health-checks/clear", response_model=HealthCheckClearOut)
+async def clear_health_checks_now(
+    user: User = Depends(require_perm(BOARD_READ_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> HealthCheckClearOut:
+    """Reset every health-check result in reach to ``never_checked``.
+
+    The legacy ``POST /admin/health-checks/clear``. What it is *for*: a
+    board carrying stale ``error`` and ``mismatch`` verdicts from an
+    outage that is over reads as a broken estate until the next
+    scheduled sweep replaces each one. Clearing says *we do not know
+    yet*, which is a true statement and a different one from *it is
+    wrong*.
+
+    **Not rate-limited, and the asymmetry is the point.** ``run`` fans
+    out to other people's nameservers; this is one scoped ``UPDATE``
+    against our own database. Debouncing it would be a control with no
+    cost to bound.
+
+    It writes ``NULL`` into all four columns — see
+    :func:`~atrium_ddns.worker_jobs.clear_health_check_results` for why
+    ``NEVER_CHECKED`` and not ``MISSING`` is the honest reset — and it
+    deletes nothing. No hostname, no published address, and in
+    particular no ``ddns_event`` row: the log has its own retention and
+    the route that cleared *it* is the one the operator struck.
+    """
+    summary = await clear_health_check_results(scope=scope)
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity=AUDIT_ENTITY_HEALTH_CHECK,
+        entity_id=user.id,
+        action=AUDIT_ACTION_CLEAR,
+        diff={
+            "cleared": summary.cleared,
+            "in_scope": summary.in_scope,
+            "cross_tenant": scope.reaches_all_tenants(Hostname),
+        },
+    )
+    await session.commit()
+    return HealthCheckClearOut(cleared=summary.cleared, in_scope=summary.in_scope)
 
 
 # ===================================================================== #
@@ -1217,13 +1585,69 @@ class DomainOut(BaseModel):
     hostname_count: int
 
 
-class DomainCreateIn(BaseModel):
-    name: str = Field(min_length=1, max_length=253)
-
-
 class DomainBackendCreateIn(_CredentialsField):
     backend_type: str = Field(min_length=1, max_length=64)
     config: dict[str, Any] = Field(default_factory=dict)
+
+
+class DomainCreateIn(BaseModel):
+    """Claim a zone, and — the point of #88 — bind its first provider.
+
+    ``backend`` is optional in the schema and **not** optional in the
+    product's terms, which is a distinction worth writing down rather
+    than resolving.
+
+    A zone with no provider is not an incomplete draft. Every update for
+    a name under it answers ``911`` — *the service is broken, stop
+    asking* — and that is frozen in the wire table
+    (``update/no-backends-911``), not inferred. So a create path that
+    can only produce that state manufactures a broken zone in one click
+    and then renders it identically to a working one.
+
+    Two things follow, and they are why this field exists rather than a
+    second request from the browser:
+
+    - **One submission means one transaction.** With two requests, a
+      credential the provider adapter refuses leaves the zone behind —
+      the exact state the design says must never be arrived at by
+      accident. Here the binding is created before the commit, so a
+      refusal takes the zone with it.
+    - **The path stays open.** An operator staging a migration has a
+      real reason to claim a zone before its credentials exist, so
+      ``None`` is still accepted and still means *no provider yet*. It
+      is a deliberate act with its consequence written next to it (the
+      UI renders that zone diverged), not the thing that happens when
+      you fill in the only field on offer.
+    """
+
+    name: str = Field(min_length=1, max_length=253)
+    #: The first provider binding, created in the same transaction.
+    #: ``None`` is the "add a provider later" path, taken deliberately.
+    backend: DomainBackendCreateIn | None = None
+
+
+class DomainRenameIn(BaseModel):
+    """The body of ``PATCH /domains/{id}`` — the legacy rename (#75).
+
+    One field, and the operation is *rename the zone*. Ownership is not
+    spellable here for the reason :func:`create_domain` gives about its
+    own body: a ``user_id`` in a payload is a way to write into another
+    tenant's account through an endpoint whose read side is correctly
+    scoped.
+
+    **The rename does not rewrite hostnames, and the refusal is the
+    feature.** The two options were reject-or-rewrite and this model
+    picks reject; :func:`rename_domain` argues it, and
+    ``tests/test_router_hostnames.py`` asserts it in both directions.
+
+    ``PUT`` stays ``405`` deliberately. Every mutation on this surface
+    that changes part of a row is a ``PATCH``
+    (``/backends/{id}``, ``/hostnames/{id}``); a ``PUT`` alias would be a
+    second spelling of one operation, and the first thing a second
+    spelling grows is a divergent validation path.
+    """
+
+    name: str = Field(min_length=1, max_length=253)
 
 
 class DomainBackendUpdateIn(_CredentialsField):
@@ -1263,6 +1687,18 @@ class DeviceSummaryOut(BaseModel):
     #: ``NULL`` means *inherit the namespace default*, which is not the
     #: same as ``0`` (may never call). Two states, carried as two.
     rate_limit_per_minute: int | None
+    #: What the limiter will actually allow this device, with ``NULL``
+    #: already resolved against the namespace default.
+    #:
+    #: Computed by :func:`~atrium_ddns.auth_device.effective_rate_limit`
+    #: — *the same function* ``/nic/update`` calls on the request path,
+    #: not a second reading of the two columns. A browser that resolved
+    #: ``NULL`` itself would need the namespace default, which a plain
+    #: tenant cannot read (it is behind ``app_setting.manage``), so it
+    #: would either show nothing or invent one. Shipping the resolved
+    #: value means the number on the screen is the number the limiter
+    #: enforces, by construction.
+    effective_rate_limit_per_minute: int
     #: :class:`CredentialOrigin`. The one thing a read says about the
     #: secret, and the reason a migrated device can be described
     #: honestly instead of rendered as an empty field.
@@ -1270,9 +1706,97 @@ class DeviceSummaryOut(BaseModel):
     hostname_count: int
 
 
+def _clean_device_name(value: Any) -> Any:
+    """Strip, and refuse what is left when nothing is left.
+
+    One validator, on both the create and the rename path — §13.1's rule
+    ("one validator, still") applied one object along, because a second
+    implementation is where the two drift. Before this existed the
+    create route called ``body.name.strip()`` in the *handler* while
+    ``min_length=1`` was measured against the *unstripped* string, so
+    ``"   "`` created a device named ``""``: a row the list renders as
+    an empty cell and the uniqueness index treats as a real name.
+    Adding a rename without fixing that would have given the
+    installation a second way to reach the same unnamed row.
+
+    A non-string is handed straight through rather than coerced — the
+    core ``str`` schema behind this refuses it with the message pydantic
+    already writes for that, and inventing a second one here would make
+    ``{"name": 7}`` and ``{"name": " "}`` two flavours of the same
+    error.
+    """
+    if not isinstance(value, str):
+        return value
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError("a device name cannot be blank")
+    return cleaned
+
+
+#: A device name as the column stores it. A *before* validator, so the
+#: strip happens ahead of the length check rather than after it and 255
+#: characters of trailing whitespace is not a 422; ``max_length``
+#: matches ``ddns_device.name``.
+DeviceName = Annotated[
+    str, BeforeValidator(_clean_device_name), Field(max_length=255)
+]
+
+
 class DeviceCreateIn(BaseModel):
-    name: str = Field(min_length=1, max_length=255)
+    name: DeviceName
     rate_limit_per_minute: int | None = Field(default=None, ge=0)
+
+
+class DeviceUpdateIn(BaseModel):
+    """The per-device rate limit and its name — and still no secret.
+
+    ``rate_limit_per_minute`` is **required**, and that is not an
+    oversight. ``None`` is a *value* on this field — it means *inherit
+    the installation default* — so a body that omits the key and a body
+    that sends ``null`` would be indistinguishable under a default of
+    ``None``, and one of the two readings silently un-mutes a device an
+    operator muted on purpose. Required means the omission is a 422 the
+    caller can read instead of a mutation nobody asked for.
+
+    ``name`` is **optional**, and the asymmetry with the field above is
+    deliberate rather than sloppy: **the column decides.**
+    ``ddns_device.rate_limit_per_minute`` is nullable and ``NULL`` names
+    a real state, so ``None`` there cannot mean *absent*.
+    ``ddns_device.name`` is ``NOT NULL``, so there is no state ``null``
+    could name and ``None`` is free to mean exactly one thing — *leave
+    the name alone*. A caller that sends ``{"name": null, …}`` is
+    therefore not renaming; it is not refused, because refusing it would
+    invent a fourth reading of a field that has three.
+
+    #73 wrote here that renaming was "a separate change (the create path
+    has a uniqueness conflict to handle and this route does not)". The
+    reasoning was sound and the conclusion has expired: the conflict is
+    ``uq_ddns_device_user_name`` — ``UNIQUE(user_id, name)`` — and
+    handling it is a 409 with the offending name in it, which is what
+    the create path already does. It is surfaced, not avoided: nothing
+    here appends a suffix and nothing here accepts a duplicate.
+
+    **The secret is still not on this model**, and that is the half #73
+    was actually about — tightening an abusive device's limit used to
+    mean delete-and-recreate, which rotates the credential and breaks
+    the device until its owner reconfigures it. Rotation has a different
+    consequence from fixing a typo and keeps its own route, its own
+    confirmation and its own once-only display. This model has no field
+    that could carry a secret and ``tests/test_router_tenant.py``
+    compares the stored hash across the call — across a rename as well
+    as across a limit change, because a rename is a write to the same
+    row and the byte comparison is only evidence on the path it covers.
+    """
+
+    #: ``0`` mutes the device; ``null`` returns it to the installation
+    #: default. ``ge=0`` and no upper bound of its own — the namespace's
+    #: ``le=10_000`` bounds the default, and a per-device override that
+    #: could not exceed it would be a rule nobody wrote down.
+    rate_limit_per_minute: int | None = Field(ge=0)
+    #: Absent or ``null`` leaves the name alone. Same validator as the
+    #: create path, so a name that could not be created cannot be
+    #: renamed into either.
+    name: DeviceName | None = None
 
 
 class DeviceSecretOut(BaseModel):
@@ -1310,6 +1834,25 @@ def _normalise_zone(name: str) -> str:
 
 def _conflict(detail: str) -> HTTPException:
     return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+
+
+def _device_name_conflict(name: str) -> HTTPException:
+    """409 for ``uq_ddns_device_user_name``, in the operator's words.
+
+    One sentence, one place, two call sites — create and rename — so the
+    form that renders the server's words verbatim renders the same
+    sentence whichever way the collision was reached.
+
+    **The offending name is in the message, and that is safe here
+    precisely because the constraint is ``UNIQUE(user_id, name)``.**
+    Compare ``_conflict("the zone … is already claimed")``: zone names
+    are unique across the whole installation, so naming the holder would
+    disclose another tenant's rows, and that refusal names nobody. This
+    one can only ever be about a device the caller already owns and can
+    already list, so withholding the name would withhold the one piece
+    of information that makes the refusal actionable.
+    """
+    return _conflict(f"you already have a device called {name!r}")
 
 
 def _not_found(what: str) -> HTTPException:
@@ -1369,7 +1912,17 @@ def _render_backend(backend: DomainBackend) -> DomainBackendOut:
     )
 
 
-def _render_device(device: Device, hostname_count: int) -> DeviceSummaryOut:
+def _render_device(
+    device: Device, hostname_count: int, *, default_per_minute: int
+) -> DeviceSummaryOut:
+    """One device, with its limit resolved by the limiter's own function.
+
+    ``default_per_minute`` is ``DdnsConfig.rate_limit_per_minute``, read
+    from the namespace by the caller. It is a required keyword rather
+    than an optional one: a default here would let a call site that
+    forgot to read the config render an *effective* limit that is not
+    the effective limit, and it would look right.
+    """
     return DeviceSummaryOut(
         id=device.id,
         name=device.name,
@@ -1377,6 +1930,9 @@ def _render_device(device: Device, hostname_count: int) -> DeviceSummaryOut:
         created_at=_iso(device.created_at) or "",
         last_seen_at=_iso(device.last_seen_at),
         rate_limit_per_minute=device.rate_limit_per_minute,
+        effective_rate_limit_per_minute=effective_rate_limit(
+            device, default_per_minute
+        ),
         credential_origin=credential_origin(device.password_hash),
         hostname_count=hostname_count,
     )
@@ -1450,6 +2006,27 @@ async def create_domain(
     reachable for a name *another* tenant owns, and it deliberately says
     nothing about who. "Already claimed" and "already claimed by you"
     are the same sentence here on purpose.
+
+    #88 — the first provider, in the same transaction
+    -------------------------------------------------
+    ``body.backend`` binds a provider before the commit. Not a
+    convenience: a zone with none answers ``911`` for every update under
+    it (``update/no-backends-911``, frozen), so a create endpoint that
+    could only ever produce that state was manufacturing a broken zone
+    per call.
+
+    **Atomic, and that is the whole reason it lives here rather than in
+    a second request from the browser.** Two requests can half-succeed —
+    the zone lands, the credential is refused, and the tenant is left
+    holding exactly the state this is meant to prevent, having been told
+    their submission failed. Here nothing is committed until both rows
+    exist, so a refusal takes the zone with it and the tenant's account
+    is unchanged.
+
+    ``None`` remains legal and remains the "add a provider later" path.
+    It is deliberate rather than default: staging a migration is a real
+    reason to claim a zone before its credentials exist, and the surface
+    that offers it renders the result diverged.
     """
     if scope.user_id is None:
         raise HTTPException(
@@ -1483,15 +2060,199 @@ async def create_domain(
         entity="ddns_domain",
         entity_id=domain.id,
         action="create",
-        diff={"name": name},
+        # Which of the two shapes this call was. `false` is a real
+        # measurement of a deliberate act — the operator took the "add a
+        # provider later" link — and it is the state an audit reader
+        # wants to be able to find, because it is the state that answers
+        # 911. Recording nothing for it would make the two
+        # indistinguishable after the fact.
+        diff={"name": name, "with_backend": body.backend is not None},
     )
+
+    backends: list[DomainBackendOut] = []
+    if body.backend is not None:
+        backend = await _bind_backend(
+            session, domain=domain, body=body.backend, actor_user_id=user.id
+        )
+        backends.append(_render_backend(backend))
+
     await session.commit()
     return DomainOut(
         id=domain.id,
         name=domain.name,
         created_at=_iso(domain.created_at) or "",
-        backends=[],
+        backends=backends,
         hostname_count=0,
+    )
+
+
+#: How many orphaned names a refusal names before it stops listing them.
+#: The count is always exact; the list is a sample, and the message says
+#: which is which. A refusal that printed 4,000 names would be unreadable
+#: and one that printed none would be unactionable.
+RENAME_ORPHAN_SAMPLE = 5
+
+
+@router.patch("/domains/{domain_id}", response_model=DomainOut)
+async def rename_domain(
+    domain_id: int,
+    body: DomainRenameIn,
+    user: User = Depends(require_perm(DOMAIN_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> DomainOut:
+    """Rename a zone. **Refuses rather than orphaning a name.**
+
+    The legacy ``GET,POST /admin/domains/<id>`` (ui-parity §3.3 G4).
+    Delete-and-recreate was never an equivalent — ``DELETE`` cascades and
+    takes the hostnames and the provider bindings with it — so until this
+    existed, correcting a typo in a zone name cost the tenant every name
+    under it and every stored credential.
+
+    Reject or rewrite: this rejects, and here is the argument
+    ---------------------------------------------------------
+    A rename is not a string swap. Every ``ddns_hostname`` under the zone
+    has to satisfy :func:`zone_contains` afterwards or it becomes a row
+    that ``POST /hostnames`` would refuse to create and ``/nic/update``
+    answers ``nohost`` for — creatable once, updatable never. There were
+    two ways to keep that true, and only one of them is available here:
+
+    - **Rewrite the names transactionally**, replacing the old zone
+      suffix on each. This is *already decided against*, one model along:
+      :class:`HostnameAssignIn` says in as many words that a hostname's
+      name is not editable, because *"a hostname is the DNS name — it is
+      what /nic/update looks the row up by and what a provider has
+      already published a record under. Renaming the row would leave the
+      old record in the zone with nothing pointing at it and no way to
+      reach it again."* A rename that rewrote names would do exactly that
+      to every name at once, silently, as a side effect of correcting a
+      spelling — and it would do it to records already published at a
+      provider this endpoint is not going to call.
+    - **Refuse the rename that would orphan a name.** The tenant keeps
+      the choice the model already gives them: delete the affected names
+      deliberately, seeing what they are giving up, and recreate them.
+
+    So this endpoint refuses, with ``409`` and the count of names that
+    would be orphaned. A rename to a zone that still contains every
+    existing name — narrowing ``example.invalid`` to
+    ``sub.example.invalid`` when every name is already under ``sub`` — is
+    allowed and rewrites nothing, because there is nothing to rewrite.
+    A zone with no names is renameable to anything free.
+
+    The containment test is :func:`zone_contains`, the **same function
+    object** ``/nic/update`` and ``POST /hostnames`` reach, with all
+    three of its preserved legacy quirks. A second copy here would agree
+    on the day it was written and diverge silently afterwards, and the
+    direction it diverges in decides whether a tenant ends up with names
+    the wire cannot update.
+
+    ``409`` twice, for two different conflicts
+    ------------------------------------------
+    A name another tenant already claims and a rename that would orphan
+    names are both ``409`` — both are refusals about rows that exist
+    rather than about a malformed body — and the details say which. The
+    first deliberately says nothing about *who* holds the name, for the
+    reason :func:`create_domain` records.
+    """
+    domain = await scope.get(session, Domain, domain_id)
+    if domain is None:
+        raise _not_found("domain")
+
+    name = _normalise_zone(body.name)
+    if not name:
+        raise HTTPException(
+            status_code=UNPROCESSABLE,
+            detail="a zone name cannot be empty once normalised",
+        )
+
+    previous = domain.name
+    if name == previous:
+        # Not an error: a form that submits an unchanged field is a
+        # normal thing for a form to do. It writes nothing and audits
+        # nothing, so an unchanged submit cannot manufacture history.
+        return await _render_domain(session, scope, domain)
+
+    # The names under this zone, read through the scope. Not
+    # `domain.hostnames`: a relationship load here is a lazy load in an
+    # async session, and the collection would not carry the scope.
+    names = list(
+        (
+            await session.execute(
+                scope.select(Hostname, Hostname.name)
+                .where(Hostname.domain_id == domain.id)
+                .order_by(Hostname.name)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    orphans = [existing for existing in names if not zone_contains(name, existing)]
+    if orphans:
+        sample = ", ".join(repr(o) for o in orphans[:RENAME_ORPHAN_SAMPLE])
+        more = len(orphans) - min(len(orphans), RENAME_ORPHAN_SAMPLE)
+        raise _conflict(
+            f"renaming {previous!r} to {name!r} would leave "
+            f"{len(orphans)} of {len(names)} hostname"
+            f"{'' if len(orphans) == 1 else 's'} outside the zone: {sample}"
+            + (f" and {more} more" if more else "")
+            + ". /nic/update answers nohost for a hostname outside its "
+            "domain's zone, so those rows would exist and never be "
+            "updatable again. The rename is refused rather than rewriting "
+            "them: a hostname is the DNS name a provider has already "
+            "published a record under. Delete the names you no longer "
+            "want, then rename."
+        )
+
+    domain.name = name
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise _conflict(f"the zone {name} is already claimed") from exc
+
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity="ddns_domain",
+        entity_id=domain.id,
+        action="rename",
+        # Both sides. An audit row carrying only the new value cannot
+        # answer "what was it before", which is the only question anyone
+        # reads a rename audit for.
+        diff={"name": {"from": previous, "to": name}, "hostnames": len(names)},
+    )
+    await session.commit()
+    return await _render_domain(session, scope, domain)
+
+
+async def _render_domain(
+    session: AsyncSession, scope: DdnsScope, domain: Domain
+) -> DomainOut:
+    """One zone in :class:`DomainOut`'s shape, backends and count included.
+
+    Shares :func:`_render_backend` and :func:`_hostname_counts` with
+    :func:`list_domains` rather than assembling a second, thinner
+    rendering — a single-row shape that drifts from the list's is how a
+    page ends up showing different facts before and after an edit.
+    """
+    backends = list(
+        (
+            await session.execute(
+                scope.select(DomainBackend)
+                .where(DomainBackend.domain_id == domain.id)
+                .order_by(DomainBackend.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_domain, _ = await _hostname_counts(session, scope)
+    return DomainOut(
+        id=domain.id,
+        name=domain.name,
+        created_at=_iso(domain.created_at) or "",
+        backends=[_render_backend(backend) for backend in backends],
+        hostname_count=by_domain.get(domain.id, 0),
     )
 
 
@@ -1622,26 +2383,27 @@ def _credential_audit(incoming: CredentialsIn, touched: bool) -> str:
     return "replaced"
 
 
-@router.post(
-    "/domains/{domain_id}/backends",
-    response_model=DomainBackendOut,
-    status_code=201,
-)
-async def create_backend(
-    domain_id: int,
+async def _bind_backend(
+    session: AsyncSession,
+    *,
+    domain: Domain,
     body: DomainBackendCreateIn,
-    user: User = Depends(require_perm(DOMAIN_MANAGE_PERMISSION)),
-    scope: DdnsScope = Depends(get_scope),
-    session: AsyncSession = Depends(get_session),
-) -> DomainBackendOut:
-    """Bind a provider to a zone, optionally with its credentials.
+    actor_user_id: int,
+) -> DomainBackend:
+    """Bind a provider to a zone. **Does not commit.**
+
+    Factored out of :func:`create_backend` when #88 gave
+    :func:`create_domain` a second caller, and factored rather than
+    copied for the reason the docstring below spends its length on: two
+    copies of this would be two chances to take the owner from the
+    wrong place.
 
     **The row's ``user_id`` is the domain's, never the caller's**, and
-    that is the single most consequential line in this handler. A caller
-    holding ``atrium_ddns.admin`` reaches every tenant's zones, so
-    taking the owner from the scope would encrypt the credential under
-    the *administrator's* key: ``/nic/update`` unlocks the device
-    owner's key and would fail to decrypt it, and
+    that is the single most consequential line here. A caller holding
+    ``atrium_ddns.admin`` reaches every tenant's zones, so taking the
+    owner from the scope would encrypt the credential under the
+    *administrator's* key: ``/nic/update`` unlocks the device owner's
+    key and would fail to decrypt it, and
     :class:`~atrium_ddns.scope.DdnsScope` would hide the row from the
     tenant who owns the zone it hangs under. Two silent failures from
     one plausible line.
@@ -1651,11 +2413,13 @@ async def create_backend(
     service nobody claims, and ``models.py`` says so — but a row minted
     through this endpoint could only ever answer ``911``, so refusing is
     the kinder answer.
-    """
-    domain = await scope.get(session, Domain, domain_id)
-    if domain is None:
-        raise _not_found("domain")
 
+    The commit belongs to the caller, and that is what makes #88's
+    one-submission create atomic: :func:`create_domain` calls this
+    between its own ``flush`` and its own ``commit``, so a refused
+    credential rolls the *zone* back too rather than leaving behind the
+    zero-provider zone the whole issue is about.
+    """
     if provider_class(body.backend_type) is None:
         raise HTTPException(
             status_code=UNPROCESSABLE,
@@ -1701,7 +2465,7 @@ async def create_backend(
 
     await record_audit(
         session,
-        actor_user_id=user.id,
+        actor_user_id=actor_user_id,
         entity="ddns_domain_backend",
         entity_id=backend.id,
         action="create",
@@ -1714,6 +2478,34 @@ async def create_backend(
             "config_keys": sorted(body.config),
             "credentials": _credential_audit(credentials, touched),
         },
+    )
+    return backend
+
+
+@router.post(
+    "/domains/{domain_id}/backends",
+    response_model=DomainBackendOut,
+    status_code=201,
+)
+async def create_backend(
+    domain_id: int,
+    body: DomainBackendCreateIn,
+    user: User = Depends(require_perm(DOMAIN_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> DomainBackendOut:
+    """Bind a provider to a zone, optionally with its credentials.
+
+    Everything this endpoint decides is in :func:`_bind_backend`, which
+    :func:`create_domain` also calls; this handler is the scoped lookup
+    and the commit.
+    """
+    domain = await scope.get(session, Domain, domain_id)
+    if domain is None:
+        raise _not_found("domain")
+
+    backend = await _bind_backend(
+        session, domain=domain, body=body, actor_user_id=user.id
     )
     await session.commit()
     return _render_backend(backend)
@@ -1833,6 +2625,7 @@ async def list_devices(
     session: AsyncSession = Depends(get_session),
 ) -> list[DeviceSummaryOut]:
     """A tenant's devices. No secret, and no field that could hold one."""
+    config = await load_config(session)
     devices = list(
         (await session.execute(scope.select(Device).order_by(Device.name)))
         .scalars()
@@ -1840,8 +2633,50 @@ async def list_devices(
     )
     _, by_device = await _hostname_counts(session, scope)
     return [
-        _render_device(device, by_device.get(device.id, 0)) for device in devices
+        _render_device(
+            device,
+            by_device.get(device.id, 0),
+            default_per_minute=config.rate_limit_per_minute,
+        )
+        for device in devices
     ]
+
+
+@router.get("/devices/{device_id}", response_model=DeviceSummaryOut)
+async def get_device(
+    device_id: int,
+    _user: User = Depends(require_perm(DEVICE_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> DeviceSummaryOut:
+    """One device, for ``/atrium-ddns/devices/:id``.
+
+    The detail route exists because the list does not scale
+    (``ui-design.md`` §11.2), and a detail route that reads the whole
+    list and picks a row out of it would not have fixed that — it would
+    have moved the same ``SELECT *`` behind a URL that looks narrower.
+
+    ``hostname_count`` still comes from :func:`_hostname_counts`, which
+    counts every hostname the *scope* can see and then indexes by
+    device. That is one scoped query rather than a count restricted to
+    this id, and it is the same reading the list shows, which is the
+    point: two ways of counting one device's names is how the list and
+    the detail come to disagree about a number they both display.
+
+    Scoped like every other device route — another tenant's device is
+    ``None`` from :meth:`DdnsScope.get` and becomes the same 404 a
+    nonexistent id gets, because a 403 would confirm the row exists.
+    """
+    device = await scope.get(session, Device, device_id)
+    if device is None:
+        raise _not_found("device")
+    config = await load_config(session)
+    _, by_device = await _hostname_counts(session, scope)
+    return _render_device(
+        device,
+        by_device.get(device.id, 0),
+        default_per_minute=config.rate_limit_per_minute,
+    )
 
 
 @router.post("/devices", response_model=DeviceSecretOut, status_code=201)
@@ -1865,12 +2700,16 @@ async def create_device(
             detail="this caller has no tenant identity and cannot own a device",
         )
 
+    config = await load_config(session)
     secret = _generate_secret()
     device = Device(
         user_id=scope.user_id,
         username=_generate_username(),
         password_hash=await hash_password(secret),
-        name=body.name.strip(),
+        # No `.strip()` here any more: `DeviceName` did it, and the
+        # handler doing it again is the second implementation §13.1
+        # forbids — the one that survives when the validator changes.
+        name=body.name,
         rate_limit_per_minute=body.rate_limit_per_minute,
     )
     session.add(device)
@@ -1878,9 +2717,7 @@ async def create_device(
         await session.flush()
     except IntegrityError as exc:
         await session.rollback()
-        raise _conflict(
-            f"you already have a device called {body.name.strip()!r}"
-        ) from exc
+        raise _device_name_conflict(body.name) from exc
 
     await session.refresh(device)
 
@@ -1899,7 +2736,12 @@ async def create_device(
         },
     )
     await session.commit()
-    return DeviceSecretOut(device=_render_device(device, 0), secret=secret)
+    return DeviceSecretOut(
+        device=_render_device(
+            device, 0, default_per_minute=config.rate_limit_per_minute
+        ),
+        secret=secret,
+    )
 
 
 @router.post("/devices/{device_id}/rotate", response_model=DeviceSecretOut)
@@ -1926,6 +2768,7 @@ async def rotate_device_secret(
     if device is None:
         raise _not_found("device")
 
+    config = await load_config(session)
     before = credential_origin(device.password_hash)
     secret = _generate_secret()
     device.password_hash = await hash_password(secret)
@@ -1946,8 +2789,132 @@ async def rotate_device_secret(
     )
     await session.commit()
     return DeviceSecretOut(
-        device=_render_device(device, by_device.get(device.id, 0)),
+        device=_render_device(
+            device,
+            by_device.get(device.id, 0),
+            default_per_minute=config.rate_limit_per_minute,
+        ),
         secret=secret,
+    )
+
+
+@router.patch("/devices/{device_id}", response_model=DeviceSummaryOut)
+async def update_device(
+    device_id: int,
+    body: DeviceUpdateIn,
+    user: User = Depends(require_perm(DEVICE_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> DeviceSummaryOut:
+    """Change a device's rate limit and its name — **not its credential**.
+
+    The route #73 opened this issue for. Before it, the only way to
+    tighten one device's limit was delete-and-recreate — which mints a
+    new username and a new secret, so the operator's only route to
+    slowing an abusive device was to break it until its owner
+    reconfigured the router. That is backwards: the abuse control and
+    the credential are different decisions and only one of them was
+    reachable.
+
+    **The name joined the body in #89.** #73's docstring said renaming
+    was a separate change because "the create path has a uniqueness
+    conflict to handle and this route does not"; the conflict is
+    ``uq_ddns_device_user_name`` and it is now handled here the way the
+    create path handles it — an explicit ``flush`` inside a ``try``, and
+    a 409 naming the device the caller already owns. Nothing appends a
+    suffix and nothing accepts a duplicate: a rename that collides is
+    refused, in words the form renders verbatim.
+
+    **The constraint is per user**, so a rename onto a name *another*
+    tenant holds succeeds and must. There is no cross-tenant device
+    namespace and inventing one here would leak the fact that some other
+    account owns something called ``router``.
+
+    **Nothing in this function reads or writes ``password_hash``**, and
+    that is asserted rather than asserted-about: ``test_router_tenant``
+    captures the stored hash before and after and compares the bytes,
+    *and* drives ``/nic/update`` with the original secret afterwards, so
+    a rewrite that happened to produce an equal-length hash still fails.
+    One of those two alone would be weaker — a byte comparison cannot
+    tell a hash that still verifies from one that does not, and a
+    successful login cannot see a hash quietly upgraded in place. #89
+    extended both instruments over the *rename* path rather than
+    trusting the limit path's reading to cover it: a rename is a
+    different write to the same row, and evidence taken on one path is
+    not evidence about the other.
+
+    Scoped like every other device route: ``scope.get`` answers ``None``
+    for another tenant's device, which becomes the same 404 a
+    nonexistent id gets. A 403 here would confirm the row exists.
+    """
+    device = await scope.get(session, Device, device_id)
+    if device is None:
+        raise _not_found("device")
+
+    config = await load_config(session)
+    before = device.rate_limit_per_minute
+    device.rate_limit_per_minute = body.rate_limit_per_minute
+
+    # `None` is *absent* on this field and only on this field — see
+    # `DeviceUpdateIn`, where the column's nullability is what decides.
+    name_before = device.name
+    renaming = body.name is not None and body.name != name_before
+    if renaming:
+        device.name = body.name
+
+    # Explicit, so the conflict is caught here rather than by whatever
+    # runs next. A `commit()` that raises leaves the audit write already
+    # issued and the exception arriving from a line that says nothing
+    # about names.
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        await session.rollback()
+        if not renaming:
+            # The name is the only thing this route writes that carries
+            # a uniqueness constraint, so an IntegrityError without a
+            # rename in flight is something else entirely. Re-raise it
+            # rather than relabelling a real database fault as a name
+            # collision — a 409 saying "you already have a device
+            # called …" about a request that renamed nothing is the
+            # error message equivalent of a probe that cannot fail.
+            raise
+        # `body.name` and not `device.name`: the session is rolled back,
+        # so the attribute is expired and reading it would emit a SELECT
+        # inside the error path. The refused value is the one the caller
+        # sent.
+        raise _device_name_conflict(body.name or "") from exc
+
+    _, by_device = await _hostname_counts(session, scope)
+    # Both readings on the limit, because `null` and `0` are different
+    # states and an audit row saying "rate_limit_per_minute changed"
+    # would not let a reader tell *muted* from *returned to the
+    # default*.
+    diff: dict[str, Any] = {
+        "rate_limit_per_minute": {
+            "before": before,
+            "after": device.rate_limit_per_minute,
+        }
+    }
+    # The key appears only when the name actually moved. A `{"before":
+    # x, "after": x}` row on every limit change would make "this device
+    # was renamed" unsearchable in the audit log, which is the question
+    # the key exists to answer.
+    if renaming:
+        diff["name"] = {"before": name_before, "after": device.name}
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity="ddns_device",
+        entity_id=device.id,
+        action="update",
+        diff=diff,
+    )
+    await session.commit()
+    return _render_device(
+        device,
+        by_device.get(device.id, 0),
+        default_per_minute=config.rate_limit_per_minute,
     )
 
 
@@ -2411,6 +3378,587 @@ async def delete_hostname(
 
 
 # --------------------------------------------------------------------- #
+# Publishing — which backends, at what TTL, and "do it now" (#74)
+# --------------------------------------------------------------------- #
+#
+# The legacy `/admin/hostnames/<id>/backends` page and its admin twin,
+# which did three things on one form: choose the backends, edit the TTL,
+# and trigger a DNS update against a typed-in address. All three needed
+# a schema change rather than a page — `0004` is it.
+#
+# **The default-behaviour trap, and where it is answered.** Introducing
+# a selection table makes explicit what was implicit ("publishes to all
+# of the domain's backends"). An empty selection therefore has to mean
+# *inherit the domain*, not *publish nowhere*, or every hostname that
+# existed before the migration stops publishing — silently, because a
+# router that receives `911` retries and logs and nothing on the board
+# says the name has been muted. `models.resolve_backends` is where that
+# is decided, `0004`'s docstring is where the alternative is argued
+# down, and `test_router_hostname_backends.py` §0 is where it is
+# asserted against a row shaped exactly as a pre-migration one.
+#
+# The three surfaces below all read through that one resolver, and so
+# does `/nic/update`. There is no second answer to "which backends".
+
+
+class HostnameBackendChoiceOut(BaseModel):
+    """One binding on the hostname's zone, and whether it is chosen.
+
+    Every binding the zone has is listed, chosen or not — the editor's
+    question is *which of these*, and a list containing only the chosen
+    ones cannot be rendered as a set of checkboxes without a second
+    request.
+    """
+
+    backend_id: int
+    backend_type: str
+    #: Whether a ``ddns_hostname_backend`` row exists for this pair.
+    #: **Not** the same as "this backend is published to": with an empty
+    #: selection every entry is ``selected: false`` and every entry is
+    #: published to. :attr:`HostnamePublishingOut.publishes_to` is the
+    #: resolved answer and this is the stored state; rendering the
+    #: stored state as the effect is the whole defect this feature can
+    #: produce.
+    selected: bool
+    #: Whether the binding carries credentials at all. A backend with
+    #: none answers ``911`` for every hostname on it, and an editor that
+    #: offers it without saying so is offering a publish that cannot
+    #: work.
+    credentials_set: bool
+    #: The binding's own ``config['ttl']``, or ``None`` when it has
+    #: none. What a hostname with no override inherits *through this
+    #: backend* — the fallback is per binding, so two backends on one
+    #: zone can legitimately answer differently.
+    binding_ttl: int | None
+    #: What this hostname would actually be published at through this
+    #: backend right now: the override, else the binding, else
+    #: :data:`~atrium_ddns.providers.DEFAULT_TTL`. Computed here rather
+    #: than in the browser for the reason ``ui-design.md`` §4.2 gives
+    #: about the five states — two implementations of a three-level
+    #: fallback is how a three-level fallback becomes a two-level one.
+    effective_ttl: int
+
+
+class HostnamePublishingOut(BaseModel):
+    """The whole publishing configuration of one name."""
+
+    hostname_id: int
+    name: str
+    domain_id: int
+    domain_name: str
+    device_id: int | None
+    #: ``True`` when no ``ddns_hostname_backend`` row exists, i.e. when
+    #: this name follows its zone. Named rather than left for the reader
+    #: to infer from an empty list: *inheriting everything* and *having
+    #: chosen nothing* are the same rows and different sentences, and
+    #: only one of them is true here.
+    inherits_backends: bool
+    #: The stored override. ``None`` is *inherit*, and it is not 60 —
+    #: a name at NULL follows a later change to its binding's TTL and a
+    #: name explicitly set to 60 does not.
+    ttl: int | None
+    #: :data:`~atrium_ddns.providers.DEFAULT_TTL`, shipped so the editor
+    #: can say what "inherit" resolves to without holding its own copy
+    #: of the number.
+    default_ttl: int
+    #: Accepted range for :attr:`ttl`, shipped for the same reason.
+    ttl_min: int
+    ttl_max: int
+    backends: list[HostnameBackendChoiceOut]
+    #: ``backend_id`` in **publish order** — the order the aggregate's
+    #: "first status that is neither good nor nochg" walks. Resolved by
+    #: ``models.resolve_backends``, the same call ``/nic/update`` makes.
+    #: Empty means this name publishes to nothing at all, which happens
+    #: only when its zone has no bindings, and which answers ``911``.
+    publishes_to: list[int]
+
+
+class HostnamePublishingIn(BaseModel):
+    """The body of ``PUT /hostnames/{id}/backends``.
+
+    **Both fields are required and both accept ``null``.** This is a
+    ``PUT`` of the whole publishing configuration, mirroring the legacy
+    page, which submitted the checkboxes and the TTL from one form. A
+    partial-update shape would need a sentinel to tell *omitted* from
+    *cleared* (as :class:`DomainBackendUpdateIn` does), and there is
+    nothing here worth that: both fields have a meaningful ``null``, so
+    making omission illegal is cheaper and unambiguous.
+
+    ``backend_ids: null`` and ``backend_ids: []`` are the **same**
+    request — both clear the selection, and a cleared selection means
+    *inherit the zone*. That is not a leniency, it is the legacy
+    behaviour: the form posted no checkbox at all when none was ticked,
+    and ``get_backends()`` fell through to the domain
+    (``backends-empty-selection-resolves-to-all-of-the-domains-
+    backends``, ``preserve``). The response says which it did.
+    """
+
+    backend_ids: list[int] | None
+    ttl: int | None = Field(default=..., ge=TTL_MIN, le=TTL_MAX)
+
+
+class BackendAttemptOut(BaseModel):
+    """One backend's own answer, not the aggregate."""
+
+    backend_id: int
+    backend_type: str
+    #: The wire vocabulary, unchanged: ``good``/``nochg``/``nohost``/
+    #: ``dnserr``/``911``. One vocabulary for the whole service — a
+    #: reader who has seen these in the log recognises them here.
+    status: str
+
+
+class ManualUpdateIn(BaseModel):
+    #: The address to publish. Required, and not defaulted to the
+    #: caller's own: the browser's address is the operator's, not the
+    #: router's, and defaulting it would publish a helpdesk's IP to a
+    #: customer's zone on a mis-click. The legacy form took it typed in
+    #: too.
+    ip: str = Field(min_length=1, max_length=IPV6_LEN)
+
+
+class ManualUpdateOut(BaseModel):
+    hostname_id: int
+    name: str
+    #: The **normalised** address, which may differ from what was sent
+    #: (``2001:0db8::1`` -> ``2001:db8::1``). Echoed so the caller sees
+    #: what was published rather than what they typed.
+    ip: str
+    #: ``A`` or ``AAAA``, decided by the address and not by a parameter.
+    rtype: str
+    #: The aggregate, through ``router_nic.aggregate`` — the same
+    #: function and the same rule the wire uses.
+    status: str
+    attempts: list[BackendAttemptOut]
+    #: ``status == "good"``. Carried as its own field because the row's
+    #: ``last_ip_*`` moves on exactly this condition and a client should
+    #: not have to re-derive the rule.
+    published: bool
+    #: What this publish cost against the device's per-minute budget,
+    #: and what the budget is. Reported on success as well as on
+    #: refusal: "you have 29 left" is a measurement and a bare 200 is
+    #: not.
+    rate_limit_per_minute: int
+    #: ``worker_jobs.SUCCESS_RESPONSE_CODES``, verbatim — the same list
+    #: :class:`EventVocabulary` ships for the log, and for the same
+    #: reason: ``ui-design.md`` §1.2 Rule 2 says ``--ddns-diverge``
+    #: appears nowhere except on a measured disagreement, and on this
+    #: panel a non-success per-backend status *is* the disagreement. A
+    #: bundle holding its own ``['good', 'nochg']`` would be a second
+    #: implementation of a classification the health-check job owns,
+    #: and the two would part company the first time a code was
+    #: reclassified — silently, because both renderings look correct.
+    success_response_codes: list[str]
+
+
+def _publishing_out(hostname: Hostname, domain: Domain) -> HostnamePublishingOut:
+    """Render the configuration. Both relationships must be loaded."""
+    selected_ids = {backend.id for backend in hostname.selected_backends}
+    resolved = resolve_backends(hostname)
+    return HostnamePublishingOut(
+        hostname_id=hostname.id,
+        name=hostname.name,
+        domain_id=domain.id,
+        domain_name=domain.name,
+        device_id=hostname.device_id,
+        inherits_backends=not selected_ids,
+        ttl=hostname.ttl,
+        default_ttl=DEFAULT_TTL,
+        ttl_min=TTL_MIN,
+        ttl_max=TTL_MAX,
+        backends=[
+            HostnameBackendChoiceOut(
+                backend_id=backend.id,
+                backend_type=backend.backend_type,
+                selected=backend.id in selected_ids,
+                credentials_set=backend.credentials_ct is not None,
+                binding_ttl=_int_or_none((backend.config or {}).get("ttl")),
+                effective_ttl=_int_or_none(resolve_ttl(hostname, backend))
+                or DEFAULT_TTL,
+            )
+            for backend in domain.backends
+        ],
+        publishes_to=[backend.id for backend in resolved],
+    )
+
+
+def _int_or_none(value: Any) -> int | None:
+    """A stored TTL as an ``int``, or ``None`` when it is not one.
+
+    ``ddns_domain_backend.config`` is free-form JSON, so ``ttl`` can be
+    a string, a float or nonsense. ``router_nic._backend_plan`` already
+    falls back to :data:`DEFAULT_TTL` and logs ``ddns.backend.bad_ttl``
+    for such a value; this renders the same fact rather than raising a
+    500 on an editing screen, and rather than reporting a number the
+    publish path would not use.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _load_publishing(
+    session: AsyncSession, scope: DdnsScope, hostname_id: int
+) -> tuple[Hostname, Domain]:
+    """The hostname with everything the resolver needs, or a 404.
+
+    Eager-loaded rather than fetched with ``scope.get``:
+    ``resolve_backends`` is a pure function over ORM state and a lazy
+    load inside it would be a synchronous database call on the event
+    loop. Both relationships are loaded here, once, for that reason.
+
+    Scoped, so another tenant's hostname is a **404** and not a 403 —
+    the same rule as everywhere else on this surface, and the reason a
+    caller holding ``atrium_ddns.admin`` reaches it: the permission
+    widens the predicate rather than adding a branch to the handler.
+
+    ``populate_existing=True`` is **not** decoration. Atrium's session
+    factory sets ``expire_on_commit=False``, so an instance already in
+    the identity map keeps its loaded collections across a commit and
+    an eager loader will not overwrite them. Without this, the re-read
+    :func:`set_hostname_publishing` does after writing returns the
+    *pre-write* collection and the endpoint answers 200 describing the
+    state it just replaced — a report about the thing reported,
+    indistinguishable from success. Measured: the selection was written
+    correctly and the response said the name still inherited its zone.
+    """
+    hostname = (
+        (
+            await session.execute(
+                scope.select(Hostname)
+                .where(Hostname.id == hostname_id)
+                .options(
+                    selectinload(Hostname.domain).selectinload(Domain.backends),
+                    selectinload(Hostname.selected_backends),
+                )
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if hostname is None:
+        raise _not_found("hostname")
+    return hostname, hostname.domain
+
+
+@router.get(
+    "/hostnames/{hostname_id}/backends", response_model=HostnamePublishingOut
+)
+async def get_hostname_publishing(
+    hostname_id: int,
+    _user: User = Depends(require_perm(HOSTNAME_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> HostnamePublishingOut:
+    """What this name publishes to, and at what TTL.
+
+    Reports the **stored** state and the **resolved** state side by
+    side (``selected`` / ``inherits_backends`` against ``publishes_to``,
+    ``ttl`` against ``effective_ttl``). Reporting only one of them is
+    how a three-level fallback gets rendered as a value somebody then
+    edits — and the state where they differ is not an edge case, it is
+    every hostname that has never been touched.
+    """
+    hostname, domain = await _load_publishing(session, scope, hostname_id)
+    return _publishing_out(hostname, domain)
+
+
+@router.put(
+    "/hostnames/{hostname_id}/backends", response_model=HostnamePublishingOut
+)
+async def set_hostname_publishing(
+    hostname_id: int,
+    body: HostnamePublishingIn,
+    user: User = Depends(require_perm(HOSTNAME_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> HostnamePublishingOut:
+    """Set the backend selection and the TTL override, together.
+
+    ``PUT`` and not ``PATCH``: this is the whole publishing
+    configuration, and the legacy page submitted it as one form.
+
+    **A backend id that is not on this hostname's zone is a 422, not a
+    silent drop.** The selection is stored as ids and resolved through
+    ``domain.backends``, so a foreign id would simply never appear in
+    ``publishes_to`` — the request would answer 200 and do nothing,
+    which is the worst available outcome. It is named instead, and the
+    ids are the caller's own zone's so naming them tells them nothing
+    they did not send.
+
+    An empty (or ``null``) selection clears the rows and restores
+    inheritance. The response's ``inherits_backends`` says so.
+    """
+    hostname, domain = await _load_publishing(session, scope, hostname_id)
+
+    requested = list(dict.fromkeys(body.backend_ids or []))
+    available = {backend.id for backend in domain.backends}
+    unknown = [backend_id for backend_id in requested if backend_id not in available]
+    if unknown:
+        raise HTTPException(
+            status_code=UNPROCESSABLE,
+            detail=(
+                f"backend id(s) {unknown} are not bound to the zone "
+                f"{domain.name!r}. A selection is resolved through the zone's "
+                f"own bindings, so an id from elsewhere would be stored and "
+                f"never published to. This zone's bindings are "
+                f"{sorted(available)}."
+            ),
+        )
+
+    before_ids = sorted(backend.id for backend in hostname.selected_backends)
+    before_ttl = hostname.ttl
+
+    # Replace wholesale rather than diffing. The set is small (one row
+    # per binding on one zone), the operation is "these, now", and a
+    # diff would need to be right about a case that never arises.
+    await session.execute(
+        scope.apply(
+            sa.delete(HostnameBackend).where(
+                HostnameBackend.hostname_id == hostname.id
+            ),
+            HostnameBackend,
+        )
+    )
+    for backend_id in requested:
+        session.add(
+            HostnameBackend(hostname_id=hostname.id, backend_id=backend_id)
+        )
+    hostname.ttl = body.ttl
+
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity="ddns_hostname",
+        entity_id=hostname.id,
+        action="set_publishing",
+        diff={
+            "backend_ids": {"before": before_ids, "after": sorted(requested)},
+            "ttl": {"before": before_ttl, "after": hostname.ttl},
+        },
+    )
+    await session.commit()
+
+    # Re-read rather than trusting the in-session collections: both
+    # relationships were loaded before the write, and `selected_backends`
+    # is `viewonly` so nothing refreshes it. Rendering the pre-write
+    # state as the result of the write is the "assertion on the report"
+    # failure with a 200 attached.
+    hostname, domain = await _load_publishing(session, scope, hostname_id)
+    return _publishing_out(hostname, domain)
+
+
+@router.post("/hostnames/{hostname_id}/update", response_model=ManualUpdateOut)
+async def manual_update(
+    hostname_id: int,
+    body: ManualUpdateIn,
+    user: User = Depends(require_perm(HOSTNAME_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> ManualUpdateOut:
+    """Publish an address for this name **now**, without waiting for the router.
+
+    The third thing the legacy backends page did. It exists for the
+    moment after a configuration change — a backend added, a TTL
+    corrected, a zone re-delegated — when the record is wrong and the
+    router will not call in for another five minutes.
+
+    **It is the same operation ``/nic/update`` performs, running the
+    same code.** ``load_plans`` resolves the backends and the
+    credentials, ``run_dns_phase`` calls the providers,
+    ``router_nic.aggregate`` decides the answer, ``persist_updates``
+    writes ``last_ip_*`` on ``good`` and nothing on ``nochg``. A second
+    publish loop here would be a second answer to every one of those
+    questions, and the wire's is the one with 124 frozen cases behind
+    it.
+
+    Four refusals, and each is a different sentence:
+
+    * **404** — no such hostname, or not yours. Never 403; see
+      :func:`create_hostname`.
+    * **409 without a device.** The publish is charged to the
+      hostname's device (below), and an unassigned name has no budget
+      to charge. Refusing is the honest answer: `/nic/update` cannot
+      publish that name either, because ownership on the wire is
+      checked against the device. The alternative — an unlimited
+      publish path for exactly the names that have no router — is a
+      strictly worse place to leave the abuse surface.
+    * **422 for an address that is not one.** Through
+      ``auth_device.normalise_address``, the same canonicaliser the
+      wire uses, so ``myip=`` and this body agree about what an address
+      is.
+    * **429 when the device is over its limit.**
+
+    **The rate limit is the device's, not a new one.** ``check_rate_
+    limit`` against ``ddns_rate_limit_event``, bounded by
+    ``ddns_device.rate_limit_per_minute`` falling back to the
+    ``atrium_ddns.rate_limit_per_minute`` namespace setting — the exact
+    control G2 exposes, and the same rows ``/nic/update`` writes. That
+    is deliberate rather than convenient: a separate budget would let a
+    caller draw the provider quota twice, and providers cost money per
+    call. A manual publish and a router publish are the same cost to
+    the same third party, so they come out of the same allowance.
+
+    The refusal is recorded as ``manual_update`` / ``abuse`` in the log,
+    with the limit in ``message`` — the one row kind that carries one
+    (``event-detail-is-populated-only-for-rate-limit-refusals``).
+
+    **A cross-tenant admin publishes as the owner, not as themselves.**
+    The ``DeviceAuth`` built below carries the *zone owner's* id and
+    email, so the log attributes the update to the tenant whose zone
+    moved, and every query behind it runs under
+    ``DdnsScope.for_user_id(owner)`` — which carries no permissions and
+    can therefore reach nothing else. Who pressed the button is
+    recorded separately, in atrium's audit log, where "an admin did
+    this to somebody's zone" belongs.
+    """
+    hostname, domain = await _load_publishing(session, scope, hostname_id)
+
+    if hostname.device_id is None:
+        raise _conflict(
+            f"{hostname.name} is not assigned to a device. A manual update is "
+            "charged against the device's rate-limit budget and attributed to "
+            "it in the log, and an unassigned name has neither. Assign a "
+            "device first — /nic/update cannot publish this name either, for "
+            "the same reason."
+        )
+    device = await scope.get(session, Device, hostname.device_id)
+    if device is None:  # pragma: no cover — the scope reached the hostname
+        raise _not_found("device")
+
+    ip = normalise_address(body.ip)
+    if ip is None:
+        raise HTTPException(
+            status_code=UNPROCESSABLE,
+            detail=(
+                f"{body.ip!r} is not an IP address. /nic/update answers 911 for "
+                f"a myip it cannot parse; this is the same canonicaliser, so "
+                f"the two agree about what an address is."
+            ),
+        )
+    rtype = BaseProvider.getiptype(ip)
+    if rtype is False:  # pragma: no cover — `ip` already parsed
+        raise HTTPException(
+            status_code=UNPROCESSABLE, detail=f"cannot determine a record type for {ip}"
+        )
+
+    owner_email = (
+        await session.execute(select(User.email).where(User.id == domain.user_id))
+    ).scalar_one_or_none()
+    auth = DeviceAuth(
+        device=device, user_id=domain.user_id, user_email=owner_email or ""
+    )
+
+    config = await load_config(session)
+    limit = effective_rate_limit(device, config.rate_limit_per_minute)
+    admitted = await check_rate_limit(
+        session, auth, default_per_minute=config.rate_limit_per_minute
+    )
+    if not admitted:
+        record_event(
+            session,
+            event_type=EVENT_MANUAL_UPDATE,
+            response_code=STATUS_ABUSE,
+            auth=auth,
+            # **With the hostname**, unlike the wire's own abuse row.
+            # `_admit` writes that one before the `hostname` parameter
+            # has been looked at — it has to, there is nothing resolved
+            # yet — so `hostname_id` is NULL there and that NULL is
+            # honest. Here the name is known, and leaving it NULL would
+            # mean "why did my manual publish not happen" returns
+            # nothing on the one filter the log search offers for it.
+            plan=HostnamePlan(
+                requested=hostname.name,
+                lookup=hostname.name,
+                hostname_id=hostname.id,
+                domain_id=domain.id,
+                domain_name=domain.name,
+            ),
+            client_ip=None,
+            ip=ip,
+            message=f"rate limit exceeded ({limit}/minute)",
+        )
+        await commit_after_dns(session, endpoint=EVENT_MANUAL_UPDATE)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                f"{device.name} is over its rate limit of {limit} per minute. "
+                f"A manual update draws on the same budget as the device's own "
+                f"calls, because both cost the provider the same. Recorded in "
+                f"the log as manual_update/abuse."
+            ),
+            headers={"Retry-After": "60"},
+        )
+
+    plans = await load_plans(session, auth, [hostname.name])
+    results = await anyio.to_thread.run_sync(
+        functools.partial(run_dns_phase, plans, op="update", ip=ip, rtype=rtype)
+    )
+    result = results[0]
+
+    await persist_updates(session, auth, results, ip=ip, rtype=rtype)
+    record_hostname_events(
+        session,
+        results,
+        event_type=EVENT_MANUAL_UPDATE,
+        auth=auth,
+        # No `client_ip`: nothing called in. Leaving it NULL says "this
+        # publish had no caller", which is true; filling it with the
+        # operator's browser address would put a helpdesk's IP in the
+        # column the board reads as "where the router is".
+        client_ip=None,
+        ip=ip,
+    )
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity="ddns_hostname",
+        entity_id=hostname.id,
+        action="manual_update",
+        diff={
+            "ip": ip,
+            "rtype": rtype,
+            "status": result.status,
+            "attempts": [
+                {"backend_type": backend_type, "status": attempt_status}
+                for backend_type, attempt_status in result.attempts
+            ],
+        },
+    )
+    await commit_after_dns(session, endpoint=EVENT_MANUAL_UPDATE)
+
+    published_ids = [backend.backend_id for backend in plans[0].backends]
+    return ManualUpdateOut(
+        hostname_id=hostname.id,
+        name=hostname.name,
+        ip=ip,
+        rtype=rtype,
+        # HTTP 200 with a `911` body is on purpose. The operation ran;
+        # `911` is its result, in the vocabulary the whole service uses,
+        # and it is exactly what `/nic/update` answers 200 with. Mapping
+        # provider outcomes onto HTTP status codes would invent a second
+        # vocabulary for the same facts and lose the per-backend detail
+        # in the process.
+        status=result.status,
+        attempts=[
+            BackendAttemptOut(
+                backend_id=backend_id, backend_type=backend_type, status=attempt_status
+            )
+            for backend_id, (backend_type, attempt_status) in zip(
+                published_ids, result.attempts
+            )
+        ],
+        published=result.status == STATUS_GOOD,
+        rate_limit_per_minute=limit,
+        success_response_codes=sorted(SUCCESS_RESPONSE_CODES),
+    )
+
+
+# --------------------------------------------------------------------- #
 # Log search
 # --------------------------------------------------------------------- #
 #
@@ -2474,7 +4022,15 @@ BACKEND_TYPE_NONE = "__none__"
 #: ``test_router_events.py`` re-derives the set from every ``EVENT_*``
 #: constant in ``router_nic`` so a fourth one added there fails here
 #: rather than silently going unfilterable.
-EVENT_TYPES: tuple[str, ...] = tuple(sorted({EVENT_UPDATE, EVENT_DELETE, EVENT_AUTH}))
+#:
+#: **Four now, and the fourth arrived through exactly that mechanism.**
+#: #74's ``POST /hostnames/{id}/update`` writes ``manual_update``, and
+#: the derivation test failed on the commit that added the constant
+#: rather than on the one that shipped an unfilterable row. That is the
+#: rule working; the count is not the point, the writer is.
+EVENT_TYPES: tuple[str, ...] = tuple(
+    sorted({EVENT_UPDATE, EVENT_DELETE, EVENT_AUTH, EVENT_MANUAL_UPDATE})
+)
 
 #: Every ``response_code`` the wire can carry, from the two modules that
 #: own the halves: ``providers.PROVIDER_STATUSES`` is what an adapter
@@ -3052,3 +4608,47 @@ async def get_events(
             filters, vocabulary, cross_tenant=cross_tenant
         ),
     )
+
+
+# --------------------------------------------------------------------- #
+# Operator configuration — the schema the settings form renders from
+# --------------------------------------------------------------------- #
+#
+# #73. The eleven `atrium_ddns.*` settings have been served by atrium's
+# `GET /api/admin/app-config` since #17 and no screen could reach them:
+# the shell's four config sections each pass a *string literal* to the
+# namespace-parameterised mutation hook, and nothing in it derives a
+# namespace from what the admin API returns.
+#
+# The host's settings pages read and write through atrium's own admin
+# endpoints — `GET /api/admin/app-config` for the values,
+# `PUT /api/admin/app-config/atrium_ddns` for the write. This route adds
+# the one thing atrium cannot serve: the *shape*. Atrium's PUT takes a
+# bare `dict[str, Any]`, so the namespace's types and bounds appear
+# nowhere in the OpenAPI document, and a form that hardcoded them would
+# be a second copy of the model with no test able to see it drift.
+#
+# It reads `DdnsConfig.model_json_schema()` — the same schema pydantic
+# validates the PUT against.
+
+
+@router.get("/config/schema", response_model=SettingsSchemaOut)
+async def get_settings_schema(
+    _actor: User = Depends(require_perm(APP_CONFIG_MANAGE_PERMISSION)),
+) -> SettingsSchemaOut:
+    """Every field of the ``atrium_ddns`` namespace, grouped for a form.
+
+    Gated on **atrium's** ``app_setting.manage`` rather than on an
+    `atrium_ddns.*` permission, and the reason is worth stating: the
+    values live in atrium's ``app_settings`` table and are written
+    through atrium's own endpoint, which is gated on exactly that. A
+    host-specific permission here would let a holder open a form whose
+    save button answers 403 — a surface that reads as broken rather than
+    as refused.
+
+    No session and no scope: this is the *description* of a global
+    namespace, identical for every caller, and it touches no tenant row.
+    The values themselves are a different request, to a different
+    endpoint, which applies its own gate.
+    """
+    return settings_schema()

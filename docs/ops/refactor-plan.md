@@ -1210,7 +1210,7 @@ clause §4 never wrote" is kept because the *lesson* outlived the defect.
 | *"The signature element: the resolution strip"* | **holds, with the arrangement corrected** | three rows on a vertical rail, not three columns; already recorded above by #43 |
 | *"Domains are a tenant surface, not an admin one. A user manages their own domains and provider credentials on their own page"* | **holds** | `registerRoute atrium-ddns-domains` `/atrium-ddns/domains`; `GET/POST /api/atrium_ddns/domains`, `POST …/backends`, `PATCH/DELETE /backends/{id}` |
 | *"Cross-tenant views live behind `atrium_ddns.admin` as an admin tab"* | **does not hold** | the admin tab is registered — key `atrium-ddns`, not `atrium-ddns-admin-tab` — and is still the scaffold's counter widget. `atrium_ddns.admin` *does* widen the scope on every model (`scope.py:97,152`), so a holder silently sees every tenant's rows merged into their own board with **no owner column and no way to tell them apart**. **Re-measured 2026-08-16 and now demonstrated rather than described:** an `atrium_ddns.admin` holder created and deleted a name inside another tenant's zone (201 / 204), and its own list endpoint returns rows whose keys contain no `owner` or `user` field at all. #69's hostname surface inherited the same shape. The permission works; the view §4 promised does not exist. The one place cross-tenant was built properly is the log (#46), which uses a *different*, narrower permission and renders a `user` column |
-| *"Configuration collapses. Rate limits, health-check config, retention become one nested group via `registerSettingsGroup`"* | **unbuilt** | `registerSettingsGroup` appears nowhere in the shipped bundle. All 11 settings exist and are served at `GET /api/admin/app-config`; atrium has no generic namespace editor, so they are reachable only by `curl`. §5 opened no issue for this clause. **Re-taken 2026-08-16 against the *served shell bundle* rather than atrium's source, and it holds:** one bundle, no lazy chunks, `atrium_ddns` appears 0 times in it, and the namespace-parameterised `PUT /admin/app-config/${e}` hook has exactly four call sites, every one a literal (`auth`, `brand`, `system`, `i18n`). Nothing derives a namespace from the admin API's own response, so a namespace no screen names is unreachable |
+| *"Configuration collapses. Rate limits, health-check config, retention become one nested group via `registerSettingsGroup`"* | ~~**unbuilt**~~ **holds — built by #73** | ~~`registerSettingsGroup` appears nowhere in the shipped bundle. All 11 settings exist and are served at `GET /api/admin/app-config`; atrium has no generic namespace editor, so they are reachable only by `curl`. §5 opened no issue for this clause. **Re-taken 2026-08-16 against the *served shell bundle* rather than atrium's source, and it holds:** one bundle, no lazy chunks, `atrium_ddns` appears 0 times in it, and the namespace-parameterised `PUT /admin/app-config/${e}` hook has exactly four call sites, every one a literal (`auth`, `brand`, `system`, `i18n`). Nothing derives a namespace from the admin API's own response, so a namespace no screen names is unreachable~~ **#73 (2026-08-16)**: one `registerSettingsGroup atrium-ddns-settings`, `section: 'admin'`, gated on atrium's own `app_setting.manage`, with three children — rate limits, health checks, retention — each a `registerRoute` this bundle serves, all present in the bundle the stack serves. The clause said "one nested group" and got one; it did not say the fields should be *derived*, and they are: the form's types, bounds, defaults and help text come from `DdnsConfig`'s JSON schema over `GET /api/atrium_ddns/config/schema`, so every field is on a page by construction rather than by a list — demonstrated by the merge rather than by argument: #75 added a twelfth field on a parallel branch and it appeared on the Health checks page with its bounds, default and help text, with no page, form or fixture edited. One line of grouping had to change, and the guard named it rather than a reviewer. The observation that made this clause worth writing is unchanged and still true — the shell names no namespace, and `atrium_ddns` still appears **0** times in it. What changed is that the host names it. `ui-parity.md` §3.3 G2 carries the walk, including what it does *not* claim: nobody clicked the sidebar |
 | *"Logs are a first-class search surface… filter by device, domain, hostname, response code, and time range… Admins get a user filter on top"* | **holds in full** | `registerRoute atrium-ddns-logs`; every named filter is implemented (#46), and the admin filter is gated on `atrium_ddns.events.read.all` with an explicit 403 rather than a silent narrowing |
 | *"Users are atrium's, not ours. The old user-management pages disappear"* | **holds** | all 13 legacy auth/user/profile routes are covered by atrium surfaces that answer on the running stack |
 
@@ -1265,13 +1265,30 @@ prune (`atrium_ddns-retention-prune`, registered on the deployed worker,
 `event_retention_days = 30`). That is a *host* feature, not atrium's, so it does
 not fit "deleted because atrium covers it" literally and is not filed there.
 
-**What §4 still owes is one clause and one page.** The unbuilt
+**What §4 still owes is ~~one clause and one page~~ one page.** ~~The unbuilt
 `registerSettingsGroup` clause is 4 of the 10 remaining routes and is the
 largest single block; §5 opened no issue for it and this re-run did not build
-it. The other honest remainder is the per-hostname *backend* screen (2 routes),
-which needs a schema change rather than a page: no per-hostname backend
-selection, no per-hostname TTL, no manual-update endpoint. Both are reported,
-neither is designed around.
+it.~~ The `registerSettingsGroup` clause was 4 of the 10 remaining routes and
+the largest single block; §5 opened no issue for it, #73 was opened for it, and
+**#73 built it** — the table moves to **6 of 39 in neither column, 4 of 22
+pages**. The remaining honest remainder is the per-hostname *backend* screen (2
+routes), which needs a schema change rather than a page: no per-hostname backend
+selection, no per-hostname TTL, no manual-update endpoint. Reported, not
+designed around, and now carried by #74.
+
+**One thing #73 added that §4 did not ask for, and the reason is worth
+keeping.** §4 says configuration collapses into a group; it says nothing about
+where the *shape* of a setting comes from. Atrium's
+`PUT /admin/app-config/{namespace}` takes a bare `dict`, so a namespace's types
+and bounds appear nowhere in the OpenAPI document, and a form has to get them
+from somewhere. Hardcoding them in the browser is a second copy of the model
+that drifts in the direction that matters — a form offering `0` for
+`health_check_batch_size` against a model requiring `ge=1` produces a 400 the
+operator cannot act on, and one offering `min=1` against a model that later
+allows `0` quietly stops offering a legal value. So the host serves the model's
+own JSON schema and the browser holds no field list at all. Any future host
+settings surface in this codebase should do the same; the alternative is not
+visible in review.
 
 ---
 
@@ -1351,6 +1368,34 @@ existing terminator (the old service already runs one) routing a hostname to
 `127.0.0.1:8443`, or accept HTTP **only** while no real device credential has
 been issued yet. Decide before the first device is created, not after.
 
+**Settled: the new stack runs its own terminator.** The `proxy` profile in
+`compose.yaml` puts Traefik 3.7 on 8443 in front of `api`, serving a certificate
+*extracted* from the old service's ACME store rather than sharing that store —
+one `acme.json`, one writer, and a second ACME-capable instance pointed at it
+corrupts the account key rather than merging. `api` moved to
+`127.0.0.1:8444` so the only listener reachable from off-host is the TLS one.
+`scripts/extract-acme-cert.sh` + `make tls-up` / `make tls-refresh` do it, and
+`make tls-verify HOST=<name>` proves the chain rather than assuming it. What
+happens to the borrowed arrangement at cutover — and the order the hand-over has
+to happen in, because the store's only writer must stop *before* the copy is
+taken — is `docs/ops/cutover.md` § 2.2 and § 5.4.
+
+**Two networking facts the cutover depends on, measured 2026-08-15.** Both
+belong here rather than only in the runbook, because they are properties of the
+deployment shape rather than of the cutover procedure:
+
+- **The new stack's docker network is IPv4-only and the old one is not** —
+  `atrium-ddns_default EnableIPv6=false` against
+  `dyndns-route53_web-network EnableIPv6=true`. **68% of production requests are
+  IPv6** (288 of 448 in 24 h) and every successful change in that window was.
+  If the container cannot resolve AAAA, `check_hostnameon_server` fails to
+  `False` — "every failure path answers `False`, which makes the write proceed"
+  — so every IPv6 `nochg` becomes a `good` and a real Route 53 write. Gate it
+  before cutover: `cutover.md` § 2.1.
+- **MySQL is published on `0.0.0.0:13353`.** That is the `.env.example` laptop
+  default and it should be loopback-bound or unmapped before this host serves
+  the real name. Nothing in the stack reaches MySQL through it.
+
 **Port collisions.** The old service binds 80/443 on the host. 8443 is free of
 those, and the compose file already parameterises the API and MySQL host ports
 (`API_HOST_PORT`, `MYSQL_HOST_PORT`) precisely so two stacks can coexist. Set
@@ -1399,10 +1444,28 @@ all gives 404.
 node builder image 25 → 26-alpine. Gate re-run on the new base: green.
 
 **The borrowed TLS certificate is accepted as-is** until atrium-ddns replaces
-the old service. No refresh automation. It goes stale around **24 Aug** when the
-old Traefik renews; from then the site serves an expired certificate until
-someone re-extracts. That is a known, accepted cost of a temporary measure —
-see §5b.
+the old service. No refresh automation. ~~It goes stale around **24 Aug** when
+the old Traefik renews; from then the site serves an expired certificate until
+someone re-extracts.~~ **Corrected 2026-08-15 — stale and expired are four weeks
+apart, and the original wording conflated them.** Measured by two instruments
+that agree to the second (the extracted `cert.pem`, and an independent decode of
+the live ACME store): `notBefore=Jun 25 14:53:30 2026 GMT`,
+`notAfter=Sep 23 14:53:29 2026 GMT`, one resolver, one certificate, three chain
+blocks.
+
+So the clock has two hands, not one:
+
+- **~24 Aug** — the old Traefik hits 30 days before expiry and renews. From then
+  the two stacks present *different* certificates. The copy is **stale**; it is
+  still a valid, trusted, unexpired Let's Encrypt certificate. `make tls-refresh`
+  re-syncs it in seconds.
+- **23 Sep** — the copy actually expires. Only from here does TLS on 8443 fail.
+
+That still makes it a temporary measure with a real deadline; it is just a
+deadline in September rather than in August, which is a month of headroom the
+earlier wording gave away. The hand-over that ends the borrowing — old writer
+stops, store is copied, new stack starts and owns ACME, in that order — is
+`docs/ops/cutover.md` § 4 and § 5.4. See also §5b.
 
 ---
 

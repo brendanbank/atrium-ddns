@@ -90,8 +90,47 @@ export function providersQuery(options: { enabled: boolean }) {
   });
 }
 
-export async function createDomain(name: string): Promise<Domain> {
-  return apiSend<Domain>('/atrium_ddns/domains', 'POST', { name });
+/** `POST /api/atrium_ddns/domains` — the zone and, #88, its first
+ *  provider in one submission.
+ *
+ * `backend` is `null` for the "add a provider later" path and is sent
+ * as an explicit `null` rather than omitted, so the request body says
+ * which of the two shapes it is. The server creates both rows in one
+ * transaction: a credential it refuses takes the zone with it, rather
+ * than leaving behind a zone that answers `911` for every update under
+ * it while the browser reports a failure.
+ *
+ * That atomicity is the reason this is one call and not two. Two calls
+ * from here would have a half-succeeded state with no owner — and it is
+ * exactly the state the design says must never be arrived at by
+ * accident.
+ */
+export async function createDomain(input: {
+  name: string;
+  backend: BackendWrite | null;
+}): Promise<Domain> {
+  return apiSend<Domain>('/atrium_ddns/domains', 'POST', {
+    name: input.name,
+    backend: input.backend,
+  });
+}
+
+/** `PATCH /api/atrium_ddns/domains/{id}` — the rename, #75 / §3.3 G4.
+ *
+ * `PATCH`, not `PUT`: `PUT` is still `405` and that is the server's
+ * decision rather than an omission — every partial mutation on this
+ * surface is a `PATCH`, and a second spelling of one operation is how a
+ * divergent validation path starts.
+ *
+ * The server refuses (`409`) a rename that would leave any hostname
+ * outside the zone, rather than rewriting the names. **Nothing here
+ * pre-checks that**, deliberately: containment is decided by
+ * `zone_contains`, the same function object `/nic/update` reaches, and
+ * a second copy of the rule in TypeScript would be a copy that could
+ * disagree with the wire. The form shows the server's refusal.
+ */
+export async function renameDomain(id: number, name: string): Promise<Domain> {
+  return apiSend<Domain>(`/atrium_ddns/domains/${id}`, 'PATCH', { name });
 }
 
 export async function deleteDomain(id: number): Promise<void> {

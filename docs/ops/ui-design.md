@@ -833,3 +833,284 @@ shape that carries `DnsCheckStatus`, `Liveness` and `window_days` to the
 frontend (this document specifies what must arrive, not the endpoint), and
 whether the log-search surface reuses the strip's station labels or gets its own
 vocabulary.
+
+---
+
+# Part II — the usability pass
+
+*Added after the first operator session with the deployed UI. §0–§7 designed the
+**display**: the strip, the board, the palette. Nothing there was wrong. What
+follows fixes the **information architecture around it**, which had never been
+designed at all — it was inherited from the schema.*
+
+## 8. The diagnosis: the IA is a picture of the database
+
+Five complaints came out of one session. Sorted by symptom they look like five
+problems. Sorted by cause they are one:
+
+| what the operator hit | the schema fact it mirrors |
+|---|---|
+| no provider can be chosen when creating a zone | `Domain` and `DomainBackend` are two tables, so they became two forms |
+| a device's name cannot be edited | `DeviceUpdateIn` is a PATCH body, and PATCH was added for one field |
+| a name must be typed as a full FQDN although its zone was just selected | the form is a thin wrapper over `HostnameCreateIn{name, domain_id}` |
+| the device list does not scale | a flat list is what a table looks like |
+| the zone list does not scale | " |
+
+**Every surface is one table, every form is one request body, and every list is
+one `SELECT`.** That is a faithful rendering of the data model and a poor
+rendering of the job. §0 already said what the job is — *which of my names no
+longer points where I think it does* — and no operator holds that question one
+table at a time.
+
+### 8.1 The measurement that makes this more than taste
+
+A zone with no provider bound to it is not an incomplete draft. It is a zone
+whose every update answers **`911`**, and that is frozen, not inferred:
+
+```
+tests/compat/protocol_cases.yaml:211
+  update/no-backends-911: "hostname owned, but zero backends -> 911 {ip}"
+  id: update-911-hostname-with-zero-backends       (+ the -ipv6 twin)
+```
+
+`911` is the DynDNS v2 code for *the service is broken, stop asking* — clients
+are specified to back off hard on it, and a well-behaved router will stop
+retrying for hours.
+
+So the current create-zone modal, which offers exactly one field and a Create
+button, **manufactures that state in one click and then renders it identically
+to a working zone.** That is the precise inverse of §0's thesis, which is that
+the product exists for the exceptional row. The exceptional row is being drawn
+in the same ink as the other 500.
+
+That is the whole argument for Part II. It is not that the flow has too many
+steps; it is that one of the states it can leave behind is indistinguishable
+from success and is not success.
+
+## 9. The rule: fold in what cannot stand alone
+
+> **If an object cannot do its job alone, it is not a separate surface. It is
+> part of the object it completes.**
+
+A zone with no provider publishes nowhere. A device with no secret cannot
+authenticate. Neither is a legitimate resting state, so neither gets its own
+page to be stranded on.
+
+This is deliberately *not* "put everything on one page". `Hostname` **can** stand
+alone — the model allows a name to exist before a device is assigned, on
+purpose, and `ON DELETE SET NULL` keeps it alive when its device is deleted. So
+a name stays its own object with its own surface. The rule is a test, and it has
+to be able to return false or it is just a preference.
+
+Applying it:
+
+| object | folds in | stays separate |
+|---|---|---|
+| **Zone** | its provider bindings | — |
+| **Device** | its credential, its limit | its hostnames (they outlive it) |
+| **Name** | — | its zone, its device |
+
+Three objects. Down from five surfaces, and the reduction is derived rather
+than chosen.
+
+## 10. Zones and providers are one object
+
+### 10.1 Creating
+
+The create-zone form asks for the zone **and its first provider**, in one
+submission, because a zone without one answers `911`.
+
+```
+┌─ Add a zone ─────────────────────────────────────────┐
+│                                                      │
+│  ; zone                                              │
+│  [ example.invalid                              ]    │
+│  Stored lower-cased, no trailing dot. Unique across  │
+│  the whole installation — DNS is global.             │
+│                                                      │
+│  ; publishes through                                 │
+│  [ Route 53                                    ▾]    │
+│  …provider credential fields, per adapter…           │
+│                                                      │
+│  ─────────────────────────────────────────────────   │
+│  ⚠ Add a provider later                    [ Add ]   │
+│                                                      │
+└──────────────────────────────────────────────────────┘
+```
+
+**"Add a provider later" is a link, not a checkbox, and it is not the default.**
+The path stays open — an operator staging a migration has a real reason to
+create a zone before its credentials exist — but it is a deliberate act with its
+consequence written next to it, rather than the thing that happens when you fill
+in the only field on offer.
+
+Taking it renders the zone in the diverged treatment (§1, `--ddns-diverge`) with
+the wire consequence stated in the operator's terms, not the protocol's:
+
+```
+  example.invalid          ⚠ publishes nowhere
+  ; every update for a name in this zone answers 911
+```
+
+Not "no backends configured". The operator does not own a backend; they own a
+zone that does or does not work.
+
+### 10.2 The zone detail route
+
+`/atrium-ddns/zones/:id`. A route, not a modal and not a drawer — see §12.
+
+```
+  ← zones
+
+  example.invalid                                      [ Rename ] [ Delete ]
+  ; 12 names · 2 providers · created 4 Mar 2026
+
+  ; publishes through
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Route 53              ttl 300      credentials set   [ Edit ]   │
+  │  Hetzner DNS           ttl 300      credentials set   [ Edit ]   │
+  └──────────────────────────────────────────────────────────────────┘
+                                                    [ Add a provider ]
+
+  ; names in this zone
+  …the existing name rows, filtered to this zone…
+```
+
+Providers are listed *inside* the zone because that is where they live. The
+current build has them nested in an accordion on a shared list page, which is
+the same information one level too deep and three clicks from the thing it
+describes.
+
+## 11. Devices
+
+### 11.1 The name is editable, and the conflict is real
+
+`DeviceUpdateIn` currently documents its own refusal:
+
+> There is no `name` here and no secret. Renaming is a separate change (the
+> create path has a uniqueness conflict to handle and this route does not).
+
+That reasoning is sound and the conclusion has expired: the conflict is
+`uq_ddns_device_user_name` — `UNIQUE(user_id, name)` — and handling it is a
+`409` with the offending name in it, which the create path already does. The
+field goes in; the conflict gets surfaced, not avoided.
+
+**The secret stays out.** Rotation is a different operation with a different
+consequence (the field device stops working until it is reconfigured) and it
+does not belong on the same Save button as a typo fix. It gets its own control,
+its own confirmation, and the existing `SecretOnce` display.
+
+### 11.2 The device detail route
+
+`/atrium-ddns/devices/:id`.
+
+```
+  ← devices
+
+  [ router47                    ]  ✎                  ; active · seen 4m ago
+  ; ddns-a41f0c  ·  created 4 Mar 2026
+
+  ; rate limit
+  [ 30 ] updates per minute      ○ inherit the installation default (30)
+  ; over this, /nic/update answers abuse and publishes nothing
+
+  ; names this device updates
+  …strips, at full width…
+
+  ─────────────────────────────────────────────────────────────────
+  ; credential
+  Rotate the secret — the device stops working until reconfigured  [ Rotate ]
+```
+
+The name is edited **in place at the top**, not in a modal. It is one short
+string with one failure mode; a modal would be heavier than the edit.
+
+## 12. Why a route, and not a drawer or a split pane
+
+The operator asked for "click, then open up a device card where you can edit".
+Three shapes deliver that. The width budget picks one, and it is already
+measured in §3.
+
+- §3.1: one resolution strip needs **≈592px**.
+- §3.6: the board's three-column arrangement needs **≈1436px** and was rejected
+  because atrium's shell gives **1168px** at a 1440px viewport.
+
+A master/detail split at a conventional 360/800 leaves **~790px** for the
+detail. That is one strip up, never two, on a surface whose whole job is
+comparing names. A right drawer at Mantine's `lg` (620px) is **below the
+one-strip minimum** — the signature element would wrap inside its own detail
+view.
+
+A route keeps the full 1168px. It also gets three things the other two cannot:
+
+1. **It is linkable.** An operator pastes a device URL into a ticket.
+2. **Back works.** A drawer teaches the browser nothing.
+3. **The strip stays at the width it was designed for**, so §3's measurements
+   continue to hold instead of being quietly invalidated by a container.
+
+The list rows stay as they are: the list's job is to find the exceptional row,
+and it is already designed to do that. This adds a destination, it does not
+redraw the list.
+
+## 13. The name field: the zone is a suffix, not a retype
+
+Today: select the zone, then type the whole FQDN including that zone. The form
+sends `name.trim()` verbatim.
+
+```
+  ; zone     [ example.invalid                       ▾]
+  ; name     [ home.example.invalid                   ]
+                    └── typed again, from the line above
+```
+
+The zone becomes a fixed suffix rendered inside the field:
+
+```
+  ; zone     [ example.invalid                       ▾]
+  ; name     [ home              ] .example.invalid
+             will send: home.example.invalid
+```
+
+**Paste tolerance is required, not a nicety.** Operators paste FQDNs out of
+zone files and tickets. If what is typed already ends with the selected zone,
+the suffix is not added twice — `home.example.invalid` pasted into the field
+sends `home.example.invalid`, not `home.example.invalid.example.invalid`.
+
+### 13.1 One validator, still
+
+The composition happens in the UI. **The validation does not.** There is no
+TypeScript reimplementation of `zone_contains`, no regex mirroring the label
+rule, no client-side pre-check that can drift from the server.
+
+The UI composes a candidate and shows it; the server accepts or refuses it; the
+refusal is rendered verbatim, which `HostnameList` already does well. This is
+the same rule the backend earned the hard way — a `.strip()` in a parallel
+implementation would have stored `"foo.example.com\n"` as valid while the wire
+answers `notfqdn` — and a suffix-composer in the browser is exactly where a
+second implementation would grow.
+
+The existing `will send:` preview stays, and now earns its place: it is the one
+line that shows what composition did.
+
+## 14. What Part II does not change
+
+1. **The palette.** Still six values. `--ddns-diverge` gets a new *use* (a zone
+   that publishes nowhere) and no new value.
+2. **The strip.** Untouched. §3 and §4 stand.
+3. **The type roles**, the `;` label convention, the mono/prose boundary.
+4. **The board.** It is the monitoring surface and it is not a CRUD list; these
+   routes are reached from the management pages.
+5. **No new element.** Part II adds two routes and moves a form field. §7's
+   closing rule holds: anything a seventh element would add, cut instead.
+
+## 15. What the implementation issues inherit from Part II
+
+1. The rule in §9, including that it must be able to return false.
+2. A zone with zero providers renders as the exceptional row, in wire terms
+   (§10.1). Not as a neutral empty state.
+3. Detail **routes**, on the width argument in §12 — not drawers, not splits.
+4. Device `name` in the PATCH body with `409` on `uq_ddns_device_user_name`;
+   the secret explicitly not in it (§11.1).
+5. Suffix composition in the UI, validation only on the server, paste-tolerant
+   (§13.1).
+6. No new palette value, no new typeface, no new signature element.

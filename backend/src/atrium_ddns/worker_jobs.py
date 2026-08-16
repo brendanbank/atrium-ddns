@@ -1,5 +1,14 @@
 """Scheduled work: DNS health checks and the retention prune.
 
+Since #75 the health check has a **second caller**: the manual trigger
+``POST /api/atrium_ddns/health-checks/run``, which is
+:func:`run_health_checks` with ``due_only=False`` and the requesting
+tenant's scope. It is not a second implementation — see that function's
+docstring for why the difference is one predicate and not a parallel
+sweep — and :func:`clear_health_check_results` next to it is the other
+half of the legacy pair. Everything below about the scheduler still
+describes the only path that *schedules* anything.
+
 Both jobs run in the **worker** process, off ``init_worker(host)`` in
 :mod:`atrium_ddns.bootstrap`. Neither has a request, a session cookie
 or an authenticated user, which is exactly the context in which a
@@ -119,50 +128,183 @@ class DdnsConfig(BaseModel):
     change is retention: 24 hours becomes 30 days, per plan §3.4 — the
     old window was sized for a dashboard and makes "which of my devices
     stopped updating, and when" unanswerable.
+
+    **Every field carries a ``description``, and that is load-bearing
+    rather than documentation.** #73's settings form renders its help
+    text, its bounds and its input type out of this model's JSON schema
+    — so a field added here appears on the form with no frontend change,
+    and a bound tightened here cannot drift from the bound the form
+    offers. ``tests/test_settings_schema.py`` refuses a field with an
+    empty description for the same reason: a number box labelled only
+    ``Prune Max Batches`` is a box an operator has to guess at.
     """
 
     # --- retention ---------------------------------------------------- #
-    event_retention_days: int = Field(default=30, ge=1, le=3650)
+    event_retention_days: int = Field(
+        default=30,
+        ge=1,
+        le=3650,
+        description=(
+            "How long a DNS-update log row is kept before the scheduled "
+            "prune deletes it."
+        ),
+    )
     #: Deliberately *not* ``event_retention_days``. ``ddns_event`` and
     #: ``ddns_rate_limit_event`` answer different questions and
     #: models.py says so explicitly: hanging the limiter off the log's
     #: retention makes "how long do we keep logs" silently also mean
     #: "how far back does the limiter look".
-    rate_limit_event_retention_hours: int = Field(default=24, ge=1, le=8760)
+    rate_limit_event_retention_hours: int = Field(
+        default=24,
+        ge=1,
+        le=8760,
+        description=(
+            "How long the rate limiter's own rows are kept. Deliberately "
+            "separate from the log's retention: these rows are the "
+            "limiter's window, not history."
+        ),
+    )
     #: Rows per committed batch. The lock is held for one batch, not for
     #: the run.
-    prune_batch_size: int = Field(default=1000, ge=1, le=50_000)
+    prune_batch_size: int = Field(
+        default=1000,
+        ge=1,
+        le=50_000,
+        description=(
+            "Rows deleted per committed batch. The lock is held for one "
+            "batch, not for the whole run."
+        ),
+    )
     #: Hard ceiling on batches per tick. A first prune against a large
     #: history stops and says there is more to do rather than holding
     #: the worker for an unbounded time.
-    prune_max_batches: int = Field(default=100, ge=1, le=10_000)
+    prune_max_batches: int = Field(
+        default=100,
+        ge=1,
+        le=10_000,
+        description=(
+            "Ceiling on batches per prune tick. A first prune against a "
+            "large history stops and reports more to do rather than "
+            "holding the worker open."
+        ),
+    )
 
     # --- health checks ------------------------------------------------ #
-    health_check_enabled: bool = True
+    health_check_enabled: bool = Field(
+        default=True,
+        description=(
+            "Whether the scheduled health check resolves hostnames at "
+            "all. Off means the board's 'answered' station stops being "
+            "updated; it does not mean the names stop being published."
+        ),
+    )
     #: How stale a hostname's ``dns_checked_at`` may get before it is
     #: re-checked. **Not** an APScheduler interval: the job ticks on a
     #: fixed short period and selects what is due, so changing this
     #: takes effect on the next tick with no reschedule dance (the
     #: legacy ``reschedule_health_checker`` exists only because the
     #: interval was baked into the trigger at startup).
-    health_check_interval_minutes: int = Field(default=15, ge=1, le=1440)
+    health_check_interval_minutes: int = Field(
+        default=15,
+        ge=1,
+        le=1440,
+        description=(
+            "How stale a hostname's last check may get before it is "
+            "re-checked. Not a scheduler interval: the job ticks often "
+            "and selects what is due, so a change takes effect on the "
+            "next tick with no restart."
+        ),
+    )
     #: Hostnames per tick. Bounds both the DNS fan-out and the write.
-    health_check_batch_size: int = Field(default=200, ge=1, le=10_000)
-    health_check_timeout_seconds: float = Field(default=5.0, ge=0.1, le=60.0)
-    health_check_concurrency: int = Field(default=8, ge=1, le=64)
+    health_check_batch_size: int = Field(
+        default=200,
+        ge=1,
+        le=10_000,
+        description=(
+            "Hostnames resolved per tick. Bounds both the DNS fan-out "
+            "and the write."
+        ),
+    )
+    health_check_timeout_seconds: float = Field(
+        default=5.0,
+        ge=0.1,
+        le=60.0,
+        description=(
+            "Per-query DNS timeout. A fractional value is allowed and is "
+            "the reason this field is not an integer."
+        ),
+    )
+    health_check_concurrency: int = Field(
+        default=8,
+        ge=1,
+        le=64,
+        description=(
+            "How many DNS queries run at once inside one tick."
+        ),
+    )
+    #: Debounce on the **manual** trigger
+    #: (``POST /api/atrium_ddns/health-checks/run``), per actor. Nothing
+    #: on the scheduled path reads it: the scheduler's own cadence is
+    #: ``HEALTH_CHECK_TICK_SECONDS`` and its due-ness filter is
+    #: ``health_check_interval_minutes`` above.
+    #:
+    #: The button fans out to real nameservers — up to
+    #: ``health_check_batch_size`` names × two record types at
+    #: ``health_check_concurrency`` — so it is the one host surface where
+    #: a held-down mouse button is an outbound query storm someone else
+    #: pays for. ``0`` disables the debounce and is a deliberate,
+    #: spellable choice rather than the default.
+    #:
+    #: #75 added this field and #73 added the settings form; they were
+    #: written against the same base and met here. The ``description``
+    #: is #73's requirement of every field on this model — the form
+    #: renders it as the help text under the input — and the sentence is
+    #: #75's own, condensed. Without it this field would still appear on
+    #: the Health checks page, because the page's field list is derived
+    #: from this model rather than typed out, but it would appear as a
+    #: bare number box, and ``test_settings_schema`` refuses that.
+    health_check_manual_cooldown_seconds: int = Field(
+        default=60,
+        ge=0,
+        le=86_400,
+        description=(
+            "Debounce on the manual 'Run health check' button, per "
+            "actor. Nothing on the scheduled path reads it. 0 disables "
+            "the debounce, which is a deliberate choice rather than the "
+            "default: the button fans out to real nameservers."
+        ),
+    )
 
     # --- status board ------------------------------------------------- #
     #: The denominator behind "zero updates in the window". Printed
     #: beside every count this module reports, because a ratio whose
     #: divisor is not named is not a measurement.
-    device_idle_window_days: int = Field(default=7, ge=1, le=365)
+    device_idle_window_days: int = Field(
+        default=7,
+        ge=1,
+        le=365,
+        description=(
+            "The board's denominator — the window 'updates / N d' is "
+            "counted over, and the window a device is called idle for "
+            "producing nothing in."
+        ),
+    )
 
     # --- rate limiting (enforced by #16; the default lives here) ------- #
     #: Installation-wide default; ``ddns_device.rate_limit_per_minute``
     #: overrides it per device and ``NULL`` there means *inherit this*,
     #: which is not the same as ``0``. models.py assigns the namespace
     #: to this issue and the enforcement to #16.
-    rate_limit_per_minute: int = Field(default=30, ge=0, le=10_000)
+    rate_limit_per_minute: int = Field(
+        default=30,
+        ge=0,
+        le=10_000,
+        description=(
+            "Updates a device may make per minute unless it carries its "
+            "own limit. A device's own value overrides this; 0 here "
+            "mutes every device that inherits."
+        ),
+    )
 
 
 # Module top level, in the module that *reads* the namespace.
@@ -317,6 +459,13 @@ class HealthCheckSummary:
     hostnames_considered: int = 0
     hostnames_never_written: int = 0
     hostnames_checked: int = 0
+    #: ``True`` when the staleness filter was skipped — i.e. this run
+    #: re-checked everything in reach rather than what was due. Carried
+    #: on the summary rather than left to the caller to remember,
+    #: because "0 checked" means two different things depending on it:
+    #: on the scheduled path it means *nothing was stale*, and on the
+    #: manual path it means *there is nothing to check at all*.
+    forced: bool = False
     records_checked: int = 0
     ok: int = 0
     mismatch: int = 0
@@ -371,6 +520,7 @@ class HealthCheckSummary:
             "devices_active": self.devices_active,
             "window_days": self.window_days,
             "truncated": self.truncated,
+            "forced": self.forced,
         }
 
 
@@ -585,6 +735,7 @@ async def run_health_checks(
     scope: DdnsScope | None = None,
     session_factory: Any = None,
     config: DdnsConfig | None = None,
+    due_only: bool = True,
 ) -> HealthCheckSummary:
     """Resolve due hostnames, compare against what we last wrote, persist.
 
@@ -599,6 +750,32 @@ async def run_health_checks(
     namespace. The tests pass it because the deployed worker container
     is sweeping the same database they are asserting against, and a job
     firing mid-assertion is a race, not a test.
+
+    ``due_only`` and the manual trigger
+    -----------------------------------
+    ``POST /api/atrium_ddns/health-checks/run`` (#75) is **this
+    function**, called with ``due_only=False`` and the caller's own
+    :class:`~atrium_ddns.scope.DdnsScope`. It is not a second
+    implementation, and that is the whole reason the parameter is a flag
+    on one predicate rather than a parallel sweep in the router: the
+    batch ceiling, the concurrency semaphore, the timeout, the
+    canonical-address comparison, the five-state classification, the
+    transition log line and the accounting assertion are all reached by
+    exactly one path.
+
+    ``due_only=False`` drops the ``dns_checked_at`` staleness clause and
+    nothing else. Keeping it would make the button *"a probe that could
+    not fail"* in the inverse direction — an operator who has just fixed
+    a provider outage presses it, every name was checked four minutes
+    ago and is therefore not due, the run reports ``0 checked`` and the
+    board does not move. That is indistinguishable from a working button
+    against a healthy estate.
+
+    What it does **not** drop is the ``last_ip`` filter: a name we have
+    never published has nothing to compare an answer against, and it is
+    counted in ``hostnames_never_written`` rather than resolved. Nor
+    does it drop ``health_check_batch_size``; a forced run over a large
+    estate returns ``truncated=True`` and says how much it did.
     """
     factory = session_factory or get_session_factory()
     scope = scope or _sweep_scope()
@@ -609,6 +786,7 @@ async def run_health_checks(
             enabled=config.health_check_enabled,
             window_days=config.device_idle_window_days,
             batch_size=config.health_check_batch_size,
+            forced=not due_only,
         )
         if not config.health_check_enabled:
             log.info("atrium_ddns.health_check.disabled")
@@ -643,6 +821,19 @@ async def run_health_checks(
         summary.hostnames_considered = int(totals.total or 0)
         summary.hostnames_never_written = int(totals.never_written or 0)
 
+        # The staleness clause, or a literal `true` when the caller
+        # forced the run. Spelled as a value rather than as two branches
+        # building two statements: one statement, one place the ordering
+        # and the batch ceiling are applied.
+        staleness = (
+            sa.or_(
+                Hostname.dns_checked_at.is_(None),
+                Hostname.dns_checked_at < stale_before,
+            )
+            if due_only
+            else sa.true()
+        )
+
         due_stmt = (
             scope.select(Hostname)
             .where(
@@ -650,10 +841,7 @@ async def run_health_checks(
                     Hostname.last_ip_v4.is_not(None),
                     Hostname.last_ip_v6.is_not(None),
                 ),
-                sa.or_(
-                    Hostname.dns_checked_at.is_(None),
-                    Hostname.dns_checked_at < stale_before,
-                ),
+                staleness,
             )
             # NULLs first: a hostname that has never been checked is more
             # interesting than one checked an hour ago, and without an
@@ -817,6 +1005,103 @@ async def run_health_checks(
     summary.assert_consistent()
     log.info("atrium_ddns.health_check.done", **summary.as_log_fields())
     return summary
+
+
+@dataclass(frozen=True)
+class ClearSummary:
+    """What one ``clear`` did, with its denominator.
+
+    ``cleared`` alone reads identically whether it reset the right rows
+    or every row in the installation, and a clear is a destructive
+    operation whose whole failure mode is reaching further than the
+    caller can see. ``in_scope`` is the population the caller's scope
+    could have touched, read back after the write.
+    """
+
+    cleared: int
+    in_scope: int
+
+
+async def clear_health_check_results(
+    *,
+    scope: DdnsScope,
+    session_factory: Any = None,
+) -> ClearSummary:
+    """Reset every health-check column in ``scope`` to ``NEVER_CHECKED``.
+
+    The legacy ``POST /admin/health-checks/clear``. It writes the four
+    columns :func:`stored_dns_status` reads and nothing else — no
+    hostname is deleted, no ``last_ip`` is touched, and the ``ddns_event``
+    history is untouched. **Clearing a result is not clearing a log**,
+    and the two were separate routes in the legacy service for that
+    reason; ``POST /admin/events/clear`` is the one the operator struck
+    (ui-parity §3.4) and this is not it.
+
+    The state it writes is ``NEVER_CHECKED``, which is the honest one:
+    ``dns_checked_at IS NULL``. Writing ``MISSING`` instead — clearing
+    the addresses and leaving the timestamp — would assert that a check
+    was made and found nothing, which is exactly the ``n/a``-rendered-
+    as-a-measurement defect the five states exist to prevent.
+
+    ``scope`` is required and has no default. Every other entry point in
+    this module falls back to :func:`_sweep_scope`; a destructive write
+    that defaults to *every tenant* is the wrong direction to be
+    convenient in.
+
+    Why the ``UPDATE`` carries a "has a result" predicate
+    ----------------------------------------------------
+    It could be omitted — writing ``NULL`` over ``NULL`` changes
+    nothing — and the first version did omit it. Then ``cleared`` was
+    **1 on a second clear of the same row**, because this driver reports
+    ``rowcount`` as rows *matched* rather than rows *changed*
+    (``CLIENT_FOUND_ROWS``), so the number said "one result discarded"
+    about a row that had none. Found by asserting the second call's
+    count rather than the first's; a test that only pressed the button
+    once agrees with either implementation.
+
+    With the predicate, ``cleared`` is the count of hostnames that
+    actually carried a health-check result, which is what the word
+    means and what an operator is owed beside ``in_scope``. It also does
+    strictly less work.
+    """
+    factory = session_factory or get_session_factory()
+    async with factory() as session:
+        result = await session.execute(
+            scope.apply(
+                sa.update(Hostname)
+                .where(
+                    sa.or_(
+                        Hostname.dns_checked_at.is_not(None),
+                        Hostname.dns_ip_v4.is_not(None),
+                        Hostname.dns_ip_v6.is_not(None),
+                        Hostname.dns_check_error.is_not(None),
+                    )
+                )
+                .values(
+                    dns_checked_at=None,
+                    dns_ip_v4=None,
+                    dns_ip_v6=None,
+                    dns_check_error=None,
+                ),
+                Hostname,
+            )
+        )
+        cleared = int(result.rowcount or 0)
+        await session.commit()
+
+    async with factory() as session:
+        in_scope = int(
+            (
+                await session.execute(
+                    scope.select(Hostname, sa.func.count()).select_from(Hostname)
+                )
+            ).scalar_one()
+        )
+
+    log.info(
+        "atrium_ddns.health_check.cleared", cleared=cleared, in_scope=in_scope
+    )
+    return ClearSummary(cleared=cleared, in_scope=in_scope)
 
 
 # --------------------------------------------------------------------- #
@@ -1160,6 +1445,7 @@ __all__ = [
     "RETENTION_PRUNE_TICK_SECONDS",
     "SUCCESS_RESPONSE_CODES",
     "SWEEP_REASON",
+    "ClearSummary",
     "DdnsConfig",
     "DeviceStatus",
     "DnsCheckStatus",
@@ -1169,6 +1455,7 @@ __all__ = [
     "RecordCheck",
     "Resolve",
     "classify_record",
+    "clear_health_check_results",
     "device_statuses",
     "guarded",
     "load_config",

@@ -70,7 +70,10 @@ function device(overrides: Partial<Device> = {}): Device {
     username: 'ddns-a1b2c3d4e5f6',
     created_at: '2026-08-15T10:00:00Z',
     last_seen_at: '2026-08-15T13:47:00Z',
+    // #73. Two readings, both the server's — `null` is *inherit* and
+    // the resolved value beside it is what the limiter enforces.
     rate_limit_per_minute: null,
+    effective_rate_limit_per_minute: 30,
     credential_origin: 'issued',
     hostname_count: 2,
     ...overrides,
@@ -82,8 +85,14 @@ let currentMe: UserContext | null = null;
 let devicesPayload: Device[] = [];
 let devicesFetches = 0;
 
+/** Every PATCH the page made, with its body. #73's route must carry the
+ *  limit and nothing else, and the only place to see that is the
+ *  request. */
+let patches: { url: string; body: Record<string, unknown> }[] = [];
+
 function stubFetch() {
   devicesFetches = 0;
+  patches = [];
   vi.stubGlobal(
     'fetch',
     vi.fn(async (url: string, init?: RequestInit) => {
@@ -100,6 +109,20 @@ function stubFetch() {
         const created = device({ id: 2, name: 'new-router', hostname_count: 0 });
         devicesPayload = [...devicesPayload, created];
         return json({ device: created, secret: ISSUED_SECRET }, 201);
+      }
+      if (method === 'PATCH') {
+        const body = JSON.parse(String(init?.body ?? '{}'));
+        patches.push({ url, body });
+        const updated = device({
+          ...devicesPayload[0],
+          rate_limit_per_minute: body.rate_limit_per_minute,
+          effective_rate_limit_per_minute:
+            body.rate_limit_per_minute === null
+              ? 30
+              : body.rate_limit_per_minute,
+        });
+        devicesPayload = [updated, ...devicesPayload.slice(1)];
+        return json(updated);
       }
       if (url.endsWith('/rotate')) {
         const rotated = device({ ...devicesPayload[0], credential_origin: 'issued' });
@@ -301,5 +324,105 @@ describe('the empty state', () => {
         'You have no devices yet. Add one to get a DDNS username and password.',
       ),
     );
+  });
+});
+
+describe('the per-device rate limit (#73)', () => {
+  test('the stored value is displayed, and says which of three states it is', async () => {
+    await mount(OPERATOR);
+    await waitFor(() =>
+      expect(
+        screen.getByTestId('limit-summary-home-router'),
+      ).toBeInTheDocument(),
+    );
+    // The fixture inherits, so the number is the installation default
+    // and the sentence says so. "30/min" alone would make *inherited*
+    // and *set to 30* the same string, and only one of them follows a
+    // change to the installation default.
+    expect(screen.getByTestId('limit-summary-home-router')).toHaveTextContent(
+      '30/min, inherited',
+    );
+  });
+
+  test('an explicit value reads as this device’s own, and zero reads as muted', async () => {
+    devicesPayload = [
+      device({ rate_limit_per_minute: 5, effective_rate_limit_per_minute: 5 }),
+    ];
+    await mount(OPERATOR);
+    await waitFor(() =>
+      expect(screen.getByTestId('limit-summary-home-router')).toHaveTextContent(
+        '5/min, set on this device',
+      ),
+    );
+
+    cleanup();
+    queryClient.clear();
+    devicesPayload = [
+      device({ rate_limit_per_minute: 0, effective_rate_limit_per_minute: 0 }),
+    ];
+    await mount(OPERATOR);
+    // Words, not `0/min`. A muted device is a decision; a zero with a
+    // unit after it reads as a measurement.
+    await waitFor(() =>
+      expect(screen.getByTestId('limit-summary-home-router')).toHaveTextContent(
+        'muted — may never call',
+      ),
+    );
+  });
+
+  test('editing the limit PATCHes the limit and only the limit', async () => {
+    await mount(OPERATOR);
+    fireEvent.click(screen.getByTestId('limit-home-router'));
+    await waitFor(() =>
+      expect(screen.getByTestId('limit-input')).toBeInTheDocument(),
+    );
+    // Said before the button: this one does *not* break the device,
+    // which is the whole reason the route exists.
+    expect(screen.getByTestId('limit-explainer')).toHaveTextContent(
+      /does not touch its username or its secret/i,
+    );
+
+    fireEvent.change(screen.getByTestId('limit-input'), {
+      target: { value: '4' },
+    });
+    fireEvent.click(screen.getByTestId('limit-submit'));
+
+    await waitFor(() => expect(patches.length).toBe(1));
+    expect(patches[0].url).toContain('/atrium_ddns/devices/1');
+    // Exactly one key. A body that also carried `name`, `username` or
+    // anything credential-shaped is the thing this route promises not
+    // to be.
+    expect(Object.keys(patches[0].body)).toEqual(['rate_limit_per_minute']);
+    expect(patches[0].body.rate_limit_per_minute).toBe(4);
+
+    await waitFor(() =>
+      expect(screen.getByTestId('limit-summary-home-router')).toHaveTextContent(
+        '4/min, set on this device',
+      ),
+    );
+  });
+
+  test('an emptied box sends null — inherit — and never zero', async () => {
+    devicesPayload = [
+      device({ rate_limit_per_minute: 9, effective_rate_limit_per_minute: 9 }),
+    ];
+    await mount(OPERATOR);
+    fireEvent.click(screen.getByTestId('limit-home-router'));
+    await waitFor(() =>
+      expect(screen.getByTestId('limit-input')).toBeInTheDocument(),
+    );
+    // Seeded from the stored value, not the effective one.
+    expect((screen.getByTestId('limit-input') as HTMLInputElement).value).toBe(
+      '9',
+    );
+    fireEvent.change(screen.getByTestId('limit-input'), {
+      target: { value: '' },
+    });
+    fireEvent.click(screen.getByTestId('limit-submit'));
+
+    await waitFor(() => expect(patches.length).toBe(1));
+    // `null`, not `0`. Coercing an empty box to zero would mute the
+    // device — the opposite of what the user asked for, and silent.
+    expect(patches[0].body.rate_limit_per_minute).toBeNull();
   });
 });

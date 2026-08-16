@@ -20,6 +20,7 @@
 import { useState } from 'react';
 import {
   Alert,
+  Anchor,
   Button,
   Group,
   Modal,
@@ -35,28 +36,49 @@ import {
   createDevice,
   deleteDevice,
   rotateDeviceSecret,
+  updateDeviceLimit,
   type Device,
   type DeviceSecret,
 } from '../api/devices';
-import { absoluteTitle, formatAge } from '../board/format';
+import { absoluteTitle, formatAge, rateLimitSummary } from '../board/format';
+import { deviceHref } from '../paths';
 import { MigratedNotice, SecretOnce } from './SecretOnce';
 
 function DeviceLine({
   device,
   onRotate,
   onDelete,
+  onEditLimit,
   busy,
 }: {
   device: Device;
   onRotate: (device: Device) => void;
   onDelete: (device: Device) => void;
+  onEditLimit: (device: Device) => void;
   busy: boolean;
 }) {
   return (
     <Stack gap="xs" data-testid={`device-${device.name}`}>
       <div className="ddns-device__line" style={{ cursor: 'default' }}>
         <span />
-        <span className="ddns-data">{device.name}</span>
+        {/* #89. The row is the only way to reach `/atrium-ddns/devices/
+            :id` — the route carries a literal `:id`, so it cannot have
+            a nav item, and a destination nothing links to is #75's
+            defect one indirection along. The *name* is the link and the
+            rest of the row is unchanged: §12's "this adds a
+            destination, it does not redraw the list."
+
+            A plain anchor, for `DeviceBoardPage`'s reason: react-
+            router's `Link` is not reachable from this tree and a bare
+            `pushState` would move the address bar without telling
+            atrium's router. */}
+        <Anchor
+          href={deviceHref(device.id)}
+          className="ddns-data"
+          data-testid={`open-${device.name}`}
+        >
+          {device.name}
+        </Anchor>
         <span
           className="ddns-station__time"
           title={absoluteTitle(device.last_seen_at)}
@@ -80,6 +102,15 @@ function DeviceLine({
           size="xs"
           variant="default"
           disabled={busy}
+          onClick={() => onEditLimit(device)}
+          data-testid={`limit-${device.name}`}
+        >
+          Rate limit
+        </Button>
+        <Button
+          size="xs"
+          variant="default"
+          disabled={busy}
           onClick={() => onDelete(device)}
           data-testid={`delete-${device.name}`}
         >
@@ -88,6 +119,16 @@ function DeviceLine({
         <Text size="xs" c="dimmed" data-testid={`names-${device.name}`}>
           {device.hostname_count} hostname
           {device.hostname_count === 1 ? '' : 's'}
+        </Text>
+        {/* #73's AC 4: the stored value is *displayed*, not merely
+            accepted at creation. Unconditionally — a limit shown only
+            when it is unusual is a limit nobody can check. */}
+        <Text
+          size="xs"
+          c="dimmed"
+          data-testid={`limit-summary-${device.name}`}
+        >
+          {rateLimitSummary(device)}
         </Text>
       </Group>
     </Stack>
@@ -103,6 +144,8 @@ export function DeviceList({ devices }: { devices: Device[] }) {
   const [name, setName] = useState('');
   const [limit, setLimit] = useState<number | ''>('');
   const [confirmRotate, setConfirmRotate] = useState<Device | null>(null);
+  const [editingLimit, setEditingLimit] = useState<Device | null>(null);
+  const [nextLimit, setNextLimit] = useState<number | ''>('');
   const [error, setError] = useState<string | null>(null);
 
   const invalidate = () =>
@@ -141,7 +184,37 @@ export function DeviceList({ devices }: { devices: Device[] }) {
     onError: (err: Error) => setError(err.message),
   });
 
-  const busy = create.isPending || rotate.isPending || remove.isPending;
+  // #73. Deliberately its own mutation and not a branch of `create`:
+  // the whole reason this route exists is that changing a limit must
+  // not go anywhere near the credential, and sharing a code path with
+  // the call that mints one is how that stops being true later.
+  const relimit = useMutation({
+    mutationFn: updateDeviceLimit,
+    onSuccess: () => {
+      setEditingLimit(null);
+      setNextLimit('');
+      setError(null);
+      void invalidate();
+    },
+    onError: (err: Error) => setError(err.message),
+  });
+
+  const busy =
+    create.isPending ||
+    rotate.isPending ||
+    remove.isPending ||
+    relimit.isPending;
+
+  const openLimit = (device: Device) => {
+    setEditingLimit(device);
+    // Seeded from the **stored** value, not the effective one: opening
+    // the box on an inheriting device and pressing Save must not turn
+    // an inherited 30 into a per-device 30 that stops following the
+    // installation default.
+    setNextLimit(
+      device.rate_limit_per_minute === null ? '' : device.rate_limit_per_minute,
+    );
+  };
 
   return (
     <Stack gap="md">
@@ -180,6 +253,7 @@ export function DeviceList({ devices }: { devices: Device[] }) {
             device={device}
             busy={busy}
             onRotate={setConfirmRotate}
+            onEditLimit={openLimit}
             onDelete={(target) => remove.mutate(target.id)}
           />
         ))
@@ -233,6 +307,63 @@ export function DeviceList({ devices }: { devices: Device[] }) {
               data-testid="device-submit"
             >
               Create
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
+
+      <Modal
+        opened={editingLimit !== null}
+        onClose={() => setEditingLimit(null)}
+        title={
+          editingLimit ? `Rate limit for ${editingLimit.name}` : 'Rate limit'
+        }
+      >
+        <Stack gap="sm">
+          {/* Said before the button, like the rotate warning next to it
+              — and saying the opposite thing, which is the point of the
+              route: this one does *not* break the device. */}
+          <Text size="sm" data-testid="limit-explainer">
+            This changes how many updates the device may make per minute. It
+            does not touch its username or its secret, so the router keeps
+            working — that is why this exists rather than deleting and
+            recreating the device, which issues a new credential and breaks it
+            until someone reconfigures it.
+          </Text>
+          <NumberInput
+            label="Rate limit (per minute)"
+            description="Leave empty to inherit the installation default. Zero means this device may never call — which is not the same thing."
+            value={nextLimit}
+            min={0}
+            disabled={busy}
+            onChange={(value) =>
+              setNextLimit(typeof value === 'number' ? value : '')
+            }
+            data-testid="limit-input"
+          />
+          {editingLimit ? (
+            <Text size="xs" c="dimmed" data-testid="limit-current">
+              Currently {rateLimitSummary(editingLimit)}.
+            </Text>
+          ) : null}
+          <Group justify="flex-end">
+            <Button
+              size="xs"
+              disabled={busy || editingLimit === null}
+              onClick={() =>
+                editingLimit
+                  ? relimit.mutate({
+                      id: editingLimit.id,
+                      // `null`, not `0`. An empty box means *inherit*;
+                      // coercing it to zero would mute the device.
+                      rate_limit_per_minute:
+                        nextLimit === '' ? null : nextLimit,
+                    })
+                  : undefined
+              }
+              data-testid="limit-submit"
+            >
+              Save
             </Button>
           </Group>
         </Stack>

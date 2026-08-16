@@ -24,6 +24,7 @@ import {
 } from '@brendanbank/atrium-test-utils';
 
 import { HostnamesPage } from '../HostnamesPage';
+import { composeHostname } from '../tenant/HostnameList';
 import { DEVICE_PERMISSION, type Device } from '../api/devices';
 import { DOMAIN_PERMISSION, type Domain } from '../api/domains';
 import { HOSTNAME_PERMISSION, type Hostname } from '../api/hostnames';
@@ -73,6 +74,7 @@ function device(overrides: Partial<Device> = {}): Device {
     created_at: '2026-08-15T10:00:00Z',
     last_seen_at: '2026-08-16T09:00:00Z',
     rate_limit_per_minute: null,
+    effective_rate_limit_per_minute: 30,
     credential_origin: 'issued',
     hostname_count: 1,
     ...overrides,
@@ -190,6 +192,18 @@ async function openTheForm() {
   );
 }
 
+/** The composed string, read off the preview as its own node.
+ *
+ *  Deliberately not a substring match on the sentence. `home.example.net`
+ *  is a substring of `home.example.net..example.net`, so
+ *  `toContain(expected)` would pass on the doubled composition — an
+ *  assertion on the report rather than on the thing reported.
+ */
+function willSend(): string | null {
+  const preview = screen.queryByTestId('hostname-will-send');
+  return preview === null ? null : preview.textContent;
+}
+
 /** Mantine's `Select` is not a `<select>`; open it, then click the
  *  option.
  *
@@ -293,13 +307,15 @@ describe('the device column has three states, not two', () => {
 });
 
 describe('creating a name', () => {
-  test('sends the trimmed name, the zone id and an explicit device', async () => {
+  test('sends the composed name, the zone id and an explicit device', async () => {
+    // The zone is typed once, in the select. What goes in the field is
+    // the part in front of it.
     hostnamesPayload = [];
     await mount(OPERATOR);
     await openTheForm();
     await choose('hostname-zone', ZONE);
     fireEvent.change(screen.getByTestId('hostname-name'), {
-      target: { value: `  attic.${ZONE}  ` },
+      target: { value: '  attic  ' },
     });
     fireEvent.click(screen.getByTestId('hostname-submit'));
 
@@ -317,18 +333,18 @@ describe('creating a name', () => {
     // accept a byte sequence `/nic/update` refuses — so the trim happens
     // here, and it happens *visibly*. Without this line a pasted
     // trailing space produces a refusal about a value that does not look
-    // like what is on screen.
+    // like what is on screen. Since #90 the same line carries the other
+    // half: whether the zone was appended or was already there.
     await mount(OPERATOR);
     await openTheForm();
+    await choose('hostname-zone', ZONE);
     fireEvent.change(screen.getByTestId('hostname-name'), {
-      target: { value: `  attic.${ZONE} ` },
+      target: { value: '  attic ' },
     });
     await waitFor(() =>
       expect(screen.getByTestId('hostname-preview')).toBeInTheDocument(),
     );
-    expect(screen.getByTestId('hostname-preview').textContent).toContain(
-      `attic.${ZONE}`,
-    );
+    expect(willSend()).toBe(`attic.${ZONE}`);
   });
 
   test('a device chosen at creation is sent as its id', async () => {
@@ -346,39 +362,185 @@ describe('creating a name', () => {
   });
 });
 
+/** #90 — the zone is a suffix, not a retype.
+ *
+ * Driven through the DOM rather than against `composeHostname` alone.
+ * A table over a pure function is a table over a function that might
+ * have no caller; typing into the field and reading the preview is the
+ * same table asserted about the thing the operator actually touches.
+ * The pure-function row underneath then only has to prove the two
+ * agree.
+ */
+describe('the zone is a suffix, not a retype', () => {
+  /** what is typed → what leaves the browser, with the zone
+   *  `example.net` selected. `null` means the preview is not rendered
+   *  at all, which is a different state from an empty string. */
+  const TABLE: [label: string, typed: string, composed: string | null][] = [
+    ['a bare label gets the zone appended', 'home', `home.${ZONE}`],
+    [
+      'a pasted FQDN is not suffixed twice',
+      `home.${ZONE}`,
+      `home.${ZONE}`,
+    ],
+    [
+      'a pasted FQDN in a different case is still recognised',
+      `home.${ZONE.toUpperCase()}`,
+      // Sent as typed. The server lower-cases on the way in; the
+      // browser does not, because "what you typed" is what the preview
+      // has to be able to show.
+      `home.${ZONE.toUpperCase()}`,
+    ],
+    [
+      'a trailing dot is not special-cased, and the preview says so',
+      `home.${ZONE}.`,
+      // Deliberate, and pinned so a later "fix" is a decision. A
+      // trailing dot marks the root — a fact about the label rule,
+      // which lives on the server. `zone_contains` answers False for
+      // `foo.example.com.`, so a browser that quietly dropped the dot
+      // would be accepting bytes the server refuses.
+      `home.${ZONE}..${ZONE}`,
+    ],
+    ['trailing whitespace is trimmed, then composed', '  home  ', `home.${ZONE}`],
+    [
+      'a paste with trailing whitespace is trimmed, then recognised',
+      `  home.${ZONE}  `,
+      `home.${ZONE}`,
+    ],
+    [
+      'the zone in the middle is not the zone at the end',
+      // The case the naive `includes()` gets wrong. This name contains
+      // `example.net` and does not end with it, so the suffix is
+      // appended — anything else would send a name outside the zone.
+      `${ZONE}.staging`,
+      `${ZONE}.staging.${ZONE}`,
+    ],
+    ['the apex is left alone', ZONE, ZONE],
+    ['an empty field composes to nothing, not to the zone', '', null],
+    ['whitespace only is also nothing', '   ', null],
+  ];
+
+  test.each(TABLE)('%s', async (_label, typed, composed) => {
+    await mount(OPERATOR);
+    await openTheForm();
+    await choose('hostname-zone', ZONE);
+    fireEvent.change(screen.getByTestId('hostname-name'), {
+      target: { value: typed },
+    });
+    await waitFor(() => expect(willSend()).toBe(composed));
+    // …and the pure composer agrees with what the form rendered, so the
+    // table below can be read as being about either.
+    expect(composeHostname(typed, ZONE)).toBe(composed ?? '');
+  });
+
+  test('the table is not vacuous — composition changed something', () => {
+    // Every row above could pass against `composeHostname = (s) => s`
+    // if the table happened to contain only already-suffixed names.
+    const changed = TABLE.filter(
+      ([, typed, composed]) => composed !== null && composed !== typed,
+    );
+    expect(changed.length).toBeGreaterThan(3);
+    // …and the identity rows are real too, or "not suffixed twice" is
+    // being asserted by a table with no paste in it.
+    const unchanged = TABLE.filter(
+      ([, typed, composed]) => composed !== null && composed === typed,
+    );
+    expect(unchanged.length).toBeGreaterThan(1);
+  });
+
+  test('the field renders the zone as a fixed suffix, and follows the select', async () => {
+    domainsPayload = [domain(), domain({ id: 2, name: 'example.org' })];
+    await mount(OPERATOR);
+    await openTheForm();
+    // Nothing chosen yet: there is no suffix to promise.
+    expect(screen.queryByTestId('hostname-suffix')).not.toBeInTheDocument();
+    await choose('hostname-zone', ZONE);
+    expect(screen.getByTestId('hostname-suffix').textContent).toBe(`.${ZONE}`);
+    // The suffix is a restatement of the row above, so it moves with it.
+    await choose('hostname-zone', 'example.org');
+    expect(screen.getByTestId('hostname-suffix').textContent).toBe(
+      '.example.org',
+    );
+  });
+
+  test('what is previewed is what is posted, byte for byte', async () => {
+    // The preview and the request body are two renderings of one
+    // string. Asserting only the body would let the preview drift into
+    // decoration; asserting only the preview would let it lie.
+    hostnamesPayload = [];
+    await mount(OPERATOR);
+    await openTheForm();
+    await choose('hostname-zone', ZONE);
+    fireEvent.change(screen.getByTestId('hostname-name'), {
+      target: { value: `  attic.${ZONE.toUpperCase()}  ` },
+    });
+    const previewed = willSend();
+    expect(previewed).toBe(`attic.${ZONE.toUpperCase()}`);
+    fireEvent.click(screen.getByTestId('hostname-submit'));
+    await waitFor(() => expect(sent.length).toBe(1));
+    expect(sent[0].body.name).toBe(previewed);
+  });
+});
+
 describe('the bundle does not second-guess the server about validity', () => {
   test('a name the server will refuse is still sent, and the refusal is shown', async () => {
-    // The one assertion this file exists for. `foo` is a dotless label:
-    // it passes the legacy syntax check and is then refused for zone
-    // containment, exactly as `/nic/update` answers `nohost`. A client
-    // regex would have blocked it here — and would have been a third
-    // implementation of a rule two code paths already share.
+    // The one assertion this file exists for, and the guard against the
+    // suffix composer growing into a validator. `bad_label` carries an
+    // underscore, which `_LABEL` in `providers/base.py` rejects — it is
+    // the first thing any client-side hostname regex would block, and
+    // it is composed and posted unchanged. The browser has no opinion.
     hostnamesPayload = [];
     nextFailure = {
       status: 422,
       detail:
-        "'foo' is not inside the zone 'example.net'. /nic/update answers " +
-        'nohost for a hostname outside its domain’s zone, so the row could ' +
-        'be created and never updated.',
+        `'bad_label.${ZONE}' is not a valid hostname. /nic/update answers ` +
+        'notfqdn for it, so the row could be created and never updated.',
     };
     await mount(OPERATOR);
     await openTheForm();
     await choose('hostname-zone', ZONE);
     fireEvent.change(screen.getByTestId('hostname-name'), {
-      target: { value: 'foo' },
+      target: { value: 'bad_label' },
     });
+    // Composition ran — and did not gate. The submit button is live.
+    expect(willSend()).toBe(`bad_label.${ZONE}`);
+    expect(screen.getByTestId('hostname-submit')).not.toBeDisabled();
     fireEvent.click(screen.getByTestId('hostname-submit'));
 
     // It was sent — the browser did not decide.
     await waitFor(() => expect(sent.length).toBe(1));
-    expect(sent[0].body.name).toBe('foo');
+    expect(sent[0].body.name).toBe(`bad_label.${ZONE}`);
 
     // …and the server's own words are what the user reads, including the
     // wire status. Diagnostics in full.
     await waitFor(() =>
       expect(screen.getByTestId('hostname-error')).toBeInTheDocument(),
     );
-    expect(screen.getByTestId('hostname-error').textContent).toContain('nohost');
+    expect(screen.getByTestId('hostname-error').textContent).toContain(
+      'notfqdn',
+    );
+  });
+
+  test('a label the composer cannot help with is still the server’s call', async () => {
+    // A leading hyphen is legal to type, illegal as a label, and
+    // untouched by composition — the second shape a client-side
+    // validator would have caught. `-bad` is refused by `_LABEL`'s
+    // `(?!-)` and the refusal arrives from the server, not from here.
+    nextFailure = {
+      status: 422,
+      detail: `'-bad.${ZONE}' is not a valid hostname (notfqdn).`,
+    };
+    await mount(OPERATOR);
+    await openTheForm();
+    await choose('hostname-zone', ZONE);
+    fireEvent.change(screen.getByTestId('hostname-name'), {
+      target: { value: '-bad' },
+    });
+    fireEvent.click(screen.getByTestId('hostname-submit'));
+    await waitFor(() => expect(sent.length).toBe(1));
+    expect(sent[0].body.name).toBe(`-bad.${ZONE}`);
+    await waitFor(() =>
+      expect(screen.getByTestId('hostname-error')).toBeInTheDocument(),
+    );
   });
 
   test('a duplicate is surfaced as the server phrased it, not as a crash', async () => {
@@ -390,7 +552,7 @@ describe('the bundle does not second-guess the server about validity', () => {
     await openTheForm();
     await choose('hostname-zone', ZONE);
     fireEvent.change(screen.getByTestId('hostname-name'), {
-      target: { value: `home.${ZONE}` },
+      target: { value: 'home' },
     });
     fireEvent.click(screen.getByTestId('hostname-submit'));
     await waitFor(() =>
@@ -423,5 +585,39 @@ describe('the bundle does not second-guess the server about validity', () => {
         'using the same two functions /nic/update uses; a third copy here would ' +
         'be the one nobody tests against the wire.',
     ).toEqual([]);
+  });
+
+  test('exactly one module in the bundle decides that the zone is already there', async () => {
+    // The TypeScript analogue of `router.zone_contains is
+    // providers_base.zone_contains`. There is no function identity to
+    // assert across a language boundary, so the property asserted is
+    // the one that actually matters: **the suffix decision has one
+    // home.** A second copy — in a device form, in a validator helper,
+    // in a "tidy" utils module — is the drift the backend paid for
+    // once, and it is the thing this sweep exists to fail on.
+    const sources = import.meta.glob('../**/*.{ts,tsx}', {
+      query: '?raw',
+      import: 'default',
+      eager: true,
+    }) as Record<string, string>;
+    // Tests are not shipped, and every fetch stub in this directory
+    // matches a URL with `url.endsWith(...)`. The glob resolves them as
+    // `./X.test.tsx` — relative to *this* file — so a `/test/` filter
+    // does not see them and the sweep would name nine offenders that
+    // are all itself.
+    const shipped = Object.entries(sources).filter(
+      ([path]) => !/\.test\.tsx?$/.test(path),
+    );
+    // Vacuity: the glob must have read the bundle, not an empty record.
+    expect(shipped.length).toBeGreaterThan(10);
+    const suffixDeciders = shipped
+      .filter(([, text]) => /\.endsWith\(/.test(text))
+      .map(([path]) => path);
+    expect(
+      suffixDeciders,
+      'more than one module tests whether a name already ends with its ' +
+        'zone. One composer, one caller — see composeHostname’s note on why ' +
+        'this is the assertion that replaces the backend’s identity check.',
+    ).toEqual(['../tenant/HostnameList.tsx']);
   });
 });

@@ -51,7 +51,51 @@ pnpm test                          # vitest — 2 passed (2)
 cd .. && make up && make migrate    # both alembic chains to head
 make test-backend                  # host tests 532 passed + compat 31 passed, 3 skipped
 make smoke PASS=<pw> EMAIL=<addr>  # scripts/smoke.sh — 11 passed (11)
+make test-e2e                      # Playwright — 16 passed (5 spec files), ~35s once the stack is up
 ```
+
+**`make test-e2e` is in the gate from #91, and it is the only instrument
+here that renders anything.** Everything above it is HTTP: the endpoints,
+the bundle's bytes, the registration keys. All of it stayed green through
+the five defects an operator found in one session (#88, #89, #90), because
+a curl cannot see a nav item that never mounted or a board that throws in
+React. It raises its own stack — `make e2e-up` builds, migrates, seeds the
+admin *and* the bundle — so it is a superset of `make up && make migrate`,
+and it needs `ATRIUM_DDNS_COMPAT_STUB=1`, which the target sets in the
+environment rather than in `.env` so a later plain `make up` does not
+inherit a fixture stack. `make e2e-down` deletes the volume.
+
+**One interaction to know before reading a red gate.** `make e2e-up` seeds
+its admin *with TOTP enrolled* (the runner needs to compute codes), so on an
+e2e stack `make smoke PASS=… EMAIL=…` reports **9 passed, 2 failed** —
+`/api/users/me/context` and `/api/atrium_ddns/state` answer `403
+{"code":"totp_required"}` on a cookie that has not passed the challenge.
+That is the account being 2FA-enabled, not the stack being broken;
+`scripts/smoke.sh` says so in its own failure hint. Run `make smoke` with no
+arguments (8 passed, 0 failed) against an e2e stack, or use a stack seeded
+without `--totp-secret` for the credentialed checks.
+
+Two traps it has already paid for, recorded here rather than rediscovered:
+the chromium binary is glibc-only, so Playwright runs on the **host** and
+never in the alpine builder stage; and `pnpm` v10 does not run dependency
+build scripts, so installing `@playwright/test` downloads **no** browser —
+`pnpm exec playwright install chromium` is the explicit step, and it is
+what `make e2e-deps` is for.
+
+**And a third, which is `check-fresh`'s missing fourth guard.** `make e2e-up`
+now ends in `make check-bundle-fresh`, because the host bundle is baked into
+the image exactly like `tests/`, `backend/` and the installed package are —
+and it had no guard. Measured on 2026-08-16: a plain `docker compose up -d
+--build` built an image carrying a newly merged UI, tagged it, and left the
+containers on the previous one. Six specs failed against a UI that was
+correct and merged, the served bundle read 801,320 bytes where the image
+held 815,012, and the only reason it was caught in minutes rather than
+argued about for an hour is that the specs were exercising the new markup.
+**Had they not been, the run would have been green about the wrong bundle.**
+The guard hashes the file inside the image with the container's interpreter
+and the bytes served over the published port with the host's, and names both
+digests when they differ; `e2e-up` also `--force-recreate`s api and worker,
+which is the prevention to the guard's detection.
 
 `make test-backend` grew a second pytest session (#23): the compat suites now
 reach the image via `COPY tests /opt/compat_tests` in the Dockerfile's **`dev`
@@ -111,9 +155,9 @@ per-issue PR into the milestone branch gets **no** GitHub CI at all, so the
 local gate is not a first opinion ahead of a second one: it is the only one.
 That is the contract's own rule (*a local gate as the only quality bar*) made
 literal, and it is safe because the gate is a strict superset of the workflow —
-same typecheck, same vitest suite, same backend tests, plus a smoke test
-against a stack it stood up itself, which CI's `smoke` job also does but only
-after a full image build.
+same typecheck, same vitest suite, same backend tests, same Playwright specs
+(CI's `e2e` job, added by #91), plus a smoke test against a stack it stood up
+itself, which CI's `smoke` job also does but only after a full image build.
 
 Two consequences an agent must not get wrong:
 

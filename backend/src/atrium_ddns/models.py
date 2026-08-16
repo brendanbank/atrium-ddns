@@ -76,6 +76,18 @@ IPV6_LEN = 45
 # the event log has to be able to hold any of them.
 EMAIL_LEN = 320
 
+# The legacy TTL form's ``NumberRange(min=30, max=86400)``, inclusive at
+# both ends — frozen as ``ttl-below-30-is-rejected``,
+# ``ttl-above-86400-is-rejected`` and ``ttl-30-and-86400-are-accepted``,
+# all ``preserve``. They bound what the *editing surface* accepts, not
+# what the write path sends: ``ttl-is-not-validated-on-the-ddns-write-
+# path`` is also ``preserve``, so a row written by something other than
+# the form (the importer, a hand-typed UPDATE) reaches the provider
+# unchanged. Enforced in the request model, deliberately not in the
+# column.
+TTL_MIN = 30
+TTL_MAX = 86400
+
 
 def _utcnow_col(**kwargs: Any) -> Any:
     """A ``DATETIME(6)`` defaulting to the server clock.
@@ -417,6 +429,22 @@ class Hostname(HostBase, TimestampMixin):
     # database must be able to hold that row.
     name: Mapped[str] = mapped_column(String(DNS_NAME_LEN), nullable=False)
 
+    # Per-hostname record TTL. The legacy schema had this column and the
+    # first cut of this one did not, which is why `import_legacy` had to
+    # fold it onto the *binding* and refuse a zone whose names disagreed.
+    # `ttl-is-stored-per-hostname-not-per-domain` is `preserve`.
+    #
+    # **NULL means inherit**, and inherit resolves to
+    # `ddns_domain_backend.config['ttl']`, which itself falls back to
+    # `providers.DEFAULT_TTL` (60 — the same number as the legacy
+    # column's default, `ttl-default-is-60`). NULL is not 0 and not 60:
+    # a hostname that has never been given a TTL follows whatever the
+    # binding says, including a later change to it, and a hostname set
+    # explicitly to 60 does not. Collapsing the two would silently
+    # detach every existing name from its zone's setting the first time
+    # anyone opened the editor.
+    ttl: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     # What we last successfully wrote. Persisted only when the
     # aggregate is `good` — a `nochg` leaves all three untouched, and
     # the compat table asserts that.
@@ -446,11 +474,193 @@ class Hostname(HostBase, TimestampMixin):
     domain: Mapped[Domain] = relationship(back_populates="hostnames")
     device: Mapped[Device | None] = relationship(back_populates="hostnames")
 
+    #: The rows of :class:`HostnameBackend` for this name. Managed
+    #: directly (the endpoint replaces the set wholesale), which is why
+    #: :attr:`selected_backends` beside it is ``viewonly``: two writable
+    #: relationships over one table is the ``overlaps`` warning and,
+    #: worse, two flush orders for one set of rows.
+    selections: Mapped[list[HostnameBackend]] = relationship(
+        back_populates="hostname",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    #: The selected backends themselves, for reading. **Empty is not
+    #: "none"** — see :func:`resolve_backends`, which is the only thing
+    #: that should ever interpret it.
+    #:
+    #: ``order_by`` matches ``Domain.backends`` because
+    #: ``backends-resolution-order-decides-the-aggregate-error`` is
+    #: ``preserve`` and the frozen table's ``firsterr.example.com`` case
+    #: fails if the order moves. :func:`resolve_backends` re-imposes the
+    #: domain's own order anyway, so this is belt and braces rather than
+    #: the mechanism.
+    selected_backends: Mapped[list[DomainBackend]] = relationship(
+        secondary="ddns_hostname_backend",
+        order_by="DomainBackend.id",
+        viewonly=True,
+    )
+
     __table_args__ = (
         UniqueConstraint("name", name="uq_ddns_hostname_name"),
         # The health-check job sweeps "hostnames not checked since X".
         Index("ix_ddns_hostname_dns_checked_at", "dns_checked_at"),
     )
+
+
+class HostnameBackend(HostBase):
+    """One row of *this name publishes to that binding*.
+
+    The legacy ``hostname_backends`` association table, brought across
+    with its semantics intact rather than reinvented — and the semantics
+    are the whole point of the table, because they are not the ones the
+    shape suggests.
+
+    **An empty selection means "every backend on the domain", not "no
+    backends".** That is ``backends-empty-selection-resolves-to-all-of-
+    the-domains-backends``, disposition ``preserve``, and it is also the
+    only reading under which introducing this table is safe: every
+    hostname that exists today has no row here, so the alternative
+    reading would stop the entire migrated fleet publishing at the
+    moment ``0004`` runs — silently, because a router that gets
+    ``911`` logs it and keeps going and nothing on the board says
+    "nobody is publishing this any more".
+
+    The consequence, stated because it is a real cost and not a
+    detail: **"publish nowhere" is not spellable.** Clearing the
+    selection restores the inherit behaviour rather than muting the
+    name. The way to stop publishing a name is to delete it, or to
+    unbind the backend from the zone. The legacy service had the same
+    property for the same reason, and a fourth state
+    (selection-is-empty-and-that-means-nothing) would need a NOT NULL
+    discriminator column on ``ddns_hostname`` and a migration that
+    backfills it — which is precisely the backfill this reading avoids.
+
+    Both foreign keys are ``ON DELETE CASCADE``, so unbinding a backend
+    from a zone takes every hostname's selection of it with it — which
+    is what makes :func:`resolve_backends`'s filter belt-and-braces
+    rather than load-bearing.
+
+    **A surrogate ``id`` with a UNIQUE on the pair, not a composite
+    primary key.** The pair is what is unique and the composite key
+    says so more directly, but every other table here is keyed on a
+    ``BigInteger id`` and so is every generic guard written against
+    them — ``DdnsScope.get`` takes ``pk_attr="id"``, and
+    ``test_tenant_isolation`` parameterises one case per registered
+    model over exactly that. A model that needs each of those guards
+    special-cased is a model that quietly stops being covered by the
+    next one somebody adds. The UNIQUE constraint keeps the property
+    the composite key would have enforced.
+
+    No ``user_id``: the owner is the hostname's domain's owner, two
+    hops away (``scope.TENANT_PATHS``), and a second copy of ownership
+    is a second source of truth for tenancy. No ``updated_at`` either —
+    a selection row is created and destroyed, never edited, so the
+    column could only ever equal ``created_at``. ``created_at`` itself
+    stays, because *when* a name was pinned to a subset is the question
+    somebody asks after a zone stops answering.
+    """
+
+    __tablename__ = "ddns_hostname_backend"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    hostname_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("ddns_hostname.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    backend_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("ddns_domain_backend.id", ondelete="CASCADE"),
+        nullable=False,
+        # The UNIQUE below leads with `hostname_id` and serves "which
+        # backends does this name use". "Which names use this backend"
+        # — what the FK's cascade does on unbind, and what the editor
+        # wants before removing a binding — leads with the other column
+        # and would be a scan without this.
+        index=True,
+    )
+    created_at: Mapped[datetime] = _utcnow_col(nullable=False)
+
+    hostname: Mapped[Hostname] = relationship(back_populates="selections")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "hostname_id", "backend_id", name="uq_ddns_hostname_backend_pair"
+        ),
+    )
+
+
+def resolve_backends(hostname: Hostname) -> list[DomainBackend]:
+    """The backends ``hostname`` publishes to. **The one resolver.**
+
+    The rewrite of the legacy ``Hostname.get_backends()``, and it is a
+    module-level function rather than a method for the same reason
+    ``zone_contains`` is: there must be exactly one of it, reachable by
+    identity from both the wire path (:mod:`atrium_ddns.router_nic`) and
+    the editing path (:mod:`atrium_ddns.router`), so the two cannot
+    answer differently about the same row. V1M3's clearest lesson was a
+    second validator that agreed on the day it was written;
+    ``test_router_hostname_backends.py`` asserts the two call sites hold
+    the same function object.
+
+    Three properties, each with a frozen case behind it:
+
+    * **empty selection -> every backend on the domain**
+      (``backends-empty-selection-resolves-to-all-of-the-domains-
+      backends``). This is the production branch and the reason the
+      ``0004`` migration needs no backfill.
+    * **non-empty selection -> exactly those**
+      (``backends-explicit-selection-wins``).
+    * **the domain's order, either way**
+      (``backends-resolution-order-decides-the-aggregate-error``). The
+      selected set is filtered *out of* ``domain.backends`` rather than
+      returned as loaded, so the aggregate's "first status that is
+      neither good nor nochg" walks the same order in both branches —
+      and a selection row naming a backend that is no longer on this
+      domain (impossible through the API, reachable by a direct write)
+      cannot widen the set.
+
+    **Both relationships must already be loaded.** This is a pure
+    function over ORM state: it issues no IO and it cannot, because a
+    lazy load inside it would be a synchronous database call on the
+    event loop (``MissingGreenlet``, not a slow query). Callers use
+    ``selectinload(Hostname.domain).selectinload(Domain.backends)`` and
+    ``selectinload(Hostname.selected_backends)``.
+    """
+    chosen = {backend.id for backend in hostname.selected_backends}
+    if not chosen:
+        return list(hostname.domain.backends)
+    return [
+        backend for backend in hostname.domain.backends if backend.id in chosen
+    ]
+
+
+def resolve_ttl(hostname: Hostname, backend: DomainBackend) -> Any:
+    """The TTL to publish ``hostname`` at through ``backend``, or ``None``.
+
+    Two levels and a default, in this order:
+
+    1. ``ddns_hostname.ttl`` — the per-name override. NULL means
+       *inherit*, and NULL is the state every row is in until somebody
+       edits one.
+    2. ``ddns_domain_backend.config['ttl']`` — where the rewrite put the
+       TTL when it had no per-name column. Still the fallback rather
+       than dead weight: it is what the importer writes, and it is the
+       right place for "this provider wants a different TTL from that
+       one".
+    3. ``None``, meaning *the caller's default* — resolved to
+       :data:`atrium_ddns.providers.DEFAULT_TTL` by ``router_nic``,
+       which is the only place that knows what a missing TTL costs.
+
+    Returns the raw stored value without range-checking or coercing it;
+    ``ttl-is-not-validated-on-the-ddns-write-path`` is ``preserve`` and
+    ``router_nic._backend_plan`` already owns the int coercion and the
+    ``ddns.backend.bad_ttl`` warning for a value that is not one.
+    """
+    if hostname.ttl is not None:
+        return hostname.ttl
+    return (backend.config or {}).get("ttl")
 
 
 class DnsEvent(HostBase):
@@ -710,6 +920,8 @@ __all__ = [
     "IPV6_LEN",
     "PERMISSIONS",
     "PERMISSION_GRANTS",
+    "TTL_MAX",
+    "TTL_MIN",
     "AtriumDdnsState",
     "Device",
     "DnsEvent",
@@ -717,7 +929,10 @@ __all__ = [
     "DomainBackend",
     "HostBase",
     "Hostname",
+    "HostnameBackend",
     "RateLimitEvent",
     "TimestampMixin",
     "include_object",
+    "resolve_backends",
+    "resolve_ttl",
 ]

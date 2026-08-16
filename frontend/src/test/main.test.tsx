@@ -47,9 +47,25 @@ test('every registered surface still mounts through the wrapper element', async 
   await import('../main');
 
   // Vacuity guard: the sweep has to be over a non-empty population.
-  // Nine — the scaffold's four (home widget, demo page, admin tab,
+  // Fifteen — the scaffold's four (home widget, demo page, admin tab,
   // profile item), the board's one (#44), #45's two tenant pages, #46's
-  // log search, and #69's names page.
+  // log search, #69's names page, #75's help page, #73's three settings
+  // pages, #88's zone detail route and #89's device detail route.
+  //
+  // **This number was resolved as a union at #89's rebase**, and it is
+  // the fourth time that has been necessary. #88 and #89 were written
+  // against the same base, both added a route, and both edited this
+  // line to 14; the merged value is 15 and the named-key list below
+  // carries both keys. Keeping either side's 14 would have compiled,
+  // passed that side's half of the suite, and dropped one surface out
+  // of the sweep — the one thing the sweep exists to prevent.
+  //
+  // #75 and #73 were written against the same base and both edited this
+  // number; the merged value is the **union** (9 + 1 + 3), not either
+  // side's. Worth saying because "whichever side won" is a resolution
+  // that compiles, passes its own half of the suite, and silently drops
+  // a surface from the sweep — which is the one thing this sweep exists
+  // to prevent.
   //
   // An exact count rather than a floor, on purpose (#45's argument,
   // kept): a registration added without going through
@@ -65,22 +81,39 @@ test('every registered surface still mounts through the wrapper element', async 
   // to be 8", so the comment above names what the number is made of —
   // which is what turns that message from a puzzle into an instruction.
   // (#69 was the fourth issue to append here and the message did read as
-  // an instruction, which is the evidence for keeping it.)
+  // an instruction; #75 read `expected 10 to be 9` and #73 read
+  // `expected 12 to be 9`, #88 read `expected 14 to be 13` and #89 read
+  // `expected 15 to be 14`, which is the same evidence four times over.)
   const rendered = [
     ...handles.homeWidgets,
     ...handles.routes,
     ...handles.adminTabs,
     ...handles.profileItems,
   ];
-  expect(rendered.length).toBe(9);
+  expect(rendered.length).toBe(15);
   // Keys are the registry's primary key: two registrations sharing one
-  // silently replace each other, so the count above would still read 9
+  // silently replace each other, so the count above would still read 15
   // while one surface never mounts. Added by #46 because three issues
   // have now appended to this file and the fourth will not have read
   // the other three.
   expect(new Set(rendered.map((entry) => entry.key)).size).toBe(
     rendered.length,
   );
+  // …and the count is not made of the right number of the wrong things.
+  // #73's three pages are named, because "12" would also be satisfied by
+  // three copies of the board.
+  for (const key of [
+    'atrium-ddns-settings-rate-limits',
+    'atrium-ddns-settings-health-checks',
+    'atrium-ddns-settings-retention',
+    'atrium-ddns-zone-detail',
+    'atrium-ddns-device-detail',
+  ]) {
+    expect(
+      rendered.find((entry) => entry.key === key),
+      `${key} was never registered`,
+    ).toBeDefined();
+  }
 
   for (const entry of rendered) {
     const render = entry.render;
@@ -96,6 +129,58 @@ test('every registered surface still mounts through the wrapper element', async 
       'function',
     );
   }
+});
+
+test('the zone detail route is registered with a parameter, and no nav item', async () => {
+  const main = await import('../main');
+
+  const route = handles.routes.find(
+    (entry) => entry.key === 'atrium-ddns-zone-detail',
+  );
+  expect(route, 'the zone detail route was never registered').toBeDefined();
+  // Compared against the module's own constant, not a literal typed
+  // twice — and the constant is what `zoneHref` is built from, so the
+  // registered path and the links pointing at it cannot drift.
+  expect(route!.path).toBe(main.ZONE_ROUTE_PATH);
+  // The parameter is the point. Atrium drops a registered `path`
+  // straight into react-router's `<Route path=…>`, so `:id` is matched
+  // there; a route registered as a literal `/atrium-ddns/zones/:id`
+  // would serve exactly one URL, and it would be the one with a colon
+  // in it.
+  expect(route!.path).toContain('/:id');
+
+  // Deliberately no nav item. Every other surface has one; this is
+  // reached from a row, and a sidebar entry would be a link to a literal
+  // colon.
+  expect(
+    handles.navItems.filter((entry) => entry.to?.startsWith('/atrium-ddns/zones')),
+  ).toEqual([]);
+});
+
+test('the device detail route is registered at the path the list links to', async () => {
+  const main = await import('../main');
+  const paths = await import('../paths');
+
+  const route = handles.routes.find(
+    (entry) => entry.key === 'atrium-ddns-device-detail',
+  );
+  expect(route, 'the device detail route was never registered').toBeDefined();
+  expect(route!.path).toBe(main.DEVICE_DETAIL_PATH);
+
+  // The two halves of one string, checked against each other rather
+  // than against a literal typed twice: the pattern registered with
+  // atrium, and the href the device list composes. A route registered
+  // at a path nothing produces is #75's defect — a surface that exists
+  // and nothing names — and no component test can see it.
+  const href = paths.deviceHref(42);
+  expect(paths.deviceIdFromPath(href)).toBe(42);
+  expect(href.startsWith(`${main.DEVICES_PATH}/`)).toBe(true);
+
+  // …and it deliberately has no nav item. A sidebar entry pointing at a
+  // literal `:id` is a dead link.
+  expect(
+    handles.navItems.find((entry) => entry.to === main.DEVICE_DETAIL_PATH),
+  ).toBeUndefined();
 });
 
 test('the nav item for the board is not permission-gated away', async () => {

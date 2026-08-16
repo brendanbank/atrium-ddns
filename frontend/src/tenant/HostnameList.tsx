@@ -21,9 +21,23 @@
  * third opinion would be worse than a round trip.
  *
  * What the form *does* do is show the exact string it is about to send,
- * because it trims and the API does not. `will send:` is not decoration:
- * without it, a pasted trailing space produces a refusal about a value
- * that does not look like what is on screen.
+ * because it composes and trims and the API does neither. `will send:`
+ * is not decoration: without it, a pasted trailing space produces a
+ * refusal about a value that does not look like what is on screen.
+ *
+ * ## The zone is a suffix, not a retype (#90, design §13)
+ *
+ * The form used to send `name.trim()` verbatim, so the zone chosen in
+ * the select above contributed `domain_id` and nothing else — the
+ * operator picked `example.invalid` and then typed it again. Now the
+ * zone is rendered as a fixed suffix inside the field and
+ * `composeHostname` joins the two.
+ *
+ * The line between *composing* and *validating* is the whole point of
+ * the change, and it is drawn at: **the composer never blocks and never
+ * decides.** It produces one string, that string is what `will send:`
+ * shows, and that string is what leaves the browser. Whether it is a
+ * legal name is answered by the server, once, in its own words.
  */
 import { useState } from 'react';
 import {
@@ -48,12 +62,65 @@ import {
   type Hostname,
 } from '../api/hostnames';
 import { absoluteTitle, formatAge } from '../board/format';
+import { HostnamePublishingModal } from './HostnamePublishingModal';
 
 /** The `value` a Mantine `Select` uses for *no device*. `Select` speaks
  *  `string | null`, and `null` is already how it spells "nothing
  *  chosen" — which is a different fact from "chosen: unassigned". Two
  *  facts, two values. */
 const UNASSIGNED = 'unassigned';
+
+/** Join what was typed to the zone that was selected. Two rules, and
+ *  deliberately no third.
+ *
+ *  1. Trim. The API does not, and a pasted trailing space is otherwise
+ *     a refusal about a value that does not look like what is on screen.
+ *  2. Append `.<zone>` **unless what was typed already ends with the
+ *     zone** — the paste tolerance §13 requires, because operators paste
+ *     FQDNs out of zone files and tickets and
+ *     `home.example.invalid.example.invalid` is not what they meant.
+ *
+ *  ### Why this is not a second `zone_contains`
+ *
+ *  The suffix test here and `providers/base.py`'s `zone_contains` are
+ *  the same string primitive, and saying otherwise would be a dodge:
+ *  `rfind` plus an end-offset check *is* `endsWith`. What makes this not
+ *  the second implementation the backend was warned about is that the
+ *  two answer different questions and only one of them is believed.
+ *  `zone_contains` decides **whether the row may exist**; this decides
+ *  **whether to type four more characters for you**. Nothing branches
+ *  on the answer, nothing is blocked, no request is withheld. Get it
+ *  wrong and the operator sees a wrong string in `will send:` and the
+ *  server refuses it — which is the same outcome as typing it wrong by
+ *  hand, and is why there is no client-side pre-check to drift.
+ *
+ *  ### The trailing dot is deliberately not special-cased
+ *
+ *  `home.example.invalid.` does not end with `example.invalid`, so the
+ *  suffix is appended and `will send:` reads
+ *  `home.example.invalid..example.invalid`. That looks like a bug and is
+ *  a decision. To do better this function would have to know that a
+ *  trailing dot marks the root — a fact about the label rule, which is
+ *  exactly the knowledge §13.1 says must not live here. It is not even
+ *  a harmless fact: `zone_contains('example.com', 'foo.example.com.')`
+ *  is **False**, so a browser that quietly dropped the dot would be
+ *  accepting a byte sequence the server refuses, which is the `.strip()`
+ *  incident rewritten in TypeScript. The preview shows the absurd
+ *  string before anything is sent; one keystroke fixes it.
+ *
+ *  Exported so the table in `HostnamesPage.test.tsx` can drive it
+ *  directly. It has exactly one caller.
+ */
+export function composeHostname(typed: string, zone: string | null): string {
+  const entered = typed.trim();
+  // Nothing typed is nothing to send — not the zone apex. An empty
+  // field is an absence of input, and inventing `example.invalid` from
+  // it would submit a name the operator never wrote.
+  if (entered === '') return '';
+  if (zone === null || zone === '') return entered;
+  if (entered.toLowerCase().endsWith(zone.toLowerCase())) return entered;
+  return `${entered}.${zone}`;
+}
 
 function deviceOptions(devices: Device[]) {
   return [
@@ -70,12 +137,14 @@ function HostnameLine({
   devices,
   onAssign,
   onDelete,
+  onPublishing,
   busy,
 }: {
   hostname: Hostname;
   devices: Device[];
   onAssign: (hostname: Hostname, deviceId: number | null) => void;
   onDelete: (hostname: Hostname) => void;
+  onPublishing: (hostname: Hostname) => void;
   busy: boolean;
 }) {
   return (
@@ -115,6 +184,15 @@ function HostnameLine({
           size="xs"
           variant="default"
           disabled={busy}
+          onClick={() => onPublishing(hostname)}
+          data-testid={`publishing-${hostname.name}`}
+        >
+          Publishing
+        </Button>
+        <Button
+          size="xs"
+          variant="default"
+          disabled={busy}
           onClick={() => onDelete(hostname)}
           data-testid={`delete-hostname-${hostname.name}`}
         >
@@ -140,6 +218,10 @@ export function HostnameList({
   const [zone, setZone] = useState<string | null>(null);
   const [device, setDevice] = useState<string>(UNASSIGNED);
   const [confirmDelete, setConfirmDelete] = useState<Hostname | null>(null);
+  //: The name whose publishing settings are open, or `null`. Held as
+  //: the row rather than as its id so the modal can render the device
+  //: name and the assignment state without a second lookup.
+  const [publishing, setPublishing] = useState<Hostname | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const invalidate = () =>
@@ -174,9 +256,10 @@ export function HostnameList({
   const busy = create.isPending || assign.isPending || remove.isPending;
 
   const selectedZone = domains.find((d) => String(d.id) === zone) ?? null;
-  // Trimmed, because the form trims and the API does not. Shown to the
-  // user rather than applied behind their back.
-  const willSend = name.trim();
+  // Composed and trimmed, because the form does both and the API does
+  // neither. Shown to the user rather than applied behind their back —
+  // this one string is the only thing that leaves the browser.
+  const willSend = composeHostname(name, selectedZone?.name ?? null);
 
   return (
     <Stack gap="md">
@@ -228,6 +311,7 @@ export function HostnameList({
               assign.mutate({ id: target.id, deviceId })
             }
             onDelete={setConfirmDelete}
+            onPublishing={setPublishing}
           />
         ))
       )}
@@ -261,21 +345,59 @@ export function HostnameList({
             label="Name"
             description={
               selectedZone
-                ? `The full name, including the zone — for example home.${selectedZone.name}`
-                : 'The full name, including the zone.'
+                ? 'Just the part in front of the zone — for example home. Pasting the whole name works too; the zone is not added twice.'
+                : 'Pick a zone above, and this becomes just the part in front of it.'
             }
             value={name}
             onChange={(event) => setName(event.currentTarget.value)}
+            /* The zone, fixed, inside the field — §13's whole point. It
+               is never editable and never focusable: it is the row
+               above, restated where it is being used, not a second
+               place to change it. */
+            rightSection={
+              selectedZone ? (
+                <Text
+                  span
+                  size="sm"
+                  c="dimmed"
+                  /* The declared data face, not `ff="monospace"` and not
+                     `className="ddns-data"`. `ff="monospace"` resolves to
+                     Mantine's stack, which is the one §2.1 removed
+                     Courier New from — so it would reintroduce a face the
+                     design rejected. `.ddns-data` carries
+                     `color: var(--ddns-ink)`, which beats `c="dimmed"` and
+                     would paint a value the operator did not type as
+                     loudly as the one they did. No new token either way. */
+                  style={{ fontFamily: 'var(--ddns-font-data)' }}
+                  data-testid="hostname-suffix"
+                >
+                  .{selectedZone.name}
+                </Text>
+              ) : null
+            }
+            rightSectionPointerEvents="none"
+            /* Sized from the string itself rather than from a constant,
+               because the zone is whatever the tenant owns. `ch` is the
+               width of a `0` in the current font and the suffix renders
+               in the mono face, so this is the real width and not an
+               estimate — the input's own padding follows this variable. */
+            rightSectionWidth={
+              selectedZone ? `${selectedZone.name.length + 2.5}ch` : undefined
+            }
             data-testid="hostname-name"
           />
           {willSend === '' ? null : (
             <Text size="xs" c="dimmed" data-testid="hostname-preview">
-              {/* The exact bytes. The server lower-cases on the way in —
-                  `/nic/update` looks the row up lower-cased, so an
-                  upper-cased row would be unreachable — and refuses
-                  anything else it would refuse on the wire. */}
-              will send: <code>{willSend}</code> — stored lower-cased, because
-              that is how <code>/nic/update</code> looks it up.
+              {/* The exact bytes, and now the one line that shows what
+                  composition did — whether the suffix was appended or
+                  recognised as already there. The server lower-cases on
+                  the way in — `/nic/update` looks the row up
+                  lower-cased, so an upper-cased row would be
+                  unreachable — and refuses anything else it would
+                  refuse on the wire. */}
+              will send: <code data-testid="hostname-will-send">{willSend}</code>{' '}
+              — stored lower-cased, because that is how{' '}
+              <code>/nic/update</code> looks it up.
             </Text>
           )}
           <Select
@@ -339,6 +461,14 @@ export function HostnameList({
           </Group>
         </Stack>
       </Modal>
+
+      {/* #74. The three things the legacy `/admin/hostnames/<id>/
+          backends` page did, on the surface the criterion counts as
+          this route's registration. */}
+      <HostnamePublishingModal
+        hostname={publishing}
+        onClose={() => setPublishing(null)}
+      />
     </Stack>
   );
 }

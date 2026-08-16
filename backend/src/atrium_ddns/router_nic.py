@@ -82,7 +82,14 @@ from .auth_device import (
     normalise_address,
     parse_basic_auth,
 )
-from .models import DnsEvent, Domain, Hostname
+from .models import (
+    DnsEvent,
+    Domain,
+    DomainBackend,
+    Hostname,
+    resolve_backends,
+    resolve_ttl,
+)
 from .providers import (
     DEFAULT_TTL,
     RTYPE_A,
@@ -114,6 +121,23 @@ STATUS_911 = STATUS_UNKNOWN_SERVICE
 EVENT_UPDATE = "update"
 EVENT_DELETE = "delete"
 EVENT_AUTH = "auth"
+
+#: A publish this service performed because a *person* asked it to, not
+#: because a router called in (#74's ``POST /hostnames/{id}/update``).
+#:
+#: A distinct value rather than another ``update`` row, for one
+#: operational reason: ``worker_jobs.device_statuses`` derives liveness
+#: from ``event_type == "update"``, so folding manual publishes into it
+#: would make a name look like it had a healthy router behind it because
+#: somebody pressed a button. The board's "this device stopped calling
+#: in" is exactly the question that must not be answerable by the UI's
+#: own traffic.
+#:
+#: It is a **filter option the moment it exists**:
+#: ``router.EVENT_TYPES`` is derived from every ``EVENT_*`` constant in
+#: this module, and ``test_router_events.py`` re-derives it, so a value
+#: added here cannot go unfilterable.
+EVENT_MANUAL_UPDATE = "manual_update"
 
 #: The `checkip` HTML wrapper, byte for byte.
 #:
@@ -313,10 +337,17 @@ def _run_backend(
     return result.get(hostname, STATUS_DNSERR)
 
 
-def _run_dns_phase(
+def run_dns_phase(
     plans: Sequence[HostnamePlan], *, op: str, ip: str | None, rtype: str | None
 ) -> list[HostnameResult]:
     """Every backend call for the whole request. **Blocking.**
+
+    Public since #74: the manual-update endpoint in
+    :mod:`atrium_ddns.router` calls this exact function rather than
+    growing its own publish loop. It was ``_run_dns_phase``; a private
+    name imported from another module is a fiction, and the honest
+    alternative — a second implementation of "ask each backend, then
+    aggregate" — is the one thing the 124 frozen cases could not see.
 
     Called through ``anyio.to_thread.run_sync`` exactly once per
     request. One hop rather than one per backend: a 25-hostname request
@@ -397,7 +428,12 @@ async def load_plans(
                     Hostname.device_id == auth.device.id,
                 )
                 .options(
-                    selectinload(Hostname.domain).selectinload(Domain.backends)
+                    selectinload(Hostname.domain).selectinload(Domain.backends),
+                    # #74. Loaded here, on the event loop, for the same
+                    # reason the domain's backends are: `resolve_backends`
+                    # runs inside the plan build and a lazy load there is
+                    # a synchronous database call from an async context.
+                    selectinload(Hostname.selected_backends),
                 )
             )
         )
@@ -437,15 +473,22 @@ async def load_plans(
                 domain_id=row.domain_id,
                 domain_name=row.domain.name,
                 backends=tuple(
-                    _backend_plan(backend, row.domain, locked)
-                    for backend in row.domain.backends
+                    # `resolve_backends`, not `row.domain.backends`.
+                    # The two are the same list for every row that has
+                    # no selection — which is every row that existed
+                    # before #74's migration — and they part the moment
+                    # a tenant narrows a name to a subset.
+                    _backend_plan(backend, row, locked)
+                    for backend in resolve_backends(row)
                 ),
             )
         )
     return plans
 
 
-def _backend_plan(backend: Any, domain: Domain, locked: set[int]) -> BackendPlan:
+def _backend_plan(
+    backend: DomainBackend, hostname: Hostname, locked: set[int]
+) -> BackendPlan:
     """Flatten one backend row, revealing its credentials.
 
     ``backend.credentials`` is the ``UserSecret`` descriptor; reading it
@@ -453,6 +496,16 @@ def _backend_plan(backend: Any, domain: Domain, locked: set[int]) -> BackendPlan
     A row whose ciphertext is ``NULL`` returns ``None`` without needing
     a key at all, which is why the unlock above is scoped to owners
     that hold ciphertext.
+
+    **The TTL is resolved per (hostname, backend), not per backend.**
+    ``models.resolve_ttl`` takes ``ddns_hostname.ttl`` when it is set
+    and the binding's ``config['ttl']`` when it is not (#74). This
+    function keeps the two things that are genuinely its own: the
+    coercion to ``int`` and the ``DEFAULT_TTL`` fallback for a value
+    that is neither an int nor absent. ``ttl-is-not-validated-on-the-
+    ddns-write-path`` is ``preserve``, so a value inside no particular
+    range is sent as it stands; a value of the wrong *type* is not a
+    range question and would raise inside the provider.
     """
     if backend.credentials_ct is None or backend.user_id in locked:
         credentials: Mapping[str, Any] | None = None
@@ -461,19 +514,23 @@ def _backend_plan(backend: Any, domain: Domain, locked: set[int]) -> BackendPlan
         credentials = None if revealed is None else revealed.reveal()
 
     config = dict(backend.config or {})
-    ttl = config.get("ttl", DEFAULT_TTL)
+    raw_ttl = resolve_ttl(hostname, backend)
+    ttl = DEFAULT_TTL if raw_ttl is None else raw_ttl
     try:
         ttl = int(ttl)
     except (TypeError, ValueError):
         log.warning(
-            "ddns.backend.bad_ttl", backend_id=backend.id, ttl=repr(ttl)
+            "ddns.backend.bad_ttl",
+            backend_id=backend.id,
+            hostname_id=hostname.id,
+            ttl=repr(ttl),
         )
         ttl = DEFAULT_TTL
 
     return BackendPlan(
         backend_id=backend.id,
         backend_type=backend.backend_type,
-        domains=(domain.name,),
+        domains=(hostname.domain.name,),
         credentials=credentials,
         config=config,
         ttl=ttl,
@@ -565,7 +622,7 @@ def record_event(
     )
 
 
-async def _commit(session: AsyncSession, *, endpoint: str) -> None:
+async def commit_after_dns(session: AsyncSession, *, endpoint: str) -> None:
     """Commit, and never let the commit decide the response.
 
     ``event-a-failed-event-write-never-fails-the-request``: a full disk
@@ -694,7 +751,7 @@ def _touch_device(
         device.last_ip_v4 = client_ip
 
 
-def _record_hostname_events(
+def record_hostname_events(
     session: AsyncSession,
     results: Iterable[HostnameResult],
     *,
@@ -786,7 +843,7 @@ async def update(
         request, session, event_type=EVENT_UPDATE, client_ip=client_ip
     )
     if admission.refusal is not None:
-        await _commit(session, endpoint="update")
+        await commit_after_dns(session, endpoint="update")
         return PlainTextResponse(admission.refusal)
     auth = admission.auth
     assert auth is not None  # narrowed by `refusal is None`
@@ -839,11 +896,11 @@ async def update(
 
     plans = await load_plans(session, auth, requested)
     results = await anyio.to_thread.run_sync(
-        functools.partial(_run_dns_phase, plans, op="update", ip=ip, rtype=rtype)
+        functools.partial(run_dns_phase, plans, op="update", ip=ip, rtype=rtype)
     )
 
-    await _persist_updates(session, auth, results, ip=ip, rtype=rtype)
-    _record_hostname_events(
+    await persist_updates(session, auth, results, ip=ip, rtype=rtype)
+    record_hostname_events(
         session,
         results,
         event_type=EVENT_UPDATE,
@@ -851,7 +908,7 @@ async def update(
         client_ip=client_ip,
         ip=ip,
     )
-    await _commit(session, endpoint="update")
+    await commit_after_dns(session, endpoint="update")
 
     # One line per requested hostname, newline-joined, in request order,
     # with no trailing newline. `"\n".join(...)`, asserted byte for byte.
@@ -860,7 +917,7 @@ async def update(
     )
 
 
-async def _persist_updates(
+async def persist_updates(
     session: AsyncSession,
     auth: DeviceAuth,
     results: Sequence[HostnameResult],
@@ -924,7 +981,7 @@ async def _refuse(
         client_ip=client_ip,
         ip=ip,
     )
-    await _commit(session, endpoint=event_type)
+    await commit_after_dns(session, endpoint=event_type)
     return PlainTextResponse(status)
 
 
@@ -967,7 +1024,7 @@ async def delete(
         request, session, event_type=EVENT_DELETE, client_ip=client_ip
     )
     if admission.refusal is not None:
-        await _commit(session, endpoint="delete")
+        await commit_after_dns(session, endpoint="delete")
         return PlainTextResponse(admission.refusal)
     auth = admission.auth
     assert auth is not None
@@ -1007,14 +1064,14 @@ async def delete(
 
     plans = await load_plans(session, auth, requested)
     results = await anyio.to_thread.run_sync(
-        functools.partial(_run_dns_phase, plans, op="delete", ip=None, rtype=rtype)
+        functools.partial(run_dns_phase, plans, op="delete", ip=None, rtype=rtype)
     )
 
     # Delete persists nothing: `last_ip_v4` / `last_ip_v6` /
     # `last_updated_at` are untouched, which the frozen
     # `delete-good-single-backend` records in its `effects:` block and
     # which no runner asserts — `backend/tests/test_router_nic.py` does.
-    _record_hostname_events(
+    record_hostname_events(
         session,
         results,
         event_type=EVENT_DELETE,
@@ -1029,7 +1086,7 @@ async def delete(
         # outside (divergence 1: delete replies carry no IP suffix).
         ip=ip,
     )
-    await _commit(session, endpoint="delete")
+    await commit_after_dns(session, endpoint="delete")
 
     # No IP suffix — divergence 1. `good`, `nochg`, `nohost`, `911`,
     # `dnserr`, bare.
@@ -1054,6 +1111,7 @@ __all__ = [
     "CHECKIP_HTML",
     "EVENT_AUTH",
     "EVENT_DELETE",
+    "EVENT_MANUAL_UPDATE",
     "EVENT_UPDATE",
     "STATUS_911",
     "STATUS_ABUSE",
@@ -1065,7 +1123,11 @@ __all__ = [
     "HostnameResult",
     "aggregate",
     "load_plans",
+    "commit_after_dns",
+    "persist_updates",
     "record_event",
+    "record_hostname_events",
     "router",
+    "run_dns_phase",
     "split_hostnames",
 ]

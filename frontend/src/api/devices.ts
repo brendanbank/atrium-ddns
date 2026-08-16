@@ -47,6 +47,16 @@ export interface Device {
   /** `null` means *inherit the namespace default*, which is not `0`
    *  (may never call). Two states, carried as two. */
   rate_limit_per_minute: number | null;
+  /** What the limiter will actually allow, with `null` already resolved
+   *  against the installation default.
+   *
+   *  Computed on the server by `effective_rate_limit` — the same
+   *  function `/nic/update` calls on the request path. The browser must
+   *  not resolve `null` itself: the installation default lives behind
+   *  `app_setting.manage`, which a plain tenant does not hold, so a
+   *  client-side resolution would either show nothing or invent a
+   *  number. The one on screen is the one enforced, by construction. */
+  effective_rate_limit_per_minute: number;
   credential_origin: CredentialOrigin;
   hostname_count: number;
 }
@@ -76,11 +86,98 @@ export function devicesQuery(options: { enabled: boolean }) {
   });
 }
 
+/** One device, for `/atrium-ddns/devices/:id` (#89).
+ *
+ * Its own request rather than a `find` over the list, because the
+ * reason the detail route exists is that *the list does not scale*
+ * (`ui-design.md` §11.2) and a detail page that fetched every device to
+ * display one would have moved the same `SELECT *` behind a narrower
+ * URL.
+ */
+export async function getDevice(id: number): Promise<Device> {
+  return apiGet<Device>(`/atrium_ddns/devices/${id}`);
+}
+
+/** Its own query key, per id.
+ *
+ * Deliberately *not* a slice of `DEVICES_QUERY_KEY`: a detail page that
+ * read out of the list's cache would render nothing until the list had
+ * been fetched, which on a linked URL pasted into a ticket is the whole
+ * arrival path.
+ */
+export function deviceQuery(id: number | null, options: { enabled: boolean }) {
+  return queryOptions({
+    queryKey: [...DEVICES_QUERY_KEY, id] as const,
+    queryFn: () => getDevice(id as number),
+    enabled: options.enabled && id !== null,
+  });
+}
+
 export async function createDevice(body: {
   name: string;
   rate_limit_per_minute?: number | null;
 }): Promise<DeviceSecret> {
   return apiSend<DeviceSecret>('/atrium_ddns/devices', 'POST', body);
+}
+
+/** Change one device's rate limit. **Nothing else, and not the secret.**
+ *
+ * #73's route. Before it existed the only way to tighten a device's
+ * limit was delete-and-recreate, which mints a new username and a new
+ * secret — so the operator's only route to slowing an abusive device
+ * was to break it until its owner reconfigured the router.
+ *
+ * `null` is a *value* here and means *inherit the installation
+ * default*; `0` means *may never call*. The server requires the key to
+ * be present for exactly that reason: an omitted key and an explicit
+ * `null` would otherwise be the same request, and one of the two
+ * readings un-mutes a device somebody muted on purpose.
+ *
+ * Returns the device as a **read** model — `Device`, not
+ * `DeviceSecret`. There is no field on it that could carry a secret.
+ */
+export async function updateDeviceLimit(body: {
+  id: number;
+  rate_limit_per_minute: number | null;
+}): Promise<Device> {
+  return apiSend<Device>(`/atrium_ddns/devices/${body.id}`, 'PATCH', {
+    rate_limit_per_minute: body.rate_limit_per_minute,
+  });
+}
+
+/** Rename one device. **Still not the secret.**
+ *
+ * #89. `ui-design.md` §11.1: the conflict is `uq_ddns_device_user_name`
+ * — `UNIQUE(user_id, name)` — and the server answers `409` with the
+ * offending name in it. Nothing here catches that and retries with a
+ * suffix; the refusal is the server's words and the form renders them
+ * verbatim, which is the same rule `HostnameList` follows for the
+ * zone-containment refusal.
+ *
+ * **`rate_limit_per_minute` is sent, and it must be the device's
+ * *stored* value.** The server requires the key (#73: `null` is a
+ * value, so an omitted key and an explicit `null` would be one request
+ * and one of the two readings un-mutes a device somebody muted on
+ * purpose). That leaves the rename with an obligation rather than a
+ * choice: it has to re-send what is already stored, and sending
+ * `effective_rate_limit_per_minute` instead would silently pin an
+ * inheriting device to today's installation default — a rename that
+ * quietly stops a device following a setting is exactly the class of
+ * change #73 built this route to avoid.
+ *
+ * Returns the **read** model. There is no field on it that could carry
+ * a secret.
+ */
+export async function renameDevice(body: {
+  id: number;
+  name: string;
+  /** The stored value, `null` for *inherit*. Not the effective one. */
+  rate_limit_per_minute: number | null;
+}): Promise<Device> {
+  return apiSend<Device>(`/atrium_ddns/devices/${body.id}`, 'PATCH', {
+    name: body.name,
+    rate_limit_per_minute: body.rate_limit_per_minute,
+  });
 }
 
 export async function rotateDeviceSecret(id: number): Promise<DeviceSecret> {

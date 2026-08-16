@@ -29,7 +29,23 @@
  * keeps rendering the old two, and every credential it writes is
  * incomplete in a way the server can only refuse or the provider can
  * only fail on.
+ *
+ * ## Why #88 extended this rather than forking it
+ *
+ * The create-zone flow needs the same fields with a zone name above
+ * them and a different submit label. Everything above is the reason a
+ * second copy would be a defect and not a duplication: the mode
+ * selector, `buildCredentialsPayload`, and the server-derived field
+ * list are one implementation of one rule, and the create path is
+ * precisely where a fork would look harmless — a new zone has nothing
+ * stored, so two of the three modes are unreachable and the copy would
+ * pass its own tests on the day it was written.
+ *
+ * So the form grew three optional slots — `header`, `footer`,
+ * `submitLabel` — and no new behaviour. A caller composing around it
+ * cannot change what leaves the browser.
  */
+import type { ReactNode } from 'react';
 import { useState } from 'react';
 import {
   Alert,
@@ -89,14 +105,36 @@ export function BackendForm({
   onSubmit,
   onCancel,
   busy,
+  header,
+  footer,
+  submitLabel = 'Save',
+  submitDisabled = false,
 }: {
   providers: Provider[];
   /** `undefined` for a new binding. When present, the form is editing —
    *  and `credentials_set` is what decides the safe default mode. */
   existing?: DomainBackend;
   onSubmit: (value: BackendFormValue) => void;
-  onCancel: () => void;
+  /** Omitted renders no Cancel button. #88's create-zone modal draws the
+   *  escape hatch as "add a provider later" instead — a different act
+   *  with a different consequence — and a Cancel beside it would offer
+   *  two exits that mean different things and look the same. */
+  onCancel?: () => void;
   busy: boolean;
+  /** Rendered above the provider select. #88 puts the zone name here so
+   *  the zone and its first provider are one submission (design §10.1).
+   *  Deliberately a slot and not a `zoneName` prop: this form knows
+   *  about providers and credentials, and giving it a second subject
+   *  would make it the create-zone form rather than a reusable one. */
+  header?: ReactNode;
+  /** Rendered at the left of the button row — the "add a provider
+   *  later" link. */
+  footer?: ReactNode;
+  submitLabel?: string;
+  /** Additional reason the submit is unavailable, ANDed with the form's
+   *  own. The caller's condition cannot make the button *available*
+   *  when the form's own checks say otherwise. */
+  submitDisabled?: boolean;
 }) {
   const [service, setService] = useState(
     existing?.backend_type ?? providers[0]?.service ?? '',
@@ -144,6 +182,8 @@ export function BackendForm({
           <Text size="sm">{problem}</Text>
         </Alert>
       ) : null}
+
+      {header}
 
       <Select
         label="Provider"
@@ -230,18 +270,28 @@ export function BackendForm({
         </Stack>
       ) : null}
 
-      <Group justify="flex-end">
-        <Button size="xs" variant="default" onClick={onCancel} disabled={busy}>
-          Cancel
-        </Button>
-        <Button
-          size="xs"
-          onClick={submit}
-          disabled={busy || service === ''}
-          data-testid="backend-submit"
-        >
-          Save
-        </Button>
+      <Group justify={footer ? 'space-between' : 'flex-end'} align="center">
+        {footer}
+        <Group gap="xs">
+          {onCancel ? (
+            <Button
+              size="xs"
+              variant="default"
+              onClick={onCancel}
+              disabled={busy}
+            >
+              Cancel
+            </Button>
+          ) : null}
+          <Button
+            size="xs"
+            onClick={submit}
+            disabled={busy || service === '' || submitDisabled}
+            data-testid="backend-submit"
+          >
+            {submitLabel}
+          </Button>
+        </Group>
       </Group>
     </Stack>
   );

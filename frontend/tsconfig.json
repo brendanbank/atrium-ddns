@@ -26,5 +26,10 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src"]
+  // `tests-e2e` is in here on purpose: `pnpm typecheck` is in the gate,
+  // and a Playwright spec that does not compile is a spec that fails at
+  // run time on a stack someone waited five minutes for. The vite lib
+  // build reads `src/main.tsx` alone, so nothing here reaches the
+  // shipped bundle.
+  "include": ["src", "tests-e2e", "playwright.config.ts"]
 }

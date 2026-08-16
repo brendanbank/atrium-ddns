@@ -1,18 +1,23 @@
-/** Zones, provider bindings, and the credential form.
+/** The zone list and the create flow — #88.
  *
- * The assertion this file exists for is the last one:
- * **`test_editing_an_unrelated_field_does_not_touch_the_credential`**
- * drives the real form — open the editor, change the settings JSON,
- * save — and reads the request body that actually left the browser. The
- * unit test in `credentials.test.ts` proves `buildCredentialsPayload`
- * is right; this proves the *form* calls it, with the mode the user is
- * actually looking at, and that nothing between the two turns `''` into
- * something else.
+ * The assertions this file exists for are the create-flow ones. The
+ * defect Part II §8.1 measures is not a missing feature: it is that the
+ * create modal offered one field and a Create button, so **one click
+ * produced a zone that answers `911` for every update under it** and the
+ * list then drew it identically to a working zone.
  *
- * That is the two-instruments rule applied to one rule: a pure function
- * and its caller share an author, so testing the function alone leaves
- * the wiring unmeasured — and the wiring is where "editing a TTL
- * blanked my Route53 key" actually happens.
+ * So the tests below are about what leaves the browser and what is on
+ * screen afterwards:
+ *
+ * - one submission carries the zone **and** its first provider, in one
+ *   request, so the server can make it one transaction;
+ * - "add a provider later" is reachable, is not the default, and states
+ *   its consequence before it can be taken;
+ * - a zone with no provider is marked, in wire terms.
+ *
+ * The provider *bindings* moved to `ZoneDetailPage` (§10.2) and their
+ * tests moved with them — including the blank-preserves assertion, which
+ * is the most important one in this bundle.
  */
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { cleanup, fireEvent, screen, waitFor } from '@testing-library/react';
@@ -31,6 +36,8 @@ import {
   type DomainBackend,
   type Provider,
 } from '../api/domains';
+import { WIRE_CONSEQUENCE } from '../tenant/ZoneStatus';
+import { zoneHref } from '../paths';
 import { queryClient } from '../queryClient';
 
 const OPERATOR: UserContext = {
@@ -77,7 +84,7 @@ function backend(overrides: Partial<DomainBackend> = {}): DomainBackend {
 function domain(overrides: Partial<Domain> = {}): Domain {
   return {
     id: 1,
-    name: 'example.net',
+    name: 'example.invalid',
     created_at: '2026-08-15T10:00:00Z',
     backends: [backend()],
     hostname_count: 3,
@@ -89,8 +96,7 @@ let handles: MockAtriumHandles;
 let currentMe: UserContext | null = null;
 let domainsPayload: Domain[] = [];
 let domainFetches = 0;
-/** Every non-GET request the page made, in order. The instrument for
- *  the blank-preserves assertion. */
+/** Every non-GET request the page made, in order. */
 let sent: { url: string; method: string; body: unknown }[] = [];
 
 function json(body: unknown, status = 200) {
@@ -124,9 +130,6 @@ function stubFetch() {
       if (url.endsWith('/atrium_ddns/domains') && method === 'GET') {
         domainFetches += 1;
         return json(domainsPayload);
-      }
-      if (url.includes('/atrium_ddns/backends/')) {
-        return json(backend());
       }
       return json({});
     }),
@@ -174,142 +177,93 @@ describe('the permission gate', () => {
   test('a holder sees their zones', async () => {
     await mount(OPERATOR);
     await waitFor(() =>
-      expect(screen.getByTestId('domain-example.net')).toBeInTheDocument(),
+      expect(screen.getByTestId('domain-example.invalid')).toBeInTheDocument(),
     );
   });
 });
 
-describe('what a backend row says about its credential', () => {
-  test('a stored credential is a word, never a masked value', async () => {
-    await mount(OPERATOR);
-    await waitFor(() =>
-      expect(screen.getByTestId('credentials-10')).toHaveTextContent(
-        'credential stored',
-      ),
-    );
-    // No mask, no length, no prefix: "a prefix of an API token is still
-    // a disclosure and it is the shape people reach for first."
-    expect(document.body.textContent).not.toMatch(/[•*]{3,}/);
-    expect(document.body.textContent).not.toMatch(/AKIA/);
-  });
-
-  test('no credential stored is a different word, not the same one', async () => {
-    domainsPayload = [
-      domain({ backends: [backend({ credentials_set: false })] }),
-    ];
-    await mount(OPERATOR);
-    await waitFor(() =>
-      expect(screen.getByTestId('credentials-10')).toHaveTextContent(
-        'no credential stored',
-      ),
-    );
-  });
-
-  test('a service this build cannot resolve is named as such', async () => {
-    domainsPayload = [
-      domain({
-        backends: [
-          backend({
-            backend_type: 'unknownsvc',
-            known_service: false,
-            credential_keys: [],
-          }),
-        ],
-      }),
-    ];
-    await mount(OPERATOR);
-    await waitFor(() =>
-      expect(screen.getByTestId('unknown-10')).toHaveTextContent(/911/),
-    );
-  });
-
-  test('a zone with no provider says what that means on the wire', async () => {
+describe('a zone with no provider is the exceptional row', () => {
+  test('it is marked diverged, in the operator’s terms and not the protocol’s', async () => {
     domainsPayload = [domain({ backends: [] })];
     await mount(OPERATOR);
-    await waitFor(() =>
-      expect(screen.getByTestId('domain-example.net')).toHaveTextContent(
-        /updates for this zone answer 911/i,
-      ),
+    const row = await screen.findByTestId('domain-example.invalid');
+
+    // The first of the three channels (§1.2 Rule 3) — the treatment the
+    // stylesheet keys `--ddns-diverge` off. An attribute rather than a
+    // class, so the component does not decide which class means what.
+    expect(row).toHaveAttribute('data-diverged', 'true');
+    // The second and third: the glyph and the word.
+    expect(screen.getByTestId('nowhere-example.invalid')).toHaveTextContent(
+      'publishes nowhere',
     );
+    expect(screen.getByTestId('nowhere-why-example.invalid')).toHaveTextContent(
+      WIRE_CONSEQUENCE,
+    );
+    // …and the wire fact is stated. `911` is what a router actually
+    // receives, and it is the reason this row is marked at all.
+    expect(row).toHaveTextContent(/911/);
+    // Never the protocol's noun. §10.1: "The operator does not own a
+    // backend; they own a zone that does or does not work."
+    expect(row.textContent).not.toMatch(/backend/i);
+  });
+
+  test('a zone that does publish is not marked — agreement has no colour', async () => {
+    // §1.2 Rule 1, and the reason it matters here: if a healthy zone
+    // carried the treatment too, the mark would be on every row and
+    // would mean nothing on any of them.
+    await mount(OPERATOR);
+    const row = await screen.findByTestId('domain-example.invalid');
+    expect(row).toHaveAttribute('data-diverged', 'false');
+    expect(
+      screen.queryByTestId('nowhere-example.invalid'),
+    ).not.toBeInTheDocument();
+    expect(row.textContent).not.toMatch(/911/);
+  });
+
+  test('the row links to the zone’s own route', async () => {
+    // §12's first argument for a route over a drawer: it is linkable.
+    await mount(OPERATOR);
+    const link = await screen.findByTestId('open-domain-example.invalid');
+    expect(link).toHaveAttribute('href', zoneHref(1));
+    expect(link).toHaveAttribute('href', '/atrium-ddns/zones/1');
   });
 });
 
-describe('the credential form', () => {
-  test('defaults to keeping a stored credential', async () => {
+describe('creating a zone', () => {
+  async function openCreate() {
     await mount(OPERATOR);
+    fireEvent.click(screen.getByTestId('add-domain'));
     await waitFor(() =>
-      expect(screen.getByTestId('edit-backend-10')).toBeInTheDocument(),
+      expect(screen.getByTestId('zone-name')).toBeInTheDocument(),
     );
-    fireEvent.click(screen.getByTestId('edit-backend-10'));
-    await waitFor(() =>
-      expect(screen.getByTestId('credential-mode-keep')).toBeChecked(),
-    );
-    // …and the fields are not even rendered, so there is nothing to
-    // accidentally type a partial value into.
-    expect(
-      screen.queryByTestId('credential-aws_access_key_id'),
-    ).not.toBeInTheDocument();
-  });
+  }
 
-  test('editing an unrelated field sends preserve, not a blank', async () => {
-    // The assertion this whole file is for. Read off the request body
-    // that actually left the browser, not off the builder — the builder
-    // and its caller share an author.
-    await mount(OPERATOR);
-    await waitFor(() =>
-      expect(screen.getByTestId('edit-backend-10')).toBeInTheDocument(),
-    );
-    fireEvent.click(screen.getByTestId('edit-backend-10'));
-    await waitFor(() =>
-      expect(screen.getByTestId('backend-config')).toBeInTheDocument(),
-    );
-    fireEvent.change(screen.getByTestId('backend-config'), {
-      target: { value: '{"ttl": 300}' },
-    });
-    fireEvent.click(screen.getByTestId('backend-submit'));
-
-    await waitFor(() => expect(sent.length).toBe(1));
-    const request = sent[0];
-    expect(request.method).toBe('PATCH');
-    expect(request.body).toEqual({
-      config: { ttl: 300 },
-      // `""`, the preserve sentinel — not `null` (which would clear it)
-      // and not an object (which would replace it with whatever the
-      // untouched boxes held).
-      credentials: '',
-    });
-  });
-
-  test('clearing is an explicit choice and sends null', async () => {
-    await mount(OPERATOR);
-    await waitFor(() =>
-      expect(screen.getByTestId('edit-backend-10')).toBeInTheDocument(),
-    );
-    fireEvent.click(screen.getByTestId('edit-backend-10'));
-    await waitFor(() =>
-      expect(screen.getByTestId('credential-mode-clear')).toBeInTheDocument(),
-    );
-    fireEvent.click(screen.getByTestId('credential-mode-clear'));
-    fireEvent.click(screen.getByTestId('backend-submit'));
-
-    await waitFor(() => expect(sent.length).toBe(1));
-    expect((sent[0].body as { credentials: unknown }).credentials).toBeNull();
-  });
-
-  test('replacing sends the object, with fields from the provider', async () => {
-    await mount(OPERATOR);
-    await waitFor(() =>
-      expect(screen.getByTestId('edit-backend-10')).toBeInTheDocument(),
-    );
-    fireEvent.click(screen.getByTestId('edit-backend-10'));
-    await waitFor(() =>
-      expect(screen.getByTestId('credential-mode-replace')).toBeInTheDocument(),
-    );
+  test('the provider is in the form, and it is not optional-looking', async () => {
+    await openCreate();
+    // The zone field and the provider select are in the same submission.
+    expect(screen.getByTestId('zone-name')).toBeInTheDocument();
+    expect(screen.getByTestId('backend-service')).toBeInTheDocument();
+    // …and the credential fields are `BackendForm`'s, derived from
+    // `GET /providers`. A field list retyped into a create-only fork is
+    // the identical defect one release later, and this is the assertion
+    // that the fork does not exist.
     fireEvent.click(screen.getByTestId('credential-mode-replace'));
+    await waitFor(() =>
+      expect(
+        screen.getByTestId('credential-aws_access_key_id'),
+      ).toBeInTheDocument(),
+    );
+    expect(
+      screen.getByTestId('credential-aws_secret_access_key'),
+    ).toBeInTheDocument();
+  });
 
-    // The fields come from `GET /providers`, which derives them from
-    // `BaseProvider.REQUIRED_CREDENTIALS`. A list typed into the
-    // frontend is the identical defect one release later.
+  test('one submission sends the zone and its first provider in one request', async () => {
+    await openCreate();
+    fireEvent.change(screen.getByTestId('zone-name'), {
+      target: { value: '  new.example.invalid  ' },
+    });
+    fireEvent.click(screen.getByTestId('credential-mode-replace'));
     await waitFor(() =>
       expect(
         screen.getByTestId('credential-aws_access_key_id'),
@@ -323,22 +277,46 @@ describe('the credential form', () => {
     });
     fireEvent.click(screen.getByTestId('backend-submit'));
 
+    // **One** request. Two would be able to half-succeed — the zone
+    // lands, the credential is refused — and leave behind exactly the
+    // zero-provider zone this whole issue is about, while telling the
+    // operator their submission failed.
     await waitFor(() => expect(sent.length).toBe(1));
-    expect((sent[0].body as { credentials: unknown }).credentials).toEqual({
-      aws_access_key_id: 'AKIAEXAMPLE',
-      aws_secret_access_key: 'sekrit',
+    expect(sent[0].method).toBe('POST');
+    expect(sent[0].url).toContain('/atrium_ddns/domains');
+    expect(sent[0].url).not.toContain('/backends');
+    expect(sent[0].body).toEqual({
+      // Trimmed by the form, visibly: the API does not strip.
+      name: 'new.example.invalid',
+      backend: {
+        backend_type: 'route53',
+        config: {},
+        credentials: {
+          aws_access_key_id: 'AKIAEXAMPLE',
+          aws_secret_access_key: 'sekrit',
+        },
+      },
     });
   });
 
-  test('a half-filled replacement is refused in the form, not sent', async () => {
-    await mount(OPERATOR);
+  test('the submit is unavailable until the zone has a name', async () => {
+    await openCreate();
+    expect(screen.getByTestId('backend-submit')).toBeDisabled();
+    fireEvent.change(screen.getByTestId('zone-name'), {
+      target: { value: 'new.example.invalid' },
+    });
     await waitFor(() =>
-      expect(screen.getByTestId('edit-backend-10')).toBeInTheDocument(),
+      expect(screen.getByTestId('backend-submit')).not.toBeDisabled(),
     );
-    fireEvent.click(screen.getByTestId('edit-backend-10'));
-    await waitFor(() =>
-      expect(screen.getByTestId('credential-mode-replace')).toBeInTheDocument(),
-    );
+  });
+
+  test('a half-filled credential is refused in the form, and no zone is created', async () => {
+    // The atomicity argument from the browser's side: the request never
+    // leaves, so there is no zone to clean up.
+    await openCreate();
+    fireEvent.change(screen.getByTestId('zone-name'), {
+      target: { value: 'new.example.invalid' },
+    });
     fireEvent.click(screen.getByTestId('credential-mode-replace'));
     await waitFor(() =>
       expect(
@@ -355,29 +333,74 @@ describe('the credential form', () => {
         'aws_secret_access_key',
       ),
     );
-    // Nothing left the browser, and the message names the field and not
-    // the value the user did type.
     expect(sent).toEqual([]);
     expect(
       screen.getByTestId('backend-form-problem').textContent,
     ).not.toContain('AKIAEXAMPLE');
   });
+});
 
-  test('keep and clear are unavailable when nothing is stored', async () => {
-    // Offering them would let the form describe a state the row cannot
-    // be in: there is nothing to keep and nothing to remove.
-    domainsPayload = [
-      domain({ backends: [backend({ credentials_set: false })] }),
-    ];
+describe('“add a provider later” — a link, not a checkbox, not the default', () => {
+  test('there is no checkbox, and nothing is pre-selected for the user', async () => {
     await mount(OPERATOR);
+    fireEvent.click(screen.getByTestId('add-domain'));
     await waitFor(() =>
-      expect(screen.getByTestId('edit-backend-10')).toBeInTheDocument(),
+      expect(screen.getByTestId('zone-later-link')).toBeInTheDocument(),
     );
-    fireEvent.click(screen.getByTestId('edit-backend-10'));
+    // A `button` rendered as a link, never an `input[type=checkbox]`:
+    // a checkbox sits in the form's reading order as one more option and
+    // can be left in either state by accident.
+    expect(screen.getByTestId('zone-later-link').tagName).toBe('BUTTON');
+    expect(
+      document.querySelectorAll('input[type="checkbox"]'),
+    ).toHaveLength(0);
+    // Not the default: the consequence and its confirm button are not
+    // even rendered until the link is taken.
+    expect(screen.queryByTestId('zone-later-warning')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('zone-later-submit')).not.toBeInTheDocument();
+  });
+
+  test('taking it states the wire consequence before it can be confirmed', async () => {
+    await mount(OPERATOR);
+    fireEvent.click(screen.getByTestId('add-domain'));
     await waitFor(() =>
-      expect(screen.getByTestId('credential-mode-replace')).toBeChecked(),
+      expect(screen.getByTestId('zone-later-link')).toBeInTheDocument(),
     );
-    expect(screen.getByTestId('credential-mode-keep')).toBeDisabled();
-    expect(screen.getByTestId('credential-mode-clear')).toBeDisabled();
+    fireEvent.click(screen.getByTestId('zone-later-link'));
+    await waitFor(() =>
+      expect(screen.getByTestId('zone-later-warning')).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId('zone-later-warning')).toHaveTextContent(
+      WIRE_CONSEQUENCE,
+    );
+    expect(screen.getByTestId('zone-later-warning')).toHaveTextContent(/911/);
+  });
+
+  test('confirming sends an explicit null backend, not an omitted key', async () => {
+    // `null` and "absent" would both create a zero-provider zone, and
+    // only one of them says on the wire that it was asked for. The audit
+    // row records which shape the call was.
+    await mount(OPERATOR);
+    fireEvent.click(screen.getByTestId('add-domain'));
+    await waitFor(() =>
+      expect(screen.getByTestId('zone-name')).toBeInTheDocument(),
+    );
+    fireEvent.change(screen.getByTestId('zone-name'), {
+      target: { value: 'staged.example.invalid' },
+    });
+    fireEvent.click(screen.getByTestId('zone-later-link'));
+    await waitFor(() =>
+      expect(screen.getByTestId('zone-later-submit')).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByTestId('zone-later-submit'));
+
+    await waitFor(() => expect(sent.length).toBe(1));
+    expect(sent[0].body).toEqual({
+      name: 'staged.example.invalid',
+      backend: null,
+    });
+    expect(
+      Object.keys(sent[0].body as Record<string, unknown>),
+    ).toContain('backend');
   });
 });
