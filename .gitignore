@@ -27,3 +27,9 @@ __pycache__/
 
 # Extracted TLS material (a copy of the old service.s ACME cert).
 certs/
+
+# This stack's own ACME store, after the hand-over. It holds the account
+# private key and every issued certificate's private key — the one file in
+# the deployment whose loss means re-issuing and whose disclosure means
+# somebody else can speak as the service.
+letsencrypt/

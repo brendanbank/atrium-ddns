@@ -323,8 +323,43 @@ tls-refresh: tls-extract  ## re-extract after a renewal and reload the proxy
 	$(COMPOSE) --profile tls restart proxy
 	@echo "reloaded; verify with: make tls-verify HOST=<name>"
 
+# CONNECT exists so this can be pointed at a stack that does not resolve —
+# a throwaway one on loopback, or the deploy host before DNS moves. HOST stays
+# the SNI name either way: a check that reaches the right socket with the
+# wrong SNI is a check of the default certificate, not of the router's.
 tls-verify:  ## prove TLS actually serves a valid chain (HOST=<name> required)
-	@test -n "$(HOST)" || { echo "usage: make tls-verify HOST=<name> [PORT=8443]"; exit 2; }
-	@echo | openssl s_client -connect $(HOST):$(or $(PORT),8443) -servername $(HOST) 2>/dev/null \
+	@test -n "$(HOST)" || { echo "usage: make tls-verify HOST=<name> [PORT=8443] [CONNECT=<addr>]"; exit 2; }
+	@echo | openssl s_client -connect $(or $(CONNECT),$(HOST)):$(or $(PORT),8443) -servername $(HOST) 2>/dev/null \
 	  | openssl x509 -noout -subject -dates -checkend 0 \
 	  && echo "  chain valid and not expired"
+
+# --- ACME hand-over (cutover; docs/ops/cutover.md § 2.2 and § 5.4) ---------
+# Everything above serves a COPY of the incumbent's certificate. Everything
+# below is the arrangement that stops copying: this stack's own ACME store,
+# its own resolver, 80/443. It lives in `compose.acme.yaml` — a file the
+# operator names on purpose — so that a routine `docker compose up -d` can
+# never perform the hand-over by accident.
+COMPOSE_ACME := $(COMPOSE) -f compose.yaml -f compose.acme.yaml
+
+acme-config:  ## render the hand-over configuration without starting anything
+	$(COMPOSE_ACME) --profile tls config
+
+# Deliberately NOT `up -d` on the whole stack: this replaces the proxy and
+# nothing else. Runbook step 5.4(c).
+acme-up:  ## start the TLS terminator with ACME on 80/443 (THE HAND-OVER)
+	$(COMPOSE_ACME) --profile tls up -d proxy
+
+acme-down:  ## stop it again — runbook rollback for step 5.4(c)
+	$(COMPOSE_ACME) --profile tls stop proxy
+
+# The check that distinguishes "TLS works" from "the hand-over took".
+acme-verify:  ## which certificate is on the wire (HOST=<name> required)
+	@test -n "$(HOST)" || { echo "usage: make acme-verify HOST=<name> [PORT=443] [CONNECT=<addr>]"; exit 2; }
+	./scripts/verify-acme-handover.sh \
+	  --store $(or $(ACME_STORE_DIR),./letsencrypt)/acme.json \
+	  --host $(HOST) --port $(or $(PORT),443) \
+	  $(if $(CONNECT),--connect $(CONNECT),) \
+	  --fallback $(TLS_CERT_DIR)/cert.pem
+
+test-acme-handover:  ## gate-test the hand-over on a throwaway stack (LIVE=1 adds LE staging)
+	./scripts/test-acme-handover.sh $(if $(LIVE),--live-staging,)
