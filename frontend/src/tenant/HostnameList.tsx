@@ -48,6 +48,7 @@ import {
   type Hostname,
 } from '../api/hostnames';
 import { absoluteTitle, formatAge } from '../board/format';
+import { HostnamePublishingModal } from './HostnamePublishingModal';
 
 /** The `value` a Mantine `Select` uses for *no device*. `Select` speaks
  *  `string | null`, and `null` is already how it spells "nothing
@@ -70,12 +71,14 @@ function HostnameLine({
   devices,
   onAssign,
   onDelete,
+  onPublishing,
   busy,
 }: {
   hostname: Hostname;
   devices: Device[];
   onAssign: (hostname: Hostname, deviceId: number | null) => void;
   onDelete: (hostname: Hostname) => void;
+  onPublishing: (hostname: Hostname) => void;
   busy: boolean;
 }) {
   return (
@@ -115,6 +118,15 @@ function HostnameLine({
           size="xs"
           variant="default"
           disabled={busy}
+          onClick={() => onPublishing(hostname)}
+          data-testid={`publishing-${hostname.name}`}
+        >
+          Publishing
+        </Button>
+        <Button
+          size="xs"
+          variant="default"
+          disabled={busy}
           onClick={() => onDelete(hostname)}
           data-testid={`delete-hostname-${hostname.name}`}
         >
@@ -140,6 +152,10 @@ export function HostnameList({
   const [zone, setZone] = useState<string | null>(null);
   const [device, setDevice] = useState<string>(UNASSIGNED);
   const [confirmDelete, setConfirmDelete] = useState<Hostname | null>(null);
+  //: The name whose publishing settings are open, or `null`. Held as
+  //: the row rather than as its id so the modal can render the device
+  //: name and the assignment state without a second lookup.
+  const [publishing, setPublishing] = useState<Hostname | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const invalidate = () =>
@@ -228,6 +244,7 @@ export function HostnameList({
               assign.mutate({ id: target.id, deviceId })
             }
             onDelete={setConfirmDelete}
+            onPublishing={setPublishing}
           />
         ))
       )}
@@ -339,6 +356,14 @@ export function HostnameList({
           </Group>
         </Stack>
       </Modal>
+
+      {/* #74. The three things the legacy `/admin/hostnames/<id>/
+          backends` page did, on the surface the criterion counts as
+          this route's registration. */}
+      <HostnamePublishingModal
+        hostname={publishing}
+        onClose={() => setPublishing(null)}
+      />
     </Stack>
   );
 }
