@@ -128,37 +128,120 @@ class DdnsConfig(BaseModel):
     change is retention: 24 hours becomes 30 days, per plan §3.4 — the
     old window was sized for a dashboard and makes "which of my devices
     stopped updating, and when" unanswerable.
+
+    **Every field carries a ``description``, and that is load-bearing
+    rather than documentation.** #73's settings form renders its help
+    text, its bounds and its input type out of this model's JSON schema
+    — so a field added here appears on the form with no frontend change,
+    and a bound tightened here cannot drift from the bound the form
+    offers. ``tests/test_settings_schema.py`` refuses a field with an
+    empty description for the same reason: a number box labelled only
+    ``Prune Max Batches`` is a box an operator has to guess at.
     """
 
     # --- retention ---------------------------------------------------- #
-    event_retention_days: int = Field(default=30, ge=1, le=3650)
+    event_retention_days: int = Field(
+        default=30,
+        ge=1,
+        le=3650,
+        description=(
+            "How long a DNS-update log row is kept before the scheduled "
+            "prune deletes it."
+        ),
+    )
     #: Deliberately *not* ``event_retention_days``. ``ddns_event`` and
     #: ``ddns_rate_limit_event`` answer different questions and
     #: models.py says so explicitly: hanging the limiter off the log's
     #: retention makes "how long do we keep logs" silently also mean
     #: "how far back does the limiter look".
-    rate_limit_event_retention_hours: int = Field(default=24, ge=1, le=8760)
+    rate_limit_event_retention_hours: int = Field(
+        default=24,
+        ge=1,
+        le=8760,
+        description=(
+            "How long the rate limiter's own rows are kept. Deliberately "
+            "separate from the log's retention: these rows are the "
+            "limiter's window, not history."
+        ),
+    )
     #: Rows per committed batch. The lock is held for one batch, not for
     #: the run.
-    prune_batch_size: int = Field(default=1000, ge=1, le=50_000)
+    prune_batch_size: int = Field(
+        default=1000,
+        ge=1,
+        le=50_000,
+        description=(
+            "Rows deleted per committed batch. The lock is held for one "
+            "batch, not for the whole run."
+        ),
+    )
     #: Hard ceiling on batches per tick. A first prune against a large
     #: history stops and says there is more to do rather than holding
     #: the worker for an unbounded time.
-    prune_max_batches: int = Field(default=100, ge=1, le=10_000)
+    prune_max_batches: int = Field(
+        default=100,
+        ge=1,
+        le=10_000,
+        description=(
+            "Ceiling on batches per prune tick. A first prune against a "
+            "large history stops and reports more to do rather than "
+            "holding the worker open."
+        ),
+    )
 
     # --- health checks ------------------------------------------------ #
-    health_check_enabled: bool = True
+    health_check_enabled: bool = Field(
+        default=True,
+        description=(
+            "Whether the scheduled health check resolves hostnames at "
+            "all. Off means the board's 'answered' station stops being "
+            "updated; it does not mean the names stop being published."
+        ),
+    )
     #: How stale a hostname's ``dns_checked_at`` may get before it is
     #: re-checked. **Not** an APScheduler interval: the job ticks on a
     #: fixed short period and selects what is due, so changing this
     #: takes effect on the next tick with no reschedule dance (the
     #: legacy ``reschedule_health_checker`` exists only because the
     #: interval was baked into the trigger at startup).
-    health_check_interval_minutes: int = Field(default=15, ge=1, le=1440)
+    health_check_interval_minutes: int = Field(
+        default=15,
+        ge=1,
+        le=1440,
+        description=(
+            "How stale a hostname's last check may get before it is "
+            "re-checked. Not a scheduler interval: the job ticks often "
+            "and selects what is due, so a change takes effect on the "
+            "next tick with no restart."
+        ),
+    )
     #: Hostnames per tick. Bounds both the DNS fan-out and the write.
-    health_check_batch_size: int = Field(default=200, ge=1, le=10_000)
-    health_check_timeout_seconds: float = Field(default=5.0, ge=0.1, le=60.0)
-    health_check_concurrency: int = Field(default=8, ge=1, le=64)
+    health_check_batch_size: int = Field(
+        default=200,
+        ge=1,
+        le=10_000,
+        description=(
+            "Hostnames resolved per tick. Bounds both the DNS fan-out "
+            "and the write."
+        ),
+    )
+    health_check_timeout_seconds: float = Field(
+        default=5.0,
+        ge=0.1,
+        le=60.0,
+        description=(
+            "Per-query DNS timeout. A fractional value is allowed and is "
+            "the reason this field is not an integer."
+        ),
+    )
+    health_check_concurrency: int = Field(
+        default=8,
+        ge=1,
+        le=64,
+        description=(
+            "How many DNS queries run at once inside one tick."
+        ),
+    )
     #: Debounce on the **manual** trigger
     #: (``POST /api/atrium_ddns/health-checks/run``), per actor. Nothing
     #: on the scheduled path reads it: the scheduler's own cadence is
@@ -171,20 +254,57 @@ class DdnsConfig(BaseModel):
     #: a held-down mouse button is an outbound query storm someone else
     #: pays for. ``0`` disables the debounce and is a deliberate,
     #: spellable choice rather than the default.
-    health_check_manual_cooldown_seconds: int = Field(default=60, ge=0, le=86_400)
+    #:
+    #: #75 added this field and #73 added the settings form; they were
+    #: written against the same base and met here. The ``description``
+    #: is #73's requirement of every field on this model — the form
+    #: renders it as the help text under the input — and the sentence is
+    #: #75's own, condensed. Without it this field would still appear on
+    #: the Health checks page, because the page's field list is derived
+    #: from this model rather than typed out, but it would appear as a
+    #: bare number box, and ``test_settings_schema`` refuses that.
+    health_check_manual_cooldown_seconds: int = Field(
+        default=60,
+        ge=0,
+        le=86_400,
+        description=(
+            "Debounce on the manual 'Run health check' button, per "
+            "actor. Nothing on the scheduled path reads it. 0 disables "
+            "the debounce, which is a deliberate choice rather than the "
+            "default: the button fans out to real nameservers."
+        ),
+    )
 
     # --- status board ------------------------------------------------- #
     #: The denominator behind "zero updates in the window". Printed
     #: beside every count this module reports, because a ratio whose
     #: divisor is not named is not a measurement.
-    device_idle_window_days: int = Field(default=7, ge=1, le=365)
+    device_idle_window_days: int = Field(
+        default=7,
+        ge=1,
+        le=365,
+        description=(
+            "The board's denominator — the window 'updates / N d' is "
+            "counted over, and the window a device is called idle for "
+            "producing nothing in."
+        ),
+    )
 
     # --- rate limiting (enforced by #16; the default lives here) ------- #
     #: Installation-wide default; ``ddns_device.rate_limit_per_minute``
     #: overrides it per device and ``NULL`` there means *inherit this*,
     #: which is not the same as ``0``. models.py assigns the namespace
     #: to this issue and the enforcement to #16.
-    rate_limit_per_minute: int = Field(default=30, ge=0, le=10_000)
+    rate_limit_per_minute: int = Field(
+        default=30,
+        ge=0,
+        le=10_000,
+        description=(
+            "Updates a device may make per minute unless it carries its "
+            "own limit. A device's own value overrides this; 0 here "
+            "mutes every device that inherits."
+        ),
+    )
 
 
 # Module top level, in the module that *reads* the namespace.

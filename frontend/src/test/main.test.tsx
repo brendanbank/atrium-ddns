@@ -47,9 +47,17 @@ test('every registered surface still mounts through the wrapper element', async 
   await import('../main');
 
   // Vacuity guard: the sweep has to be over a non-empty population.
-  // Ten — the scaffold's four (home widget, demo page, admin tab,
+  // Thirteen — the scaffold's four (home widget, demo page, admin tab,
   // profile item), the board's one (#44), #45's two tenant pages, #46's
-  // log search, #69's names page, and #75's help page.
+  // log search, #69's names page, #75's help page, and #73's three
+  // settings pages.
+  //
+  // #75 and #73 were written against the same base and both edited this
+  // number; the merged value is the **union** (9 + 1 + 3), not either
+  // side's. Worth saying because "whichever side won" is a resolution
+  // that compiles, passes its own half of the suite, and silently drops
+  // a surface from the sweep — which is the one thing this sweep exists
+  // to prevent.
   //
   // An exact count rather than a floor, on purpose (#45's argument,
   // kept): a registration added without going through
@@ -65,23 +73,36 @@ test('every registered surface still mounts through the wrapper element', async 
   // to be 8", so the comment above names what the number is made of —
   // which is what turns that message from a puzzle into an instruction.
   // (#69 was the fourth issue to append here and the message did read as
-  // an instruction; #75 was the fifth and read `expected 10 to be 9`,
-  // which is the evidence for keeping it.)
+  // an instruction; #75 read `expected 10 to be 9` and #73 read
+  // `expected 12 to be 9`, which is the same evidence twice over.)
   const rendered = [
     ...handles.homeWidgets,
     ...handles.routes,
     ...handles.adminTabs,
     ...handles.profileItems,
   ];
-  expect(rendered.length).toBe(10);
+  expect(rendered.length).toBe(13);
   // Keys are the registry's primary key: two registrations sharing one
-  // silently replace each other, so the count above would still read 10
+  // silently replace each other, so the count above would still read 13
   // while one surface never mounts. Added by #46 because three issues
   // have now appended to this file and the fourth will not have read
   // the other three.
   expect(new Set(rendered.map((entry) => entry.key)).size).toBe(
     rendered.length,
   );
+  // …and the count is not made of the right number of the wrong things.
+  // #73's three pages are named, because "12" would also be satisfied by
+  // three copies of the board.
+  for (const key of [
+    'atrium-ddns-settings-rate-limits',
+    'atrium-ddns-settings-health-checks',
+    'atrium-ddns-settings-retention',
+  ]) {
+    expect(
+      rendered.find((entry) => entry.key === key),
+      `${key} was never registered`,
+    ).toBeDefined();
+  }
 
   for (const entry of rendered) {
     const render = entry.render;

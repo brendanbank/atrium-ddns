@@ -186,6 +186,38 @@ export function absoluteTitle(iso: string | null): string {
   return iso ?? 'never';
 }
 
+/** The rate limit, as a sentence that says which of three states it is.
+ *
+ * #73. `rate_limit_per_minute` is `null` (*inherit*), `0` (*may never
+ * call*) or a number, and the resolved value the limiter enforces
+ * arrives beside it as `effective_rate_limit_per_minute`. Rendering the
+ * resolved number alone would make "30/min" and "30/min because nobody
+ * set one" the same string, and the second is the one an operator needs
+ * to know before they change the installation default.
+ *
+ * `0` is rendered as words rather than as `0/min` for the reason
+ * §4.2's second prohibition gives about `never`: a muted device is a
+ * *decision*, and a zero with a unit after it reads as a measurement.
+ *
+ * Both readings are the server's. Nothing here resolves `null` — the
+ * installation default lives behind `app_setting.manage` and a browser
+ * that does not hold it cannot know the number.
+ */
+export function rateLimitSummary(device: {
+  rate_limit_per_minute: number | null;
+  effective_rate_limit_per_minute: number;
+}): string {
+  if (device.effective_rate_limit_per_minute === 0) {
+    return device.rate_limit_per_minute === 0
+      ? 'muted — may never call'
+      : 'muted — may never call (the installation default is 0)';
+  }
+  if (device.rate_limit_per_minute === null) {
+    return `${device.effective_rate_limit_per_minute}/min, inherited`;
+  }
+  return `${device.effective_rate_limit_per_minute}/min, set on this device`;
+}
+
 /** The collapsed strip's summary line — §3.4.
  *
  * It **names its denominator**. `; agrees` on its own would be a ratio
