@@ -103,7 +103,7 @@ export const SURFACES: { to: string; label: string; blurb: string }[] = [
     to: NAMES_PATH,
     label: 'Names',
     blurb:
-      'Register a hostname under one of your zones and assign it to a device. A name is refused here if the wire protocol could never update it.',
+      'Register a hostname under one of your zones and assign it to a device. A name is refused here if the wire protocol could never update it. “Publishing” on each row chooses which of the zone’s providers that name is published to, overrides its TTL, and publishes an address immediately instead of waiting for the router — leaving the provider list untouched means the name follows the zone, including providers you bind to it later.',
   },
   {
     to: DOMAINS_PATH,

@@ -54,17 +54,20 @@ against. This module adds no sixth reading of the columns.
 """
 from __future__ import annotations
 
+import functools
 import secrets as secrets_module
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Literal
 
+import anyio
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.attributes import flag_dirty
 from sqlalchemy.sql import Select
 
@@ -82,16 +85,39 @@ from app.models.auth import User
 from app.models.ops import AuditLog
 from app.services.audit import record as record_audit
 
-from .auth_device import effective_rate_limit, hash_password
+from .auth_device import (
+    DeviceAuth,
+    check_rate_limit,
+    effective_rate_limit,
+    hash_password,
+    normalise_address,
+)
 from .models import (
+    IPV6_LEN,
+    TTL_MAX,
+    TTL_MIN,
     AtriumDdnsState,
     Device,
     DnsEvent,
     Domain,
     DomainBackend,
     Hostname,
+    HostnameBackend,
+    # The one resolver. `/nic/update` calls this exact object, which is
+    # what stops the editor and the wire disagreeing about which
+    # backends a name publishes to — the `zone_contains` lesson applied
+    # to #74's join table.
+    resolve_backends,
+    resolve_ttl,
 )
-from .providers import PROVIDER_STATUSES, known_services, provider_class
+from .providers import (
+    DEFAULT_TTL,
+    PROVIDER_STATUSES,
+    STATUS_GOOD,
+    BaseProvider,
+    known_services,
+    provider_class,
+)
 from .settings_schema import (
     APP_CONFIG_MANAGE_PERMISSION,
     SettingsSchemaOut,
@@ -106,12 +132,25 @@ from .providers.base import zone_contains
 from .router_nic import (
     EVENT_AUTH,
     EVENT_DELETE,
+    EVENT_MANUAL_UPDATE,
     EVENT_UPDATE,
     STATUS_911,
     STATUS_ABUSE,
     STATUS_BADAUTH,
     STATUS_NOHOST,
     STATUS_NOTFQDN,
+    # The publish path itself, whole. The manual update is the same
+    # operation `/nic/update` performs, so it runs the same code — a
+    # second implementation would be a second answer to "which backends,
+    # what did they say, what does that aggregate to, and which column
+    # moves", and the wire's is the one with 124 frozen cases behind it.
+    HostnamePlan,
+    commit_after_dns,
+    load_plans,
+    persist_updates,
+    record_event,
+    record_hostname_events,
+    run_dns_phase,
     # The syntax rule, likewise: `/nic/update` calls this exact function
     # to decide `notfqdn`, and so does `POST /hostnames`.
     split_hostnames,
@@ -3068,6 +3107,587 @@ async def delete_hostname(
 
 
 # --------------------------------------------------------------------- #
+# Publishing — which backends, at what TTL, and "do it now" (#74)
+# --------------------------------------------------------------------- #
+#
+# The legacy `/admin/hostnames/<id>/backends` page and its admin twin,
+# which did three things on one form: choose the backends, edit the TTL,
+# and trigger a DNS update against a typed-in address. All three needed
+# a schema change rather than a page — `0004` is it.
+#
+# **The default-behaviour trap, and where it is answered.** Introducing
+# a selection table makes explicit what was implicit ("publishes to all
+# of the domain's backends"). An empty selection therefore has to mean
+# *inherit the domain*, not *publish nowhere*, or every hostname that
+# existed before the migration stops publishing — silently, because a
+# router that receives `911` retries and logs and nothing on the board
+# says the name has been muted. `models.resolve_backends` is where that
+# is decided, `0004`'s docstring is where the alternative is argued
+# down, and `test_router_hostname_backends.py` §0 is where it is
+# asserted against a row shaped exactly as a pre-migration one.
+#
+# The three surfaces below all read through that one resolver, and so
+# does `/nic/update`. There is no second answer to "which backends".
+
+
+class HostnameBackendChoiceOut(BaseModel):
+    """One binding on the hostname's zone, and whether it is chosen.
+
+    Every binding the zone has is listed, chosen or not — the editor's
+    question is *which of these*, and a list containing only the chosen
+    ones cannot be rendered as a set of checkboxes without a second
+    request.
+    """
+
+    backend_id: int
+    backend_type: str
+    #: Whether a ``ddns_hostname_backend`` row exists for this pair.
+    #: **Not** the same as "this backend is published to": with an empty
+    #: selection every entry is ``selected: false`` and every entry is
+    #: published to. :attr:`HostnamePublishingOut.publishes_to` is the
+    #: resolved answer and this is the stored state; rendering the
+    #: stored state as the effect is the whole defect this feature can
+    #: produce.
+    selected: bool
+    #: Whether the binding carries credentials at all. A backend with
+    #: none answers ``911`` for every hostname on it, and an editor that
+    #: offers it without saying so is offering a publish that cannot
+    #: work.
+    credentials_set: bool
+    #: The binding's own ``config['ttl']``, or ``None`` when it has
+    #: none. What a hostname with no override inherits *through this
+    #: backend* — the fallback is per binding, so two backends on one
+    #: zone can legitimately answer differently.
+    binding_ttl: int | None
+    #: What this hostname would actually be published at through this
+    #: backend right now: the override, else the binding, else
+    #: :data:`~atrium_ddns.providers.DEFAULT_TTL`. Computed here rather
+    #: than in the browser for the reason ``ui-design.md`` §4.2 gives
+    #: about the five states — two implementations of a three-level
+    #: fallback is how a three-level fallback becomes a two-level one.
+    effective_ttl: int
+
+
+class HostnamePublishingOut(BaseModel):
+    """The whole publishing configuration of one name."""
+
+    hostname_id: int
+    name: str
+    domain_id: int
+    domain_name: str
+    device_id: int | None
+    #: ``True`` when no ``ddns_hostname_backend`` row exists, i.e. when
+    #: this name follows its zone. Named rather than left for the reader
+    #: to infer from an empty list: *inheriting everything* and *having
+    #: chosen nothing* are the same rows and different sentences, and
+    #: only one of them is true here.
+    inherits_backends: bool
+    #: The stored override. ``None`` is *inherit*, and it is not 60 —
+    #: a name at NULL follows a later change to its binding's TTL and a
+    #: name explicitly set to 60 does not.
+    ttl: int | None
+    #: :data:`~atrium_ddns.providers.DEFAULT_TTL`, shipped so the editor
+    #: can say what "inherit" resolves to without holding its own copy
+    #: of the number.
+    default_ttl: int
+    #: Accepted range for :attr:`ttl`, shipped for the same reason.
+    ttl_min: int
+    ttl_max: int
+    backends: list[HostnameBackendChoiceOut]
+    #: ``backend_id`` in **publish order** — the order the aggregate's
+    #: "first status that is neither good nor nochg" walks. Resolved by
+    #: ``models.resolve_backends``, the same call ``/nic/update`` makes.
+    #: Empty means this name publishes to nothing at all, which happens
+    #: only when its zone has no bindings, and which answers ``911``.
+    publishes_to: list[int]
+
+
+class HostnamePublishingIn(BaseModel):
+    """The body of ``PUT /hostnames/{id}/backends``.
+
+    **Both fields are required and both accept ``null``.** This is a
+    ``PUT`` of the whole publishing configuration, mirroring the legacy
+    page, which submitted the checkboxes and the TTL from one form. A
+    partial-update shape would need a sentinel to tell *omitted* from
+    *cleared* (as :class:`DomainBackendUpdateIn` does), and there is
+    nothing here worth that: both fields have a meaningful ``null``, so
+    making omission illegal is cheaper and unambiguous.
+
+    ``backend_ids: null`` and ``backend_ids: []`` are the **same**
+    request — both clear the selection, and a cleared selection means
+    *inherit the zone*. That is not a leniency, it is the legacy
+    behaviour: the form posted no checkbox at all when none was ticked,
+    and ``get_backends()`` fell through to the domain
+    (``backends-empty-selection-resolves-to-all-of-the-domains-
+    backends``, ``preserve``). The response says which it did.
+    """
+
+    backend_ids: list[int] | None
+    ttl: int | None = Field(default=..., ge=TTL_MIN, le=TTL_MAX)
+
+
+class BackendAttemptOut(BaseModel):
+    """One backend's own answer, not the aggregate."""
+
+    backend_id: int
+    backend_type: str
+    #: The wire vocabulary, unchanged: ``good``/``nochg``/``nohost``/
+    #: ``dnserr``/``911``. One vocabulary for the whole service — a
+    #: reader who has seen these in the log recognises them here.
+    status: str
+
+
+class ManualUpdateIn(BaseModel):
+    #: The address to publish. Required, and not defaulted to the
+    #: caller's own: the browser's address is the operator's, not the
+    #: router's, and defaulting it would publish a helpdesk's IP to a
+    #: customer's zone on a mis-click. The legacy form took it typed in
+    #: too.
+    ip: str = Field(min_length=1, max_length=IPV6_LEN)
+
+
+class ManualUpdateOut(BaseModel):
+    hostname_id: int
+    name: str
+    #: The **normalised** address, which may differ from what was sent
+    #: (``2001:0db8::1`` -> ``2001:db8::1``). Echoed so the caller sees
+    #: what was published rather than what they typed.
+    ip: str
+    #: ``A`` or ``AAAA``, decided by the address and not by a parameter.
+    rtype: str
+    #: The aggregate, through ``router_nic.aggregate`` — the same
+    #: function and the same rule the wire uses.
+    status: str
+    attempts: list[BackendAttemptOut]
+    #: ``status == "good"``. Carried as its own field because the row's
+    #: ``last_ip_*`` moves on exactly this condition and a client should
+    #: not have to re-derive the rule.
+    published: bool
+    #: What this publish cost against the device's per-minute budget,
+    #: and what the budget is. Reported on success as well as on
+    #: refusal: "you have 29 left" is a measurement and a bare 200 is
+    #: not.
+    rate_limit_per_minute: int
+    #: ``worker_jobs.SUCCESS_RESPONSE_CODES``, verbatim — the same list
+    #: :class:`EventVocabulary` ships for the log, and for the same
+    #: reason: ``ui-design.md`` §1.2 Rule 2 says ``--ddns-diverge``
+    #: appears nowhere except on a measured disagreement, and on this
+    #: panel a non-success per-backend status *is* the disagreement. A
+    #: bundle holding its own ``['good', 'nochg']`` would be a second
+    #: implementation of a classification the health-check job owns,
+    #: and the two would part company the first time a code was
+    #: reclassified — silently, because both renderings look correct.
+    success_response_codes: list[str]
+
+
+def _publishing_out(hostname: Hostname, domain: Domain) -> HostnamePublishingOut:
+    """Render the configuration. Both relationships must be loaded."""
+    selected_ids = {backend.id for backend in hostname.selected_backends}
+    resolved = resolve_backends(hostname)
+    return HostnamePublishingOut(
+        hostname_id=hostname.id,
+        name=hostname.name,
+        domain_id=domain.id,
+        domain_name=domain.name,
+        device_id=hostname.device_id,
+        inherits_backends=not selected_ids,
+        ttl=hostname.ttl,
+        default_ttl=DEFAULT_TTL,
+        ttl_min=TTL_MIN,
+        ttl_max=TTL_MAX,
+        backends=[
+            HostnameBackendChoiceOut(
+                backend_id=backend.id,
+                backend_type=backend.backend_type,
+                selected=backend.id in selected_ids,
+                credentials_set=backend.credentials_ct is not None,
+                binding_ttl=_int_or_none((backend.config or {}).get("ttl")),
+                effective_ttl=_int_or_none(resolve_ttl(hostname, backend))
+                or DEFAULT_TTL,
+            )
+            for backend in domain.backends
+        ],
+        publishes_to=[backend.id for backend in resolved],
+    )
+
+
+def _int_or_none(value: Any) -> int | None:
+    """A stored TTL as an ``int``, or ``None`` when it is not one.
+
+    ``ddns_domain_backend.config`` is free-form JSON, so ``ttl`` can be
+    a string, a float or nonsense. ``router_nic._backend_plan`` already
+    falls back to :data:`DEFAULT_TTL` and logs ``ddns.backend.bad_ttl``
+    for such a value; this renders the same fact rather than raising a
+    500 on an editing screen, and rather than reporting a number the
+    publish path would not use.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _load_publishing(
+    session: AsyncSession, scope: DdnsScope, hostname_id: int
+) -> tuple[Hostname, Domain]:
+    """The hostname with everything the resolver needs, or a 404.
+
+    Eager-loaded rather than fetched with ``scope.get``:
+    ``resolve_backends`` is a pure function over ORM state and a lazy
+    load inside it would be a synchronous database call on the event
+    loop. Both relationships are loaded here, once, for that reason.
+
+    Scoped, so another tenant's hostname is a **404** and not a 403 —
+    the same rule as everywhere else on this surface, and the reason a
+    caller holding ``atrium_ddns.admin`` reaches it: the permission
+    widens the predicate rather than adding a branch to the handler.
+
+    ``populate_existing=True`` is **not** decoration. Atrium's session
+    factory sets ``expire_on_commit=False``, so an instance already in
+    the identity map keeps its loaded collections across a commit and
+    an eager loader will not overwrite them. Without this, the re-read
+    :func:`set_hostname_publishing` does after writing returns the
+    *pre-write* collection and the endpoint answers 200 describing the
+    state it just replaced — a report about the thing reported,
+    indistinguishable from success. Measured: the selection was written
+    correctly and the response said the name still inherited its zone.
+    """
+    hostname = (
+        (
+            await session.execute(
+                scope.select(Hostname)
+                .where(Hostname.id == hostname_id)
+                .options(
+                    selectinload(Hostname.domain).selectinload(Domain.backends),
+                    selectinload(Hostname.selected_backends),
+                )
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if hostname is None:
+        raise _not_found("hostname")
+    return hostname, hostname.domain
+
+
+@router.get(
+    "/hostnames/{hostname_id}/backends", response_model=HostnamePublishingOut
+)
+async def get_hostname_publishing(
+    hostname_id: int,
+    _user: User = Depends(require_perm(HOSTNAME_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> HostnamePublishingOut:
+    """What this name publishes to, and at what TTL.
+
+    Reports the **stored** state and the **resolved** state side by
+    side (``selected`` / ``inherits_backends`` against ``publishes_to``,
+    ``ttl`` against ``effective_ttl``). Reporting only one of them is
+    how a three-level fallback gets rendered as a value somebody then
+    edits — and the state where they differ is not an edge case, it is
+    every hostname that has never been touched.
+    """
+    hostname, domain = await _load_publishing(session, scope, hostname_id)
+    return _publishing_out(hostname, domain)
+
+
+@router.put(
+    "/hostnames/{hostname_id}/backends", response_model=HostnamePublishingOut
+)
+async def set_hostname_publishing(
+    hostname_id: int,
+    body: HostnamePublishingIn,
+    user: User = Depends(require_perm(HOSTNAME_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> HostnamePublishingOut:
+    """Set the backend selection and the TTL override, together.
+
+    ``PUT`` and not ``PATCH``: this is the whole publishing
+    configuration, and the legacy page submitted it as one form.
+
+    **A backend id that is not on this hostname's zone is a 422, not a
+    silent drop.** The selection is stored as ids and resolved through
+    ``domain.backends``, so a foreign id would simply never appear in
+    ``publishes_to`` — the request would answer 200 and do nothing,
+    which is the worst available outcome. It is named instead, and the
+    ids are the caller's own zone's so naming them tells them nothing
+    they did not send.
+
+    An empty (or ``null``) selection clears the rows and restores
+    inheritance. The response's ``inherits_backends`` says so.
+    """
+    hostname, domain = await _load_publishing(session, scope, hostname_id)
+
+    requested = list(dict.fromkeys(body.backend_ids or []))
+    available = {backend.id for backend in domain.backends}
+    unknown = [backend_id for backend_id in requested if backend_id not in available]
+    if unknown:
+        raise HTTPException(
+            status_code=UNPROCESSABLE,
+            detail=(
+                f"backend id(s) {unknown} are not bound to the zone "
+                f"{domain.name!r}. A selection is resolved through the zone's "
+                f"own bindings, so an id from elsewhere would be stored and "
+                f"never published to. This zone's bindings are "
+                f"{sorted(available)}."
+            ),
+        )
+
+    before_ids = sorted(backend.id for backend in hostname.selected_backends)
+    before_ttl = hostname.ttl
+
+    # Replace wholesale rather than diffing. The set is small (one row
+    # per binding on one zone), the operation is "these, now", and a
+    # diff would need to be right about a case that never arises.
+    await session.execute(
+        scope.apply(
+            sa.delete(HostnameBackend).where(
+                HostnameBackend.hostname_id == hostname.id
+            ),
+            HostnameBackend,
+        )
+    )
+    for backend_id in requested:
+        session.add(
+            HostnameBackend(hostname_id=hostname.id, backend_id=backend_id)
+        )
+    hostname.ttl = body.ttl
+
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity="ddns_hostname",
+        entity_id=hostname.id,
+        action="set_publishing",
+        diff={
+            "backend_ids": {"before": before_ids, "after": sorted(requested)},
+            "ttl": {"before": before_ttl, "after": hostname.ttl},
+        },
+    )
+    await session.commit()
+
+    # Re-read rather than trusting the in-session collections: both
+    # relationships were loaded before the write, and `selected_backends`
+    # is `viewonly` so nothing refreshes it. Rendering the pre-write
+    # state as the result of the write is the "assertion on the report"
+    # failure with a 200 attached.
+    hostname, domain = await _load_publishing(session, scope, hostname_id)
+    return _publishing_out(hostname, domain)
+
+
+@router.post("/hostnames/{hostname_id}/update", response_model=ManualUpdateOut)
+async def manual_update(
+    hostname_id: int,
+    body: ManualUpdateIn,
+    user: User = Depends(require_perm(HOSTNAME_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> ManualUpdateOut:
+    """Publish an address for this name **now**, without waiting for the router.
+
+    The third thing the legacy backends page did. It exists for the
+    moment after a configuration change — a backend added, a TTL
+    corrected, a zone re-delegated — when the record is wrong and the
+    router will not call in for another five minutes.
+
+    **It is the same operation ``/nic/update`` performs, running the
+    same code.** ``load_plans`` resolves the backends and the
+    credentials, ``run_dns_phase`` calls the providers,
+    ``router_nic.aggregate`` decides the answer, ``persist_updates``
+    writes ``last_ip_*`` on ``good`` and nothing on ``nochg``. A second
+    publish loop here would be a second answer to every one of those
+    questions, and the wire's is the one with 124 frozen cases behind
+    it.
+
+    Four refusals, and each is a different sentence:
+
+    * **404** — no such hostname, or not yours. Never 403; see
+      :func:`create_hostname`.
+    * **409 without a device.** The publish is charged to the
+      hostname's device (below), and an unassigned name has no budget
+      to charge. Refusing is the honest answer: `/nic/update` cannot
+      publish that name either, because ownership on the wire is
+      checked against the device. The alternative — an unlimited
+      publish path for exactly the names that have no router — is a
+      strictly worse place to leave the abuse surface.
+    * **422 for an address that is not one.** Through
+      ``auth_device.normalise_address``, the same canonicaliser the
+      wire uses, so ``myip=`` and this body agree about what an address
+      is.
+    * **429 when the device is over its limit.**
+
+    **The rate limit is the device's, not a new one.** ``check_rate_
+    limit`` against ``ddns_rate_limit_event``, bounded by
+    ``ddns_device.rate_limit_per_minute`` falling back to the
+    ``atrium_ddns.rate_limit_per_minute`` namespace setting — the exact
+    control G2 exposes, and the same rows ``/nic/update`` writes. That
+    is deliberate rather than convenient: a separate budget would let a
+    caller draw the provider quota twice, and providers cost money per
+    call. A manual publish and a router publish are the same cost to
+    the same third party, so they come out of the same allowance.
+
+    The refusal is recorded as ``manual_update`` / ``abuse`` in the log,
+    with the limit in ``message`` — the one row kind that carries one
+    (``event-detail-is-populated-only-for-rate-limit-refusals``).
+
+    **A cross-tenant admin publishes as the owner, not as themselves.**
+    The ``DeviceAuth`` built below carries the *zone owner's* id and
+    email, so the log attributes the update to the tenant whose zone
+    moved, and every query behind it runs under
+    ``DdnsScope.for_user_id(owner)`` — which carries no permissions and
+    can therefore reach nothing else. Who pressed the button is
+    recorded separately, in atrium's audit log, where "an admin did
+    this to somebody's zone" belongs.
+    """
+    hostname, domain = await _load_publishing(session, scope, hostname_id)
+
+    if hostname.device_id is None:
+        raise _conflict(
+            f"{hostname.name} is not assigned to a device. A manual update is "
+            "charged against the device's rate-limit budget and attributed to "
+            "it in the log, and an unassigned name has neither. Assign a "
+            "device first — /nic/update cannot publish this name either, for "
+            "the same reason."
+        )
+    device = await scope.get(session, Device, hostname.device_id)
+    if device is None:  # pragma: no cover — the scope reached the hostname
+        raise _not_found("device")
+
+    ip = normalise_address(body.ip)
+    if ip is None:
+        raise HTTPException(
+            status_code=UNPROCESSABLE,
+            detail=(
+                f"{body.ip!r} is not an IP address. /nic/update answers 911 for "
+                f"a myip it cannot parse; this is the same canonicaliser, so "
+                f"the two agree about what an address is."
+            ),
+        )
+    rtype = BaseProvider.getiptype(ip)
+    if rtype is False:  # pragma: no cover — `ip` already parsed
+        raise HTTPException(
+            status_code=UNPROCESSABLE, detail=f"cannot determine a record type for {ip}"
+        )
+
+    owner_email = (
+        await session.execute(select(User.email).where(User.id == domain.user_id))
+    ).scalar_one_or_none()
+    auth = DeviceAuth(
+        device=device, user_id=domain.user_id, user_email=owner_email or ""
+    )
+
+    config = await load_config(session)
+    limit = effective_rate_limit(device, config.rate_limit_per_minute)
+    admitted = await check_rate_limit(
+        session, auth, default_per_minute=config.rate_limit_per_minute
+    )
+    if not admitted:
+        record_event(
+            session,
+            event_type=EVENT_MANUAL_UPDATE,
+            response_code=STATUS_ABUSE,
+            auth=auth,
+            # **With the hostname**, unlike the wire's own abuse row.
+            # `_admit` writes that one before the `hostname` parameter
+            # has been looked at — it has to, there is nothing resolved
+            # yet — so `hostname_id` is NULL there and that NULL is
+            # honest. Here the name is known, and leaving it NULL would
+            # mean "why did my manual publish not happen" returns
+            # nothing on the one filter the log search offers for it.
+            plan=HostnamePlan(
+                requested=hostname.name,
+                lookup=hostname.name,
+                hostname_id=hostname.id,
+                domain_id=domain.id,
+                domain_name=domain.name,
+            ),
+            client_ip=None,
+            ip=ip,
+            message=f"rate limit exceeded ({limit}/minute)",
+        )
+        await commit_after_dns(session, endpoint=EVENT_MANUAL_UPDATE)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                f"{device.name} is over its rate limit of {limit} per minute. "
+                f"A manual update draws on the same budget as the device's own "
+                f"calls, because both cost the provider the same. Recorded in "
+                f"the log as manual_update/abuse."
+            ),
+            headers={"Retry-After": "60"},
+        )
+
+    plans = await load_plans(session, auth, [hostname.name])
+    results = await anyio.to_thread.run_sync(
+        functools.partial(run_dns_phase, plans, op="update", ip=ip, rtype=rtype)
+    )
+    result = results[0]
+
+    await persist_updates(session, auth, results, ip=ip, rtype=rtype)
+    record_hostname_events(
+        session,
+        results,
+        event_type=EVENT_MANUAL_UPDATE,
+        auth=auth,
+        # No `client_ip`: nothing called in. Leaving it NULL says "this
+        # publish had no caller", which is true; filling it with the
+        # operator's browser address would put a helpdesk's IP in the
+        # column the board reads as "where the router is".
+        client_ip=None,
+        ip=ip,
+    )
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity="ddns_hostname",
+        entity_id=hostname.id,
+        action="manual_update",
+        diff={
+            "ip": ip,
+            "rtype": rtype,
+            "status": result.status,
+            "attempts": [
+                {"backend_type": backend_type, "status": attempt_status}
+                for backend_type, attempt_status in result.attempts
+            ],
+        },
+    )
+    await commit_after_dns(session, endpoint=EVENT_MANUAL_UPDATE)
+
+    published_ids = [backend.backend_id for backend in plans[0].backends]
+    return ManualUpdateOut(
+        hostname_id=hostname.id,
+        name=hostname.name,
+        ip=ip,
+        rtype=rtype,
+        # HTTP 200 with a `911` body is on purpose. The operation ran;
+        # `911` is its result, in the vocabulary the whole service uses,
+        # and it is exactly what `/nic/update` answers 200 with. Mapping
+        # provider outcomes onto HTTP status codes would invent a second
+        # vocabulary for the same facts and lose the per-backend detail
+        # in the process.
+        status=result.status,
+        attempts=[
+            BackendAttemptOut(
+                backend_id=backend_id, backend_type=backend_type, status=attempt_status
+            )
+            for backend_id, (backend_type, attempt_status) in zip(
+                published_ids, result.attempts
+            )
+        ],
+        published=result.status == STATUS_GOOD,
+        rate_limit_per_minute=limit,
+        success_response_codes=sorted(SUCCESS_RESPONSE_CODES),
+    )
+
+
+# --------------------------------------------------------------------- #
 # Log search
 # --------------------------------------------------------------------- #
 #
@@ -3131,7 +3751,15 @@ BACKEND_TYPE_NONE = "__none__"
 #: ``test_router_events.py`` re-derives the set from every ``EVENT_*``
 #: constant in ``router_nic`` so a fourth one added there fails here
 #: rather than silently going unfilterable.
-EVENT_TYPES: tuple[str, ...] = tuple(sorted({EVENT_UPDATE, EVENT_DELETE, EVENT_AUTH}))
+#:
+#: **Four now, and the fourth arrived through exactly that mechanism.**
+#: #74's ``POST /hostnames/{id}/update`` writes ``manual_update``, and
+#: the derivation test failed on the commit that added the constant
+#: rather than on the one that shipped an unfilterable row. That is the
+#: rule working; the count is not the point, the writer is.
+EVENT_TYPES: tuple[str, ...] = tuple(
+    sorted({EVENT_UPDATE, EVENT_DELETE, EVENT_AUTH, EVENT_MANUAL_UPDATE})
+)
 
 #: Every ``response_code`` the wire can carry, from the two modules that
 #: own the halves: ``providers.PROVIDER_STATUSES`` is what an adapter

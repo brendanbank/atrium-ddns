@@ -800,7 +800,14 @@ async def test_every_hostname_route_is_gated_on_hostname_manage(
     """
     a = tenants["a"]
     routes = _hostname_routes()
-    assert len(routes) == 4, f"expected four hostname routes, found {routes}"
+    # Seven since #74: the four lifecycle routes plus `GET`/`PUT
+    # /{id}/backends` and `POST /{id}/update`. The number is asserted
+    # rather than derived-and-trusted precisely so that adding a route
+    # is a decision someone takes here — this line failing on the
+    # commit that added them is the guard doing its job, and it is how
+    # the three new routes came to be covered by the loop below rather
+    # than silently not being.
+    assert len(routes) == 7, f"expected seven hostname routes, found {routes}"
 
     without = ALL_PERMS - {HOSTNAME_MANAGE_PERMISSION}
     async with _client(a["user"], without) as client:

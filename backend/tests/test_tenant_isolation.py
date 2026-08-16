@@ -88,6 +88,7 @@ ISOLATION_FIXTURE: dict[type[Any], str] = {
     m.DomainBackend: "backend_id",
     m.Device: "device_id",
     m.Hostname: "hostname_id",
+    m.HostnameBackend: "hostname_backend_id",
     m.DnsEvent: "event_id",
     m.RateLimitEvent: "rate_limit_event_id",
 }
@@ -168,7 +169,15 @@ async def tenants():
                 ip="192.0.2.1",
             )
             rate_limit_event = m.RateLimitEvent(device_id=device.id)
-            s.add_all([event, rate_limit_event])
+            # #74's selection row. Two hops from its owner — this row has
+            # no `user_id`, and neither does the hostname it hangs off;
+            # the tenant is the hostname's *domain's* `user_id`. It is in
+            # the fixture so the parameterised cases below cover it like
+            # every other model rather than special-casing it.
+            selection = m.HostnameBackend(
+                hostname_id=hostname.id, backend_id=backend.id
+            )
+            s.add_all([event, rate_limit_event, selection])
             await s.flush()
             built[tag] = {
                 "user_id": uid,
@@ -177,6 +186,7 @@ async def tenants():
                 "backend_id": backend.id,
                 "device_id": device.id,
                 "hostname_id": hostname.id,
+                "hostname_backend_id": selection.id,
                 "event_id": event.id,
                 "rate_limit_event_id": rate_limit_event.id,
             }

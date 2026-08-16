@@ -3,27 +3,42 @@
 > **every legacy page either exists as a registration or is deleted because
 > atrium covers it — demonstrated against the deployed stack**
 
-**Verdict: exit 2. ~~15~~ ~~11~~ ~~10~~ 2 of 39 legacy routes are in neither
-column**, in ~~five~~ one capability group, counted apart and never averaged.
+**Verdict: ~~exit 2~~ exit 0. ~~15~~ ~~11~~ ~~10~~ ~~2~~ **0** of 39 legacy
+routes are in neither column**, in ~~five~~ ~~one capability group~~ no groups.
+The counts were kept apart and never averaged on the way down, which is why the
+zero is a result and not a rounding.
 
 This file is the route-by-route walk. Every verdict in it is a live response
 from a stack the run that wrote it stood up. Reproduction commands are inline so
 the table can be re-run rather than believed.
 
+**A zero deserves more suspicion than any other number here**, so §4 records
+what the instrument did on its first pass rather than only its last: three rows
+disagreed with their stated predictions, and the walk exits non-zero when that
+happens. All three turned out to be probe defects and are described in §0 — but
+they are the reason this reading is a measurement rather than a formality, and a
+"0 gaps" run that had never printed a gap would be worth very little.
+
 ---
 
-## 0. Four readings, and what moved between them
+## 0. Five readings, and what moved between them
 
 A verdict is amended **visibly** here, never replaced. Changed cells are struck
 through and the reasoning is kept.
 
-| | #47 (2026-08-16) | #69 (2026-08-16) | #47-rerun (2026-08-16) | **#75 + #73, re-measured on the merged tree (2026-08-16)** |
-|---|---|---|---|---|
-| deleted — atrium covers it | 13 (33.3%) | 13 (33.3%) | 13 (33.3%) | 13 (33.3%) |
-| registered | 11 (28.2%) | 15 (38.5%) | 15 (38.5%) | **23 (59.0%)** |
-| **deliberately dropped** — *a third disposition, see §3.4* | — | — | 1 (2.6%) | 1 (2.6%) |
-| **neither — the finding** | **15 (38.5%)** | **11 (28.2%)** | **10 (25.6%)** | **2 (5.1%)** |
-| gaps restricted to the 22 *pages* | 9 (40.9%) | 7 (31.8%) | 7 (31.8%) | **2 (9.1%)** |
+| | #47 | #69 | #47-rerun | #75 + #73, merged tree | **#74, merged tree (2026-08-16)** |
+|---|---|---|---|---|---|
+| deleted — atrium covers it | 13 (33.3%) | 13 (33.3%) | 13 (33.3%) | 13 (33.3%) | 13 (33.3%) |
+| registered | 11 (28.2%) | 15 (38.5%) | 15 (38.5%) | 23 (59.0%) | **25 (64.1%)** |
+| **deliberately dropped** — *a third disposition, see §3.4* | — | — | 1 (2.6%) | 1 (2.6%) | 1 (2.6%) |
+| **neither — the finding** | **15 (38.5%)** | **11 (28.2%)** | **10 (25.6%)** | **2 (5.1%)** | **0 (0.0%)** |
+| gaps restricted to the 22 *pages* | 9 (40.9%) | 7 (31.8%) | 7 (31.8%) | 2 (9.1%) | **0 (0.0%)** |
+
+**The gap column is empty.** Every reading before this one closed routes with a
+page; #74's two needed a schema change, which is why they were the last two
+standing and why three earlier readings reported rather than built them. §4
+carries the walk that measured it and the first run's disagreements, which are
+what establish that the instrument can still say `gap` at all.
 
 Both denominators were re-derived from the legacy source at each reading and
 have not moved: 39 routes, 22 pages, `dyndns-route53` still pinned at
@@ -60,6 +75,44 @@ be inventing a disposition.
 or struck as a third-disposition route, and said the call is the operator's.
 The entry is registered — the issue's own default, and the cheap thing — but
 the question it raises is recorded under G5 rather than answered.
+
+### What #74 changed, and the probe it had to correct to see it
+
+**G1 is closed and its two routes move to *registered*.** They were the per-
+hostname *backend* screen, and the rewrite had no data model for any of the
+three things it did — which is why #47, #69 and the #47 re-run each reported
+them and none built them. `0004_hostname_backends_and_ttl` adds
+`ddns_hostname_backend` and `ddns_hostname.ttl`; `POST /hostnames/{id}/update`
+is the manual trigger, running the wire's own publish path. §3.3's G1 block
+keeps the finding struck through and carries the closing evidence, taken from a
+stack this run stood up (`COMPOSE_PROJECT_NAME=ddns74`, API on `:8074`).
+
+**The two denominators did not move.** Instrument A was re-run against
+`dyndns-route53` at `5d1c941` for this reading: 39 routes, 22 pages. The gap
+went to zero over a fixed divisor.
+
+**The walk found two probe defects of its own, and one of them is #73's lesson
+pointing the other way.** #73 corrected its `/nic/*` probes to read the body
+because `GET /nic/update` answers `200 text/plain badauth` — the wire carries
+errors in the body, not the status. `/nic/checkip` needs the body for the
+*opposite* reason: it answers **`200 text/html` from the router**, because
+`CHECKIP_HTML` is an HTML wrapper by legacy contract. So a probe that reads
+`text/html` as "this is the SPA catch-all" — which is exactly what §2.1 tells
+you to do — classifies a real, frozen-table-covered route as **absent**.
+Content type discriminates two of the three `/nic/*` routes and misreads the
+third. Only the body separates all three from the shell.
+
+**And a registration key composed at run time is not in the bundle.** #73's
+three settings routes register as `` `atrium-ddns-settings-${key}` ``, so the
+composed keys never appear as literals in the shipped artefact; the **paths**
+do. A bundle-grep keyed on the registration key reports ABSENT for a surface
+that is present, and it reports it identically to a surface that is genuinely
+missing. §3.2's claim that all registrations "were confirmed in the bundle the
+running stack serves" holds for those three rows by path and not by key, which
+is worth knowing before the next reading greps for a key.
+
+Both defects were in **this** walk's first run, both were corrected, and both
+are recorded rather than quietly fixed — see §4.
 
 ### What #73 changed, and the one thing it does not claim
 
@@ -342,12 +395,20 @@ Atrium's audit log (`GET /api/admin/audit -> 200`) and notifications are
 additional surfaces with no legacy counterpart. They are not in the table
 because the criterion runs legacy→atrium, not the reverse.
 
-### 3.2 Registered — name the registration (~~11~~ ~~15~~ 23 routes)
+### 3.2 Registered — name the registration (~~11~~ ~~15~~ ~~23~~ 25 routes)
 
-All ~~15~~ 23 registrations were confirmed **in the bundle the running stack
-serves** — ~~`GET /host/main.js -> 200, 748,893 bytes`~~ ~~763,680 at #75~~
-~~767,491 after #73~~ `GET /host/main.js -> 200, 783,112 bytes` on the
-merged tree — not in `frontend/src/`.
+All ~~15~~ ~~23~~ 25 registrations were confirmed **in the bundle the running
+stack serves** — ~~`GET /host/main.js -> 200, 748,893 bytes`~~ ~~763,680 at
+#75~~ ~~767,491 after #73~~ ~~783,112 on the merged tree~~ `GET /host/main.js
+-> 200, 801,320 bytes` after #74 — not in `frontend/src/`.
+
+**With one caveat #74's walk found, which applies to three rows below.** The
+settings routes register as `` `atrium-ddns-settings-${key}` `` — a template
+literal composed at run time — so those three keys are **not** in the bundle as
+literals and cannot be. Their *paths* are. Confirming them "in the bundle"
+therefore means by path, and a later reading that greps for the key will get
+`False` from a surface that is present, indistinguishable from one that is
+absent. Every other row here is confirmable by key.
 
 | legacy route | registration | backing endpoint on the running stack |
 |---|---|---|
@@ -374,6 +435,8 @@ merged tree — not in `frontend/src/`.
 | **`GET,POST /admin/rate-limits/user/<id>`** (#73) | re-keyed to the device: `registerRoute atrium-ddns-devices`, the *Rate limit* control on each row | `PATCH /api/atrium_ddns/devices/{device_id}` |
 | **`POST /admin/rate-limits/user/<id>/delete`** (#73) | same control, emptied — *inherit* is `null`, not `0` | same endpoint, `{"rate_limit_per_minute": null}` |
 | **`GET,POST /admin/health-checks/config`** (#73) | same group → child `health-checks`, `registerRoute atrium-ddns-settings-health-checks` `/atrium-ddns/settings/health-checks` | the three endpoints above |
+| **`GET,POST /admin/hostnames/<id>/backends`** (#74) | `registerRoute atrium-ddns-names` — the *Publishing* modal on each row, "same page" in the sense the four `/admin/domains/<id>/backends/*` rows already use | `GET`/`PUT /api/atrium_ddns/hostnames/{hostname_id}/backends`, `POST /api/atrium_ddns/hostnames/{hostname_id}/update` — §3.3 G1 |
+| **`GET,POST /admin/users/<uid>/hostnames/<hn>/backends`** (#74) | same, under `atrium_ddns.admin` — see §4's stricter reading | same endpoints, scope widened |
 
 The third child, `retention` (`/atrium-ddns/settings/retention`), has **no legacy
 counterpart** and so appears in no row: the old service pruned inside
@@ -407,55 +470,94 @@ They are counted as registrations because they *are* registrations and the
 criterion asks for a registration; a reader should know that the dashboard row
 above rests on the board and the log page, not on the home widget.
 
-### 3.3 In neither column — the finding (~~15~~ ~~11~~ ~~10~~ 2 routes, ~~5~~ one group)
+### 3.3 In neither column — the finding (~~15~~ ~~11~~ ~~10~~ ~~2~~ 0 routes, ~~5~~ ~~one group~~ none)
 
-Counted apart, never averaged.
+Counted apart, never averaged. **This section is now empty of open rows**; every
+group below is kept, struck through, with the evidence that closed it.
 
-#### G1 — the hostname lifecycle (~~6~~ 2 routes) · severity: ~~blocking~~ medium
+#### ~~G1 — the hostname lifecycle (~~6~~ 2 routes) · severity: ~~blocking~~ medium~~ — **CLOSED by #74**
 
-| legacy route | what it did | this re-run |
+| legacy route | what it did | disposition |
 |---|---|---|
 | ~~`GET,POST /admin/hostnames`~~ | list my hostnames **and create one** | **closed by #69** — re-demonstrated §3.3.1 |
 | ~~`POST /admin/hostnames/<id>/delete`~~ | remove a hostname | **closed by #69** — re-demonstrated |
-| `GET,POST /admin/hostnames/<id>/backends` | choose which provider backends a hostname publishes to; edit its TTL; trigger a manual DNS update | **still open** |
+| ~~`GET,POST /admin/hostnames/<id>/backends`~~ | choose which provider backends a hostname publishes to; edit its TTL; trigger a manual DNS update | **closed by #74** — schema change `0004`, demonstrated §3.3.2 |
 | ~~`GET,POST /admin/users/<uid>/hostnames`~~ | the same, for another tenant, as an admin | **closed by #69** (scope-widened; see §4's stricter reading) |
 | ~~`POST /admin/users/<uid>/hostnames/<hn>/delete`~~ | " | **closed by #69** — re-demonstrated |
-| `GET,POST /admin/users/<uid>/hostnames/<hn>/backends` | " | **still open** |
+| ~~`GET,POST /admin/users/<uid>/hostnames/<hn>/backends`~~ | " | **closed by #74** — same endpoints under `atrium_ddns.admin`, §3.3.2 step 11 |
 
-Measured again on this stack, as the super_admin above:
+**Registration**: `registerRoute atrium-ddns-names` `/atrium-ddns/names` +
+`registerNavItem atrium-ddns-names-nav` ("Names") — a *Publishing* modal on each
+row, in the same "same page" sense §3.2 already uses for the four
+`/admin/domains/<id>/backends/*` routes. **It registers no new route**, so the
+bundle's registration sweep stays at thirteen surfaces and #75's help guard —
+which asserts every registered route has a help entry — is satisfied without a
+new entry. The Names entry's blurb was extended anyway: the guard's letter did
+not require it and its intent does.
+
+**Backing endpoints**: `GET`/`PUT
+/api/atrium_ddns/hostnames/{hostname_id}/backends` and `POST
+/api/atrium_ddns/hostnames/{hostname_id}/update`.
+
+~~Measured again on this stack, as the super_admin above:~~ superseded — the
+`405`s below were the correct reading in the #47 re-run and are kept for the
+record:
 
 ```
 POST /api/atrium_ddns/hostnames/1/backends -> 405 {'detail': 'Method Not Allowed'}
 POST /api/atrium_ddns/hostnames/1/update   -> 405 {'detail': 'Method Not Allowed'}
-GET  /api/atrium_ddns/hostnames/1/backends -> 200 text/html  (the §2.1 catch-all, not an endpoint)
-/api/atrium_ddns/hostnames/{hostname_id}/backends : NOT in the served OpenAPI schema
 ```
 
-**What is left, and why it is not a UI omission either.** The two surviving
-routes are the per-hostname *backend* screen, and the rewrite has no data model
-for the three things it did. The single hostname mutator the stack serves is
-`PATCH /api/atrium_ddns/hostnames/{id}`, and its request body — read from the
-running stack's own schema, not from the source — is device assignment and
-nothing else:
+Re-measured on the merged tree, with a **control first** so "routed" is a
+comparison rather than a hope:
 
 ```
-HostnameAssignIn properties: ['device_id']
-HostnameCreateIn properties: ['device_id', 'domain_id', 'name']
+PUT  /api/atrium_ddns/hostnames/1/no-such-route  -> 405   <- the control: absent
+PUT  /api/atrium_ddns/hostnames/999999/backends  -> 422   <- routed
+POST /api/atrium_ddns/hostnames/999999/update    -> 422   <- routed
+served OpenAPI schema: /api/atrium_ddns/hostnames/{hostname_id}/backends ['get', 'put']
+served OpenAPI schema: /api/atrium_ddns/hostnames/{hostname_id}/update   ['post']
 ```
 
-- **Which backends a hostname publishes to** is not a choice under this schema.
-  A hostname publishes to every backend bound to its domain — `router_nic`
-  iterates `Domain.backends` and aggregates — so there is no column to edit and
-  no join table to populate. Closing this is a schema change, not a page.
-- **Per-hostname TTL** has no column either. TTL lives in
-  `ddns_domain_backend.config`, i.e. per binding, not per name.
-- **A manual DNS update trigger** has no endpoint; the health check is scheduled
-  only, which is the same gap G3 records for `POST /admin/health-checks/run`.
+The three sub-features and where each now lives:
 
-Counted as open on the criterion's literal wording, at medium rather than
-blocking severity: the product is usable end to end without them, which is the
-change from #47's reading. **Reported, not built** — this re-run's brief is
-explicit that a schema change is not its scope.
+- **Which backends a hostname publishes to** — `ddns_hostname_backend`, a
+  selection table. **An empty selection means *inherit the zone*, not *publish
+  nowhere*.** That is the legacy service's own `Hostname.get_backends()` and the
+  frozen model case
+  `backends-empty-selection-resolves-to-all-of-the-domains-backends`
+  (`preserve`) — and it is the only reading under which introducing the table is
+  safe, because every hostname that exists has no row in it. The migration
+  therefore backfills nothing. The alternative is argued down in `0004`'s
+  docstring rather than left implied: a backfill freezes each name's backend set
+  at migration time, so a binding added to a zone afterwards would be published
+  to by new names and not by old ones — the same silence, moved six months out.
+  `backends-empty-selection-tracks-the-domain-live` is `preserve` and is exactly
+  that property. The cost, stated where it is paid: "publish nowhere" becomes
+  unspellable.
+- **Per-hostname TTL** — `ddns_hostname.ttl`, nullable. NULL is *inherit*, and
+  inherit resolves to `ddns_domain_backend.config['ttl']`, which falls back to
+  `providers.DEFAULT_TTL`. NULL is deliberately not 60: a name at NULL follows a
+  later change to its binding and a name explicitly set to 60 does not.
+- **A manual DNS update trigger** — `POST /hostnames/{id}/update`, running the
+  wire's own publish path (`load_plans` → `run_dns_phase` → `aggregate` →
+  `persist_updates` → `record_hostname_events`, by identity, asserted).
+  Rate-limited on the **device's** existing `ddns_rate_limit_event` budget —
+  the same control #73's settings pages expose — because a separate budget
+  would let a caller draw the metered provider quota twice. Logged as a distinct
+  `manual_update` event type so pressing the button cannot make a dead router
+  read as live on the board; §3.3.2 step 12 shows `liveness=never_seen` after
+  five successful manual publishes. G3's `POST /admin/health-checks/run` is a
+  different button, closed separately by #75, and its debounce is a different
+  mechanism (atrium's `audit_log`) for a different reason — that one is not
+  per-device.
+
+**The one thing this closes that is not a route.** `scripts/import_legacy.py`
+refuses two legacy states it can now represent — a zone whose hostnames disagree
+about TTL, and a *selective* `hostname_backends` binding. Both refusals still
+refuse rather than corrupt, and both are now unnecessary. Not changed by #74 (it
+is #50's file and outside that issue's acceptance criteria); recorded so the
+next migration-cutover issue finds it.
 
 <details>
 <summary>the original blocking finding, for the record (#47, 2026-08-16)</summary>
@@ -568,6 +670,144 @@ admin POST into tenant A's zone -> 201 {"id":8,"name":"byadmin.za6602e.example.i
 admin DELETE another tenant's name -> 204
    tenant A now sees: ['home.za6602e.example.invalid']
 ```
+
+#### 3.3.2 The publishing half (#74), driven from two empty accounts
+
+Not carried forward and not asserted from inside the process: driven over HTTP
+from **outside** it, against a stack built from the merged tree
+(`COMPOSE_PROJECT_NAME=ddns74`, API on `:8074`), by two `user`-role tenants
+created through atrium's own invite flow. The zone's three providers are the
+frozen fixture's scripted stub slots (`ATRIUM_DDNS_COMPAT_STUB=1`), scripted
+`nochg` / `good` / `dnserr` so that the aggregate is a **measurement** rather
+than a tautology — with all three the answer is `good`, and dropping the middle
+one makes it `dnserr`, which holds only if the selection is read *and* read in
+the zone's own order.
+
+Nothing reaches a real nameserver, and nothing is written to the database except
+through the API.
+
+*(The bundle line carries two numbers because the first draft printed one and it
+was the wrong one: `801114` is the **character** count of the decoded body and
+`801320` is the byte count, the 206 difference being this bundle's own curly
+quotes and its `≠` glyph. §3.2's figures are bytes. A 0.03% disagreement between
+two instruments is exactly the size that gets read as noise when only one of
+them is ever printed.)*
+
+```
+== 0. the routes exist. Probed with PUT/POST — never GET ==
+   PUT  /hostnames/1/no-such-route  -> 405   <- the control: absent
+   PUT  /hostnames/999999/backends  -> 422   <- routed (the body was validated)
+   POST /hostnames/999999/update    -> 422   <- routed (the body was validated)
+   GET /host/main.js -> 801320 bytes (801114 characters)
+     PRESENT  publishing-save   publishing-update   inherits_backends
+
+== 4. THE DEFAULT. A name nobody has configured — what does it publish to? ==
+   inherits_backends : True
+   selected rows     : []                  <- no ddns_hostname_backend rows
+   publishes_to      : [7805, 7806, 7807]  <- all three, resolved
+   ttl               : None  (None = inherit)
+   effective_ttl     : [60]
+
+== 5. publish it now, with no selection: all three backends are contacted ==
+   POST /hostnames/7495/update -> 200
+   aggregate  : good   published=True
+     stub1    -> nochg
+     stub2    -> good
+     stub3    -> dnserr
+   rate limit : 30/minute for this device
+
+== 6. narrow it to two, dropping the one that answers `good` ==
+   PUT  /hostnames/7495/backends {"backend_ids":[stub3,stub1],"ttl":300} -> 200
+   inherits_backends : False
+   publishes_to      : [7805, 7807]  <- zone order, not request order
+   ttl               : 300
+   effective_ttl     : [300]
+   POST /hostnames/7495/update -> 200
+   aggregate  : dnserr  <- the aggregate MOVED, so the selection is read
+     stub1    -> nochg
+     stub3    -> dnserr
+
+== 7. the log ==
+   GET /events?hostname_id=7495 -> 200, 5 rows
+     manual_update  stub3    dnserr  client_ip=None
+     manual_update  stub1    nochg   client_ip=None
+     manual_update  stub3    dnserr  client_ip=None
+     manual_update  stub2    good    client_ip=None
+     manual_update  stub1    nochg   client_ip=None
+   event types written: ['manual_update']
+   vocabulary offers  : ['auth', 'delete', 'manual_update', 'update']
+
+== 8. clear the selection: back to inheriting, NOT to publishing nowhere ==
+   PUT  /hostnames/7495/backends {"backend_ids":null,"ttl":null} -> 200
+   inherits_backends : True
+   publishes_to      : [7805, 7806, 7807]  <- all three again
+
+== 9. the refusals, each a different sentence ==
+   manual update on a name with no device      -> 409 "…is not assigned to a device…"
+   manual update with an address that is not   -> 422
+   ttl below the legacy form's minimum of 30   -> 422
+   ttl above the legacy form's maximum         -> 422
+
+== 10. tenant B cannot see or touch tenant A's name ==
+   B: GET   backends   -> 404  (404 = not yours, never 403)
+   B: PUT   backends   -> 404
+   B: POST  update     -> 404
+
+== 11. THE ADMIN PAIR, cross-tenant, against a zone owned by another tenant ==
+   admin GET  another tenant's publishing -> 200 domain=yc06692.example.invalid
+   admin PUT  selection + ttl=120         -> 200 publishes_to=[7808] ttl=120
+   admin POST manual update               -> 200 status=good
+   B sees the admin's change              -> 200 ttl=120
+   B's OWN log carries the admin's publish -> 200, 1 rows, attributed to B
+
+== 12. the board, after everything ==
+   device router-c06692  liveness=never_seen
+     home.zc06692.example.invalid  strips=1
+       family      : A
+       published   : {'address': '203.0.113.74', 'updated_at': '…'}
+       answered    : {'address': None, 'status': 'never_checked', …}
+       called from : {'address': None, 'reason': 'no_update_on_record', …}
+       lower joint : not_applicable
+```
+
+**Step 12 is the result worth reading twice, and it is not decoration.** Five
+successful manual publishes have moved `last_ip_v4` and drawn a strip, and the
+device still reads `liveness=never_seen` with `called from:
+no_update_on_record`. That is the reason `manual_update` is a distinct
+`event_type` rather than another `update` row: `worker_jobs.device_statuses`
+derives "which of my devices stopped calling in" from `event_type == 'update'`,
+so folding the button's own traffic into it would let an operator answer the
+board's liveness question by pressing a button. A router offline for a week
+would have read as active.
+
+**Step 11's last line is the one an attribution bug leaves looking fine.** The
+admin's publish is attributed to the *owner* in `ddns_event` — so it appears in
+the owner's log search, which is the surface built to answer "why did my name
+change". The admin's identity is recorded separately, in atrium's audit log,
+where "an admin did this to somebody's zone" belongs. The owner's own log is
+read back rather than assumed.
+
+**What the walk does not show, and where it is shown instead.** That a hostname
+row created *before* `0004` ran still publishes to every backend of its zone. No
+row on this stack predates the migration, so the walk cannot reach that clause —
+it is asserted in `backend/tests/test_router_hostname_backends.py` §0 against a
+row inserted naming only the columns that existed at `0003`, together with two
+structural readings that make the reconstruction faithful: the live
+`information_schema` says `ttl` is nullable with no server default, and `0004`'s
+own AST contains no data-writing call (parsed rather than grepped, because the
+docstring argues about backfilling at length; vacuity-guarded on `add_column`
+and `create_table`).
+
+The independent second reading is the frozen 124-case wire table, whose twelve
+fixture hostnames are seeded by a script that has never heard of
+`ddns_hostname_backend`: three of its cases aggregate across two or three
+backends, so "empty means nowhere" takes them to `911`. Measured both ways —
+**124/124** with the change, and **46 of 124 failing** when `resolve_backends` is
+mutated to the reading the table's shape suggests. A second mutation — the
+selection stored and never read — fails **6 of 42** host tests and **0 of 124**
+wire cases, because every fixture hostname has an empty selection. That is the
+honest limit of the frozen table as an instrument here, and the reason the
+reconstruction exists.
 
 #### ~~G2 — operator configuration has no UI (4 routes) · severity: high~~ — **CLOSED by #73**
 
@@ -1127,19 +1367,56 @@ gap routes (2):
 of which pages: 2 of 22 = 9.1%
 ```
 
+**#74 re-walked all 39 again rather than subtracting its own two.** The
+arithmetic was obvious — the two remaining gap routes were the two that issue
+closed — and that is precisely why it was not taken. Same method: a stack built
+from the merged tree (`COMPOSE_PROJECT_NAME=ddns74`, API on `:8074`), one probe
+per route, the disposition **stated per row before its probe ran**, exit
+non-zero on any disagreement. Instrument A was re-run against `5d1c941` first
+and still answers 39 routes and 22 pages.
+
+**Three rows disagreed on the first run, and all three were the probe's fault —
+which is the outcome that makes the walk worth running.** Two are recorded in §0
+(`/nic/checkip` answers `200 text/html` *from the router*, so a content-type
+verdict misreads it; the settings routes' registration keys are composed at run
+time and are not in the bundle as literals). They are named here because they
+are also the evidence that **this instrument can still return `gap`** — a walk
+whose final line is "0 gaps" and which never once printed one would be the
+probe-that-could-not-fail, aimed at the exit criterion. It printed three, and
+each was investigated rather than tuned away.
+
+```
+control: GET  /api/atrium_ddns/made-up-fdca7f -> 200 text/html
+control: POST /api/atrium_ddns/made-up-fdca7f -> 405
+
+deleted       13   33.3%
+registered    25   64.1%
+dropped        1    2.6%
+gap            0    0.0%
+total         39
+
+gap routes (0):
+   (none)
+of which pages: 0 of 22 = 0.0%
+
+every row's probe agreed with its stated prediction.
+```
+
 | column | routes | share |
 |---|---|---|
 | deleted — atrium covers it | 13 | 33.3% |
-| registered | ~~15~~ ~~19~~ 23 | ~~38.5%~~ 59.0% |
+| registered | ~~15~~ ~~19~~ ~~23~~ 25 | ~~38.5%~~ ~~59.0%~~ 64.1% |
 | deliberately dropped (§3.4) | 1 | 2.6% |
-| **neither — the finding** | ~~**10**~~ ~~**6**~~ **2** | ~~**25.6%**~~ **5.1%** |
+| **neither — the finding** | ~~**10**~~ ~~**6**~~ ~~**2**~~ **0** | ~~**25.6%**~~ ~~**5.1%**~~ **0.0%** |
 | | **39** | **100%** |
 
 Restricted to the 22 *pages* — the criterion's own word — the gaps are
-`/admin/hostnames/<id>/backends`, `/admin/users/<uid>/hostnames/<hn>/backends`,
+~~`/admin/hostnames/<id>/backends`, `/admin/users/<uid>/hostnames/<hn>/backends`,~~
 ~~`/admin/rate-limits`, `/admin/rate-limits/user/<id>`,
 `/admin/health-checks/config`, `/admin/domains/<id>` and `/admin/help`~~ —
-~~**7 of 22, 31.8%**~~ **2 of 22, 9.1%**. ~~**The page figure did not move from
+**none**: ~~**7 of 22, 31.8%**~~ ~~**2 of 22, 9.1%**~~ **0 of 22, 0.0%**. The
+last two were pages, so the page figure and the route figure reached zero
+together. ~~**The page figure did not move from
 #69's**, because the one route that left the gap column since —
 `POST /admin/events/clear` — is a `POST` and renders no template.~~ **It moved
 twice, in parallel.** #75 closed `/admin/domains/<id>` and `/admin/help`, both
@@ -1148,12 +1425,15 @@ pages; #73 closed `/admin/rate-limits`, `/admin/rate-limits/user/<id>` and
 (`/admin/rate-limits/user/<id>/delete`, a `POST` that renders no template). The
 narrower denominator does not flatter the result, which is why both are given.
 
-**A stricter reading gives 4, not 2**, and it changes the headline, so it is
-stated rather than assumed. Two of the four routes #69 closed are the *admin
-acting on another tenant's names* pair, and they are served by the **same**
-endpoints under a widened scope (`atrium_ddns.admin`) rather than by a distinct
-per-user page. Demonstrated above — and with one real difference from the legacy
-surface, measured on this stack:
+**A stricter reading gives ~~4~~ 3, not 0**, and it changes the headline — it is
+the difference between *the gap column is empty* and *the gap column is empty
+except for the admin variants* — so it is stated rather than assumed. Two of the
+four routes #69 closed are the *admin acting on another tenant's names* pair;
+#74 adds a third of the same shape
+(`/admin/users/<uid>/hostnames/<hn>/backends`). All three are served by the
+**same** endpoints under a widened scope (`atrium_ddns.admin`) rather than by a
+distinct per-user page. Demonstrated above — and with one real difference from
+the legacy surface, measured on this stack:
 
 ```
 admin GET /api/atrium_ddns/hostnames -> 200, 4 rows
@@ -1165,12 +1445,20 @@ row keys: ['created_at', 'device_id', 'device_name', 'domain_id',
 
 The admin sees a single merged list with no tenant column and no tenant filter,
 so *"whose name is this"* is answerable only from the zone. A reader who
-requires the admin variant to be its own surface should count those two as still
-open, giving ~~**12 of 39 (30.8%)** and **8 of 22 pages (36.4%)**~~
-**4 of 39 (10.3%)** and **3 of 22 pages (13.6%)** on the merged tree. The looser count
-is the one in the table because the criterion's own word is *capability*
-("either exists as a registration") and the capability is reachable; the
-stricter count is here so the choice is visible.
+requires the admin variant to be its own surface should count those ~~two~~
+three as still open, giving ~~**12 of 39 (30.8%)** and **8 of 22 pages
+(36.4%)**~~ ~~**4 of 39 (10.3%)** and **3 of 22 pages (13.6%)**~~ **3 of 39
+(7.7%)** and **3 of 22 pages (13.6%)** after #74. The looser count is the one in
+the table because the criterion's own word is *capability* ("either exists as a
+registration") and the capability is reachable; the stricter count is here so
+the choice is visible.
+
+**#74's admin half has one property #69's does not**, and on the strict reading
+it is the argument against counting it open: the cross-tenant publish is
+attributed to the **zone's owner** in `ddns_event`, not to the admin, so it
+lands in the owner's log search rather than the admin's. Measured at §3.3.2 step
+11 by reading the owner's own log back. The legacy per-user page had no log at
+all.
 
 ---
 
@@ -1209,11 +1497,21 @@ Stated so a later reader does not take the table for more than it is.
   striking them does not arise.** The one disposition question still open is
   G5's, and it is stated there rather than decided.
 - **A prune tick was not observed** (§3.4). Registration was.
-- ~~**Every group was re-measured for this reading.**~~ **#75 re-measured G3, G4
-  and G5 only** — the three groups it changed — with `POST`-based probes and
+- ~~**Every group was re-measured for this reading.**~~ ~~**#75 re-measured G3,
+  G4 and G5 only** — the three groups it changed — with `POST`-based probes and
   §2.1's control taken in the same session. **G1 and G2 are carried forward from
   the #47 re-run and were not re-taken here.** That is the same
   carried-forward exposure that re-run was written to close, said out loud
   rather than left to be discovered: the next reader should treat the G1 and G2
   cells as older than the rest of this file, and the whole file as older than
-  the estate.
+  the estate.~~
+- **#74 re-walked all 39 routes on the merged tree** (§4), so no cell in the
+  tally is carried forward any more — every disposition in it was probed in one
+  session against one stack. What *is* carried forward is the prose: the
+  narrative blocks for G2–G5 are #73's and #75's own words, re-checked only to
+  the extent that §4's walk touches the routes they describe. G1's block and
+  §3.3.2 are #74's, taken live.
+- **Nobody has loaded any of this in a browser**, and #73's caveat still stands
+  unchanged for #74's modal: this repository has no browser harness. The
+  Publishing surface is evidenced from the served bundle, from vitest, and from
+  the endpoints it calls — not from a click.
