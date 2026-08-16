@@ -46,7 +46,15 @@ import { absoluteTitle, formatAge, rateLimitSummary } from './format';
    id, so a device whose name was reused does not collect a predecessor's
    history. */
 
-function HostnameBlock({ hostname }: { hostname: BoardHostname }) {
+/** One name and its strips.
+ *
+ * Exported for #89's device detail route, which renders the same block
+ * at full width under `; names this device updates`. Reused rather than
+ * reimplemented for `api/board.ts`'s own reason — the shapes may be
+ * restated, the verdicts may not — and a second renderer of the
+ * signature element is precisely where a sixth `DnsCheckStatus` would
+ * get a default branch. */
+export function HostnameBlock({ hostname }: { hostname: BoardHostname }) {
   const logLink = (
     <LogLink
       params={{ hostname_id: hostname.id }}

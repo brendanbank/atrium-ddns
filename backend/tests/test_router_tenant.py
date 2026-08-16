@@ -45,6 +45,7 @@ collisions that read as flakiness.
 """
 from __future__ import annotations
 
+import base64
 import os
 from typing import Any, AsyncIterator
 
@@ -2087,3 +2088,480 @@ async def test_the_limit_change_is_audited_with_both_readings(
     assert len(rows) == 1, rows
     diff = rows[0].diff["rate_limit_per_minute"]
     assert diff == {"before": None, "after": 0}, diff
+
+
+# ===================================================================== #
+# 6. The device can be renamed, the conflict is surfaced, and the
+#    credential is still not touched
+#
+# #89. #73's `DeviceUpdateIn` documented its own refusal — "there is no
+# `name` here … renaming is a separate change (the create path has a
+# uniqueness conflict to handle and this route does not)". The reasoning
+# was sound; the conclusion expired. The conflict is
+# `uq_ddns_device_user_name`, `UNIQUE(user_id, name)`, and it is now
+# handled here the way the create path handles it.
+#
+# The tests below are written so that three tempting implementations
+# fail:
+#
+#   * one that avoids the conflict by minting `router (2)` — caught by
+#     asserting the 409 *and* the stored name;
+#   * one that treats the constraint as installation-wide — caught by
+#     renaming onto a name a *different* tenant holds and requiring it
+#     to succeed;
+#   * one that re-hashes the credential on the way past — caught by the
+#     same two instruments #73 used, re-taken on the rename path,
+#     because evidence gathered on the limit path is evidence about the
+#     limit path.
+# ===================================================================== #
+
+
+def _nic_app() -> FastAPI:
+    """``/nic/*`` with nothing else mounted.
+
+    Built here rather than reusing ``_app`` because the two
+    authenticate differently and that is the point: ``_app`` overrides
+    ``current_principal`` with a fixture, so every request through it is
+    authenticated *by the test*. ``/nic/*`` reads HTTP Basic off the
+    wire and verifies it against ``ddns_device.password_hash`` — the
+    only instrument in this file that can say the stored hash still
+    opens for the secret the device was issued.
+    """
+    from atrium_ddns import router_nic
+
+    application = FastAPI()
+    application.include_router(router_nic.router)
+    return application
+
+
+def _basic(username: str, secret: str) -> dict[str, str]:
+    token = base64.b64encode(f"{username}:{secret}".encode()).decode()
+    return {"Authorization": f"Basic {token}"}
+
+
+async def _attach_hostname(domain_id: int, device_id: int, name: str) -> int:
+    factory = get_session_factory()
+    async with factory() as s:
+        row = m.Hostname(domain_id=domain_id, device_id=device_id, name=name)
+        s.add(row)
+        await s.flush()
+        row_id = row.id
+        await s.commit()
+    return row_id
+
+
+async def test_a_device_can_be_renamed_and_the_secret_is_untouched(
+    tenants: dict[str, Any],
+):
+    """The rename lands, and both of #73's instruments are re-taken on it.
+
+    #73 proved the *limit* path leaves the credential alone. A rename is
+    a different write to the same row, so that reading is not evidence
+    about this path — it is re-taken here rather than inherited.
+
+    The second instrument is stronger than #73's: instead of calling
+    ``verify_password`` (the function the router also calls, which makes
+    the test and the implementation share an author), this drives
+    ``/nic/update`` over HTTP Basic with the original secret. The frozen
+    table's ``update-badauth-precedes-911`` fixes the order — ``badauth``
+    is decided before ``911`` — so a ``911`` answer is only reachable
+    *after* the credential verified, and the wrong-secret request below
+    shows the probe can still say ``badauth``.
+    """
+    a = tenants["a"]
+    async with _client(a["user"]) as client:
+        created = await client.post(
+            "/api/atrium_ddns/devices",
+            json={"name": f"typo-{W}", "rate_limit_per_minute": 7},
+        )
+        assert created.status_code == 201, created.text
+        device = created.json()["device"]
+        device_id = device["id"]
+        username = device["username"]
+        secret = created.json()["secret"]
+
+    # A name this device owns, in a zone with no backends — so a
+    # successfully authenticated update answers `911` and reaches no
+    # provider and no nameserver.
+    hostname = f"renamed-{W}.{a['domain_name']}"
+    await _attach_hostname(a["domain_id"], device_id, hostname)
+
+    before_hash = await _stored_hash(device_id)
+
+    async with _client(a["user"]) as client:
+        renamed = await client.patch(
+            f"/api/atrium_ddns/devices/{device_id}",
+            json={"name": f"fixed-{W}", "rate_limit_per_minute": 7},
+        )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["name"] == f"fixed-{W}"
+    # The credential pair's readable half is unchanged, and the response
+    # is still the read model.
+    assert renamed.json()["username"] == username
+    assert "secret" not in renamed.text
+    assert secret not in renamed.text
+    # …and the limit was carried through untouched by the rename.
+    assert renamed.json()["rate_limit_per_minute"] == 7
+
+    # The stored row, not the response the write happened to build.
+    async with _client(a["user"]) as client:
+        row = (await client.get(f"/api/atrium_ddns/devices/{device_id}")).json()
+    assert row["name"] == f"fixed-{W}"
+    assert row["username"] == username
+
+    # Instrument one: the bytes.
+    after_hash = await _stored_hash(device_id)
+    assert after_hash == before_hash, (
+        "the rename rewrote password_hash. Renaming a device must not "
+        "rotate its credential — the field device would stop working "
+        "and nobody asked for that."
+    )
+
+    # Instrument two: the wire. `911` means the request got past
+    # authentication and ownership and found a zone with no backends.
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=_nic_app()), base_url="http://nic.test"
+    ) as nic:
+        good = await nic.get(
+            "/nic/update",
+            params={"hostname": hostname, "myip": "192.0.2.10"},
+            headers=_basic(username, secret),
+        )
+        bad = await nic.get(
+            "/nic/update",
+            params={"hostname": hostname, "myip": "192.0.2.10"},
+            headers=_basic(username, secret + "x"),
+        )
+    assert good.status_code == 200, good.text
+    assert good.text.split()[0] == "911", (
+        f"the secret the device was issued no longer authenticates after "
+        f"the rename: /nic/update answered {good.text!r}"
+    )
+    # The probe is not answering `911` to everything: change one
+    # character of the secret and the same request is refused.
+    assert bad.text.split()[0] == "badauth", bad.text
+
+
+async def test_renaming_onto_a_name_this_tenant_already_uses_is_a_409(
+    tenants: dict[str, Any],
+):
+    """The conflict is surfaced, not avoided.
+
+    No suffix is minted and no duplicate is stored: the refusal carries
+    the offending name — which is disclosable precisely because the
+    constraint is per user, so it can only ever be about a device the
+    caller already owns and can already list.
+    """
+    a = tenants["a"]
+    taken = f"occupied-{W}"
+    async with _client(a["user"]) as client:
+        assert (
+            await client.post("/api/atrium_ddns/devices", json={"name": taken})
+        ).status_code == 201
+        mover_id = (
+            await client.post(
+                "/api/atrium_ddns/devices", json={"name": f"mover-{W}"}
+            )
+        ).json()["device"]["id"]
+
+        refused = await client.patch(
+            f"/api/atrium_ddns/devices/{mover_id}",
+            json={"name": taken, "rate_limit_per_minute": None},
+        )
+        assert refused.status_code == 409, refused.text
+        assert taken in refused.json()["detail"], refused.text
+
+        # Nothing was written on the way to the refusal, and no
+        # suffixed variant was invented behind it.
+        listing = (await client.get("/api/atrium_ddns/devices")).json()
+        names = [row["name"] for row in listing]
+        assert names.count(taken) == 1, names
+        assert next(r for r in listing if r["id"] == mover_id)["name"] == (
+            f"mover-{W}"
+        )
+        assert not [n for n in names if n.startswith(f"{taken} (")], names
+
+    # …and the session survived the rollback: a later write on the same
+    # route still works, which is the half a bare `except` would break.
+    async with _client(a["user"]) as client:
+        ok = await client.patch(
+            f"/api/atrium_ddns/devices/{mover_id}",
+            json={"name": f"moved-{W}", "rate_limit_per_minute": None},
+        )
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["name"] == f"moved-{W}"
+
+
+async def test_renaming_onto_a_name_another_tenant_uses_succeeds(
+    tenants: dict[str, Any],
+):
+    """``UNIQUE(user_id, name)`` — the scope is the *user*.
+
+    A test that only checked "a duplicate is a 409" would be asserting
+    the wrong scope: it passes identically against an implementation
+    that made device names unique installation-wide, which would let one
+    tenant's naming choices refuse another's and would disclose that
+    somebody, somewhere, already has a device called ``router``.
+    """
+    a, b = tenants["a"], tenants["b"]
+    shared = f"router-{W}"
+    async with _client(b["user"]) as client:
+        b_id = (
+            await client.post("/api/atrium_ddns/devices", json={"name": shared})
+        ).json()["device"]["id"]
+
+    async with _client(a["user"]) as client:
+        a_id = (
+            await client.post(
+                "/api/atrium_ddns/devices", json={"name": f"a-side-{W}"}
+            )
+        ).json()["device"]["id"]
+        allowed = await client.patch(
+            f"/api/atrium_ddns/devices/{a_id}",
+            json={"name": shared, "rate_limit_per_minute": None},
+        )
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.json()["name"] == shared
+
+    # Both rows exist, both are called the same thing, and each tenant
+    # sees exactly one of them.
+    async with _client(a["user"]) as client:
+        a_names = [
+            r["name"] for r in (await client.get("/api/atrium_ddns/devices")).json()
+        ]
+    async with _client(b["user"]) as client:
+        b_rows = (await client.get("/api/atrium_ddns/devices")).json()
+    assert a_names.count(shared) == 1, a_names
+    assert [r["id"] for r in b_rows if r["name"] == shared] == [b_id]
+    assert a_id != b_id
+
+
+async def test_renaming_another_tenants_device_is_a_404_and_writes_nothing(
+    tenants: dict[str, Any],
+):
+    """404, not 403 — "not yours" and "no such row" must not be
+    distinguishable, or the response is an enumeration oracle. Asserted
+    on the *name* as well as on the status, because a route that
+    refused after writing would still answer 404."""
+    a, b = tenants["a"], tenants["b"]
+    original = f"b-owned-{W}"
+    async with _client(b["user"]) as client:
+        victim = (
+            await client.post("/api/atrium_ddns/devices", json={"name": original})
+        ).json()["device"]["id"]
+    before = await _stored_hash(victim)
+
+    async with _client(a["user"]) as client:
+        refused = await client.patch(
+            f"/api/atrium_ddns/devices/{victim}",
+            json={"name": f"a-took-it-{W}", "rate_limit_per_minute": None},
+        )
+        # The detail route is scoped the same way, and by the same
+        # helper — so it is checked here rather than trusted.
+        unseen = await client.get(f"/api/atrium_ddns/devices/{victim}")
+    assert refused.status_code == 404, refused.text
+    assert unseen.status_code == 404, unseen.text
+
+    async with _client(b["user"]) as client:
+        row = (await client.get(f"/api/atrium_ddns/devices/{victim}")).json()
+    assert row["name"] == original
+    assert await _stored_hash(victim) == before
+
+
+async def test_the_rename_is_audited_with_both_readings_and_only_when_it_moved(
+    tenants: dict[str, Any],
+):
+    """``before`` and ``after`` on the name, and no ``name`` key at all
+    when the name did not change.
+
+    A diff that recorded ``{"before": x, "after": x}`` on every limit
+    change would make "this device was renamed" unsearchable, which is
+    the only question the key exists to answer.
+    """
+    a = tenants["a"]
+    async with _client(a["user"]) as client:
+        device_id = (
+            await client.post(
+                "/api/atrium_ddns/devices", json={"name": f"audited-name-{W}"}
+            )
+        ).json()["device"]["id"]
+        # 1: a rename.
+        assert (
+            await client.patch(
+                f"/api/atrium_ddns/devices/{device_id}",
+                json={"name": f"audited-new-{W}", "rate_limit_per_minute": None},
+            )
+        ).status_code == 200
+        # 2: a limit change with the name resubmitted unchanged.
+        assert (
+            await client.patch(
+                f"/api/atrium_ddns/devices/{device_id}",
+                json={"name": f"audited-new-{W}", "rate_limit_per_minute": 5},
+            )
+        ).status_code == 200
+        # 3: a limit change with no name key at all — the #73 shape,
+        #    which must still be accepted.
+        assert (
+            await client.patch(
+                f"/api/atrium_ddns/devices/{device_id}",
+                json={"rate_limit_per_minute": 6},
+            )
+        ).status_code == 200
+
+    factory = get_session_factory()
+    async with factory() as s:
+        rows = (
+            await s.execute(
+                sa.select(AuditLog.diff)
+                .where(
+                    AuditLog.entity == "ddns_device",
+                    AuditLog.entity_id == device_id,
+                    AuditLog.action == "update",
+                )
+                .order_by(AuditLog.id)
+            )
+        ).all()
+    assert len(rows) == 3, rows
+    assert rows[0].diff["name"] == {
+        "before": f"audited-name-{W}",
+        "after": f"audited-new-{W}",
+    }, rows[0].diff
+    assert "name" not in rows[1].diff, rows[1].diff
+    assert "name" not in rows[2].diff, rows[2].diff
+    # The limit half is unchanged by any of this.
+    assert rows[2].diff["rate_limit_per_minute"] == {"before": 5, "after": 6}
+
+
+async def test_one_device_name_validator_serves_create_and_rename(
+    tenants: dict[str, Any],
+):
+    """§13.1's rule, one object along: the composition may happen twice,
+    the validation may not.
+
+    Whitespace-only is the case that proves it. Before ``DeviceName``,
+    ``min_length=1`` was measured against the *unstripped* string while
+    the handler stripped afterwards, so ``"   "`` created a device named
+    ``""``. A rename validated separately would have had its own version
+    of that hole.
+    """
+    a = tenants["a"]
+    async with _client(a["user"]) as client:
+        blank_create = await client.post(
+            "/api/atrium_ddns/devices", json={"name": "   "}
+        )
+        assert blank_create.status_code == 422, blank_create.text
+
+        device_id = (
+            await client.post(
+                "/api/atrium_ddns/devices", json={"name": f"  padded-{W}  "}
+            )
+        ).json()["device"]["id"]
+        # Stripped on the way in, by the validator and not by the
+        # handler.
+        stored = (await client.get(f"/api/atrium_ddns/devices/{device_id}")).json()
+        assert stored["name"] == f"padded-{W}"
+
+        blank_rename = await client.patch(
+            f"/api/atrium_ddns/devices/{device_id}",
+            json={"name": "\t\n ", "rate_limit_per_minute": None},
+        )
+        assert blank_rename.status_code == 422, blank_rename.text
+
+        padded_rename = await client.patch(
+            f"/api/atrium_ddns/devices/{device_id}",
+            json={"name": f"  trimmed-{W} ", "rate_limit_per_minute": None},
+        )
+        assert padded_rename.status_code == 200, padded_rename.text
+        assert padded_rename.json()["name"] == f"trimmed-{W}"
+
+        # `null` is *absent* on this field and only on this field —
+        # `ddns_device.name` is NOT NULL, so there is no state it could
+        # name. It leaves the name alone rather than being refused.
+        untouched = await client.patch(
+            f"/api/atrium_ddns/devices/{device_id}",
+            json={"name": None, "rate_limit_per_minute": 4},
+        )
+        assert untouched.status_code == 200, untouched.text
+        assert untouched.json()["name"] == f"trimmed-{W}"
+        assert untouched.json()["rate_limit_per_minute"] == 4
+
+        too_long = await client.patch(
+            f"/api/atrium_ddns/devices/{device_id}",
+            json={"name": "x" * 256, "rate_limit_per_minute": None},
+        )
+        assert too_long.status_code == 422, too_long.text
+        # …and the strip happens *before* the length check, so trailing
+        # whitespace is not what makes a 255-character name too long.
+        at_limit = await client.patch(
+            f"/api/atrium_ddns/devices/{device_id}",
+            json={"name": "y" * 255 + "   ", "rate_limit_per_minute": None},
+        )
+        assert at_limit.status_code == 200, at_limit.text
+        assert at_limit.json()["name"] == "y" * 255
+
+
+async def test_the_detail_route_counts_the_same_names_the_list_does(
+    tenants: dict[str, Any],
+):
+    """``GET /devices/{id}`` — the route ``/atrium-ddns/devices/:id``
+    reads, and the reason the list not scaling is fixable at all.
+
+    Two instruments on one number: the detail row and the list row for
+    the same device must agree field for field. They are built by the
+    same ``_render_device``, which is the point — a detail route that
+    counted a device's hostnames with its own query is how the list and
+    the detail come to display two different numbers for one device.
+    """
+    a = tenants["a"]
+    async with _client(a["user"]) as client:
+        device_id = (
+            await client.post(
+                "/api/atrium_ddns/devices",
+                json={"name": f"detail-{W}", "rate_limit_per_minute": 11},
+            )
+        ).json()["device"]["id"]
+
+    for index in range(2):
+        await _attach_hostname(
+            a["domain_id"], device_id, f"detail{index}-{W}.{a['domain_name']}"
+        )
+
+    async with _client(a["user"]) as client:
+        detail = await client.get(f"/api/atrium_ddns/devices/{device_id}")
+        listing = (await client.get("/api/atrium_ddns/devices")).json()
+        missing = await client.get("/api/atrium_ddns/devices/9999999")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["hostname_count"] == 2
+    assert detail.json() == next(r for r in listing if r["id"] == device_id)
+    # A read model, so there is no field that could carry a secret —
+    # asserted structurally for every route in section 2, and
+    # behaviourally here.
+    assert "secret" not in detail.text
+    assert missing.status_code == 404, missing.text
+
+
+async def test_a_caller_without_the_device_permission_cannot_read_the_detail(
+    tenants: dict[str, Any],
+):
+    """The detail route is gated on the same permission as the list.
+
+    Gating the two differently would produce a list a reader can open
+    and rows they cannot follow — which is the shape #45 avoided for the
+    board and the devices page, one level down.
+    """
+    a = tenants["a"]
+    async with _client(a["user"]) as client:
+        device_id = (
+            await client.post(
+                "/api/atrium_ddns/devices", json={"name": f"ungated-{W}"}
+            )
+        ).json()["device"]["id"]
+
+    async with _client(a["user"], permissions={DOMAIN_MANAGE_PERMISSION}) as client:
+        refused = await client.get(f"/api/atrium_ddns/devices/{device_id}")
+        refused_list = await client.get("/api/atrium_ddns/devices")
+    assert refused.status_code == refused_list.status_code, (
+        f"the detail route and the list disagree about the gate: "
+        f"{refused.status_code} vs {refused_list.status_code}"
+    )
+    assert refused.status_code == 403, refused.text

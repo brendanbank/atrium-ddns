@@ -20,6 +20,7 @@
 import { useState } from 'react';
 import {
   Alert,
+  Anchor,
   Button,
   Group,
   Modal,
@@ -40,6 +41,7 @@ import {
   type DeviceSecret,
 } from '../api/devices';
 import { absoluteTitle, formatAge, rateLimitSummary } from '../board/format';
+import { deviceHref } from '../paths';
 import { MigratedNotice, SecretOnce } from './SecretOnce';
 
 function DeviceLine({
@@ -59,7 +61,24 @@ function DeviceLine({
     <Stack gap="xs" data-testid={`device-${device.name}`}>
       <div className="ddns-device__line" style={{ cursor: 'default' }}>
         <span />
-        <span className="ddns-data">{device.name}</span>
+        {/* #89. The row is the only way to reach `/atrium-ddns/devices/
+            :id` — the route carries a literal `:id`, so it cannot have
+            a nav item, and a destination nothing links to is #75's
+            defect one indirection along. The *name* is the link and the
+            rest of the row is unchanged: §12's "this adds a
+            destination, it does not redraw the list."
+
+            A plain anchor, for `DeviceBoardPage`'s reason: react-
+            router's `Link` is not reachable from this tree and a bare
+            `pushState` would move the address bar without telling
+            atrium's router. */}
+        <Anchor
+          href={deviceHref(device.id)}
+          className="ddns-data"
+          data-testid={`open-${device.name}`}
+        >
+          {device.name}
+        </Anchor>
         <span
           className="ddns-station__time"
           title={absoluteTitle(device.last_seen_at)}
