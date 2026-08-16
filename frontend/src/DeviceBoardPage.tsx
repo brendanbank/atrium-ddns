@@ -27,6 +27,7 @@ import { usePerm } from '@brendanbank/atrium-host-bundle-utils/react';
 import { BOARD_PERMISSION, boardQuery } from './api/board';
 import { HOSTNAME_PERMISSION } from './api/hostnames';
 import { BoardSkeleton, DeviceBoard } from './board/DeviceBoard';
+import { HealthCheckActions } from './board/HealthCheckActions';
 import { NAMES_PATH } from './HostnamesPage';
 import { DdnsRoot } from './host/DdnsRoot';
 
@@ -81,7 +82,19 @@ export function DeviceBoardInner() {
           </Text>
         </Alert>
       ) : data ? (
-        <DeviceBoard board={data} />
+        <>
+          {/* #75's two on-demand actions. Rendered only in the `data`
+              branch, and that is not a layout choice: the cadence
+              sentence quotes `health_check_interval_minutes` out of the
+              board payload, so there is no reading of it to render
+              before the payload arrives. A button placed in the loading
+              or refused branch would either invent that number or print
+              a blank where it goes. */}
+          <HealthCheckActions
+            intervalMinutes={data.health_check_interval_minutes}
+          />
+          <DeviceBoard board={data} />
+        </>
       ) : null}
     </Stack>
   );

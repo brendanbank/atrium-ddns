@@ -22,6 +22,7 @@ import {
   createDomain,
   deleteBackend,
   deleteDomain,
+  renameDomain,
   updateBackend,
   type Domain,
   type DomainBackend,
@@ -90,6 +91,12 @@ export function DomainList({
   const [backendFor, setBackendFor] = useState<Domain | null>(null);
   const [editing, setEditing] = useState<DomainBackend | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /* #75's rename. Two pieces of state rather than one, because the
+     modal has to keep showing the zone it is renaming *and* what has
+     been typed, and reusing `zoneName` would have the create form and
+     the rename form share a text box. */
+  const [renaming, setRenaming] = useState<Domain | null>(null);
+  const [newZoneName, setNewZoneName] = useState('');
 
   const invalidate = () =>
     client.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
@@ -100,6 +107,8 @@ export function DomainList({
     setEditing(null);
     setAdding(false);
     setZoneName('');
+    setRenaming(null);
+    setNewZoneName('');
     void invalidate();
   };
 
@@ -111,6 +120,16 @@ export function DomainList({
   const dropZone = useMutation({
     mutationFn: deleteDomain,
     onSuccess: done,
+    onError: fail,
+  });
+  const renameZone = useMutation({
+    mutationFn: (input: { id: number; name: string }) =>
+      renameDomain(input.id, input.name),
+    onSuccess: done,
+    // The server's refusal, verbatim. A rename that would leave names
+    // outside the zone is a 409 whose detail carries the count and a
+    // sample of the offending names — the whole point of which is that
+    // the operator can act on it, so it is not reworded here.
     onError: fail,
   });
   const addBackend = useMutation({
@@ -137,6 +156,7 @@ export function DomainList({
   const busy =
     addZone.isPending ||
     dropZone.isPending ||
+    renameZone.isPending ||
     addBackend.isPending ||
     editBackend.isPending ||
     dropBackend.isPending;
@@ -177,6 +197,18 @@ export function DomainList({
                 data-testid={`add-backend-${domain.name}`}
               >
                 Add a provider
+              </Button>
+              <Button
+                size="xs"
+                variant="default"
+                disabled={busy}
+                onClick={() => {
+                  setRenaming(domain);
+                  setNewZoneName(domain.name);
+                }}
+                data-testid={`rename-domain-${domain.name}`}
+              >
+                Rename
               </Button>
               <Button
                 size="xs"
@@ -242,6 +274,63 @@ export function DomainList({
             </Button>
           </Group>
         </Stack>
+      </Modal>
+
+      <Modal
+        opened={renaming !== null}
+        onClose={() => setRenaming(null)}
+        title={`Rename ${renaming?.name ?? ''}`}
+      >
+        {renaming ? (
+          <Stack gap="sm">
+            <input
+              className="ddns-data"
+              aria-label="New zone name"
+              value={newZoneName}
+              onChange={(event) => setNewZoneName(event.currentTarget.value)}
+              data-testid="rename-zone-name"
+            />
+            <Text size="xs" c="dimmed" data-testid="rename-zone-warning">
+              {/* The rule, stated before the refusal rather than after
+                  it. `hostname_count` is the server's own count for this
+                  zone, so the sentence cannot claim a number the list
+                  does not show. */}
+              {renaming.hostname_count === 0
+                ? 'This zone has no names in it, so any free zone name is accepted.'
+                : `This zone has ${renaming.hostname_count} name${
+                    renaming.hostname_count === 1 ? '' : 's'
+                  } under it. A rename that would leave any of them outside the zone is refused rather than rewriting them — a hostname is the DNS name a provider has already published a record under. Delete the ones you no longer want first.`}
+            </Text>
+            <Group justify="flex-end">
+              <Button
+                size="xs"
+                variant="default"
+                disabled={busy}
+                onClick={() => setRenaming(null)}
+                data-testid="rename-zone-cancel"
+              >
+                Cancel
+              </Button>
+              <Button
+                size="xs"
+                disabled={
+                  busy ||
+                  newZoneName.trim() === '' ||
+                  newZoneName.trim() === renaming.name
+                }
+                onClick={() =>
+                  renameZone.mutate({
+                    id: renaming.id,
+                    name: newZoneName.trim(),
+                  })
+                }
+                data-testid="rename-zone-submit"
+              >
+                Rename
+              </Button>
+            </Group>
+          </Stack>
+        ) : null}
       </Modal>
 
       <Modal

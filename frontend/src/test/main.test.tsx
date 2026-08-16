@@ -47,9 +47,9 @@ test('every registered surface still mounts through the wrapper element', async 
   await import('../main');
 
   // Vacuity guard: the sweep has to be over a non-empty population.
-  // Nine — the scaffold's four (home widget, demo page, admin tab,
+  // Ten — the scaffold's four (home widget, demo page, admin tab,
   // profile item), the board's one (#44), #45's two tenant pages, #46's
-  // log search, and #69's names page.
+  // log search, #69's names page, and #75's help page.
   //
   // An exact count rather than a floor, on purpose (#45's argument,
   // kept): a registration added without going through
@@ -65,16 +65,17 @@ test('every registered surface still mounts through the wrapper element', async 
   // to be 8", so the comment above names what the number is made of —
   // which is what turns that message from a puzzle into an instruction.
   // (#69 was the fourth issue to append here and the message did read as
-  // an instruction, which is the evidence for keeping it.)
+  // an instruction; #75 was the fifth and read `expected 10 to be 9`,
+  // which is the evidence for keeping it.)
   const rendered = [
     ...handles.homeWidgets,
     ...handles.routes,
     ...handles.adminTabs,
     ...handles.profileItems,
   ];
-  expect(rendered.length).toBe(9);
+  expect(rendered.length).toBe(10);
   // Keys are the registry's primary key: two registrations sharing one
-  // silently replace each other, so the count above would still read 9
+  // silently replace each other, so the count above would still read 10
   // while one surface never mounts. Added by #46 because three issues
   // have now appended to this file and the fourth will not have read
   // the other three.

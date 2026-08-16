@@ -16,6 +16,7 @@
  */
 import {
   IconHandStop,
+  IconHelp,
   IconKey,
   IconListSearch,
   IconRouter,
@@ -34,28 +35,29 @@ import { AtriumDdnsWidget } from './AtriumDdnsWidget';
 import { DeviceBoardPage } from './DeviceBoardPage';
 import { DevicesPage } from './DevicesPage';
 import { DomainsPage } from './DomainsPage';
+import { HELP_PATH, HelpPage } from './HelpPage';
 import { NAMES_PATH, HostnamesPage } from './HostnamesPage';
 import { LOG_PATH, LogSearchPage } from './LogSearchPage';
+import { BOARD_PATH, DEVICES_PATH, DOMAINS_PATH } from './paths';
 
-/** The board's path. Exported so a test asserts the registered route
- *  against the same string the nav item points at, rather than against
- *  a literal typed twice. */
-export const BOARD_PATH = '/atrium-ddns/board';
-
-/** #45's two tenant surfaces, same rule. */
-export const DOMAINS_PATH = '/atrium-ddns/domains';
-export const DEVICES_PATH = '/atrium-ddns/devices';
+/** The three paths this file used to declare. They moved to `paths.ts`
+ *  when #75's help page needed to name them: `main` imports `HelpPage`,
+ *  so `HelpPage` importing `main` would be a cycle. Re-exported
+ *  unchanged, so this file stays the one place a reader looks for
+ *  "what paths does this bundle own". */
+export { BOARD_PATH, DEVICES_PATH, DOMAINS_PATH };
 
 /** #46's log search. Defined in `LogSearchPage` because `logHref` needs
- *  it too, and re-exported here so this file stays the one place a
- *  reader looks for "what paths does this bundle own". */
+ *  it too, and re-exported here for the same reason. */
 export { LOG_PATH };
 
 /** #69's hostname lifecycle — the legacy `/admin/hostnames`. Defined in
- *  `HostnamesPage` because the board and the zones page link to it, and
- *  importing it from here would be a cycle. Re-exported for the same
- *  reason `LOG_PATH` is. */
+ *  `HostnamesPage` because the board and the zones page link to it. */
 export { NAMES_PATH };
+
+/** #75's help entry — the legacy `/admin/help`, which swept to a
+ *  negative across both deployed bundles. */
+export { HELP_PATH };
 
 const reg = window.__ATRIUM_REGISTRY__ as AtriumRegistry | undefined;
 const AtriumReact = window.React;
@@ -158,6 +160,32 @@ if (!reg || !AtriumReact) {
     label: 'Log search',
     to: LOG_PATH,
     icon: AtriumReact.createElement(IconListSearch, { size: 18 }),
+  });
+  // #75's help entry — the legacy `GET /admin/help`, which #47 swept to
+  // a negative across both deployed bundles: zero help surfaces
+  // anywhere, host side or shell side. Registered with a nav item
+  // rather than only a route, because a help page nothing links to is
+  // the same absence one indirection further along.
+  //
+  // No `perm`, and unlike its neighbours that is not a refusal-versus-
+  // empty argument: this page reads no tenant data and calls no
+  // endpoint. It describes the surfaces and links the documentation, so
+  // there is nothing here to be refused.
+  //
+  // `order` puts it last in the sidebar. The five items above are the
+  // work; help is where you go when one of them did not do what you
+  // expected.
+  reg.registerRoute({
+    key: 'atrium-ddns-help',
+    path: HELP_PATH,
+    render: () => makeWrapperElement(<HelpPage />),
+  });
+  reg.registerNavItem({
+    key: 'atrium-ddns-help-nav',
+    label: 'Help',
+    to: HELP_PATH,
+    icon: AtriumReact.createElement(IconHelp, { size: 18 }),
+    order: 900,
   });
   reg.registerAdminTab({
     key: 'atrium-ddns',

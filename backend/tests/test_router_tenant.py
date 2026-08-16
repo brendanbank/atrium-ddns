@@ -300,6 +300,24 @@ ALLOWED_USER_ID_COMPARISONS: dict[str, str] = {
         "and dropping the scope from that statement reds nine tests in "
         "`test_router_events.py` — measured by mutation, not assumed."
     ),
+    "AuditLog.actor_user_id == actor_user_id,": (
+        "#75's health-check debounce, and the row it compares is not a "
+        "host table at all: `audit_log` is atrium's, it has no "
+        "`DdnsScope` tenancy path, and `classify()` would refuse it — "
+        "correctly, because those rows are *actor* history rather than "
+        "tenant data. The comparison is the debounce key. It narrows "
+        "nothing a tenant could otherwise reach: the statement selects "
+        "one aggregate (`MAX(created_at)`) over the requesting user's "
+        "own audit rows for one entity, returns a timestamp and no row, "
+        "and the only thing that value can do is make the caller's own "
+        "request fail with 429. Deleting the line would widen the "
+        "debounce to installation-wide — one operator's press blocking "
+        "every other tenant's board — which is a bug in the opposite "
+        "direction from a leak. The tenancy of the *work* the endpoint "
+        "then does belongs to the scope, and "
+        "`test_router_health_checks.py` asserts it against a second "
+        "tenant's rows."
+    ),
 }
 
 
@@ -1213,6 +1231,295 @@ async def test_a_zone_claimed_by_another_tenant_is_a_conflict_that_names_nobody(
     assert response.status_code == 409, response.text
     assert b["email"] not in response.text
     assert str(b["user_id"]) not in response.json()["detail"]
+
+
+# ===================================================================== #
+# 7. The zone rename (#75, ui-parity §3.3 G4)
+#
+# `PATCH /domains/{id}` both existed as `405` and had no equivalent:
+# `DELETE` cascades, so "delete and recreate" costs the tenant every name
+# under the zone and every stored provider credential.
+#
+# The rule the endpoint has to hold is not "the string changed". It is
+# that every `ddns_hostname` under the zone still satisfies
+# `zone_contains` afterwards — through the **same function object**
+# `/nic/update` and `POST /hostnames` reach — or the rename has minted
+# rows that are creatable once and updatable never. The endpoint refuses
+# rather than rewriting, and the tests below assert **both** directions:
+# a rename that would orphan is refused *and nothing moved*, and a rename
+# that keeps every name inside is allowed. A test that only checked the
+# refusal would pass against an endpoint that refused everything.
+# ===================================================================== #
+
+
+async def _seed_names(domain_id: int, *names: str) -> list[int]:
+    """Hostname rows under one zone, written directly.
+
+    Directly rather than through `POST /hostnames` because this file's
+    `ALL_PERMS` deliberately does not carry `atrium_ddns.hostname.manage`
+    — widening it here would weaken
+    `test_the_gate_bites_in_both_directions`, which is a real assertion
+    about a different endpoint. The rows are cleaned up by the fixture's
+    `purge_tenants`, which reaches them through the user cascade.
+    """
+    ids: list[int] = []
+    async with fixture_writes("test_router_tenant._seed_names") as s:
+        for name in names:
+            row = m.Hostname(domain_id=domain_id, name=name)
+            s.add(row)
+            await s.flush()
+            ids.append(row.id)
+    return ids
+
+
+async def _zone_of(domain_id: int) -> str:
+    factory = get_session_factory()
+    async with factory() as s:
+        return (
+            await s.execute(
+                sa.text("SELECT name FROM ddns_domain WHERE id = :i"),
+                {"i": domain_id},
+            )
+        ).scalar_one()
+
+
+async def test_a_rename_that_would_orphan_a_name_is_refused_and_writes_nothing(
+    tenants: dict[str, Any],
+):
+    """The chosen disposition, asserted rather than described.
+
+    Two instruments on the same refusal: the ``409`` status **and** the
+    stored zone name read back with SQL afterwards. The status alone
+    would pass against a handler that refused after committing — which
+    is not a hypothetical shape, it is what `domain.name = …` followed
+    by a raise produces if the session is not rolled back.
+
+    The message is asserted to carry the *count* and at least one name,
+    because a refusal an operator cannot act on gets worked around.
+    """
+    a = tenants["a"]
+    zone = a["domain_name"]
+    await _seed_names(a["domain_id"], f"box.{zone}", f"nas.{zone}")
+
+    async with _client(a["user"]) as client:
+        response = await client.patch(
+            f"/api/atrium_ddns/domains/{a['domain_id']}",
+            json={"name": f"elsewhere-{W}.example.invalid"},
+        )
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert "2 of 2 hostnames" in detail, detail
+    assert f"box.{zone}" in detail, detail
+
+    assert await _zone_of(a["domain_id"]) == zone, (
+        "the zone name moved despite the refusal — the 409 is being raised "
+        "after the write rather than instead of it"
+    )
+
+
+async def test_a_rename_that_keeps_every_name_inside_the_zone_is_allowed(
+    tenants: dict[str, Any],
+):
+    """The other direction, and the reason it is not decoration.
+
+    Without it, an endpoint hardcoded to ``raise _conflict(...)`` would
+    pass every assertion in the test above. Narrowing
+    ``a-crud-….example.invalid`` to ``deep.a-crud-….example.invalid``
+    when the one name already sits under ``deep`` keeps containment true,
+    so it is allowed — and **no hostname row is rewritten**, which is the
+    property the whole disposition rests on.
+    """
+    a = tenants["a"]
+    zone = a["domain_name"]
+    name = f"box.deep.{zone}"
+    (hostname_id,) = await _seed_names(a["domain_id"], name)
+
+    async with _client(a["user"]) as client:
+        response = await client.patch(
+            f"/api/atrium_ddns/domains/{a['domain_id']}",
+            json={"name": f"deep.{zone}"},
+        )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["name"] == f"deep.{zone}"
+    assert body["hostname_count"] == 1
+
+    assert await _zone_of(a["domain_id"]) == f"deep.{zone}"
+    factory = get_session_factory()
+    async with factory() as s:
+        stored = (
+            await s.execute(
+                sa.text("SELECT name FROM ddns_hostname WHERE id = :i"),
+                {"i": hostname_id},
+            )
+        ).scalar_one()
+    assert stored == name, (
+        "the rename rewrote a hostname. That is the option this endpoint "
+        "deliberately did not take — HostnameAssignIn already records why "
+        "a hostname's name is not editable."
+    )
+
+
+async def test_the_rename_uses_the_wires_own_containment_function(
+    tenants: dict[str, Any],
+):
+    """One `zone_contains`, quirks and all — not a second suffix test.
+
+    The load-bearing assertion is the third one. `notexample.com` **is**
+    inside `example.com` under the preserved legacy rule, so a rename
+    that produced that relationship must be *allowed* here. An endpoint
+    that had grown its own stricter containment check would refuse it,
+    and the tenant would be unable to rename into a zone the wire is
+    perfectly happy to serve.
+    """
+    from atrium_ddns.providers import base as providers_base
+
+    assert tenant_router.zone_contains is providers_base.zone_contains
+
+    a = tenants["a"]
+    zone = a["domain_name"]
+    await _seed_names(a["domain_id"], f"not{zone}")
+
+    async with _client(a["user"]) as client:
+        response = await client.patch(
+            f"/api/atrium_ddns/domains/{a['domain_id']}",
+            json={"name": zone},  # unchanged; the row above is the point
+        )
+        assert response.status_code == 200, response.text
+        # `not<zone>` ends with `<zone>`, so containment holds and the
+        # name is not counted as an orphan.
+        narrower = await client.patch(
+            f"/api/atrium_ddns/domains/{a['domain_id']}",
+            json={"name": f"t{zone}"},
+        )
+    assert narrower.status_code == 200, narrower.text
+    assert providers_base.zone_contains(f"t{zone}", f"not{zone}") is True
+
+
+async def test_renaming_another_tenants_zone_is_a_404_not_a_403(
+    tenants: dict[str, Any],
+):
+    """"Not yours" and "no such row" are one answer, on this verb too.
+
+    The refusal has to come from the scope rather than from a name
+    check: B's zone name is real and free of orphans, so an endpoint
+    that looked the row up with `session.get` would rename it happily.
+    """
+    a, b = tenants["a"], tenants["b"]
+    async with _client(a["user"]) as client:
+        response = await client.patch(
+            f"/api/atrium_ddns/domains/{b['domain_id']}",
+            json={"name": f"stolen-{W}.example.invalid"},
+        )
+    assert response.status_code == 404, response.text
+    assert await _zone_of(b["domain_id"]) == b["domain_name"]
+
+
+async def test_renaming_onto_a_zone_another_tenant_holds_is_a_conflict_naming_nobody(
+    tenants: dict[str, Any],
+):
+    """The `create` rule, on the rename path.
+
+    Zone names are globally unique, so this conflict is reachable for a
+    name a *different* tenant owns — and the message must not confirm
+    that, for the same reason
+    `test_a_zone_claimed_by_another_tenant_is_a_conflict_that_names_nobody`
+    gives.
+    """
+    a, b = tenants["a"], tenants["b"]
+    async with _client(a["user"]) as client:
+        response = await client.patch(
+            f"/api/atrium_ddns/domains/{a['domain_id']}",
+            json={"name": b["domain_name"]},
+        )
+    assert response.status_code == 409, response.text
+    assert b["email"] not in response.text
+    assert str(b["user_id"]) not in response.json()["detail"]
+    assert await _zone_of(a["domain_id"]) == a["domain_name"]
+
+
+async def test_the_rename_normalises_and_an_unchanged_submit_audits_nothing(
+    tenants: dict[str, Any],
+):
+    """Normalisation is the create path's, and a no-op writes no history.
+
+    A form that submits an unchanged field is a normal thing for a form
+    to do; if that minted an audit row, a rename audit would stop being
+    a record of renames.
+    """
+    a = tenants["a"]
+    factory = get_session_factory()
+
+    async def _rename_audits() -> int:
+        async with factory() as s:
+            return int(
+                (
+                    await s.execute(
+                        sa.select(sa.func.count())
+                        .select_from(AuditLog)
+                        .where(
+                            AuditLog.entity == "ddns_domain",
+                            AuditLog.action == "rename",
+                            AuditLog.actor_user_id == a["user_id"],
+                        )
+                    )
+                ).scalar_one()
+            )
+
+    before = await _rename_audits()
+    async with _client(a["user"]) as client:
+        unchanged = await client.patch(
+            f"/api/atrium_ddns/domains/{a['domain_id']}",
+            json={"name": f"  {a['domain_name'].upper()}.  "},
+        )
+        assert unchanged.status_code == 200, unchanged.text
+        assert unchanged.json()["name"] == a["domain_name"]
+        assert await _rename_audits() == before, (
+            "an unchanged submit wrote a rename audit row"
+        )
+
+        changed = await client.patch(
+            f"/api/atrium_ddns/domains/{a['domain_id']}",
+            json={"name": f"  RENAMED-{W}.Example.INVALID.  "},
+        )
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["name"] == f"renamed-{W}.example.invalid"
+    assert await _rename_audits() == before + 1
+
+    async with factory() as s:
+        diff = (
+            await s.execute(
+                sa.select(AuditLog.diff)
+                .where(
+                    AuditLog.entity == "ddns_domain",
+                    AuditLog.action == "rename",
+                    AuditLog.actor_user_id == a["user_id"],
+                )
+                .order_by(AuditLog.id.desc())
+                .limit(1)
+            )
+        ).scalar_one()
+    # Both sides. An audit row carrying only the new value cannot answer
+    # the only question anyone reads a rename audit for.
+    assert diff["name"]["from"] == a["domain_name"]
+    assert diff["name"]["to"] == f"renamed-{W}.example.invalid"
+
+
+async def test_put_is_still_405_and_that_is_the_decision(tenants: dict[str, Any]):
+    """The measurement in ui-parity §3.3 G4 named two verbs; one moved.
+
+    Recorded as a test rather than as prose because "we chose PATCH" and
+    "we forgot PUT" are indistinguishable from the outside, and the next
+    reader re-measuring this row deserves to know which it is.
+    """
+    a = tenants["a"]
+    async with _client(a["user"]) as client:
+        response = await client.put(
+            f"/api/atrium_ddns/domains/{a['domain_id']}",
+            json={"name": f"put-{W}.example.invalid"},
+        )
+    assert response.status_code == 405, response.text
+    assert await _zone_of(a["domain_id"]) == a["domain_name"]
 
 
 async def test_an_unknown_service_is_refused_on_create_but_the_column_still_holds_one(
