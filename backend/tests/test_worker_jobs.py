@@ -78,6 +78,7 @@ from app.db import get_engine, get_session_factory
 from app.models.auth import User
 from app.models.ops import AppSetting
 from app.services.app_config import NAMESPACES, get_namespace, put_namespace
+from conftest import fixture_writes, purge_tenants, unusable_password_hash
 
 from atrium_ddns import models as m
 from atrium_ddns import worker_jobs as wj
@@ -115,40 +116,20 @@ def _now() -> datetime:
 # --------------------------------------------------------------------- #
 
 
-def _password_hash() -> str:
-    from fastapi_users.password import PasswordHelper
-
-    return PasswordHelper().hash("unusable-" + "x" * 24)
-
-
-async def _purge(emails: list[str]) -> None:
-    factory = get_session_factory()
-    async with factory() as s:
-        await s.execute(
-            sa.text("DELETE FROM ddns_event WHERE user_email IN :e").bindparams(
-                sa.bindparam("e", expanding=True)
-            ),
-            {"e": emails},
-        )
-        for email in emails:
-            await s.execute(sa.text("DELETE FROM users WHERE email = :e"), {"e": email})
-        await s.commit()
-
-
 @pytest_asyncio.fixture
 async def tenants():
     """Two tenants, each with a domain and a device. Rows are added per
     test; this only builds the skeleton every test needs."""
-    factory = get_session_factory()
     emails = [f"ddns-jobs-a-{W}@example.invalid", f"ddns-jobs-b-{W}@example.invalid"]
-    await _purge(emails)
+    await purge_tenants(emails, owner="test_worker_jobs.tenants")
 
+    hashed = unusable_password_hash()
     built: dict[str, Any] = {"emails": emails}
-    async with factory() as s:
+    async with fixture_writes("test_worker_jobs.tenants") as s:
         for tag, email in (("a", emails[0]), ("b", emails[1])):
             user = User(
                 email=email,
-                hashed_password=_password_hash(),
+                hashed_password=hashed,
                 is_active=True,
                 is_verified=True,
                 full_name=f"DDNS jobs probe {W}",
@@ -171,11 +152,10 @@ async def tenants():
                 "domain_id": domain.id,
                 "device_id": device.id,
             }
-        await s.commit()
 
     yield built
 
-    await _purge(emails)
+    await purge_tenants(emails, owner="test_worker_jobs.tenants")
 
 
 @pytest_asyncio.fixture

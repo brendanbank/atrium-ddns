@@ -42,6 +42,7 @@ from __future__ import annotations
 import base64
 import os
 import re
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -52,6 +53,7 @@ import pytest_asyncio
 import sqlalchemy as sa
 from app.db import get_session_factory
 from app.models.auth import User
+from conftest import fixture_writes, purge_tenants
 from fastapi import FastAPI
 from httpx import ASGITransport
 
@@ -148,23 +150,14 @@ LAYOUT: dict[str, dict[str, Any]] = {
 #: content of the frozen ``wrong-zone`` backend.
 OUT_OF_ZONE_DOMAIN = f"elsewhere.{SUFFIX}"
 
-
-async def _purge(emails: list[str]) -> None:
-    factory = get_session_factory()
-    async with factory() as session:
-        await session.execute(
-            sa.text("DELETE FROM ddns_event WHERE user_email IN :e").bindparams(
-                sa.bindparam("e", expanding=True)
-            ),
-            {"e": emails},
-        )
-        await session.execute(
-            sa.text("DELETE FROM users WHERE email IN :e").bindparams(
-                sa.bindparam("e", expanding=True)
-            ),
-            {"e": emails},
-        )
-        await session.commit()
+#: A ``TEST-NET-3`` address (RFC 5737) unique to this xdist worker, used
+#: by ``test_badauth_is_recorded``. A badauth row has no tenant to
+#: namespace it with — that is the point of the row — so the address is
+#: the only handle, and a global count over ``event_type='auth'`` reads
+#: nine other workers' rows as well as its own. Derived from the worker
+#: id rather than typed, so a run with more workers than this file
+#: anticipates still gets distinct values.
+BADAUTH_IP = "203.0.113.%d" % (100 + (zlib.crc32(W.encode()) % 100))
 
 
 @pytest_asyncio.fixture(scope="module")
@@ -182,9 +175,12 @@ async def world() -> Any:
     compat_stub.register_stub_providers(force=True)
 
     emails = [f"{who}@{EMAIL_DOMAIN}" for who in ("alice", "carol", "dave")]
-    await _purge(emails)
+    await purge_tenants(emails, owner="test_router_nic.world")
 
-    factory = get_session_factory()
+    # Hashing happens *before* the guarded region below: four argon2 /
+    # bcrypt hashes are ~0.5 s of pure CPU and nothing about them needs
+    # the database. Inside the lock they would be 0.5 s during which no
+    # other worker can build a fixture.
     unusable = await hash_password("unusable-web-login-" + "x" * 32)
     # alice is stored as **bcrypt** — the migrated-row shape from plan
     # §3.2 — so the auth tests exercise the legacy verify path and the
@@ -194,7 +190,7 @@ async def world() -> Any:
     carol_hash = await hash_password(CAROL_PASSWORD)
     dave_hash = await hash_password(DAVE_PASSWORD)
 
-    async with factory() as s:
+    async with fixture_writes("test_router_nic.world") as s:
         users: dict[str, int] = {}
         for who, active in (("alice", True), ("carol", True), ("dave", False)):
             user = User(
@@ -287,8 +283,6 @@ async def world() -> Any:
         await s.flush()
         hostnames["outofzone"] = out_of_zone.id
 
-        await s.commit()
-
     built = World(
         alice_id=users["alice"],
         carol_id=users["carol"],
@@ -303,7 +297,7 @@ async def world() -> Any:
     }
     yield built
 
-    await _purge(emails)
+    await purge_tenants(emails, owner="test_router_nic.world")
 
 
 @pytest.fixture(scope="module")
@@ -483,13 +477,37 @@ async def events_for(user_id: int) -> list[DnsEvent]:
 
 
 async def clear_events() -> None:
-    factory = get_session_factory()
-    async with factory() as s:
-        await s.execute(
-            sa.text("DELETE FROM ddns_event WHERE user_email LIKE :e"),
-            {"e": f"%@{EMAIL_DOMAIN}"},
+    """Drop this module's event rows between tests, by ``user_id``.
+
+    It used to read ``WHERE user_email LIKE '%@<domain>'``.
+    ``user_email`` carries no index and ``LIKE '%…'`` cannot use one
+    even if it did, so every one of the dozen calls scanned
+    ``ddns_event`` whole and took next-key locks across it — while nine
+    other workers were inserting into the same table. It never appeared
+    in a logged deadlock, but "has not deadlocked yet" is not the same
+    reading as "cannot": #65's whole subject is a statement that was
+    fine in isolation and contended between modules.
+
+    ``user_id`` is the leading column of ``ix_ddns_event_user_created``,
+    and the ids come from an equality on ``users.email``'s unique index.
+    Behaviour is unchanged: a ``LIKE`` on ``user_email`` never matched
+    the unattributed (``user_email IS NULL``) rows either.
+    """
+    async with fixture_writes("test_router_nic.clear_events") as s:
+        user_ids = list(
+            (
+                await s.execute(
+                    sa.select(User.id).where(User.email.like(f"%@{EMAIL_DOMAIN}"))
+                )
+            ).scalars()
         )
-        await s.commit()
+        if user_ids:
+            await s.execute(
+                sa.text("DELETE FROM ddns_event WHERE user_id IN :ids").bindparams(
+                    sa.bindparam("ids", expanding=True)
+                ),
+                {"ids": user_ids},
+            )
 
 
 # ===================================================================== #
@@ -1610,6 +1628,23 @@ async def test_badauth_is_recorded(client, world) -> None:
     no trace in either store". It leaves one now, under ``event_type
     'auth'``, with no user or device attached because there is nothing
     to attach — the credential did not resolve.
+
+    **Counted by this worker's own address, not globally.** The first
+    version of this test read ``SELECT COUNT(*) FROM ddns_event WHERE
+    event_type='auth'`` before and after, and asserted the difference
+    was one. That count spans ten workers sharing one table, and
+    ``test_router_events.py`` writes and then deletes a row of exactly
+    this shape — ``event_type='auth'``, ``response_code='badauth'``,
+    ``client_ip='203.0.113.10'``, every field this test could have
+    matched on. Observed once in 65 full-suite runs as
+    ``assert 909 == 909 + 1``: the sibling module's teardown removed one
+    row inside the window while this request added one, and the two
+    cancelled.
+
+    The badauth row carries no ``user_id`` and no ``user_email`` — that
+    is the state under test — so the only thing left to namespace it by
+    is the address it came from, which ``X-Forwarded-For`` decides and
+    ``ix_ddns_event_client_ip`` indexes.
     """
     await clear_events()
     factory = get_session_factory()
@@ -1617,14 +1652,16 @@ async def test_badauth_is_recorded(client, world) -> None:
         before = (
             await s.execute(
                 sa.text(
-                    "SELECT COUNT(*) FROM ddns_event WHERE event_type='auth'"
-                )
+                    "SELECT COUNT(*) FROM ddns_event "
+                    "WHERE event_type='auth' AND client_ip = :ip"
+                ),
+                {"ip": BADAUTH_IP},
             )
         ).scalar_one()
 
     await get(
         client, "/nic/update",
-        headers=basic(world.device_usernames["alice"], "wrong"),
+        headers={**basic(world.device_usernames["alice"], "wrong"), **xff(BADAUTH_IP)},
         hostname=world.name("ok"), myip="203.0.113.10",
     )
 
@@ -1632,14 +1669,17 @@ async def test_badauth_is_recorded(client, world) -> None:
         after = (
             await s.execute(
                 sa.text(
-                    "SELECT COUNT(*) FROM ddns_event WHERE event_type='auth'"
-                )
+                    "SELECT COUNT(*) FROM ddns_event "
+                    "WHERE event_type='auth' AND client_ip = :ip"
+                ),
+                {"ip": BADAUTH_IP},
             )
         ).scalar_one()
         row = (
             await s.execute(
                 sa.select(DnsEvent)
                 .where(DnsEvent.event_type == "auth")
+                .where(DnsEvent.client_ip == BADAUTH_IP)
                 .order_by(DnsEvent.id.desc())
                 .limit(1)
             )
@@ -1647,7 +1687,7 @@ async def test_badauth_is_recorded(client, world) -> None:
     assert after == before + 1
     assert row.response_code == "badauth"
     assert row.user_id is None and row.device_id is None
-    assert row.client_ip == "203.0.113.10"
+    assert row.client_ip == BADAUTH_IP
 
 
 async def test_a_rate_limited_delete_is_logged_as_a_delete(client, world) -> None:
