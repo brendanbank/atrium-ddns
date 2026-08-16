@@ -41,17 +41,21 @@ import {
   type DeviceSecret,
 } from '../api/devices';
 import { absoluteTitle, formatAge, rateLimitSummary } from '../board/format';
+import { opensInThisTab } from '../cards';
 import { deviceHref } from '../paths';
+import { DeviceCardModal } from './DeviceCard';
 import { MigratedNotice, SecretOnce } from './SecretOnce';
 
 function DeviceLine({
   device,
+  onOpen,
   onRotate,
   onDelete,
   onEditLimit,
   busy,
 }: {
   device: Device;
+  onOpen: (id: number) => void;
   onRotate: (device: Device) => void;
   onDelete: (device: Device) => void;
   onEditLimit: (device: Device) => void;
@@ -59,22 +63,31 @@ function DeviceLine({
 }) {
   return (
     <Stack gap="xs" data-testid={`device-${device.name}`}>
-      <div className="ddns-device__line" style={{ cursor: 'default' }}>
+      <div className="ddns-device__line">
         <span />
-        {/* #89. The row is the only way to reach `/atrium-ddns/devices/
-            :id` — the route carries a literal `:id`, so it cannot have
-            a nav item, and a destination nothing links to is #75's
-            defect one indirection along. The *name* is the link and the
-            rest of the row is unchanged: §12's "this adds a
-            destination, it does not redraw the list."
+        {/* #89 made the name the way in to `/atrium-ddns/devices/:id`.
+            #97 is about the fact that nothing on screen said so:
+            `.ddns-data` sets `color: var(--ddns-ink)`, which cancels
+            Mantine's link colour and underline, so on this very row
+            `log for this device` rendered blue and the device name did
+            not. §16.1's fix is in `ddns.css` §2a — an underline on the
+            data face, carried **at rest** — and the class stays,
+            because §2.3 is not being retracted on the most important
+            string on the page.
 
-            A plain anchor, for `DeviceBoardPage`'s reason: react-
-            router's `Link` is not reachable from this tree and a bare
-            `pushState` would move the address bar without telling
-            atrium's router. */}
+            Still an anchor with a real `href`: §17 keeps the route for
+            linkability and Back, so copy-link, middle-click and
+            cmd/ctrl-click all still navigate. Only the plain left click
+            is intercepted, and it opens the card in a modal — the shape
+            the operator asked for twice. */}
         <Anchor
           href={deviceHref(device.id)}
           className="ddns-data"
+          onClick={(event) => {
+            if (!opensInThisTab(event.nativeEvent)) return;
+            event.preventDefault();
+            onOpen(device.id);
+          }}
           data-testid={`open-${device.name}`}
         >
           {device.name}
@@ -147,6 +160,9 @@ export function DeviceList({ devices }: { devices: Device[] }) {
   const [editingLimit, setEditingLimit] = useState<Device | null>(null);
   const [nextLimit, setNextLimit] = useState<number | ''>('');
   const [error, setError] = useState<string | null>(null);
+  /** Which device's card is open, if any. `null` is *closed*, never
+   *  *device zero*. */
+  const [openDevice, setOpenDevice] = useState<number | null>(null);
 
   const invalidate = () =>
     client.invalidateQueries({ queryKey: DEVICES_QUERY_KEY });
@@ -252,12 +268,21 @@ export function DeviceList({ devices }: { devices: Device[] }) {
             key={device.id}
             device={device}
             busy={busy}
+            onOpen={setOpenDevice}
             onRotate={setConfirmRotate}
             onEditLimit={openLimit}
             onDelete={(target) => remove.mutate(target.id)}
           />
         ))
       )}
+
+      {/* §17's normal entrance. The same `DeviceCard` the route renders
+          and the board opens — one definition, three call sites,
+          asserted by module identity in `src/test/sharedCard.test.tsx`. */}
+      <DeviceCardModal
+        deviceId={openDevice}
+        onClose={() => setOpenDevice(null)}
+      />
 
       <Group>
         <Button

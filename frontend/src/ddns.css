@@ -122,6 +122,65 @@
 }
 
 /* --------------------------------------------------------------------- *
+ * 2a. An interactive `.ddns-data` — Part III §16.1.
+ *
+ * The defect this block exists for, stated as the operator stated it:
+ * *"I still cannot edit the zone."* The zone name on `/domains` **was**
+ * an `<Anchor href={zoneHref(id)}>` and it **did** navigate. Nothing on
+ * screen said so, because `.ddns-data` above sets
+ * `color: var(--ddns-ink)` and that cancels Mantine's link colour and
+ * underline on the most important string on the page. On the same row
+ * `log for this device` rendered blue and the name did not — one surface
+ * teaching two different lessons about what is clickable.
+ *
+ * The fix is **not** to drop `.ddns-data` from the anchors. That is
+ * §2.3, the type idea, and it is right: a hostname is a value and gets
+ * the data face, the sm size and the ink. What was wrong is that a rule
+ * written to say *this is a value* was reused where it also had to say
+ * *this is a destination*.
+ *
+ * So the affordance is not colour — colour is spoken for — and it is
+ * carried **at rest**, never on `:hover` alone. Hover-only failed this
+ * same operator on this same page, and it fails entirely on touch, where
+ * there is no hover at all. There is deliberately no `:hover` rule here:
+ * a hover rule would be a second thing a reader could mistake for the
+ * affordance, and the one that matters is the one drawn before the
+ * pointer arrives.
+ *
+ * `a` and `button` and **not** `input`. `.ddns-data` is also on the
+ * rename boxes (`DomainList`, `ZoneCard`), which are interactive and are
+ * not destinations; underlining a text field would be a lie in the other
+ * direction.
+ *
+ * 1px at a 3px offset, and the pair is load-bearing rather than taste:
+ * `.ddns-group[data-differs='true']` further down already underlines, at
+ * **2px** and a 2px offset, to mark the hextets that differ inside an
+ * address. Two underlines with two meanings have to be told apart on a
+ * greyscale screenshot, so they do not share a thickness.
+ * `design.test.ts` asserts that they differ.
+ * --------------------------------------------------------------------- */
+
+[data-ddns-root] a.ddns-data,
+[data-ddns-root] button.ddns-data {
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+/* A `button` carrying the data face is a name that opens its card — the
+   board's device name (§18.2). The UA chrome comes off; the font, the
+   size and the ink stay, because they arrive from `.ddns-data` and this
+   block deliberately declares no `font` shorthand, which would reset the
+   family to the body face and quietly undo §2.3 on this element only. */
+[data-ddns-root] button.ddns-data {
+  background: none;
+  border: 0;
+  padding: 0;
+  text-align: left;
+}
+
+/* --------------------------------------------------------------------- *
  * 3. The resolution strip — Arrangement B, §3.1.
  *
  * Three rows on a rail, not three columns. Three columns needs
@@ -393,14 +452,48 @@
   padding-bottom: var(--mantine-spacing-xs);
 }
 
+/* No `cursor: pointer` on the row, and its absence is the point.
+ *
+ * Until Part III this element was a `<button>` wrapping the whole line,
+ * so the row *was* the expand toggle and the device name inside it was
+ * an inert `<span class="ddns-data">` — §16's third cause: two jobs on
+ * one target, and it did neither visibly. The row is now a plain grid
+ * that contains two controls (the name, which opens the card, and the
+ * disclosure at the end of the line), so a pointer cursor across the
+ * whole width would advertise a click the row no longer accepts. */
 [data-ddns-root] .ddns-device__line {
   background: none;
   border: 0;
   padding: var(--mantine-spacing-xs) 0;
-  cursor: pointer;
   font: inherit;
   color: inherit;
   border-bottom: 1px solid var(--ddns-edge);
+}
+
+/* The board's rows carry a fifth cell the other two ledgers do not: the
+   disclosure. Scoped to `.ddns-board` rather than added to the shared
+   rule above, because `DeviceList` and the zone card's name table use
+   the same two classes and have nothing to disclose. */
+[data-ddns-root] .ddns-board > .ddns-board__head,
+[data-ddns-root] .ddns-board .ddns-device__line {
+  grid-template-columns: 3ch minmax(0, 1fr) 12ch 14ch 3ch;
+}
+
+/* The disclosure — §18.2's *"a way in that is distinct from
+   expanding"*, seen from the other side. Quiet, in the data face,
+   at the end of the line, and reachable by Tab in its own right: the
+   name and the disclosure are two tab stops because they are two
+   operations. */
+[data-ddns-root] .ddns-device__expand {
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  text-align: right;
+  font-family: var(--ddns-font-data);
+  font-size: var(--mantine-font-size-sm);
+  line-height: var(--mantine-line-height-sm);
+  color: var(--ddns-quiet);
 }
 
 /* §3.6: only `never_seen` and `last_call_failed` are marked. `idle` is
@@ -699,6 +792,21 @@
   [data-ddns-root] .ddns-board__head,
   [data-ddns-root] .ddns-device__line {
     grid-template-columns: 3ch minmax(0, 1fr);
+  }
+
+  /* The board's fifth cell has to be restated here: the rule that adds
+     it is scoped by `.ddns-board` and therefore outranks the two-column
+     rule above, media query or not. The disclosure is placed explicitly
+     rather than left to auto-placement, because a control that flows to
+     the second row of a collapsed ledger is a control nobody finds. */
+  [data-ddns-root] .ddns-board > .ddns-board__head,
+  [data-ddns-root] .ddns-board .ddns-device__line {
+    grid-template-columns: 3ch minmax(0, 1fr) 3ch;
+  }
+
+  [data-ddns-root] .ddns-device__expand {
+    grid-column: 3;
+    grid-row: 1;
   }
 }
 

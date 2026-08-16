@@ -413,7 +413,7 @@ describe('collapse', () => {
   test('an agreeing strip collapses and names its denominator', async () => {
     renderBoard(OPERATOR);
     await screen.findByTestId('board');
-    fireEvent.click(screen.getByRole('button', { name: /home-router/ }));
+    fireEvent.click(screen.getByTestId('device-home-router-expand'));
 
     const collapsed = screen.getByTestId('strip-collapsed-host-a.example.net-AAAA');
     // `; agrees` on its own would be a ratio with the divisor hidden,
@@ -437,7 +437,7 @@ describe('collapse', () => {
     // and not something a later reader has to infer from its absence.
     renderBoard(OPERATOR);
     await screen.findByTestId('board');
-    fireEvent.click(screen.getByRole('button', { name: /home-router/ }));
+    fireEvent.click(screen.getByTestId('device-home-router-expand'));
 
     expect(screen.getByTestId('device-home-router-limit')).toHaveTextContent(
       '30/min, inherited',
@@ -455,7 +455,7 @@ describe('collapse', () => {
     });
     renderBoard(OPERATOR);
     await screen.findByTestId('board');
-    fireEvent.click(screen.getByRole('button', { name: /home-router/ }));
+    fireEvent.click(screen.getByTestId('device-home-router-expand'));
     expect(screen.getByTestId('device-home-router-limit')).toHaveTextContent(
       'muted — may never call',
     );

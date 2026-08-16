@@ -135,11 +135,23 @@ test.describe('#88 — zones and providers are one object', () => {
     expect(creates.filter((url) => url.includes('/backends'))).toHaveLength(0);
 
     // --- the detail route, §10.2 -----------------------------------
-    await page.getByTestId(`open-domain-${zone}`).click();
-    // A route. The URL changed, Back works, and the address is
-    // pasteable into a ticket — §12's three arguments, in order.
+    //
+    // **Rewritten by #97.** A plain click on the row now opens the card
+    // in a *modal* — Part III §17, the operator's reversal of §12 —
+    // rather than navigating. The route is not gone and is not
+    // demoted: §12's two surviving arguments are linkability and Back,
+    // both properties of the URL, so the row is still an `<a href>` and
+    // the address still resolves. That is what is exercised here.
+    // #97's own spec (`card-affordance.spec.ts`) covers the modal.
+    const detailUrl = new URL(
+      (await page
+        .getByTestId(`open-domain-${zone}`)
+        .getAttribute('href')) as string,
+      page.url(),
+    ).toString();
+    expect(detailUrl).toMatch(/\/atrium-ddns\/zones\/\d+$/);
+    await page.goto(detailUrl);
     await expect(page).toHaveURL(/\/atrium-ddns\/zones\/\d+$/);
-    const detailUrl = page.url();
 
     await expect(page.getByTestId(`zone-${zone}`)).toBeVisible({
       timeout: 15_000,
@@ -167,17 +179,11 @@ test.describe('#88 — zones and providers are one object', () => {
       .evaluate((el) => el.getBoundingClientRect().width);
     expect(contentWidth).toBeGreaterThan(592);
 
-    // Back works — the second of §12's three. A drawer teaches the
-    // browser nothing.
+    // Back works — the second of §12's two survivors. A drawer teaches
+    // the browser nothing, and neither would a modal; this is the
+    // reason §17 kept the route rather than replacing it.
     await page.goBack();
     await expect(page).toHaveURL(new RegExp(`${DOMAINS_PATH}$`));
-    // …and the link is real: navigating straight to it renders the
-    // zone, which is what "an operator pastes a device URL into a
-    // ticket" actually requires.
-    await page.goto(detailUrl);
-    await expect(page.getByTestId(`zone-${zone}`)).toBeVisible({
-      timeout: 15_000,
-    });
 
     expect(pageErrors, 'the page threw while rendering').toEqual([]);
   });
@@ -352,8 +358,15 @@ test.describe('#88 — zones and providers are one object', () => {
     ).not.toBe(`911 ${DOC_ADDRESS_V4}`);
 
     // --- 7. the detail route says it too ---------------------------
+    // Reached through the row's own `href` rather than through a click:
+    // #97 made the plain click open the card in a modal (Part III §17),
+    // and the point of this step is the *route*, which §17 kept.
     await page.goto(DOMAINS_PATH);
-    await page.getByTestId(`open-domain-${zoneBroken}`).click();
+    const brokenHref = (await page
+      .getByTestId(`open-domain-${zoneBroken}`)
+      .getAttribute('href')) as string;
+    expect(brokenHref).toMatch(/\/atrium-ddns\/zones\/\d+$/);
+    await page.goto(brokenHref);
     await expect(page).toHaveURL(/\/atrium-ddns\/zones\/\d+$/);
     const detail = page.getByTestId(`zone-${zoneBroken}`);
     await expect(detail).toBeVisible({ timeout: 15_000 });
