@@ -108,9 +108,27 @@ async function syncCookies(page: Page): Promise<void> {
 }
 
 /** Log in as the seeded super_admin. */
-export async function loginAsAdmin(page: Page): Promise<void> {
+export async function loginAsSuperAdmin(page: Page): Promise<void> {
   const { email, password, totpSecret } = requiredAdminEnv();
   await loginAndPassTOTP(page, email, password, totpSecret);
+}
+
+/**
+ * Alias of {@link loginAsSuperAdmin} for specs whose dependency is "any
+ * admin who holds the permission" rather than super-admin specifically.
+ * `make e2e-up` seeds one account holding both roles, so the two are
+ * indistinguishable at the API level and the alias only keeps a spec's
+ * intent readable.
+ *
+ * Both names exist because atrium's `helpers.ts` exports both, and the
+ * point of copying its vocabulary is that a spec written against one
+ * harness compiles against the other. That was not free advice: #90's
+ * `hostname-suffix.spec.ts` was written against `loginAsSuperAdmin`,
+ * this file shipped only `loginAsAdmin`, and `tsc` refused it the first
+ * time the two met.
+ */
+export async function loginAsAdmin(page: Page): Promise<void> {
+  await loginAsSuperAdmin(page);
 }
 
 export interface ProvisionedUser {

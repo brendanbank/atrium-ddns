@@ -51,7 +51,7 @@ pnpm test                          # vitest — 2 passed (2)
 cd .. && make up && make migrate    # both alembic chains to head
 make test-backend                  # host tests 532 passed + compat 31 passed, 3 skipped
 make smoke PASS=<pw> EMAIL=<addr>  # scripts/smoke.sh — 11 passed (11)
-make test-e2e                      # Playwright — 5 passed (5), ~11s after the stack is up
+make test-e2e                      # Playwright — 16 passed (5 spec files), ~35s once the stack is up
 ```
 
 **`make test-e2e` is in the gate from #91, and it is the only instrument
@@ -81,6 +81,21 @@ never in the alpine builder stage; and `pnpm` v10 does not run dependency
 build scripts, so installing `@playwright/test` downloads **no** browser —
 `pnpm exec playwright install chromium` is the explicit step, and it is
 what `make e2e-deps` is for.
+
+**And a third, which is `check-fresh`'s missing fourth guard.** `make e2e-up`
+now ends in `make check-bundle-fresh`, because the host bundle is baked into
+the image exactly like `tests/`, `backend/` and the installed package are —
+and it had no guard. Measured on 2026-08-16: a plain `docker compose up -d
+--build` built an image carrying a newly merged UI, tagged it, and left the
+containers on the previous one. Six specs failed against a UI that was
+correct and merged, the served bundle read 801,320 bytes where the image
+held 815,012, and the only reason it was caught in minutes rather than
+argued about for an hour is that the specs were exercising the new markup.
+**Had they not been, the run would have been green about the wrong bundle.**
+The guard hashes the file inside the image with the container's interpreter
+and the bytes served over the published port with the host's, and names both
+digests when they differ; `e2e-up` also `--force-recreate`s api and worker,
+which is the prevention to the guard's detection.
 
 `make test-backend` grew a second pytest session (#23): the compat suites now
 reach the image via `COPY tests /opt/compat_tests` in the Dockerfile's **`dev`

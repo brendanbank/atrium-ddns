@@ -14,6 +14,10 @@ import {
   uniqueDeviceName,
   uniqueZoneName,
 } from './helpers';
+import {
+  PUBLISHES_NOWHERE,
+  WIRE_CONSEQUENCE,
+} from '../src/tenant/ZoneStatus';
 
 /**
  * Spec 2 of the floor, and the one this milestone exists for: the
@@ -63,6 +67,13 @@ test.describe('the §3.3.1 walk, through the UI', () => {
     const fqdn = `home.${zone}`;
 
     // --- 1. a zone, through the UI ---------------------------------
+    //
+    // Deliberately with **no** provider, which since #88 is a departure
+    // from the form's own reading order rather than the thing that
+    // happens when you fill in the only field on offer: the link has to
+    // be taken and the consequence confirmed. The walk takes it because
+    // the provider it needs is not one the catalogue offers (see step
+    // 2), and because the zero-provider state is worth rendering once.
     await page.goto(DOMAINS_PATH);
     await expect(page.getByTestId('domains-empty')).toBeVisible({
       timeout: 15_000,
@@ -71,22 +82,41 @@ test.describe('the §3.3.1 walk, through the UI', () => {
     const zoneModal = page.getByRole('dialog');
     await expect(zoneModal).toBeVisible();
     await zoneModal.getByTestId('zone-name').fill(zone);
-    await zoneModal.getByTestId('zone-submit').click();
+    // Neither the consequence nor its confirm button exists until the
+    // link is taken.
+    await expect(zoneModal.getByTestId('zone-later-warning')).toHaveCount(0);
+    await zoneModal.getByTestId('zone-later-link').click();
+    await expect(zoneModal.getByTestId('zone-later-warning')).toBeVisible();
+    await zoneModal.getByTestId('zone-later-submit').click();
+    await expect(page.getByRole('dialog')).toHaveCount(0);
 
     const zoneRow = page.getByTestId(`domain-${zone}`);
     await expect(zoneRow).toBeVisible();
-    // §10.1: a zone with no provider is the *exceptional* row, stated
-    // in the operator's terms rather than the protocol's. This is that
-    // sentence, rendered — the state the create form can leave behind
-    // in one click.
-    await expect(zoneRow).toContainText(
-      'No provider bound yet — updates for this zone answer 911.',
+    // §10.1: a zone with no provider is the *exceptional* row, in the
+    // operator's terms rather than the protocol's. Asserted against
+    // `ZoneStatus`'s own exported strings — a spec that retyped them
+    // would keep passing after the product stopped saying them.
+    await expect(zoneRow).toHaveAttribute('data-diverged', 'true');
+    await expect(page.getByTestId(`nowhere-${zone}`)).toContainText(
+      PUBLISHES_NOWHERE,
+    );
+    await expect(page.getByTestId(`nowhere-why-${zone}`)).toContainText(
+      WIRE_CONSEQUENCE,
+    );
+    await expect(page.getByTestId(`providers-${zone}`)).toHaveText(
+      '0 providers',
     );
 
     // --- 2. the provider ------------------------------------------
+    // On the zone's own route since #88 — §12's linkable destination,
+    // reached the way an operator reaches it, by clicking the zone.
+    await page.getByTestId(`open-domain-${zone}`).click();
+    await expect(page.getByTestId(`zone-${zone}`)).toBeVisible();
+    await expect(page.getByTestId('zone-no-providers')).toBeVisible();
+
     // The modal, opened and read: it is the surface an operator uses,
     // and the catalogue it offers is a property of the build.
-    await page.getByTestId(`add-backend-${zone}`).click();
+    await page.getByTestId('zone-add-backend').click();
     const providerModal = page.getByRole('dialog');
     await expect(providerModal).toBeVisible();
     await providerModal.getByTestId('backend-service').click();
@@ -113,12 +143,24 @@ test.describe('the §3.3.1 walk, through the UI', () => {
     const binding = await bindScriptedBackend(page.request, domainId!);
     expect(binding.credentials_set).toBe(true);
 
-    // …and read back through the UI, which is what an operator sees.
+    // …and read back through the UI, which is what an operator sees:
+    // on the zone's route, and — the mark being a *measurement* rather
+    // than a decoration — gone from the list row.
     await page.reload();
-    await expect(zoneRow.getByTestId(`backend-${binding.backend_type}`))
-      .toBeVisible();
-    await expect(zoneRow).toContainText('credential stored');
-    await expect(zoneRow).not.toContainText('No provider bound yet');
+    await expect(
+      page.getByTestId(`backend-${binding.backend_type}`),
+    ).toBeVisible();
+    await expect(page.getByTestId(`credentials-${binding.id}`)).toHaveText(
+      'credential stored',
+    );
+    await expect(page.getByTestId('zone-no-providers')).toHaveCount(0);
+
+    await page.goto(DOMAINS_PATH);
+    await expect(zoneRow).toHaveAttribute('data-diverged', 'false');
+    await expect(page.getByTestId(`nowhere-${zone}`)).toHaveCount(0);
+    await expect(page.getByTestId(`providers-${zone}`)).toHaveText(
+      '1 provider',
+    );
 
     // --- 3. a device, through the UI ------------------------------
     await page.goto(DEVICES_PATH);
@@ -152,10 +194,15 @@ test.describe('the §3.3.1 walk, through the UI', () => {
     const nameModal = page.getByRole('dialog');
     await expect(nameModal).toBeVisible();
     await chooseFromSelect(page, 'hostname-zone', zone);
-    await nameModal.getByTestId('hostname-name').fill(fqdn);
+    // Since #90 the zone is a suffix and not a retype: the bare label
+    // goes in the field, the zone is rendered beside it, and `will
+    // send:` is the one line that shows what composition did.
+    await expect(nameModal.getByTestId('hostname-suffix')).toHaveText(
+      `.${zone}`,
+    );
+    await nameModal.getByTestId('hostname-name').fill('home');
     await chooseFromSelect(page, 'hostname-device', deviceName);
-    // The preview is the one line that shows what will be sent.
-    await expect(nameModal.getByTestId('hostname-preview')).toContainText(fqdn);
+    await expect(nameModal.getByTestId('hostname-will-send')).toHaveText(fqdn);
     await nameModal.getByTestId('hostname-submit').click();
     await expect(page.getByTestId(`hostname-${fqdn}`)).toBeVisible();
 
