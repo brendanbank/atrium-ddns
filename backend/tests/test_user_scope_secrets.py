@@ -45,6 +45,7 @@ from app.host_sdk.crypto import (
 )
 from app.host_sdk.db import HostForeignKey
 from app.models.auth import User
+from conftest import fixture_writes, purge_tenants, unusable_password_hash
 
 pytestmark = pytest.mark.asyncio
 
@@ -89,12 +90,6 @@ class Probe(_ProbeBase):
     )
 
 
-def _password_hash() -> str:
-    from fastapi_users.password import PasswordHelper
-
-    return PasswordHelper().hash("unusable-" + "x" * 24)
-
-
 @pytest_asyncio.fixture
 async def tenants():
     """Two throwaway users and a probe table, both namespaced per worker.
@@ -105,25 +100,29 @@ async def tenants():
     key — permanently, by design, that being the property under test. On a
     developer's own stack that is real data. A test that needs to destroy
     something must create the thing it destroys.
+
+    This module never had a ``_purge`` of its own, and #65 counted it out
+    of the seven for that reason — but it inserts into ``users`` exactly
+    like the other seven, so it was a participant in the deadlock all
+    along. Counting the copies of a helper counts the modules that share
+    a *name*, not the modules that share a *contended index*.
     """
-    factory = get_session_factory()
     w = _worker_id()
     emails = [f"probe-tenant-a-{w}@example.invalid", f"probe-tenant-b-{w}@example.invalid"]
 
-    async with factory() as s:
+    async with fixture_writes("test_user_scope_secrets.tenants/drop") as s:
         # Left over from a run that died mid-test; MySQL DDL is not
         # transactional, so teardown is not guaranteed to have happened.
         await s.execute(sa.text(f"DROP TABLE IF EXISTS {PROBE_TABLE}"))
-        for email in emails:
-            await s.execute(sa.text("DELETE FROM users WHERE email = :e"), {"e": email})
-        await s.commit()
+    await purge_tenants(emails, owner="test_user_scope_secrets.tenants")
 
+    hashed = unusable_password_hash()
     ids: list[int] = []
-    async with factory() as s:
+    async with fixture_writes("test_user_scope_secrets.tenants/build") as s:
         for email in emails:
             u = User(
                 email=email,
-                hashed_password=_password_hash(),
+                hashed_password=hashed,
                 is_active=True,
                 is_verified=True,
                 full_name=f"Probe tenant {w}",
@@ -135,19 +134,12 @@ async def tenants():
         await s.run_sync(
             lambda c: Probe.__table__.create(c.connection(), checkfirst=True)
         )
-        await s.commit()
 
     yield ids[0], ids[1]
 
-    async with factory() as s:
+    async with fixture_writes("test_user_scope_secrets.tenants/drop") as s:
         await s.execute(sa.text(f"DROP TABLE IF EXISTS {PROBE_TABLE}"))
-        await s.execute(
-            sa.text("DELETE FROM user_secret_keys WHERE user_id IN (:a, :b)"),
-            {"a": ids[0], "b": ids[1]},
-        )
-        for email in emails:
-            await s.execute(sa.text("DELETE FROM users WHERE email = :e"), {"e": email})
-        await s.commit()
+    await purge_tenants(emails, owner="test_user_scope_secrets.tenants")
 
 
 async def _seed(uid_a: int, uid_b: int) -> tuple[int, int]:

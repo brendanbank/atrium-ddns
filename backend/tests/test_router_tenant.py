@@ -58,6 +58,7 @@ from app.db import get_session_factory
 from app.host_sdk.crypto import shred_user_key, unlock_user_secrets
 from app.models.auth import User
 from app.models.ops import AuditLog
+from conftest import fixture_writes, purge_tenants, unusable_password_hash
 from fastapi import FastAPI
 from httpx import ASGITransport
 
@@ -107,36 +108,6 @@ def _creds(value: str) -> dict[str, str]:
     return {key: f"{value}-{key}" for key in _keys()}
 
 
-def _password_hash() -> str:
-    from fastapi_users.password import PasswordHelper
-
-    return PasswordHelper().hash("unusable-" + "x" * 24)
-
-
-async def _purge(emails: list[str]) -> None:
-    factory = get_session_factory()
-    async with factory() as s:
-        await s.execute(
-            sa.text("DELETE FROM ddns_event WHERE user_email IN :e").bindparams(
-                sa.bindparam("e", expanding=True)
-            ),
-            {"e": emails},
-        )
-        for email in emails:
-            row = (
-                await s.execute(
-                    sa.text("SELECT id FROM users WHERE email = :e"), {"e": email}
-                )
-            ).first()
-            if row is not None:
-                await s.execute(
-                    sa.text("DELETE FROM user_secret_keys WHERE user_id = :u"),
-                    {"u": row[0]},
-                )
-            await s.execute(sa.text("DELETE FROM users WHERE email = :e"), {"e": email})
-        await s.commit()
-
-
 @pytest_asyncio.fixture
 async def tenants() -> AsyncIterator[dict[str, Any]]:
     """Three tenants: A, B (the cross-tenant control) and S (shreddable).
@@ -147,17 +118,17 @@ async def tenants() -> AsyncIterator[dict[str, Any]]:
     ``test_user_scope_secrets.py`` learned that by destroying a seeded
     admin's key.
     """
-    factory = get_session_factory()
     tags = ("a", "b", "s")
     emails = [f"ddns-tenant-{tag}-{W}@example.invalid" for tag in tags]
-    await _purge(emails)
+    await purge_tenants(emails, owner="test_router_tenant.tenants")
 
+    hashed = unusable_password_hash()
     built: dict[str, Any] = {"emails": emails}
-    async with factory() as s:
+    async with fixture_writes("test_router_tenant.tenants") as s:
         for tag, email in zip(tags, emails):
             user = User(
                 email=email,
-                hashed_password=_password_hash(),
+                hashed_password=hashed,
                 is_active=True,
                 is_verified=True,
                 full_name=f"DDNS tenant probe {W}",
@@ -175,11 +146,10 @@ async def tenants() -> AsyncIterator[dict[str, Any]]:
                 "domain_id": domain.id,
                 "domain_name": domain.name,
             }
-        await s.commit()
 
     yield built
 
-    await _purge(emails)
+    await purge_tenants(emails, owner="test_router_tenant.tenants")
 
 
 ALL_PERMS = {DOMAIN_MANAGE_PERMISSION, DEVICE_MANAGE_PERMISSION}
