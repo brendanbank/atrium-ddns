@@ -215,7 +215,11 @@ ssh <DEPLOY_HOST> 'docker compose -f /usr/local/atrium-ddns/compose.yaml \
 Do not proceed on the assumption that it is probably fine. § 1.3 says two thirds
 of the traffic depends on the answer.
 
-### 2.2 ⛔ GATE: the ACME hand-over is prepared and tested
+### 2.2 ✅ GATE: the ACME hand-over is prepared and tested
+
+**Status: shipped and gate-tested (#60). Gap G1 is closed.** What follows is a
+description of configuration that exists in the repository, not a block to
+paste. The gate test is `make test-acme-handover`; its results are in § 2.2.4.
 
 The new stack's proxy today runs **no ACME at all** — it serves a static copy of
 the old service's certificate, because that store already has exactly one writer
@@ -227,73 +231,159 @@ copy of the old account and certificate rather than have it issue a new one**,
 for one reason: issuing at cutover puts an HTTP-01 challenge on the critical
 path, at the exact moment 80/443 are changing hands, with Let's Encrypt rate
 limits on the other side of it. Copying the store means TLS is already correct
-the instant the new proxy binds 443, and the first renewal happens weeks later
-with nothing else going on.
+the instant the new proxy binds 443.
 
-The configuration this needs is **not in the repo yet** — see gap **G1** in § 9.
-It is given here in full so it can be prepared, applied to a throwaway stack,
-and gate-tested days ahead. Two files:
+#### 2.2.1 Three files, and why the hand-over is an overlay
 
-`compose.yaml`, `proxy` service — replace `command:` and `ports:`:
+| file | what it is |
+|---|---|
+| `compose.acme.yaml` | the `proxy` service, re-specified: entrypoints on 80 and 443, an ACME resolver pointed at **this stack's own** store, and a `./letsencrypt` volume. It `!override`s `command`, `ports` and `volumes` rather than merging them. |
+| `infra/traefik/dynamic-acme.yml` | the `Host()` router with `certResolver: letsencrypt`, and the extracted copy kept as `defaultCertificate`. |
+| `.env` | `TRAEFIK_HOSTNAME`, `LETSENCRYPT_EMAIL`, `LETSENCRYPT_CASERVER`. |
 
-```yaml
-    command:
-      - --entrypoints.web.address=:80
-      - --entrypoints.web.http.redirections.entrypoint.to=websecure
-      - --entrypoints.websecure.address=:443
-      - --providers.file.directory=/etc/traefik/dynamic
-      - --providers.file.watch=true
-      - --certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL}
-      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
-      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
-      - --log.level=INFO
-      - --accesslog=true
-      # `redact` is NOT a real mode — it parses, starts cleanly, behaves as keep.
-      - --accesslog.fields.queryparameters.defaultmode=drop
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./infra/traefik/dynamic.yml:/etc/traefik/dynamic/dynamic.yml:ro
-      - ${TLS_CERT_DIR:-./certs}:/certs:ro
-      - ./letsencrypt:/letsencrypt
+**It is an overlay and not an edit to `compose.yaml` on purpose.** The `proxy`
+service in `compose.yaml` is what the deploy host runs *right now* on 8443. Had
+the hand-over been written into it, the next routine `docker compose up -d`
+would have tried to bind 80 and 443 — which the old Traefik is holding — and
+the hand-over would have happened at whatever moment somebody deployed. As an
+overlay, it happens when an operator names the file:
+
+```bash
+docker compose -f compose.yaml -f compose.acme.yaml --profile tls up -d proxy
+# or: make acme-up
 ```
 
-`infra/traefik/dynamic.yml` — the router gains a host rule and a resolver; the
-static certificate **stays** as the default:
+**The three variables have no defaults**, and the overlay refuses to load
+without them:
 
-```yaml
-http:
-  routers:
-    host-api:
-      rule: Host(`<TRAEFIK_HOSTNAME>`)
-      entryPoints: [websecure]
-      service: host-api
-      tls:
-        certResolver: letsencrypt
+```
+$ docker compose -f compose.yaml -f compose.acme.yaml config
+error while interpolating services.proxy.command.[]: required variable
+LETSENCRYPT_CASERVER is missing a value: set the ACME directory explicitly —
+staging and production are one character apart in effect and weeks apart in
+symptom
 ```
 
-Note deliberately what is *not* removed: the `tls.stores.default.defaultCertificate`
-block pointing at the extracted copy. It becomes a **fallback**. If ACME fails
-for any reason after cutover, the borrowed certificate still terminates TLS and
-stays valid until § 1.6's date. That is the graceful way to stop borrowing:
-the copy goes from load-bearing to insurance rather than from load-bearing to
-deleted.
+That refusal is aimed at one failure in particular. The old compose defaults
+`LETSENCRYPT_CASERVER` to **staging**; Traefik's own default is **production**.
+Two different silent answers to the same omission, and with the extracted copy
+still terminating TLS underneath, a stack that got the wrong one looks
+completely healthy. The guard cannot live in `compose.yaml`: Compose
+interpolates the whole document at load time **including services whose profile
+is not active** (measured), so a `${VAR:?}` there breaks `make up` for
+everybody.
 
-`<TRAEFIK_HOSTNAME>` and `<LETSENCRYPT_EMAIL>` are the same values the old
-service's `.env` already holds. Copy them into the new stack's `.env`. Do not
-type them from memory.
+**The hostname is never written into a tracked file.** It reaches the router
+rule through Traefik's own file-provider templating —
+``rule: Host(`{{ env "TRAEFIK_HOSTNAME" }}`)`` — evaluated inside the container
+against the environment the overlay passes it. Two things measured rather than
+assumed: templating works in a `.yml` file, and a file named `.yml.tmpl` is
+**skipped** by the directory provider ("Skipping file, unsupported extension")
+quietly enough that the stack comes up with no router at all.
 
-**Also set `LETSENCRYPT_CASERVER` explicitly.** The old compose defaults it to
-the **staging** directory when unset, and the old `.env` does set it. A new
-stack that inherits the default silently gets a staging certificate no browser
-trusts, and the symptom appears only after the borrowed fallback is out of the
-way.
+#### 2.2.2 ⚠️ The fallback suppresses first issuance. Measured.
 
-**Gate-test it before the window**, on a throwaway stack with `--dry-run`-style
-caution: bring up the proxy with the copied store and confirm it serves the
-copied certificate *without making an ACME call*, then confirm the renewal path
-is configured. `make tls-verify HOST=<name>` is the existing check.
+The `defaultCertificate` block pointing at the extracted copy **stays**, and
+becomes a fallback: if ACME fails after the cutover, TLS still terminates on a
+valid certificate. That much was the plan and it holds.
+
+What was not known when this section was first written is that **the fallback
+also stops Traefik asking for a certificate at all**. Measured on traefik:3.7,
+same stack, one block of dynamic configuration the only difference:
+
+| ACME store | `defaultCertificate` | what Traefik does |
+|---|---|---|
+| empty | present | `No ACME certificate generation required for domains` — **never contacts the CA** |
+| empty | removed | `Trying to challenge certificate` → `Building ACME client` → `Unable to obtain ACME certificate` |
+
+A certificate already provided for a domain is a certificate Traefik will not go
+and ask for. So a hand-over in which **step 5.4(b) was skipped** — wrong path,
+wrong permissions, forgotten — produces a stack that looks flawless: the
+handshake succeeds, the chain validates, `curl` returns 200, `make tls-verify`
+prints a valid date. Nothing is ever issued, and the first symptom is the
+extracted copy expiring, on § 1.6's date, weeks later.
+
+**Renewal is not suppressed**, and that is what makes the design work. With a
+certificate inside the 720h (30-day) renew window in the store, the same stack
+logs `Testing certificate renew...` and attempts it — the renewal path reads
+the store's own contents, not the routers. Exercised end to end against a local
+CA: the near-expiry certificate was renewed, the new one written to the store,
+and the new one served (§ 2.2.4, phase E).
+
+The consequence for the operator is one line at the end of step 5.4, and it is
+not optional:
+
+```bash
+make acme-verify HOST=<TRAEFIK_HOSTNAME>
+```
+
+It compares the certificate **on the wire** with the one **inside this stack's
+store**, by SHA-256 fingerprint. A match means the hand-over took. A mismatch
+where the wire matches `certs/cert.pem` means the store was never copied, and
+it says so in those words.
+
+#### 2.2.3 ⏱ A renewal may fire seconds after the hand-over, not weeks later
+
+The original wording of this section — *"the first renewal happens weeks later
+with nothing else going on"* — is true only on one side of a date, and today is
+on the other side of it.
+
+Traefik checks for renewal **at start-up** and every 24h thereafter, and renews
+anything within 720h of expiry. § 1.6's certificate expires **23 Sep 2026**, so
+it enters that window on **24 Aug 2026**. Cutting over after that date with a
+store the old Traefik has not yet refreshed means the new proxy attempts a real
+HTTP-01 renewal within seconds of binding 443.
+
+That is survivable — it is what the design is for — but it moves two things
+onto the critical path that § 2.2 assumed were weeks away:
+
+* `LETSENCRYPT_CASERVER` must already be right;
+* port **80** must already reach the new proxy from the internet, because
+  HTTP-01 is the challenge type configured.
+
+If the old Traefik has already renewed by the time the store is copied, the
+copy is fresh and none of this applies. Check which case you are in before the
+window: `openssl x509 -in certs/cert.pem -noout -enddate`, and compare with
+today.
+
+#### 2.2.4 What the gate test covers, and what it does not
+
+`make test-acme-handover` (`scripts/test-acme-handover.sh`) stands the
+**shipped** proxy service up — the real `compose.yaml` + `compose.acme.yaml`
+pair, through `docker compose`, on throwaway ports — against a synthetic ACME
+store built by `openssl`. It never reads the incumbent's store and never binds
+80 or 443. **60 checks, 0 failures**, most recently on 2026-08-16.
+
+| phase | what it exercises | ACME endpoint |
+|---|---|---|
+| 0 | the overlay refuses to load with each variable unset, naming it | none |
+| 1 | the rendered service is the hand-over: 80/443, resolver, `./letsencrypt` read-write, 8443 gone, the pre-hand-over dynamic file not mounted | none |
+| 2 | `extract-acme-cert.sh` leaves the incumbent's store byte- and mtime-identical | none |
+| A | the copied store terminates TLS, and **no ACME call is made** | unroutable `https://127.0.0.1:1/directory` |
+| B/C | the fallback terminates TLS when the store is empty — and suppresses issuance, with the control that proves it | unroutable |
+| D | a near-expiry certificate in the store **does** trigger a renewal, which fails safely and leaves the store intact | unroutable |
+| E | a renewal completing end to end: account registered, certificate issued, store rewritten, new certificate on the wire | `pebble`, Let's Encrypt's own test CA, on a private docker network |
+| F | this configuration reaching the real Let's Encrypt | **staging** — `https://acme-staging-v02.api.letsencrypt.org/directory` |
+
+Phases A–D assert that a digest did *not* move; phase E is the control that
+proves that digest can move at all. Phase C's assertion has its own control —
+the same stack with the fallback removed, where the CA *is* contacted — so
+neither is a probe that could only ever pass.
+
+**Not covered, and worth knowing before the window:**
+
+* **Registration and issuance against Let's Encrypt itself.** Phase F reaches
+  staging and gets a protocol-level answer from it (a 400 from `new-acct` is a
+  full TLS handshake and a signed JWS round trip), then stops at the account
+  contact: Let's Encrypt validates the contact address first and refuses both
+  `.invalid` and `example.com`, and every address that would pass is a real
+  one. Issuance is covered by phase E instead, against a CA that accepts the
+  contact. **Let's Encrypt production was contacted by no phase.**
+* **The real hostname, the real store and the real port 80.** Everything here
+  runs on `handover.example.invalid` and on loopback. The first time the
+  configuration meets the actual name is step 5.4(c).
+* **The 24h renewal ticker.** Only the start-up check is exercised; the
+  periodic one is Traefik's and is taken on trust.
 
 ### 2.3 GATE: the MySQL port is not published to the world
 
@@ -424,6 +514,10 @@ to:
   step 5.4: re-run `make tls-refresh` on the new stack so the fallback
   certificate is the current one, and copy the *renewed* store in § 5.4 rather
   than a stale one. Both take seconds. Nothing is expired; nothing is broken.
+  Step 5.4(c) now does the first half for you. **But read § 2.2.3**: in this
+  branch the new proxy may attempt a real renewal within seconds of binding
+  443, which is fine and is also not what "the first renewal happens weeks
+  later" led anyone to expect.
 * **Cut over after 23 Sep** and the fallback is dead. It does not stop the
   cutover — ACME on the new stack issues a fresh certificate — but the insurance
   policy in § 2.2 is gone, so a failed ACME hand-over becomes a TLS outage
@@ -592,6 +686,21 @@ it comes before anything irreversible.
 
 Do it in exactly this order. Each sub-step is reversible until the last.
 
+**Before the window**, once, on the new stack — this is preparation, not a
+cutover step, and it is the only part of § 2.2 that needs typing:
+
+```bash
+cd /usr/local/atrium-ddns
+# The three variables § 2.2.1 lists. TRAEFIK_HOSTNAME and LETSENCRYPT_EMAIL
+# are the values the OLD service's .env already holds — copy them across, do
+# not type them from memory. LETSENCRYPT_CASERVER is the production directory.
+$EDITOR .env
+mkdir -p -m 700 letsencrypt
+make acme-config >/dev/null && echo "the overlay loads"   # refuses if one is missing
+```
+
+Then, in the window:
+
 ```bash
 cd /usr/local/dyndns-route53
 
@@ -600,17 +709,52 @@ cd /usr/local/dyndns-route53
 docker compose stop traefik           # 80/443 are now free; nothing serves the hostname
 
 # (b) copy the account and certificate to the new stack.
+#     THE STEP WHOSE OMISSION IS SILENT — see § 2.2.2. Sub-step (e) is what
+#     catches it.
 cp letsencrypt/acme.json /usr/local/atrium-ddns/letsencrypt/acme.json
 chmod 600 /usr/local/atrium-ddns/letsencrypt/acme.json
 
-# (c) start the new proxy on 80/443 with the config from § 2.2.
+# (c) refresh the fallback, so the insurance policy is current rather than
+#     whatever was extracted last. Seconds, and § 4 explains when it matters.
 cd /usr/local/atrium-ddns
-docker compose --profile tls up -d proxy
+make tls-extract
+
+# (d) start the new proxy on 80/443 — the hand-over itself.
+make acme-up                          # == docker compose -f compose.yaml \
+                                      #      -f compose.acme.yaml --profile tls up -d proxy
+
+# (e) VERIFY WHICH CERTIFICATE IS ON THE WIRE. Not that TLS works — which
+#     certificate. See § 2.2.2; this is the whole reason the step exists.
+make acme-verify HOST=<TRAEFIK_HOSTNAME>
 ```
+
+`make acme-verify` prints both fingerprints and one of two verdicts:
+
+```
+  store  : <sha256>  (expires <date>)
+  wire   : <sha256>  (expires <date>)
+  MATCH — the certificate on the wire is the one in this stack's own ACME
+  store. The hand-over took: renewal will run from that store.
+```
+
+or
+
+```
+  MISMATCH — the wire is NOT serving this stack's ACME store.
+  It is serving the extracted FALLBACK. That is the 'store was never
+  copied' failure: TLS looks perfect and nothing will ever renew.
+  Re-do runbook step 5.4(b) and restart the proxy.
+```
+
+**A `MISMATCH` here is not an emergency and does not need a rollback.** TLS is
+terminating on the fallback, which is valid until § 1.6's date. Fix (b), then
+`make acme-up` again — the container restarts in well under a second — and
+re-run (e).
 
 Measured on the workstation: proxy cold start **0.71 s**, restart **0.29 s**,
 first TLS request through it answering `/api/healthz` **200 in 0.062 s**.
 Stopping a container is **0.73 s**. Sub-step (b) is a 16 KB file copy.
+`make acme-verify` is two decodes and one handshake.
 
 **The borrowed arrangement ends here, and it ends in the right order.** The old
 Traefik — the store's sole writer — is stopped *before* the copy is taken, so
@@ -627,10 +771,22 @@ fleet that sends a request every 3.2 minutes.
 has changed.
 *Rollback at (b):* delete the copy. Nothing has changed — the copy has no
 writer.
-*Rollback at (c):* `docker compose --profile tls stop proxy` on the new stack,
-then `docker compose start traefik` on the old. The old Traefik resumes its
-store, which it has never stopped owning. **Do this before step 5.5 and the
-cutover has left no trace.**
+*Rollback at (c):* nothing to undo; `make tls-extract` only reads the old
+store and rewrites `certs/`, which nothing else consumes.
+*Rollback at (d):* `make acme-down` on the new stack (== `docker compose -f
+compose.yaml -f compose.acme.yaml --profile tls stop proxy`), then
+`docker compose start traefik` on the old. The old Traefik resumes its store,
+which it has never stopped owning. **Do this before step 5.5 and the cutover
+has left no trace.**
+
+**One asymmetry to know about before you need it.** Once the new proxy has
+successfully renewed — which § 2.2.3 says can be seconds after (d), not weeks —
+the copy in `/usr/local/atrium-ddns/letsencrypt/acme.json` has moved on and the
+old service's own store has not. Rolling back still works: the old Traefik's
+store still holds a certificate valid until § 1.6's date and it resumes serving
+it. What is lost is that the two stores now hold *different* certificates, so a
+second cutover attempt must re-copy rather than assume. That is bookkeeping,
+not an outage, and it is the same shape as § 7.1's argument about `last_ip_*`.
 
 ---
 
@@ -946,13 +1102,26 @@ archive; § 8.2's are. Verified empty on both sides before the session ends.
 The acceptance criterion asks for a document that raises no questions, and says
 to name the gaps rather than paper over them. These are the gaps.
 
-**G1 — the ACME hand-over configuration is not in the repo.** § 2.2 gives it in
-full and it has not been applied to any stack. Someone must put it in
-`compose.yaml` and `infra/traefik/dynamic.yml`, run the gate, and test it on a
-throwaway stack **before** the window. Writing it here was in this issue's file
-scope; shipping it was not. *Effort: small. Risk if skipped: the cutover window
-contains an untested Traefik configuration change, which is the one thing this
-runbook is designed to prevent.*
+**G1 — ~~the ACME hand-over configuration is not in the repo~~ CLOSED (#60).**
+It is now `compose.acme.yaml` + `infra/traefik/dynamic-acme.yml` + three
+variables in `.env.example`, gate-tested on a throwaway stack by
+`make test-acme-handover` (60 checks, 0 failures). It went in as an **overlay**
+rather than an edit to `compose.yaml`, because editing the deployed `proxy`
+service in place would have let a routine `docker compose up -d` perform the
+hand-over by accident — § 2.2.1.
+
+Two things the gate test found that this section did not know:
+
+* the fallback certificate **suppresses first issuance** (§ 2.2.2), which makes
+  a skipped step 5.4(b) invisible to every check an operator would normally
+  run — hence step 5.4(e), `make acme-verify`;
+* a renewal can fire **seconds** after the hand-over rather than weeks later
+  (§ 2.2.3), which puts `LETSENCRYPT_CASERVER` and port 80 on the critical path
+  after all.
+
+What remains open is narrower and is listed in § 2.2.4: no phase registered or
+issued against Let's Encrypt itself (staging was reached and answered;
+production was never contacted), and nothing has met the real hostname.
 
 **G2 — the AAAA gate has been measured on the workstation, not on the deploy
 host.** § 2.1 gives the exact one-line probe and both possible outcomes. This is
@@ -1027,5 +1196,9 @@ estimated.
 * `docs/ops/refactor-plan.md` § 5c — behaviour changes accepted at cutover
 * `scripts/copy-legacy-db.sh` — the only sanctioned reader of the live database
 * `scripts/extract-acme-cert.sh` — why the certificate is borrowed and what that costs
+* `compose.acme.yaml` — the hand-over overlay, and why it is not an edit to `compose.yaml`
+* `infra/traefik/dynamic-acme.yml` — the router after the hand-over, and the fallback's side effect
+* `scripts/test-acme-handover.sh` — the gate test behind § 2.2.4 (`make test-acme-handover`)
+* `scripts/verify-acme-handover.sh` — step 5.4(e) (`make acme-verify`)
 * `backend/src/atrium_ddns/scripts/import_legacy.py` — the importer and its ten refusals
 * `backend/src/atrium_ddns/scripts/rehearse_migration.py` — the rehearsal harness (#50)

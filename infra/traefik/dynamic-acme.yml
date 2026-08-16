@@ -1,0 +1,91 @@
+# Dynamic configuration for the TLS terminator AFTER the ACME hand-over.
+#
+# Loaded only by `compose.acme.yaml`; `infra/traefik/dynamic.yml` is the
+# pre-hand-over file and stays exactly as it is. The two are never mounted
+# together — both declare a router called `host-api`, and letting Traefik pick
+# between them is not a configuration, it is a coin toss. `compose.acme.yaml`
+# replaces the volume list rather than merging it for that reason.
+#
+# ---------------------------------------------------------------------------
+# The hostname is not written here, and that is not squeamishness
+# ---------------------------------------------------------------------------
+#
+# `{{ env "TRAEFIK_HOSTNAME" }}` is Traefik's own file-provider templating,
+# evaluated inside the container against the environment `compose.acme.yaml`
+# passes it. The real hostname therefore lives in `.env` and in no tracked
+# file.
+#
+# Two things about that templating, both measured against traefik:3.7 rather
+# than assumed:
+#
+#   * it works in a `.yml` file. A file named `.yml.tmpl` is **skipped** by
+#     the directory provider — "Skipping file, unsupported extension" — and
+#     skipped silently enough that the stack comes up with no router at all.
+#   * the router rule is where Traefik finds the domain to request a
+#     certificate for ("Trying to challenge certificate for domain [...] found
+#     in HostSNI rule"). `PathPrefix(/)` — which is what the pre-hand-over
+#     file uses — names no domain, so a `certResolver` on it would resolve
+#     nothing and say so only at DEBUG level.
+#
+# ---------------------------------------------------------------------------
+# The fallback certificate, and the trap that comes with it
+# ---------------------------------------------------------------------------
+#
+# `defaultCertificate` below is the copy extracted from the incumbent's store
+# by `scripts/extract-acme-cert.sh`. Keeping it is deliberate: if ACME fails
+# after the cutover, TLS still terminates on a valid certificate instead of
+# falling over.
+#
+# **But it also suppresses first issuance.** Measured on traefik:3.7 with an
+# empty ACME store: with this block present Traefik logs "No ACME certificate
+# generation required for domains" and never contacts the CA; with the block
+# removed, the identical stack logs "Trying to challenge certificate" and
+# "Building ACME client". A certificate already provided for a domain is a
+# certificate Traefik will not go and ask for.
+#
+# What that means operationally, and it is the reason runbook step 5.4 has a
+# verification line rather than just three commands:
+#
+#   * if the store WAS copied (5.4b), everything is right — the copied
+#     certificate is served, no ACME call is made at hand-over, and renewal
+#     still fires from the store's own timer. Renewal is **not** suppressed:
+#     with a certificate inside the 720h renew window in the store, the same
+#     stack logs "Testing certificate renew..." and then attempts it.
+#   * if the store was NOT copied — forgotten, wrong path, wrong permissions —
+#     the stack looks perfect. TLS terminates, the chain validates, health
+#     checks pass. Traefik simply never issues anything, and the first symptom
+#     is the extracted copy expiring weeks later.
+#
+# So "TLS answers 200" does not prove the hand-over happened, and neither does
+# `make tls-verify` — both are equally true of the fallback. The check that
+# tells them apart compares the certificate on the wire with the one inside
+# this stack's store, by fingerprint: `make acme-verify HOST=<name>`. It is
+# the last line of runbook step 5.4 for that reason.
+#
+# Note what is NOT here: the `tls.certificates:` list that the pre-hand-over
+# file carries. Listing the extracted copy there as well would make it an
+# SNI-matching certificate for the real hostname, which shadows the one
+# Traefik loads from the ACME store — so after a successful renewal the proxy
+# would go on presenting the stale copy. As `defaultCertificate` only, it is
+# reached when nothing else matches, which is exactly what a fallback is.
+
+tls:
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /certs/cert.pem
+        keyFile: /certs/key.pem
+
+http:
+  routers:
+    host-api:
+      rule: Host(`{{ env "TRAEFIK_HOSTNAME" }}`)
+      entryPoints: [websecure]
+      service: host-api
+      tls:
+        certResolver: letsencrypt
+  services:
+    host-api:
+      loadBalancer:
+        servers:
+          - url: http://api:8000
