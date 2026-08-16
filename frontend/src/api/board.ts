@@ -106,6 +106,11 @@ export interface BoardDevice {
   updates_in_window: number | null;
   updates_display: string;
   window_days: number;
+  /** `null` means *inherit the installation default*. #73. */
+  rate_limit_per_minute: number | null;
+  /** The resolved limit, from `effective_rate_limit` on the server —
+   *  the limiter's own function. See `api/devices.ts`. */
+  effective_rate_limit_per_minute: number;
   hostnames: BoardHostname[];
 }
 

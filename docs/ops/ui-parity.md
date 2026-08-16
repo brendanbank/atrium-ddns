@@ -3,8 +3,8 @@
 > **every legacy page either exists as a registration or is deleted because
 > atrium covers it — demonstrated against the deployed stack**
 
-**Verdict: exit 2. ~~15~~ ~~11~~ ~~10~~ 6 of 39 legacy routes are in neither
-column**, in ~~five~~ two capability groups, counted apart and never averaged.
+**Verdict: exit 2. ~~15~~ ~~11~~ ~~10~~ 2 of 39 legacy routes are in neither
+column**, in ~~five~~ one capability group, counted apart and never averaged.
 
 This file is the route-by-route walk. Every verdict in it is a live response
 from a stack the run that wrote it stood up. Reproduction commands are inline so
@@ -17,13 +17,13 @@ the table can be re-run rather than believed.
 A verdict is amended **visibly** here, never replaced. Changed cells are struck
 through and the reasoning is kept.
 
-| | #47 (2026-08-16) | #69 (2026-08-16) | #47-rerun (2026-08-16) | **#75 (2026-08-16)** |
+| | #47 (2026-08-16) | #69 (2026-08-16) | #47-rerun (2026-08-16) | **#75 + #73, re-measured on the merged tree (2026-08-16)** |
 |---|---|---|---|---|
 | deleted — atrium covers it | 13 (33.3%) | 13 (33.3%) | 13 (33.3%) | 13 (33.3%) |
-| registered | 11 (28.2%) | 15 (38.5%) | 15 (38.5%) | **19 (48.7%)** |
+| registered | 11 (28.2%) | 15 (38.5%) | 15 (38.5%) | **23 (59.0%)** |
 | **deliberately dropped** — *a third disposition, see §3.4* | — | — | 1 (2.6%) | 1 (2.6%) |
-| **neither — the finding** | **15 (38.5%)** | **11 (28.2%)** | **10 (25.6%)** | **6 (15.4%)** |
-| gaps restricted to the 22 *pages* | 9 (40.9%) | 7 (31.8%) | 7 (31.8%) | **5 (22.7%)** |
+| **neither — the finding** | **15 (38.5%)** | **11 (28.2%)** | **10 (25.6%)** | **2 (5.1%)** |
+| gaps restricted to the 22 *pages* | 9 (40.9%) | 7 (31.8%) | 7 (31.8%) | **2 (9.1%)** |
 
 Both denominators were re-derived from the legacy source at each reading and
 have not moved: 39 routes, 22 pages, `dyndns-route53` still pinned at
@@ -61,7 +61,46 @@ or struck as a third-disposition route, and said the call is the operator's.
 The entry is registered — the issue's own default, and the cheap thing — but
 the question it raises is recorded under G5 rather than answered.
 
-### What this re-run did, and why it was not a formality
+### What #73 changed, and the one thing it does not claim
+
+**G2 is closed and the four routes move to *registered*.** The
+`registerSettingsGroup` container plan §4 asked for exists, with three child
+pages covering every field of the namespace — eleven when #73 was written,
+twelve once #75's `health_check_manual_cooldown_seconds` merged, and the page
+needed no edit for the twelfth because its field list is derived from the model
+rather than typed out — and
+`PATCH /api/atrium_ddns/devices/{id}` changes a device's limit without
+rotating its credential. §3.3's G2 block below keeps the finding struck through
+and carries the closing evidence, all of it taken from a stack this run stood
+up (`COMPOSE_PROJECT_NAME=ddns73`, API on `:8173`).
+
+**The two denominators did not move.** Still 39 routes and 22 pages, still
+`dyndns-route53` at `5d1c941`. The gap shrank over a fixed divisor.
+
+**What it does not claim, stated here rather than buried in §3.3.** Nobody
+loaded the page in a browser. This repository has no browser harness — no
+Playwright, no `*.spec.ts`, nothing that renders atrium's shell — so the
+sidebar entry is evidenced from **both bundles the stack serves** (the host
+calls `registerSettingsGroup`; the shell carries that function's own
+implementation, warning string and all) and from the vitest suite, and not from
+a click. Everything *below* the sidebar is demonstrated over HTTP: the schema,
+the write, the refusals, and the rate limiter changing behaviour. §3.3's G2
+block says which is which, line by line.
+
+### The two readings above were taken against the same base, and this one
+### was not
+
+**#75 and #73 were written in parallel off `4ff2da4` and merged here.** Each
+independently measured the gap column at **10 → 6**, each correctly against the
+base it could see, and neither accounted for the other. So the merged figure is
+neither side's 6 — and it is not "obviously 2" either, because a number arrived
+at by subtracting two diffs is exactly the kind of arithmetic this file is not
+allowed to carry. It was **re-measured against the merged tree**, from a stack
+built from it (`COMPOSE_PROJECT_NAME=ddns73`, API on `:8173`), and the counts in
+§0 and §4 are that reading. The predicted value is recorded beside it in §4 so a
+disagreement would have been visible rather than absorbed.
+
+### What the #47 re-run did, and why it was not a formality
 
 **#69 re-measured G1 only** and recorded, in this file, that G2–G5 were carried
 forward without being re-taken. Carried-forward verdicts are where a stale pass
@@ -303,11 +342,12 @@ Atrium's audit log (`GET /api/admin/audit -> 200`) and notifications are
 additional surfaces with no legacy counterpart. They are not in the table
 because the criterion runs legacy→atrium, not the reverse.
 
-### 3.2 Registered — name the registration (~~11~~ ~~15~~ 19 routes)
+### 3.2 Registered — name the registration (~~11~~ ~~15~~ 23 routes)
 
-All ~~15~~ 19 registrations were confirmed **in the bundle the running stack
-serves** — ~~`GET /host/main.js -> 200, 748,893 bytes`~~
-`GET /host/main.js -> 200, 763,680 bytes` at #75 — not in `frontend/src/`.
+All ~~15~~ 23 registrations were confirmed **in the bundle the running stack
+serves** — ~~`GET /host/main.js -> 200, 748,893 bytes`~~ ~~763,680 at #75~~
+~~767,491 after #73~~ `GET /host/main.js -> 200, 783,112 bytes` on the
+merged tree — not in `frontend/src/`.
 
 | legacy route | registration | backing endpoint on the running stack |
 |---|---|---|
@@ -330,6 +370,15 @@ serves** — ~~`GET /host/main.js -> 200, 748,893 bytes`~~
 | **`POST /admin/health-checks/clear`** (#75) | *Clear results*, same strip | `POST /api/atrium_ddns/health-checks/clear` — §3.3 G3 |
 | **`GET,POST /admin/domains/<id>`** (#75) | *Rename* on `registerRoute atrium-ddns-domains` | `PATCH /api/atrium_ddns/domains/{domain_id}` — §3.3 G4 |
 | **`GET /admin/help`** (#75) | `registerRoute atrium-ddns-help` `/atrium-ddns/help` + `registerNavItem atrium-ddns-help-nav` ("Help") | none — the page calls no endpoint, see §3.3 G5 |
+| **`GET,POST /admin/rate-limits`** (#73) | `registerSettingsGroup atrium-ddns-settings` → child `rate-limits`, backed by `registerRoute atrium-ddns-settings-rate-limits` `/atrium-ddns/settings/rate-limits` | `GET /api/admin/app-config` (values), `GET /api/atrium_ddns/config/schema` (shape), `PUT /api/admin/app-config/atrium_ddns` (write) |
+| **`GET,POST /admin/rate-limits/user/<id>`** (#73) | re-keyed to the device: `registerRoute atrium-ddns-devices`, the *Rate limit* control on each row | `PATCH /api/atrium_ddns/devices/{device_id}` |
+| **`POST /admin/rate-limits/user/<id>/delete`** (#73) | same control, emptied — *inherit* is `null`, not `0` | same endpoint, `{"rate_limit_per_minute": null}` |
+| **`GET,POST /admin/health-checks/config`** (#73) | same group → child `health-checks`, `registerRoute atrium-ddns-settings-health-checks` `/atrium-ddns/settings/health-checks` | the three endpoints above |
+
+The third child, `retention` (`/atrium-ddns/settings/retention`), has **no legacy
+counterpart** and so appears in no row: the old service pruned inside
+`log_event` and had no retention screen. It is counted nowhere and named here
+for the same reason the two device registrations are.
 
 The ~~six~~ seven nav items in the served bundle, read out of the bundle rather
 than out of `main.tsx`:
@@ -358,7 +407,7 @@ They are counted as registrations because they *are* registrations and the
 criterion asks for a registration; a reader should know that the dashboard row
 above rests on the board and the log page, not on the home widget.
 
-### 3.3 In neither column — the finding (~~15~~ ~~11~~ ~~10~~ 6 routes, ~~5~~ 2 groups)
+### 3.3 In neither column — the finding (~~15~~ ~~11~~ ~~10~~ 2 routes, ~~5~~ one group)
 
 Counted apart, never averaged.
 
@@ -520,17 +569,218 @@ admin DELETE another tenant's name -> 204
    tenant A now sees: ['home.za6602e.example.invalid']
 ```
 
-#### G2 — operator configuration has no UI (4 routes) · severity: high
+#### ~~G2 — operator configuration has no UI (4 routes) · severity: high~~ — **CLOSED by #73**
 
-**This is the honest remainder.** Never scoped, model exists, page does not.
-Reported, not built.
+**This was the honest remainder** — never scoped, model exists, page does not —
+and it is now built. The four routes are in §3.2. The finding is kept below,
+struck through rather than deleted, because the *shape* of it is the useful
+part: a namespace the API served completely and no screen named.
 
-| legacy route | the setting that replaced it |
-|---|---|
-| `GET,POST /admin/rate-limits` | `atrium_ddns.rate_limit_per_minute` |
-| `GET,POST /admin/rate-limits/user/<id>` | re-keyed to `ddns_device.rate_limit_per_minute` |
-| `POST /admin/rate-limits/user/<id>/delete` | " |
-| `GET,POST /admin/health-checks/config` | `atrium_ddns.health_check_*` |
+| legacy route | the setting that replaced it | closed by |
+|---|---|---|
+| ~~`GET,POST /admin/rate-limits`~~ | `atrium_ddns.rate_limit_per_minute` | the `rate-limits` child page |
+| ~~`GET,POST /admin/rate-limits/user/<id>`~~ | re-keyed to `ddns_device.rate_limit_per_minute` | `PATCH /api/atrium_ddns/devices/{id}` + the *Rate limit* control |
+| ~~`POST /admin/rate-limits/user/<id>/delete`~~ | " | the same control, emptied |
+| ~~`GET,POST /admin/health-checks/config`~~ | `atrium_ddns.health_check_*` | the `health-checks` child page |
+
+<details>
+<summary><b>the closing evidence, from a stack this run stood up</b>
+(<code>COMPOSE_PROJECT_NAME=ddns73</code>, API on <code>:8173</code>)</summary>
+
+Every line is a live response, **re-taken on the merged tree** after #75
+landed — not carried from #73's own branch, which is the carried-forward
+staleness this file keeps warning about. The expected verdicts were written
+**before** the first run, and the two disagreements are recorded below rather
+than tuned away.
+
+**1. The group and its three pages, in the bundle the stack serves.**
+
+```
+GET /host/main.js -> 200, 783112 bytes, text/javascript; charset=utf-8
+  PRESENT  registerSettingsGroup
+  PRESENT  atrium-ddns-settings
+  PRESENT  /atrium-ddns/settings/rate-limits
+  PRESENT  /atrium-ddns/settings/health-checks
+  PRESENT  /atrium-ddns/settings/retention
+  PRESENT  app_setting.manage
+  PRESENT  /atrium_ddns/config/schema
+  PRESENT  /admin/app-config
+```
+
+The other end of the same seam — the shell has to *implement* what the host
+calls. Read out of the served shell bundle, and not from the atrium checkout,
+which is at 0.26.12 while the image is 0.28 and therefore cannot answer this:
+
+```
+shell bundle : /assets/index-C362tQAs.js  1,536,603 bytes
+'registerSettingsGroup' in the SHELL bundle          : PRESENT
+'[atrium-registry] registerSettingsGroup({ key: "'   : PRESENT
+    ^ the implementation's own warning string, not just the property name
+'atrium_ddns' occurrences in the SHELL bundle        : still 0
+    ^ unchanged, and correct: the shell never names the namespace. The host does.
+```
+
+**2. Every field of the namespace, on a page, with the bounds the server
+enforces.** The field list, types, bounds, defaults and help text are derived
+from `DdnsConfig`'s own JSON schema — the model atrium validates the PUT
+against — so the population is the model's and cannot be a subset of it.
+
+**The merge is the demonstration of that, and it was not planned as one.** #73
+was written against eleven fields. #75, on a branch cut from the same base,
+added a twelfth (`health_check_manual_cooldown_seconds`). No page, no form and
+no test data changed: the field appeared on the Health checks page with its
+bounds, its default and its help text because the page reads the model. What
+*did* have to change was one line of grouping — and the guard found it, rather
+than a reviewer: an unassigned field lands in the `ungrouped` bucket and
+`test_settings_schema` refuses that bucket being non-empty.
+
+```
+GET /api/admin/app-config           -> 200   atrium_ddns fields served: 12
+                                             (11 at #73; #75 added one)
+GET /api/atrium_ddns/config/schema  -> 200
+  write_path: /admin/app-config/atrium_ddns   permission: app_setting.manage
+  groups: [('rate-limits', 2), ('health-checks', 6), ('retention', 4)]
+  every served field is on a page : PASS      no group is 'ungrouped' : PASS
+  every field carries help text   : PASS
+
+  rate_limit_per_minute                 integer  [0, 10000]  default=30
+  rate_limit_event_retention_hours      integer  [1, 8760]   default=24
+  health_check_enabled                  boolean  [-, -]      default=True
+  health_check_interval_minutes         integer  [1, 1440]   default=15
+  health_check_batch_size               integer  [1, 10000]  default=200
+  health_check_timeout_seconds          number   [0.1, 60.0] default=5.0
+  health_check_concurrency              integer  [1, 64]     default=8
+  health_check_manual_cooldown_seconds  integer  [0, 86400]  default=60   <- #75
+  event_retention_days                  integer  [1, 3650]   default=30
+  prune_batch_size                      integer  [1, 50000]  default=1000
+  prune_max_batches                     integer  [1, 10000]  default=100
+  device_idle_window_days               integer  [1, 365]    default=7
+```
+
+**3. The bounds bite on the server, not only in the browser** — swept over
+every bounded field rather than asserted for the one the issue named by hand:
+
+```
+PUT /api/admin/app-config/atrium_ddns, one step below each minimum:
+  rate_limit_per_minute                = -1    -> 400
+  rate_limit_event_retention_hours     = 0     -> 400
+  health_check_interval_minutes        = 0     -> 400
+  health_check_batch_size              = 0     -> 400   <- AC 2's own example
+  health_check_timeout_seconds         = 0.05  -> 400
+  health_check_concurrency             = 0     -> 400
+  health_check_manual_cooldown_seconds = -1    -> 400   <- #75's field, swept
+  event_retention_days                 = 0     -> 400   without being added
+  prune_batch_size                     = 0     -> 400   to this list
+  prune_max_batches                    = 0     -> 400
+  device_idle_window_days              = 0     -> 400
+  ...and the namespace is back to where the walk found it : PASS
+```
+
+The sweep is over the served schema, so #75's field was covered the first time
+the walk ran on the merged tree without anybody adding a row to it. That is the
+same property as the page, aimed at the evidence instead of the UI.
+
+**4. The per-device limit changes without touching the credential.** The stored
+hash is read from MySQL directly on both sides — a byte comparison is the only
+instrument that can see a credential quietly rewritten, and the response body
+cannot:
+
+```
+POST /api/atrium_ddns/devices -> 201
+  rate_limit_per_minute=None  effective_rate_limit_per_minute=30
+stored hash BEFORE : $argon2id$v=19$m=65536… len=97
+PATCH /api/atrium_ddns/devices/{id} {"rate_limit_per_minute": 2} -> 200
+  rate_limit_per_minute=2  effective_rate_limit_per_minute=2   'secret' in body: False
+stored hash AFTER  : $argon2id$v=19$m=65536… len=97
+  byte-identical across the PATCH : PASS
+```
+
+**5. AC 5 — the rate limiter honouring the changed value, which is the
+demonstration.** Reading the config row back is not; these are `/nic/update`
+calls made by the device over HTTP Basic with the credential it already had.
+
+*Per-device, at limit 2:*
+
+```
+four calls: ['good 203.0.113.73', 'good 203.0.113.73', 'abuse', 'abuse']
+  the credential still works after the PATCH (calls 1-2 admitted) : PASS
+  the limit written through the API is enforced   (calls 3-4)     : PASS
+```
+
+*Installation-wide, through the namespace the settings page writes:*
+
+```
+before: rate_limit_per_minute = 30
+  two calls BEFORE : ['good 203.0.113.73', 'good 203.0.113.73']
+PUT /api/admin/app-config/atrium_ddns  rate_limit_per_minute=0 -> 200
+  two calls AFTER  : ['abuse', 'abuse']
+PUT it back to 30 -> 200
+  one call after   : ['good 203.0.113.73']
+```
+
+**Two predictions were wrong, and the service was right both times.** The
+first: the walk expected
+`['good …', 'nochg …', 'abuse', 'abuse']` at limit 2 and observed `good` twice.
+`nochg` is the *provider's* answer aggregated by `router_nic._aggregate`, not a
+comparison against the stored row, and this zone's backend is a scripted `stub1`
+pinned to `result: "good"` — so `nochg` was never reachable on this fixture. The
+expectation was corrected with the reason, and the assertion narrowed to the two
+facts that carry the criterion.
+
+The second, on the merged tree: the walk asserted the namespace serves
+**eleven** fields and it serves twelve, because #75 added one. The literal was
+the defect — the page's field list is derived, so a hard-coded count in the
+evidence fails on precisely the change the page handles correctly. Replaced by
+a set-equality against the served namespace plus a floor, which is
+non-vacuous and does not need editing the next time a field is added.
+
+Both are recorded because a demonstration edited until it passes is the most
+damaging artefact a milestone can produce, and the difference between *editing
+the expectation* and *editing the assertion's subject* is only visible if the
+first version is written down.
+
+**6. The gate, in both directions, over HTTP.** A `user`-role tenant created
+through atrium's own invite flow — a real, working account, which is what makes
+the three 403s a gate rather than a dead session:
+
+```
+POST /api/invites role_codes=['user'] -> 201 ; accept -> 201 ; login -> 204
+  roles: ['user']
+  atrium_ddns perms: ['atrium_ddns.device.manage', 'atrium_ddns.domain.manage',
+                      'atrium_ddns.hostname.manage']
+  holds app_setting.manage: False
+  GET /api/atrium_ddns/devices                   -> 200   <- not refused everything
+  GET /api/atrium_ddns/config/schema             -> 403
+  GET /api/admin/app-config                      -> 403
+  PUT /api/admin/app-config/atrium_ddns          -> 403
+  ...and the super_admin still reads the schema  -> 200
+```
+
+**7. The absence probes, with the §2.1 control.** `PATCH`, never `GET`:
+
+```
+PATCH /api/atrium_ddns/devices/{id}   -> 200 application/json   <- new, #73
+GET   /api/atrium_ddns/config/schema  -> 200 application/json   <- new, #73
+PATCH /api/atrium_ddns/domains/{id}   -> 405 application/json   <- G4, still open
+GET   /api/atrium_ddns/made-up-…      -> 200 text/html          <- the control
+```
+
+**What is NOT in this evidence.** Nobody clicked the sidebar. There is no
+browser harness in this repository, so *"a super_admin sees a **DDNS
+configuration** group in the Admin sidebar with three children, and clicking one
+loads the page"* rests on: the host bundle calling `registerSettingsGroup`
+(asserted in vitest against a recorder installed on the registry, because
+`@brendanbank/atrium-test-utils` does **not** record settings groups and every
+assertion about one would otherwise pass against a bundle that never registered
+any); the string evidence above from both served bundles; and atrium's own unit
+coverage of `useAdminSectionItems`. Everything below the sidebar — the schema,
+the values, the write, the refusals and the limiter — is demonstrated over HTTP
+above.
+
+</details>
+
+<details>
+<summary><b>the original finding, for the record</b> (#47's re-run, 2026-08-16)</summary>
 
 The settings exist and the running stack serves all eleven of them:
 
@@ -598,6 +848,8 @@ means delete-and-recreate, which rotates the credential.
 ```
 PATCH /api/atrium_ddns/devices/1 -> 405 {'detail': 'Method Not Allowed'}
 ```
+
+</details>
 
 #### ~~G3~~ — on-demand operator actions (~~3~~ ~~2~~ 0 routes) · **closed by #75**
 
@@ -841,30 +1093,63 @@ job fire.
 
 ## 4. Tally
 
+**Re-derived route by route on the merged tree, not computed.** #75 and #73
+were written in parallel off `4ff2da4`; each measured the gap column at
+**10 → 6**, each correctly against the base it could see, and neither could
+account for the other. Subtracting the two diffs would have given the right
+answer here for the wrong reason, and the next time it would not. So the 39
+routes were walked again against a stack built from the merged tree
+(`COMPOSE_PROJECT_NAME=ddns73`, API on `:8173`), one probe per route, with the
+**predicted disposition stated per row before the probe ran**. The script exits
+non-zero on any disagreement.
+
+**Two rows disagreed, and the stack was right both times.** `GET /nic/update`
+and `GET /nic/delete` were predicted to answer `401` without credentials. They
+answer **`200 text/plain` with a body of `badauth`** — the wire contract (plan
+§1), which carries its errors in the body and not in the status, and which is
+the entire reason the frozen table exists. It is also §2.1 in miniature: `200`
+alone does not distinguish a real route from the SPA catch-all, and the
+**content type** does — `text/plain` from the router, `text/html` from the
+catch-all. The probe was corrected to read the body and the type; the two rows
+are registered, as claimed, for a reason the first version of the probe could
+not have seen.
+
+```
+deleted       13   33.3%
+registered    23   59.0%
+dropped        1    2.6%
+gap            2    5.1%
+total         39
+
+gap routes (2):
+   GET,POST /admin/hostnames/<id>/backends
+   GET,POST /admin/users/<uid>/hostnames/<hn>/backends
+of which pages: 2 of 22 = 9.1%
+```
+
 | column | routes | share |
 |---|---|---|
 | deleted — atrium covers it | 13 | 33.3% |
-| registered | ~~15~~ 19 | ~~38.5%~~ 48.7% |
+| registered | ~~15~~ ~~19~~ 23 | ~~38.5%~~ 59.0% |
 | deliberately dropped (§3.4) | 1 | 2.6% |
-| **neither — the finding** | ~~**10**~~ **6** | ~~**25.6%**~~ **15.4%** |
+| **neither — the finding** | ~~**10**~~ ~~**6**~~ **2** | ~~**25.6%**~~ **5.1%** |
 | | **39** | **100%** |
 
 Restricted to the 22 *pages* — the criterion's own word — the gaps are
 `/admin/hostnames/<id>/backends`, `/admin/users/<uid>/hostnames/<hn>/backends`,
-`/admin/rate-limits`, `/admin/rate-limits/user/<id>` and
-`/admin/health-checks/config` — ~~**7 of 22, 31.8%**~~ **5 of 22, 22.7%**.
-~~**The page figure did not move from #69's**, because the one route that left
-the gap column since — `POST /admin/events/clear` — is a `POST` and renders no
-template.~~ **It moved at #75**: `/admin/domains/<id>` and `/admin/help` were
-both pages and both are now registered. The one remaining non-page gap is
-`/admin/rate-limits/user/<id>/delete`; the two `health-checks` actions left with
-#75. The narrower denominator does not flatter the result, which is why both are
-given — and note that it flatters it *less* here than the route figure does
-(22.7% against 15.4%), because what #75 closed was three pages' worth of
-capability and the remaining gap is disproportionately pages.
+~~`/admin/rate-limits`, `/admin/rate-limits/user/<id>`,
+`/admin/health-checks/config`, `/admin/domains/<id>` and `/admin/help`~~ —
+~~**7 of 22, 31.8%**~~ **2 of 22, 9.1%**. ~~**The page figure did not move from
+#69's**, because the one route that left the gap column since —
+`POST /admin/events/clear` — is a `POST` and renders no template.~~ **It moved
+twice, in parallel.** #75 closed `/admin/domains/<id>` and `/admin/help`, both
+pages; #73 closed `/admin/rate-limits`, `/admin/rate-limits/user/<id>` and
+`/admin/health-checks/config`, also pages, and one non-page
+(`/admin/rate-limits/user/<id>/delete`, a `POST` that renders no template). The
+narrower denominator does not flatter the result, which is why both are given.
 
-**A stricter reading gives ~~12~~ 8, not ~~10~~ 6**, and it changes the
-headline, so it is stated rather than assumed. Two of the four routes #69 closed are the *admin
+**A stricter reading gives 4, not 2**, and it changes the headline, so it is
+stated rather than assumed. Two of the four routes #69 closed are the *admin
 acting on another tenant's names* pair, and they are served by the **same**
 endpoints under a widened scope (`atrium_ddns.admin`) rather than by a distinct
 per-user page. Demonstrated above — and with one real difference from the legacy
@@ -881,8 +1166,8 @@ row keys: ['created_at', 'device_id', 'device_name', 'domain_id',
 The admin sees a single merged list with no tenant column and no tenant filter,
 so *"whose name is this"* is answerable only from the zone. A reader who
 requires the admin variant to be its own surface should count those two as still
-open, giving ~~**12 of 39 (30.8%)**~~ **8 of 39 (20.5%)** and
-~~**8 of 22 pages (36.4%)**~~ **6 of 22 pages (27.3%)**. The looser count
+open, giving ~~**12 of 39 (30.8%)** and **8 of 22 pages (36.4%)**~~
+**4 of 39 (10.3%)** and **3 of 22 pages (13.6%)** on the merged tree. The looser count
 is the one in the table because the criterion's own word is *capability*
 ("either exists as a registration") and the capability is reachable; the
 stricter count is here so the choice is visible.
@@ -900,13 +1185,23 @@ Stated so a later reader does not take the table for more than it is.
   stricter reading that required a registration to be *product* UI would move
   `GET /admin/` into the gap column and make it 11.
 - It says nothing about the `/nic/*` wire protocol beyond "the route exists" —
-  that is the frozen 131-case compat table's job, not this file's. The
-  ~~gate run that accompanies this reading executed **0 of 131** wire cases by
-  design (`compat: NO --target GIVEN`)~~ **#75 ran it explicitly against its own
-  stack — `make test-compat TARGET=host BASE_URL=http://api:8000` — and the
-  accounting block reads `executable 124 … 124 passed, 3 skipped` out of 131 in
-  the table (4 excluded by `targets:`, 3 with unmet preconditions). It is still
-  not in the gate, and running it stays an explicit act.**
+  that is the frozen 131-case compat table's job, not this file's. ~~The gate
+  run that accompanies this reading executed **0 of 131** wire cases by design
+  (`compat: NO --target GIVEN`).~~ **Both #75 and #73 ran it explicitly against
+  their own stacks, and it was run again on the merged tree** — #73 because it
+  changes `/nic/update`'s rate-limit inputs, and a reading of that surface with
+  the table unrun would be worth nothing. `make test-compat TARGET=host
+  BASE_URL=http://api:8000` → `executable 124`, **124 passed**, 3 skipped on
+  unmet preconditions (the three `rate_limited:` cases, which are not
+  arrangeable over the wire), 4 excluded by `targets:`. It is still not in the
+  gate, and running it stays an explicit act. Note the three skipped are the
+  cases closest to #73's change, so the table does **not** cover it; §3.3 G2
+  does, twice.
+- **The sidebar entry is not demonstrated in a browser** (§3.3, G2). There is no
+  browser harness in this repository — no Playwright, no `*.spec.ts`. The three
+  settings *pages* and everything they call are demonstrated over HTTP; the
+  group's appearance in atrium's Admin sidebar rests on both served bundles and
+  on vitest.
 - ~~`/admin/health-checks/run|clear` and the domain rename are still counted as
   gaps on the criterion's literal wording. Striking them is the milestone
   owner's call to record, not a reader's to assume; the counts stand above

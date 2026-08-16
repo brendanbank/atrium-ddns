@@ -73,6 +73,7 @@ function device(overrides: Partial<Device> = {}): Device {
     created_at: '2026-08-15T10:00:00Z',
     last_seen_at: '2026-08-16T09:00:00Z',
     rate_limit_per_minute: null,
+    effective_rate_limit_per_minute: 30,
     credential_origin: 'issued',
     hostname_count: 1,
     ...overrides,

@@ -47,6 +47,16 @@ export interface Device {
   /** `null` means *inherit the namespace default*, which is not `0`
    *  (may never call). Two states, carried as two. */
   rate_limit_per_minute: number | null;
+  /** What the limiter will actually allow, with `null` already resolved
+   *  against the installation default.
+   *
+   *  Computed on the server by `effective_rate_limit` — the same
+   *  function `/nic/update` calls on the request path. The browser must
+   *  not resolve `null` itself: the installation default lives behind
+   *  `app_setting.manage`, which a plain tenant does not hold, so a
+   *  client-side resolution would either show nothing or invent a
+   *  number. The one on screen is the one enforced, by construction. */
+  effective_rate_limit_per_minute: number;
   credential_origin: CredentialOrigin;
   hostname_count: number;
 }
@@ -81,6 +91,31 @@ export async function createDevice(body: {
   rate_limit_per_minute?: number | null;
 }): Promise<DeviceSecret> {
   return apiSend<DeviceSecret>('/atrium_ddns/devices', 'POST', body);
+}
+
+/** Change one device's rate limit. **Nothing else, and not the secret.**
+ *
+ * #73's route. Before it existed the only way to tighten a device's
+ * limit was delete-and-recreate, which mints a new username and a new
+ * secret — so the operator's only route to slowing an abusive device
+ * was to break it until its owner reconfigured the router.
+ *
+ * `null` is a *value* here and means *inherit the installation
+ * default*; `0` means *may never call*. The server requires the key to
+ * be present for exactly that reason: an omitted key and an explicit
+ * `null` would otherwise be the same request, and one of the two
+ * readings un-mutes a device somebody muted on purpose.
+ *
+ * Returns the device as a **read** model — `Device`, not
+ * `DeviceSecret`. There is no field on it that could carry a secret.
+ */
+export async function updateDeviceLimit(body: {
+  id: number;
+  rate_limit_per_minute: number | null;
+}): Promise<Device> {
+  return apiSend<Device>(`/atrium_ddns/devices/${body.id}`, 'PATCH', {
+    rate_limit_per_minute: body.rate_limit_per_minute,
+  });
 }
 
 export async function rotateDeviceSecret(id: number): Promise<DeviceSecret> {

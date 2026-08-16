@@ -82,7 +82,7 @@ from app.models.auth import User
 from app.models.ops import AuditLog
 from app.services.audit import record as record_audit
 
-from .auth_device import hash_password
+from .auth_device import effective_rate_limit, hash_password
 from .models import (
     AtriumDdnsState,
     Device,
@@ -92,6 +92,11 @@ from .models import (
     Hostname,
 )
 from .providers import PROVIDER_STATUSES, known_services, provider_class
+from .settings_schema import (
+    APP_CONFIG_MANAGE_PERMISSION,
+    SettingsSchemaOut,
+    settings_schema,
+)
 
 # The zone-containment rule, imported rather than re-derived. This is the
 # same function object ``BaseProvider.domaininhostname`` calls, which is
@@ -387,6 +392,15 @@ class DeviceOut(BaseModel):
     #: The denominator, beside the numerator, so a caller cannot render
     #: the count without being able to render what it is out of.
     window_days: int
+    #: ``NULL`` means *inherit*. Carried beside the resolved value below
+    #: rather than instead of it: "30/min" and "30/min because nobody
+    #: set one" are different facts and the board is allowed to say
+    #: which. #73's AC 4 — the stored value is displayed wherever a
+    #: device is shown, not only accepted at creation.
+    rate_limit_per_minute: int | None
+    #: :func:`~atrium_ddns.auth_device.effective_rate_limit`, the
+    #: limiter's own function. See ``DeviceSummaryOut``.
+    effective_rate_limit_per_minute: int
     hostnames: list[HostnameOut]
 
 
@@ -776,6 +790,10 @@ async def get_board(
                 updates_in_window=status.updates_in_window,
                 updates_display=status.render_updates(),
                 window_days=status.window_days,
+                rate_limit_per_minute=device.rate_limit_per_minute,
+                effective_rate_limit_per_minute=effective_rate_limit(
+                    device, config.rate_limit_per_minute
+                ),
                 hostnames=nested[device.id],
             )
         )
@@ -1598,6 +1616,18 @@ class DeviceSummaryOut(BaseModel):
     #: ``NULL`` means *inherit the namespace default*, which is not the
     #: same as ``0`` (may never call). Two states, carried as two.
     rate_limit_per_minute: int | None
+    #: What the limiter will actually allow this device, with ``NULL``
+    #: already resolved against the namespace default.
+    #:
+    #: Computed by :func:`~atrium_ddns.auth_device.effective_rate_limit`
+    #: — *the same function* ``/nic/update`` calls on the request path,
+    #: not a second reading of the two columns. A browser that resolved
+    #: ``NULL`` itself would need the namespace default, which a plain
+    #: tenant cannot read (it is behind ``app_setting.manage``), so it
+    #: would either show nothing or invent one. Shipping the resolved
+    #: value means the number on the screen is the number the limiter
+    #: enforces, by construction.
+    effective_rate_limit_per_minute: int
     #: :class:`CredentialOrigin`. The one thing a read says about the
     #: secret, and the reason a migrated device can be described
     #: honestly instead of rendered as an empty field.
@@ -1608,6 +1638,34 @@ class DeviceSummaryOut(BaseModel):
 class DeviceCreateIn(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     rate_limit_per_minute: int | None = Field(default=None, ge=0)
+
+
+class DeviceUpdateIn(BaseModel):
+    """The per-device rate limit, and deliberately nothing else.
+
+    ``rate_limit_per_minute`` is **required**, and that is not an
+    oversight. ``None`` is a *value* on this field — it means *inherit
+    the installation default* — so a body that omits the key and a body
+    that sends ``null`` would be indistinguishable under a default of
+    ``None``, and one of the two readings silently un-mutes a device an
+    operator muted on purpose. Required means the omission is a 422 the
+    caller can read instead of a mutation nobody asked for.
+
+    There is no ``name`` here and no secret. Renaming is a separate
+    change (the create path has a uniqueness conflict to handle and this
+    route does not), and the secret is the point of the route: #73 exists
+    because tightening an abusive device's limit meant delete-and-
+    recreate, which rotates the credential and breaks the device until
+    its owner reconfigures it. This model has no field that could carry
+    one and ``tests/test_router_tenant.py`` compares the stored hash
+    across the call.
+    """
+
+    #: ``0`` mutes the device; ``null`` returns it to the installation
+    #: default. ``ge=0`` and no upper bound of its own — the namespace's
+    #: ``le=10_000`` bounds the default, and a per-device override that
+    #: could not exceed it would be a rule nobody wrote down.
+    rate_limit_per_minute: int | None = Field(ge=0)
 
 
 class DeviceSecretOut(BaseModel):
@@ -1704,7 +1762,17 @@ def _render_backend(backend: DomainBackend) -> DomainBackendOut:
     )
 
 
-def _render_device(device: Device, hostname_count: int) -> DeviceSummaryOut:
+def _render_device(
+    device: Device, hostname_count: int, *, default_per_minute: int
+) -> DeviceSummaryOut:
+    """One device, with its limit resolved by the limiter's own function.
+
+    ``default_per_minute`` is ``DdnsConfig.rate_limit_per_minute``, read
+    from the namespace by the caller. It is a required keyword rather
+    than an optional one: a default here would let a call site that
+    forgot to read the config render an *effective* limit that is not
+    the effective limit, and it would look right.
+    """
     return DeviceSummaryOut(
         id=device.id,
         name=device.name,
@@ -1712,6 +1780,9 @@ def _render_device(device: Device, hostname_count: int) -> DeviceSummaryOut:
         created_at=_iso(device.created_at) or "",
         last_seen_at=_iso(device.last_seen_at),
         rate_limit_per_minute=device.rate_limit_per_minute,
+        effective_rate_limit_per_minute=effective_rate_limit(
+            device, default_per_minute
+        ),
         credential_origin=credential_origin(device.password_hash),
         hostname_count=hostname_count,
     )
@@ -2338,6 +2409,7 @@ async def list_devices(
     session: AsyncSession = Depends(get_session),
 ) -> list[DeviceSummaryOut]:
     """A tenant's devices. No secret, and no field that could hold one."""
+    config = await load_config(session)
     devices = list(
         (await session.execute(scope.select(Device).order_by(Device.name)))
         .scalars()
@@ -2345,7 +2417,12 @@ async def list_devices(
     )
     _, by_device = await _hostname_counts(session, scope)
     return [
-        _render_device(device, by_device.get(device.id, 0)) for device in devices
+        _render_device(
+            device,
+            by_device.get(device.id, 0),
+            default_per_minute=config.rate_limit_per_minute,
+        )
+        for device in devices
     ]
 
 
@@ -2370,6 +2447,7 @@ async def create_device(
             detail="this caller has no tenant identity and cannot own a device",
         )
 
+    config = await load_config(session)
     secret = _generate_secret()
     device = Device(
         user_id=scope.user_id,
@@ -2404,7 +2482,12 @@ async def create_device(
         },
     )
     await session.commit()
-    return DeviceSecretOut(device=_render_device(device, 0), secret=secret)
+    return DeviceSecretOut(
+        device=_render_device(
+            device, 0, default_per_minute=config.rate_limit_per_minute
+        ),
+        secret=secret,
+    )
 
 
 @router.post("/devices/{device_id}/rotate", response_model=DeviceSecretOut)
@@ -2431,6 +2514,7 @@ async def rotate_device_secret(
     if device is None:
         raise _not_found("device")
 
+    config = await load_config(session)
     before = credential_origin(device.password_hash)
     secret = _generate_secret()
     device.password_hash = await hash_password(secret)
@@ -2451,8 +2535,76 @@ async def rotate_device_secret(
     )
     await session.commit()
     return DeviceSecretOut(
-        device=_render_device(device, by_device.get(device.id, 0)),
+        device=_render_device(
+            device,
+            by_device.get(device.id, 0),
+            default_per_minute=config.rate_limit_per_minute,
+        ),
         secret=secret,
+    )
+
+
+@router.patch("/devices/{device_id}", response_model=DeviceSummaryOut)
+async def update_device(
+    device_id: int,
+    body: DeviceUpdateIn,
+    user: User = Depends(require_perm(DEVICE_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> DeviceSummaryOut:
+    """Change a device's rate limit **without touching its credential**.
+
+    The route #73 opened this issue for. Before it, the only way to
+    tighten one device's limit was delete-and-recreate — which mints a
+    new username and a new secret, so the operator's only route to
+    slowing an abusive device was to break it until its owner
+    reconfigured the router. That is backwards: the abuse control and
+    the credential are different decisions and only one of them was
+    reachable.
+
+    **Nothing in this function reads or writes ``password_hash``**, and
+    that is asserted rather than asserted-about: ``test_router_tenant``
+    captures the stored hash before and after and compares the bytes,
+    *and* drives ``/nic/update`` with the original secret afterwards, so
+    a rewrite that happened to produce an equal-length hash still fails.
+    One of those two alone would be weaker — a byte comparison cannot
+    tell a hash that still verifies from one that does not, and a
+    successful login cannot see a hash quietly upgraded in place.
+
+    Scoped like every other device route: ``scope.get`` answers ``None``
+    for another tenant's device, which becomes the same 404 a
+    nonexistent id gets. A 403 here would confirm the row exists.
+    """
+    device = await scope.get(session, Device, device_id)
+    if device is None:
+        raise _not_found("device")
+
+    config = await load_config(session)
+    before = device.rate_limit_per_minute
+    device.rate_limit_per_minute = body.rate_limit_per_minute
+
+    _, by_device = await _hostname_counts(session, scope)
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity="ddns_device",
+        entity_id=device.id,
+        action="update",
+        # Both readings, because `null` and `0` are different states and
+        # an audit row saying "rate_limit_per_minute changed" would not
+        # let a reader tell *muted* from *returned to the default*.
+        diff={
+            "rate_limit_per_minute": {
+                "before": before,
+                "after": device.rate_limit_per_minute,
+            }
+        },
+    )
+    await session.commit()
+    return _render_device(
+        device,
+        by_device.get(device.id, 0),
+        default_per_minute=config.rate_limit_per_minute,
     )
 
 
@@ -3557,3 +3709,47 @@ async def get_events(
             filters, vocabulary, cross_tenant=cross_tenant
         ),
     )
+
+
+# --------------------------------------------------------------------- #
+# Operator configuration — the schema the settings form renders from
+# --------------------------------------------------------------------- #
+#
+# #73. The eleven `atrium_ddns.*` settings have been served by atrium's
+# `GET /api/admin/app-config` since #17 and no screen could reach them:
+# the shell's four config sections each pass a *string literal* to the
+# namespace-parameterised mutation hook, and nothing in it derives a
+# namespace from what the admin API returns.
+#
+# The host's settings pages read and write through atrium's own admin
+# endpoints — `GET /api/admin/app-config` for the values,
+# `PUT /api/admin/app-config/atrium_ddns` for the write. This route adds
+# the one thing atrium cannot serve: the *shape*. Atrium's PUT takes a
+# bare `dict[str, Any]`, so the namespace's types and bounds appear
+# nowhere in the OpenAPI document, and a form that hardcoded them would
+# be a second copy of the model with no test able to see it drift.
+#
+# It reads `DdnsConfig.model_json_schema()` — the same schema pydantic
+# validates the PUT against.
+
+
+@router.get("/config/schema", response_model=SettingsSchemaOut)
+async def get_settings_schema(
+    _actor: User = Depends(require_perm(APP_CONFIG_MANAGE_PERMISSION)),
+) -> SettingsSchemaOut:
+    """Every field of the ``atrium_ddns`` namespace, grouped for a form.
+
+    Gated on **atrium's** ``app_setting.manage`` rather than on an
+    `atrium_ddns.*` permission, and the reason is worth stating: the
+    values live in atrium's ``app_settings`` table and are written
+    through atrium's own endpoint, which is gated on exactly that. A
+    host-specific permission here would let a holder open a form whose
+    save button answers 403 — a surface that reads as broken rather than
+    as refused.
+
+    No session and no scope: this is the *description* of a global
+    namespace, identical for every caller, and it touches no tenant row.
+    The values themselves are a different request, to a different
+    endpoint, which applies its own gate.
+    """
+    return settings_schema()

@@ -1519,6 +1519,106 @@ async def test_a_zero_limit_is_not_the_same_as_an_absent_one(
         await _set_limit(world.alice_device, BIG_LIMIT)
 
 
+async def test_the_api_can_tighten_a_limit_and_the_wire_honours_it(
+    client, world
+) -> None:
+    """#73's ``PATCH /devices/{id}``, joined to the wire in one process.
+
+    Two facts are already covered separately: ``test_router_tenant``
+    proves the PATCH stores the value, and
+    ``test_the_limit_answers_abuse_and_is_per_device`` proves
+    ``/nic/update`` honours the column. **Neither sees the seam.** A
+    PATCH that wrote to a different column, or a cache between the row
+    and the limiter, would leave both green — and the whole point of the
+    route is that an operator can slow an abusive device *now*, from a
+    browser, without rotating its credential.
+
+    So the limit is changed the way the settings surface changes it —
+    through the API, as the device's owner — and the very next request
+    the device makes is the assertion. The credential used on the wire
+    is the one the device already had, which is the other half of #73:
+    the tightening must not have broken the device it was aimed at.
+    """
+    from app.auth.principal import Principal
+    from app.auth.rbac import current_principal
+
+    from atrium_ddns.router import DEVICE_MANAGE_PERMISSION
+    from atrium_ddns.router import router as tenant_router
+
+    factory = get_session_factory()
+    async with factory() as session:
+        owner = await session.get(User, world.alice_id)
+        assert owner is not None
+        # Detach fully-loaded rather than holding a session open for the
+        # length of the test: the route builds its own.
+        session.expunge(owner)
+
+    tenant_app = FastAPI()
+    tenant_app.include_router(tenant_router)
+
+    async def _principal() -> Principal:
+        return Principal(
+            user=owner,
+            permissions=frozenset({DEVICE_MANAGE_PERMISSION}),
+            auth_method="password",
+            token_id=None,
+            auth_session_id=None,
+        )
+
+    tenant_app.dependency_overrides[current_principal] = _principal
+
+    await _set_limit(world.alice_device, BIG_LIMIT)
+    try:
+        # Baseline: the device is well inside its limit and says so.
+        first = await get(
+            client, "/nic/update", headers=alice(world),
+            hostname=world.name("ok"), myip="203.0.113.10",
+        )
+        assert first.text == "good 203.0.113.10"
+
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=tenant_app),
+            base_url="http://tenant.test",
+        ) as api:
+            patched = await api.patch(
+                f"/api/atrium_ddns/devices/{world.alice_device}",
+                json={"rate_limit_per_minute": 0},
+            )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["effective_rate_limit_per_minute"] == 0
+
+        # The next call on the wire, with the *same* credential.
+        refused = await get(
+            client, "/nic/update", headers=alice(world),
+            hostname=world.name("ok"), myip="203.0.113.10",
+        )
+        assert refused.text == "abuse", (
+            "the limit written through the API did not reach the limiter"
+        )
+
+        # And back up again, through the same route — so this is a
+        # setting and not a one-way door.
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=tenant_app),
+            base_url="http://tenant.test",
+        ) as api:
+            restored = await api.patch(
+                f"/api/atrium_ddns/devices/{world.alice_device}",
+                json={"rate_limit_per_minute": BIG_LIMIT},
+            )
+        assert restored.status_code == 200, restored.text
+        allowed = await get(
+            client, "/nic/update", headers=alice(world),
+            hostname=world.name("ok"), myip="203.0.113.10",
+        )
+        assert allowed.text == "good 203.0.113.10", (
+            "the device stayed refused after its limit was raised — the "
+            "credential or the window did not survive the change"
+        )
+    finally:
+        await _set_limit(world.alice_device, BIG_LIMIT)
+
+
 async def test_abuse_precedes_the_hostname_parameter(client, world) -> None:
     """``update-abuse-precedes-911`` — one of the three the runner skips.
 

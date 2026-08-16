@@ -15,6 +15,7 @@
  * spell the provider stack out again.
  */
 import {
+  IconAdjustments,
   IconHandStop,
   IconHelp,
   IconKey,
@@ -38,7 +39,15 @@ import { DomainsPage } from './DomainsPage';
 import { HELP_PATH, HelpPage } from './HelpPage';
 import { NAMES_PATH, HostnamesPage } from './HostnamesPage';
 import { LOG_PATH, LogSearchPage } from './LogSearchPage';
+import { SettingsPage } from './SettingsPage';
+import { CONFIG_PERMISSION } from './api/config';
 import { BOARD_PATH, DEVICES_PATH, DOMAINS_PATH } from './paths';
+import {
+  SETTINGS_GROUP_KEY,
+  SETTINGS_GROUP_KEYS,
+  SETTINGS_LABELS,
+  SETTINGS_ROUTES,
+} from './settings/settingsRoutes';
 
 /** The three paths this file used to declare. They moved to `paths.ts`
  *  when #75's help page needed to name them: `main` imports `HelpPage`,
@@ -187,6 +196,61 @@ if (!reg || !AtriumReact) {
     icon: AtriumReact.createElement(IconHelp, { size: 18 }),
     order: 900,
   });
+  // #73 — plan §4's one unbuilt clause: "Rate limits, health-check
+  // config, retention become one nested group via
+  // `registerSettingsGroup` rather than sibling pages."
+  //
+  // The routes come first and are registered unconditionally. A
+  // `SettingsGroup` child is nav-only — atrium's `/admin/:section` route
+  // does not look groups up — so the child's `to` must be a path this
+  // bundle serves, and a route registered only when the group is
+  // registered would make the two ways of arriving here disagree.
+  //
+  // The pages are not perm-gated at the registry level, for the same
+  // reason the tenant pages are not: each renders an explicit *refusal*
+  // for a caller without `app_setting.manage`. The group below IS
+  // perm-gated, because that is a sidebar entry rather than a page —
+  // hiding a nav item a user cannot use is not the same as answering
+  // "this does not exist" to a URL they typed.
+  for (const key of SETTINGS_GROUP_KEYS) {
+    reg.registerRoute({
+      key: `atrium-ddns-settings-${key}`,
+      path: SETTINGS_ROUTES[key],
+      render: () => makeWrapperElement(<SettingsPage groupKey={key} />),
+    });
+  }
+  if (reg.registerSettingsGroup) {
+    reg.registerSettingsGroup({
+      key: SETTINGS_GROUP_KEY,
+      label: 'DDNS configuration',
+      icon: AtriumReact.createElement(IconAdjustments, { size: 18 }),
+      // Atrium's own config sections (System, Auth, Branding) live in
+      // the admin bucket and gate on this same permission. Sitting
+      // beside them is the point: the settings are atrium's
+      // `app_settings` rows, edited through atrium's own endpoint.
+      section: 'admin',
+      perm: CONFIG_PERMISSION,
+      // After the built-ins, which occupy 100..900.
+      order: 950,
+      children: SETTINGS_GROUP_KEYS.map((key) => ({
+        key,
+        label: SETTINGS_LABELS[key],
+        to: SETTINGS_ROUTES[key],
+      })),
+    });
+  } else {
+    // Available since atrium 0.25 and typed optional on the registry,
+    // so this branch is reachable on an older image. Say what was lost
+    // and what still works: the pages are registered above and remain
+    // reachable by URL — silence here would reproduce #73 exactly, a
+    // surface that exists and nothing names.
+    console.error(
+      '[atrium-ddns] this atrium build has no registerSettingsGroup ' +
+        '(added in 0.25), so the DDNS configuration group will not appear ' +
+        'in the admin sidebar. The pages are still served at ' +
+        Object.values(SETTINGS_ROUTES).join(', '),
+    );
+  }
   reg.registerAdminTab({
     key: 'atrium-ddns',
     label: 'Atrium Ddns',

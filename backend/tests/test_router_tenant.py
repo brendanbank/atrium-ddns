@@ -237,6 +237,14 @@ UNSCOPED_ROUTES: dict[str, str] = {
         "the provider catalogue is a property of the build, not of a "
         "tenant — it reads no table at all"
     ),
+    "GET /api/atrium_ddns/config/schema": (
+        "#73. The *shape* of a global config namespace — the types, "
+        "bounds and defaults read out of DdnsConfig's own JSON schema. "
+        "It declares no session and reads no table, so there is no "
+        "tenant row for a scope to filter; it is gated on atrium's "
+        "`app_setting.manage` instead, the same permission that gates "
+        "the values themselves. See tests/test_settings_schema.py"
+    ),
 }
 
 
@@ -691,6 +699,10 @@ async def test_the_second_read_does_not_carry_the_secret(tenants: dict[str, Any]
             "created_at",
             "last_seen_at",
             "rate_limit_per_minute",
+            # #73. The stored value and the resolved one, both, because
+            # "30/min" and "30/min because nobody set one" are different
+            # facts.
+            "effective_rate_limit_per_minute",
             "credential_origin",
             "hostname_count",
         }
@@ -1596,3 +1608,206 @@ async def test_deleting_a_device_orphans_its_hostnames_rather_than_destroying_th
         row = await s.get(m.Hostname, hostname_id)
         assert row is not None, "the hostname was destroyed with its device"
         assert row.device_id is None
+
+
+# ===================================================================== #
+# 5. The per-device rate limit is editable, and the secret is not touched
+#
+# #73. Before ``PATCH /devices/{id}`` the only way to tighten one
+# device's limit was delete-and-recreate, which mints a new username and
+# a new secret — so an operator's only route to slowing an abusive
+# device was to break it until its owner reconfigured the router. The
+# tests below are written so that an implementation which "helpfully"
+# re-hashed, rotated or otherwise touched the credential fails, because
+# such an implementation satisfies every assertion about the limit.
+# ===================================================================== #
+
+
+async def test_the_limit_can_be_changed_without_touching_the_secret(
+    tenants: dict[str, Any],
+):
+    """Two instruments on the credential, and neither alone is enough.
+
+    The **bytes** of the stored hash cannot tell a hash that still
+    verifies from one that does not — argon2 is salted, so a re-hash of
+    the same plaintext produces a different string, but a byte
+    comparison also passes for a value that was never a hash of
+    anything. The **verification** cannot see a hash quietly upgraded in
+    place: a re-hash of the same secret still authenticates.
+
+    Together they close it: the row is byte-identical *and* the original
+    secret still opens it.
+    """
+    a = tenants["a"]
+    async with _client(a["user"]) as client:
+        created = await client.post(
+            "/api/atrium_ddns/devices",
+            json={"name": f"limited-{W}", "rate_limit_per_minute": None},
+        )
+        assert created.status_code == 201, created.text
+        device_id = created.json()["device"]["id"]
+        secret = created.json()["secret"]
+        assert created.json()["device"]["rate_limit_per_minute"] is None
+        # NULL resolves to the namespace default, and the resolved value
+        # travels beside the stored one.
+        assert created.json()["device"]["effective_rate_limit_per_minute"] == 30
+
+        before_hash = await _stored_hash(device_id)
+
+        patched = await client.patch(
+            f"/api/atrium_ddns/devices/{device_id}",
+            json={"rate_limit_per_minute": 3},
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["rate_limit_per_minute"] == 3
+        assert patched.json()["effective_rate_limit_per_minute"] == 3
+        # The response is a *read* model. It has no field that could
+        # carry a secret — the structural sweep in section 2 covers every
+        # route on this router, including this one, by construction —
+        # and this is the behavioural half.
+        assert "secret" not in patched.text
+        assert secret not in patched.text
+
+        after_hash = await _stored_hash(device_id)
+        assert after_hash == before_hash, (
+            "PATCH rewrote password_hash. The whole point of this route "
+            "is that changing a limit does not rotate the credential."
+        )
+
+        # The second instrument: the original secret still authenticates
+        # through the same verifier `/nic/*` uses.
+        verified, _ = await verify_password(after_hash, secret)
+        assert verified is True, (
+            "the stored hash no longer verifies the secret the device "
+            "was issued — it was changed, whatever the bytes say"
+        )
+        # …and that verifier is not answering True to everything.
+        wrong, _ = await verify_password(after_hash, secret + "x")
+        assert wrong is False
+
+        # The username is the other half of the credential pair and is
+        # equally untouched.
+        assert patched.json()["username"] == created.json()["device"]["username"]
+
+
+async def test_null_and_zero_survive_the_round_trip_as_two_states(
+    tenants: dict[str, Any],
+):
+    """``NULL`` means *inherit*; ``0`` means *may never call*.
+
+    Collapsing them is how a per-device override silently stops
+    overriding, and a PATCH is where it would happen — a body of
+    ``{"rate_limit_per_minute": 0}`` read as "unset" hands an explicitly
+    muted device the installation default.
+    """
+    a = tenants["a"]
+    async with _client(a["user"]) as client:
+        device_id = (
+            await client.post(
+                "/api/atrium_ddns/devices",
+                json={"name": f"twostate-{W}", "rate_limit_per_minute": 9},
+            )
+        ).json()["device"]["id"]
+
+        muted = await client.patch(
+            f"/api/atrium_ddns/devices/{device_id}",
+            json={"rate_limit_per_minute": 0},
+        )
+        assert muted.status_code == 200, muted.text
+        assert muted.json()["rate_limit_per_minute"] == 0
+        assert muted.json()["effective_rate_limit_per_minute"] == 0
+
+        inherited = await client.patch(
+            f"/api/atrium_ddns/devices/{device_id}",
+            json={"rate_limit_per_minute": None},
+        )
+        assert inherited.status_code == 200, inherited.text
+        assert inherited.json()["rate_limit_per_minute"] is None
+        assert inherited.json()["effective_rate_limit_per_minute"] == 30
+
+        # And the two readings come from the stored row, not from the
+        # response the request that wrote it happened to build.
+        listing = (await client.get("/api/atrium_ddns/devices")).json()
+        row = next(r for r in listing if r["id"] == device_id)
+        assert row["rate_limit_per_minute"] is None
+        assert row["effective_rate_limit_per_minute"] == 30
+
+        # An omitted key is a 422, not a silent un-mute. `None` is a
+        # *value* on this field, so a default of `None` would make
+        # "leave it alone" and "return it to the default" one request.
+        omitted = await client.patch(
+            f"/api/atrium_ddns/devices/{device_id}", json={}
+        )
+        assert omitted.status_code == 422, omitted.text
+        # A negative limit is refused rather than stored and resolved
+        # into something surprising later.
+        negative = await client.patch(
+            f"/api/atrium_ddns/devices/{device_id}",
+            json={"rate_limit_per_minute": -1},
+        )
+        assert negative.status_code == 422, negative.text
+
+
+async def test_another_tenants_device_cannot_be_rate_limited(
+    tenants: dict[str, Any],
+):
+    """404, not 403 — "not yours" and "no such row" must not be
+    distinguishable, or the response is an enumeration oracle."""
+    a, b = tenants["a"], tenants["b"]
+    async with _client(b["user"]) as client:
+        victim = (
+            await client.post(
+                "/api/atrium_ddns/devices", json={"name": f"b-router-{W}"}
+            )
+        ).json()["device"]["id"]
+    before = await _stored_hash(victim)
+
+    async with _client(a["user"]) as client:
+        refused = await client.patch(
+            f"/api/atrium_ddns/devices/{victim}",
+            json={"rate_limit_per_minute": 0},
+        )
+    assert refused.status_code == 404, refused.text
+    # The refusal is not a partial write: nothing was committed on the
+    # way to it.
+    async with _client(b["user"]) as client:
+        row = next(
+            r
+            for r in (await client.get("/api/atrium_ddns/devices")).json()
+            if r["id"] == victim
+        )
+    assert row["rate_limit_per_minute"] is None
+    assert await _stored_hash(victim) == before
+
+
+async def test_the_limit_change_is_audited_with_both_readings(
+    tenants: dict[str, Any],
+):
+    """``before`` and ``after``, because ``null`` and ``0`` are different
+    states and "the limit changed" does not say which."""
+    a = tenants["a"]
+    async with _client(a["user"]) as client:
+        device_id = (
+            await client.post(
+                "/api/atrium_ddns/devices", json={"name": f"audited-limit-{W}"}
+            )
+        ).json()["device"]["id"]
+        await client.patch(
+            f"/api/atrium_ddns/devices/{device_id}",
+            json={"rate_limit_per_minute": 0},
+        )
+
+    factory = get_session_factory()
+    async with factory() as s:
+        rows = (
+            await s.execute(
+                sa.select(AuditLog.action, AuditLog.diff).where(
+                    AuditLog.entity == "ddns_device",
+                    AuditLog.entity_id == device_id,
+                    AuditLog.action == "update",
+                )
+            )
+        ).all()
+    assert len(rows) == 1, rows
+    diff = rows[0].diff["rate_limit_per_minute"]
+    assert diff == {"before": None, "after": 0}, diff

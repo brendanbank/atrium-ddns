@@ -70,6 +70,10 @@ export function device(overrides: Partial<BoardDevice> = {}): BoardDevice {
     updates_in_window: 213,
     updates_display: '213',
     window_days: 7,
+    // #73. Both readings, as the server ships them — the fixture does
+    // not resolve `null` any more than the component does.
+    rate_limit_per_minute: null,
+    effective_rate_limit_per_minute: 30,
     hostnames: [hostname()],
     ...overrides,
   };

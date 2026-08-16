@@ -36,7 +36,7 @@ import { useState } from 'react';
 import type { Board, BoardDevice, BoardHostname } from '../api/board';
 import { LogLink } from '../LogSearchPage';
 import { ResolutionStrip, StripSkeleton } from './ResolutionStrip';
-import { absoluteTitle, formatAge } from './format';
+import { absoluteTitle, formatAge, rateLimitSummary } from './format';
 
 /* The board answers *which* device stopped talking. The next question is
    always *when, and what did it say* — and that is the log, filtered to
@@ -140,6 +140,19 @@ function DeviceBlock({
           >
             log for this device
           </LogLink>
+          {/* #73's AC 4 — the stored limit is displayed wherever a
+              device is shown. In the *detail*, not in the line: the
+              board's four columns are a status grid and §4 spends its
+              boldness on the strip. This is configuration sitting
+              quietly beside the log link, which is where a reader who
+              has already asked "what is wrong with this device" looks
+              next. */}
+          <span
+            className="ddns-label"
+            data-testid={`device-${device.name}-limit`}
+          >
+            rate limit {rateLimitSummary(device)}
+          </span>
           {device.hostnames.length === 0 ? (
             <span className="ddns-label">
               this device has no hostnames. Assign one to start tracking it.

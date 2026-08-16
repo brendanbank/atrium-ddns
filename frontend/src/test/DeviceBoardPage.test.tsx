@@ -429,6 +429,38 @@ describe('collapse', () => {
     ).toBeInTheDocument();
   });
 
+  test('the device detail names its rate limit, and which of three states it is', async () => {
+    // #73's AC 4 — the stored value is displayed wherever a device is
+    // shown. In the detail rather than in the line: the board's four
+    // columns are a status grid and §4 spends its boldness on the
+    // strip. Named here so that placement is a decision on the record
+    // and not something a later reader has to infer from its absence.
+    renderBoard(OPERATOR);
+    await screen.findByTestId('board');
+    fireEvent.click(screen.getByRole('button', { name: /home-router/ }));
+
+    expect(screen.getByTestId('device-home-router-limit')).toHaveTextContent(
+      '30/min, inherited',
+    );
+  });
+
+  test('a muted device says muted rather than showing a zero with a unit', async () => {
+    boardPayload = board({
+      devices: [
+        device({
+          rate_limit_per_minute: 0,
+          effective_rate_limit_per_minute: 0,
+        }),
+      ],
+    });
+    renderBoard(OPERATOR);
+    await screen.findByTestId('board');
+    fireEvent.click(screen.getByRole('button', { name: /home-router/ }));
+    expect(screen.getByTestId('device-home-router-limit')).toHaveTextContent(
+      'muted — may never call',
+    );
+  });
+
   test('a device carrying a divergence is expanded without being asked', async () => {
     boardPayload = board({
       devices: [
