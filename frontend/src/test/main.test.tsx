@@ -47,10 +47,10 @@ test('every registered surface still mounts through the wrapper element', async 
   await import('../main');
 
   // Vacuity guard: the sweep has to be over a non-empty population.
-  // Thirteen — the scaffold's four (home widget, demo page, admin tab,
+  // Fourteen — the scaffold's four (home widget, demo page, admin tab,
   // profile item), the board's one (#44), #45's two tenant pages, #46's
-  // log search, #69's names page, #75's help page, and #73's three
-  // settings pages.
+  // log search, #69's names page, #75's help page, #73's three settings
+  // pages, and #88's zone detail route.
   //
   // #75 and #73 were written against the same base and both edited this
   // number; the merged value is the **union** (9 + 1 + 3), not either
@@ -74,14 +74,20 @@ test('every registered surface still mounts through the wrapper element', async 
   // which is what turns that message from a puzzle into an instruction.
   // (#69 was the fourth issue to append here and the message did read as
   // an instruction; #75 read `expected 10 to be 9` and #73 read
-  // `expected 12 to be 9`, which is the same evidence twice over.)
+  // `expected 12 to be 9`, and #88 read `expected 14 to be 13`, which is
+  // the same evidence three times over.)
+  //
+  // #88 and #89 were both written against this base and both add a
+  // route. Same rule as #75/#73 above: the merged value is the **union**,
+  // and the count is checked against the registration list rather than
+  // one side's number being kept because it compiles.
   const rendered = [
     ...handles.homeWidgets,
     ...handles.routes,
     ...handles.adminTabs,
     ...handles.profileItems,
   ];
-  expect(rendered.length).toBe(13);
+  expect(rendered.length).toBe(14);
   // Keys are the registry's primary key: two registrations sharing one
   // silently replace each other, so the count above would still read 13
   // while one surface never mounts. Added by #46 because three issues
@@ -97,6 +103,7 @@ test('every registered surface still mounts through the wrapper element', async 
     'atrium-ddns-settings-rate-limits',
     'atrium-ddns-settings-health-checks',
     'atrium-ddns-settings-retention',
+    'atrium-ddns-zone-detail',
   ]) {
     expect(
       rendered.find((entry) => entry.key === key),
@@ -118,6 +125,32 @@ test('every registered surface still mounts through the wrapper element', async 
       'function',
     );
   }
+});
+
+test('the zone detail route is registered with a parameter, and no nav item', async () => {
+  const main = await import('../main');
+
+  const route = handles.routes.find(
+    (entry) => entry.key === 'atrium-ddns-zone-detail',
+  );
+  expect(route, 'the zone detail route was never registered').toBeDefined();
+  // Compared against the module's own constant, not a literal typed
+  // twice — and the constant is what `zoneHref` is built from, so the
+  // registered path and the links pointing at it cannot drift.
+  expect(route!.path).toBe(main.ZONE_ROUTE_PATH);
+  // The parameter is the point. Atrium drops a registered `path`
+  // straight into react-router's `<Route path=…>`, so `:id` is matched
+  // there; a route registered as a literal `/atrium-ddns/zones/:id`
+  // would serve exactly one URL, and it would be the one with a colon
+  // in it.
+  expect(route!.path).toContain('/:id');
+
+  // Deliberately no nav item. Every other surface has one; this is
+  // reached from a row, and a sidebar entry would be a link to a literal
+  // colon.
+  expect(
+    handles.navItems.filter((entry) => entry.to?.startsWith('/atrium-ddns/zones')),
+  ).toEqual([]);
 });
 
 test('the nav item for the board is not permission-gated away', async () => {

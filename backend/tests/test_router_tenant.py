@@ -1229,6 +1229,282 @@ async def test_domains_round_trip_and_normalise(tenants: dict[str, Any]):
         assert f"mixed-{W}.example.invalid" not in names
 
 
+# ===================================================================== #
+# 6b. The zone and its first provider, in one submission (#88)
+#
+# `docs/ops/ui-design.md` Part II §10.1. The create path could only ever
+# produce a zone with no provider bound to it, and that is not an
+# incomplete draft: `tests/compat/protocol_cases.yaml:211`
+# (`update/no-backends-911`) freezes it as **911 for every update under
+# that zone** — the DynDNS v2 code for *the service is broken, stop
+# asking*.
+#
+# The tests below assert the part that a two-request browser flow cannot
+# give: **atomicity**. A credential the adapter refuses must take the
+# zone with it, or the operator is told their submission failed while
+# holding exactly the state the feature exists to prevent.
+# ===================================================================== #
+
+
+async def test_a_zone_and_its_first_provider_arrive_in_one_transaction(
+    tenants: dict[str, Any],
+):
+    a = tenants["a"]
+    name = f"one-shot-{W}.example.invalid"
+    async with _client(a["user"]) as client:
+        created = await client.post(
+            "/api/atrium_ddns/domains",
+            json={
+                "name": name,
+                "backend": {
+                    "backend_type": SERVICE,
+                    "config": {"ttl": 60},
+                    "credentials": _creds(CANARY),
+                },
+            },
+        )
+        assert created.status_code == 201, created.text
+        body = created.json()
+        assert body["name"] == name
+        # The binding comes back on the response, so the browser does
+        # not have to re-read the list to learn whether it landed.
+        assert len(body["backends"]) == 1, body
+        binding = body["backends"][0]
+        assert binding["backend_type"] == SERVICE
+        assert binding["credentials_set"] is True
+        # …and never the credential itself, on the one response that
+        # has the plaintext in the same request.
+        assert CANARY not in created.text
+
+    # Second instrument: the stored ciphertext, read with SQL, and the
+    # plaintext read back through the descriptor `/nic/update` uses.
+    # A response saying `credentials_set: true` is the endpoint's own
+    # report; these two are the row.
+    assert await _ciphertext(binding["id"]) is not None
+    assert await _plaintext(binding["id"]) == _creds(CANARY)
+
+
+async def test_a_refused_credential_takes_the_zone_with_it(
+    tenants: dict[str, Any],
+):
+    """The assertion the whole one-submission design rests on.
+
+    Two requests from the browser can half-succeed: the zone lands, the
+    credential is refused, and the tenant now owns a zone that answers
+    ``911`` for every update under it — while their screen says the
+    submission failed. One transaction cannot.
+
+    The refusal used is a *partial* credential, because it is the one an
+    operator actually produces: they fill one box and miss the other.
+    """
+    a = tenants["a"]
+    name = f"rolled-back-{W}.example.invalid"
+    partial = _creds(CANARY)
+    dropped = sorted(partial)[-1]
+    del partial[dropped]
+
+    async with _client(a["user"]) as client:
+        refused = await client.post(
+            "/api/atrium_ddns/domains",
+            json={
+                "name": name,
+                "backend": {
+                    "backend_type": SERVICE,
+                    "config": {},
+                    "credentials": partial,
+                },
+            },
+        )
+        assert refused.status_code == 422, refused.text
+        # Names the field, never the value it is refusing.
+        assert dropped in refused.text
+        assert CANARY not in refused.text
+
+        # The zone is not there. Not "is there and empty" — absent.
+        names = [
+            d["name"] for d in (await client.get("/api/atrium_ddns/domains")).json()
+        ]
+        assert name not in names, (
+            "the zone survived a refused credential — this is precisely the "
+            "zero-provider zone that answers 911 for every update under it"
+        )
+
+        # And the name is still free, which is the operator-visible half:
+        # a rolled-back create must not have consumed the zone name
+        # through the global UNIQUE index.
+        retry = await client.post(
+            "/api/atrium_ddns/domains",
+            json={
+                "name": name,
+                "backend": {
+                    "backend_type": SERVICE,
+                    "config": {},
+                    "credentials": _creds(CANARY),
+                },
+            },
+        )
+        assert retry.status_code == 201, retry.text
+
+
+async def test_an_unknown_service_takes_the_zone_with_it_too(
+    tenants: dict[str, Any],
+):
+    """The other refusal on the same path, asserted separately.
+
+    A different branch of ``_bind_backend`` raises it — the adapter
+    lookup rather than the credential completeness check — and a rollback
+    that worked for one and not the other would be invisible to a test
+    that only drove one.
+    """
+    a = tenants["a"]
+    name = f"unknown-svc-{W}.example.invalid"
+    async with _client(a["user"]) as client:
+        refused = await client.post(
+            "/api/atrium_ddns/domains",
+            json={
+                "name": name,
+                "backend": {"backend_type": f"nosuch-{W}", "config": {}},
+            },
+        )
+        assert refused.status_code == 422, refused.text
+        names = [
+            d["name"] for d in (await client.get("/api/atrium_ddns/domains")).json()
+        ]
+        assert name not in names
+
+
+async def test_omitting_the_provider_is_still_allowed_and_is_audited_as_such(
+    tenants: dict[str, Any],
+):
+    """"Add a provider later" stays open — staging a migration is a real
+    reason — and the audit row records **which** of the two shapes the
+    call was.
+
+    ``with_backend: false`` is a measurement of a deliberate act, and it
+    is the one an audit reader wants to be able to find, because it is
+    the state that answers ``911``. Recording nothing for it would make
+    the two indistinguishable after the fact.
+    """
+    a = tenants["a"]
+    name = f"staged-{W}.example.invalid"
+    async with _client(a["user"]) as client:
+        created = await client.post(
+            "/api/atrium_ddns/domains", json={"name": name, "backend": None}
+        )
+        assert created.status_code == 201, created.text
+        assert created.json()["backends"] == []
+        domain_id = created.json()["id"]
+
+        # The pre-#88 body — no `backend` key at all — is still accepted.
+        # Any caller written against the old shape keeps working.
+        legacy = await client.post(
+            "/api/atrium_ddns/domains", json={"name": f"legacy-{W}.example.invalid"}
+        )
+        assert legacy.status_code == 201, legacy.text
+        assert legacy.json()["backends"] == []
+
+    factory = get_session_factory()
+    async with factory() as s:
+        rows = (
+            await s.execute(
+                sa.select(AuditLog)
+                .where(AuditLog.entity == "ddns_domain")
+                .where(AuditLog.entity_id == domain_id)
+                .where(AuditLog.action == "create")
+            )
+        ).scalars().all()
+    assert len(rows) == 1, rows
+    assert rows[0].diff["with_backend"] is False
+
+
+async def test_the_one_shot_create_audits_both_rows(tenants: dict[str, Any]):
+    """One submission, two audit rows — and the credential in neither.
+
+    The zone row says a provider came with it; the binding row says what
+    happened to the secret. Two entities, two rows, because an audit that
+    folded them would make "who added this provider" unanswerable.
+    """
+    a = tenants["a"]
+    name = f"audited-{W}.example.invalid"
+    async with _client(a["user"]) as client:
+        created = await client.post(
+            "/api/atrium_ddns/domains",
+            json={
+                "name": name,
+                "backend": {
+                    "backend_type": SERVICE,
+                    "config": {"ttl": 60},
+                    "credentials": _creds(CANARY),
+                },
+            },
+        )
+        assert created.status_code == 201, created.text
+        domain_id = created.json()["id"]
+        backend_id = created.json()["backends"][0]["id"]
+
+    factory = get_session_factory()
+    async with factory() as s:
+        zone_row = (
+            await s.execute(
+                sa.select(AuditLog)
+                .where(AuditLog.entity == "ddns_domain")
+                .where(AuditLog.entity_id == domain_id)
+            )
+        ).scalar_one()
+        binding_row = (
+            await s.execute(
+                sa.select(AuditLog)
+                .where(AuditLog.entity == "ddns_domain_backend")
+                .where(AuditLog.entity_id == backend_id)
+            )
+        ).scalar_one()
+
+    assert zone_row.diff["with_backend"] is True
+    assert binding_row.diff["credentials"] == "replaced"
+    # Key names, never values. `_credential_audit` is what keeps that
+    # true and this is the assertion that it was reached on this path.
+    assert CANARY not in str(zone_row.diff)
+    assert CANARY not in str(binding_row.diff)
+
+
+async def test_the_first_provider_is_owned_by_the_zone_not_by_the_caller(
+    tenants: dict[str, Any],
+):
+    """The same rule ``_bind_backend``'s docstring spends its length on,
+    exercised through the create path.
+
+    A cross-tenant administrator creating a zone *for* themselves is the
+    ordinary case; the assertion is that the binding's ``user_id`` is
+    read off the zone row either way, because taking it from the scope
+    would encrypt the credential under a key ``/nic/update`` never
+    unlocks.
+    """
+    a = tenants["a"]
+    async with _client(a["user"], ALL_PERMS | {CROSS_TENANT_PERMISSION}) as client:
+        created = await client.post(
+            "/api/atrium_ddns/domains",
+            json={
+                "name": f"owner-{W}.example.invalid",
+                "backend": {
+                    "backend_type": SERVICE,
+                    "config": {},
+                    "credentials": _creds(CANARY),
+                },
+            },
+        )
+        assert created.status_code == 201, created.text
+        backend_id = created.json()["backends"][0]["id"]
+
+    factory = get_session_factory()
+    async with factory() as s:
+        row = await s.get(m.DomainBackend, backend_id)
+        assert row is not None
+        assert row.user_id == a["user_id"]
+    # Decryptable by the owner's key, which is the half a `user_id`
+    # assertion alone cannot see.
+    assert await _plaintext(backend_id) == _creds(CANARY)
+
+
 async def test_a_zone_claimed_by_another_tenant_is_a_conflict_that_names_nobody(
     tenants: dict[str, Any],
 ):

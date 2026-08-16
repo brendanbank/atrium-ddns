@@ -1,80 +1,98 @@
-/** Zones, and the provider bindings under them.
+/** The zone list — one row per zone, and the create flow.
  *
- * The zone is the row and the backends are nested under it, because a
- * backend has no meaning apart from the zone it writes to — a flat list
- * of bindings would make the reader carry the join.
+ * ## What #88 changed, and why it is not a preference
  *
- * Every credential decision arrives computed. `credentials_set` is a
- * boolean read off `credentials_ct IS NOT NULL`; there is no masked
- * value to render, and there is deliberately nothing here that displays
- * a prefix or a length. `known_service` is the server's answer to
- * *"does this build have an adapter for it"*, and a row that says
- * `false` is rendered as what it is — a binding that can only answer
- * `911` — rather than as one that looks like it works.
+ * Before: one row per zone with its provider bindings nested under it,
+ * and a create modal offering a single text box and a Create button.
+ *
+ * That modal manufactures a **zero-provider zone** in one click. Part II
+ * §8.1 measures what that is: every update for a name under such a zone
+ * answers `911`, frozen at `tests/compat/protocol_cases.yaml:211`
+ * (`update/no-backends-911`), which is the DynDNS v2 code for *the
+ * service is broken, stop asking*. Then the list drew it identically to
+ * a working zone — the exceptional row in the same ink as the other 500,
+ * which is the precise inverse of §0's thesis.
+ *
+ * Three consequences, all of them here:
+ *
+ * 1. **The create form asks for the zone and its first provider**, in
+ *    one submission, reusing `BackendForm` rather than a second copy of
+ *    the credential rules. One request, one transaction: the server
+ *    creates both rows or neither.
+ * 2. **"Add a provider later" is a link, not a checkbox, and not the
+ *    default.** The path stays open — staging a migration is a real
+ *    reason — but it is a deliberate act with the consequence written
+ *    next to it.
+ * 3. **A zone with no provider renders diverged**, in the operator's
+ *    terms rather than the protocol's. `ZoneStatus` owns the words.
+ *
+ * ## The bindings moved out of this file
+ *
+ * §10.2: providers are listed *inside* the zone, because that is where
+ * they live. They were nested here on a shared list page, which is the
+ * same information one level too deep and three clicks from the thing it
+ * describes. `ZoneDetailPage` is now the only surface that edits them,
+ * so there is one rendering of a binding rather than two that can
+ * disagree.
  */
 import { useState } from 'react';
-import { Alert, Button, Group, Modal, Stack, Text } from '@mantine/core';
+import { Alert, Anchor, Button, Group, Modal, Stack, Text } from '@mantine/core';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 
 import {
   DOMAINS_QUERY_KEY,
-  createBackend,
   createDomain,
-  deleteBackend,
-  deleteDomain,
-  renameDomain,
-  updateBackend,
   type Domain,
-  type DomainBackend,
   type Provider,
 } from '../api/domains';
-import { BackendForm, type BackendFormValue } from './BackendForm';
+import { zoneHref } from '../paths';
+import { BackendForm } from './BackendForm';
+import {
+  ZoneLaterConsequence,
+  ZoneNowhereMark,
+  ZoneWireConsequence,
+} from './ZoneStatus';
 
-function BackendLine({
-  backend,
-  onEdit,
-  onDelete,
-  busy,
-}: {
-  backend: DomainBackend;
-  onEdit: (backend: DomainBackend) => void;
-  onDelete: (backend: DomainBackend) => void;
-  busy: boolean;
-}) {
+/** One zone, as the list draws it.
+ *
+ * `data-diverged` carries the treatment rather than a class name, so the
+ * stylesheet expresses "a zone with no provider is diverged" as one rule
+ * instead of the component deciding which class means what.
+ */
+function ZoneRow({ domain }: { domain: Domain }) {
+  const nowhere = domain.backends.length === 0;
   return (
-    <Group gap="sm" data-testid={`backend-${backend.backend_type}`}>
-      <span className="ddns-data">{backend.backend_type}</span>
-      <span className="ddns-label" data-testid={`credentials-${backend.id}`}>
-        {/* Three words for three facts, and none of them is the
-            credential. "no credential stored" is a working state for a
-            backend nobody has finished configuring, and it is not the
-            same as one this build cannot resolve at all. */}
-        {backend.credentials_set ? 'credential stored' : 'no credential stored'}
-      </span>
-      {backend.known_service ? null : (
-        <span className="ddns-label" data-testid={`unknown-${backend.id}`}>
-          no adapter in this build — updates answer 911
+    <div
+      className="ddns-zone"
+      data-diverged={nowhere ? 'true' : 'false'}
+      data-testid={`domain-${domain.name}`}
+    >
+      <div className="ddns-zone__head">
+        {/* A link and not a button: §12's second argument for a route is
+            that it is linkable, and an operator pasting a zone URL into
+            a ticket is the case that argument names. */}
+        <Anchor
+          href={zoneHref(domain.id)}
+          className="ddns-data"
+          data-testid={`open-domain-${domain.name}`}
+        >
+          {domain.name}
+        </Anchor>
+        <span className="ddns-label">
+          {domain.hostname_count} name{domain.hostname_count === 1 ? '' : 's'}
         </span>
-      )}
-      <Button
-        size="xs"
-        variant="default"
-        disabled={busy}
-        onClick={() => onEdit(backend)}
-        data-testid={`edit-backend-${backend.id}`}
-      >
-        Edit
-      </Button>
-      <Button
-        size="xs"
-        variant="default"
-        disabled={busy}
-        onClick={() => onDelete(backend)}
-        data-testid={`delete-backend-${backend.id}`}
-      >
-        Remove
-      </Button>
-    </Group>
+        <span className="ddns-label" data-testid={`providers-${domain.name}`}>
+          {domain.backends.length} provider
+          {domain.backends.length === 1 ? '' : 's'}
+        </span>
+        {nowhere ? (
+          <ZoneNowhereMark testId={`nowhere-${domain.name}`} />
+        ) : null}
+      </div>
+      {nowhere ? (
+        <ZoneWireConsequence testId={`nowhere-why-${domain.name}`} />
+      ) : null}
+    </div>
   );
 }
 
@@ -88,78 +106,36 @@ export function DomainList({
   const client = useQueryClient();
   const [adding, setAdding] = useState(false);
   const [zoneName, setZoneName] = useState('');
-  const [backendFor, setBackendFor] = useState<Domain | null>(null);
-  const [editing, setEditing] = useState<DomainBackend | null>(null);
   const [error, setError] = useState<string | null>(null);
-  /* #75's rename. Two pieces of state rather than one, because the
-     modal has to keep showing the zone it is renaming *and* what has
-     been typed, and reusing `zoneName` would have the create form and
-     the rename form share a text box. */
-  const [renaming, setRenaming] = useState<Domain | null>(null);
-  const [newZoneName, setNewZoneName] = useState('');
+  /** The "add a provider later" confirmation. Two states and not one:
+   *  the link opens a sentence and a button, so taking the path is two
+   *  deliberate acts rather than one stray click on a modal that was
+   *  already open. */
+  const [confirmLater, setConfirmLater] = useState(false);
 
   const invalidate = () =>
     client.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
   const fail = (err: Error) => setError(err.message);
   const done = () => {
     setError(null);
-    setBackendFor(null);
-    setEditing(null);
     setAdding(false);
     setZoneName('');
-    setRenaming(null);
-    setNewZoneName('');
+    setConfirmLater(false);
     void invalidate();
   };
 
   const addZone = useMutation({
     mutationFn: createDomain,
     onSuccess: done,
-    onError: fail,
-  });
-  const dropZone = useMutation({
-    mutationFn: deleteDomain,
-    onSuccess: done,
-    onError: fail,
-  });
-  const renameZone = useMutation({
-    mutationFn: (input: { id: number; name: string }) =>
-      renameDomain(input.id, input.name),
-    onSuccess: done,
-    // The server's refusal, verbatim. A rename that would leave names
-    // outside the zone is a 409 whose detail carries the count and a
-    // sample of the offending names — the whole point of which is that
-    // the operator can act on it, so it is not reworded here.
-    onError: fail,
-  });
-  const addBackend = useMutation({
-    mutationFn: (input: { domainId: number; value: BackendFormValue }) =>
-      createBackend(input.domainId, input.value),
-    onSuccess: done,
-    onError: fail,
-  });
-  const editBackend = useMutation({
-    mutationFn: (input: { id: number; value: BackendFormValue }) =>
-      updateBackend(input.id, {
-        config: input.value.config,
-        credentials: input.value.credentials,
-      }),
-    onSuccess: done,
-    onError: fail,
-  });
-  const dropBackend = useMutation({
-    mutationFn: deleteBackend,
-    onSuccess: done,
+    // The server's refusal, verbatim. A zone name another tenant already
+    // claims is a 409 whose detail says so, and a credential the adapter
+    // will not take is a 422 naming the field — both of which the
+    // operator can act on, so neither is reworded here.
     onError: fail,
   });
 
-  const busy =
-    addZone.isPending ||
-    dropZone.isPending ||
-    renameZone.isPending ||
-    addBackend.isPending ||
-    editBackend.isPending ||
-    dropBackend.isPending;
+  const busy = addZone.isPending;
+  const trimmedZone = zoneName.trim();
 
   return (
     <Stack gap="lg">
@@ -178,69 +154,11 @@ export function DomainList({
 
       {domains.length === 0 ? (
         <Text size="sm" data-testid="domains-empty">
-          You have no zones yet. Add one, then bind a DNS provider to it.
+          You have no zones yet. Add one — a zone needs a DNS provider to
+          publish through, and the form asks for both.
         </Text>
       ) : (
-        domains.map((domain) => (
-          <Stack gap="xs" key={domain.id} data-testid={`domain-${domain.name}`}>
-            <Group gap="sm">
-              <span className="ddns-data">{domain.name}</span>
-              <span className="ddns-label">
-                {domain.hostname_count} hostname
-                {domain.hostname_count === 1 ? '' : 's'}
-              </span>
-              <Button
-                size="xs"
-                variant="default"
-                disabled={busy}
-                onClick={() => setBackendFor(domain)}
-                data-testid={`add-backend-${domain.name}`}
-              >
-                Add a provider
-              </Button>
-              <Button
-                size="xs"
-                variant="default"
-                disabled={busy}
-                onClick={() => {
-                  setRenaming(domain);
-                  setNewZoneName(domain.name);
-                }}
-                data-testid={`rename-domain-${domain.name}`}
-              >
-                Rename
-              </Button>
-              <Button
-                size="xs"
-                variant="default"
-                disabled={busy}
-                onClick={() => dropZone.mutate(domain.id)}
-                data-testid={`delete-domain-${domain.name}`}
-              >
-                Delete zone
-              </Button>
-            </Group>
-            {domain.backends.length === 0 ? (
-              <Text size="xs" c="dimmed">
-                {/* A zone with no backend is a real configuration state
-                    and the wire says so: every update against it
-                    answers 911. Said here rather than left as an empty
-                    space. */}
-                No provider bound yet — updates for this zone answer 911.
-              </Text>
-            ) : (
-              domain.backends.map((backend) => (
-                <BackendLine
-                  key={backend.id}
-                  backend={backend}
-                  busy={busy}
-                  onEdit={setEditing}
-                  onDelete={(target) => dropBackend.mutate(target.id)}
-                />
-              ))
-            )}
-          </Stack>
-        ))
+        domains.map((domain) => <ZoneRow key={domain.id} domain={domain} />)
       )}
 
       <Group>
@@ -249,121 +167,83 @@ export function DomainList({
         </Button>
       </Group>
 
-      <Modal opened={adding} onClose={() => setAdding(false)} title="Add a zone">
-        <Stack gap="sm">
-          <input
-            className="ddns-data"
-            aria-label="Zone name"
-            value={zoneName}
-            onChange={(event) => setZoneName(event.currentTarget.value)}
-            data-testid="zone-name"
-          />
-          <Text size="xs" c="dimmed">
-            Stored lower-cased and without a trailing dot. Zone names are unique
-            across the whole installation — DNS is global — so a name someone
-            else already runs is refused.
-          </Text>
-          <Group justify="flex-end">
-            <Button
-              size="xs"
-              disabled={zoneName.trim() === '' || busy}
-              onClick={() => addZone.mutate(zoneName.trim())}
-              data-testid="zone-submit"
-            >
-              Create
-            </Button>
-          </Group>
-        </Stack>
-      </Modal>
-
       <Modal
-        opened={renaming !== null}
-        onClose={() => setRenaming(null)}
-        title={`Rename ${renaming?.name ?? ''}`}
+        opened={adding}
+        onClose={() => {
+          setAdding(false);
+          setConfirmLater(false);
+        }}
+        title="Add a zone"
       >
-        {renaming ? (
-          <Stack gap="sm">
-            <input
-              className="ddns-data"
-              aria-label="New zone name"
-              value={newZoneName}
-              onChange={(event) => setNewZoneName(event.currentTarget.value)}
-              data-testid="rename-zone-name"
-            />
-            <Text size="xs" c="dimmed" data-testid="rename-zone-warning">
-              {/* The rule, stated before the refusal rather than after
-                  it. `hostname_count` is the server's own count for this
-                  zone, so the sentence cannot claim a number the list
-                  does not show. */}
-              {renaming.hostname_count === 0
-                ? 'This zone has no names in it, so any free zone name is accepted.'
-                : `This zone has ${renaming.hostname_count} name${
-                    renaming.hostname_count === 1 ? '' : 's'
-                  } under it. A rename that would leave any of them outside the zone is refused rather than rewriting them — a hostname is the DNS name a provider has already published a record under. Delete the ones you no longer want first.`}
-            </Text>
-            <Group justify="flex-end">
-              <Button
+        {/* `BackendForm`, not a copy of it. The credential mode selector,
+            `buildCredentialsPayload` and the server-derived field list
+            are one implementation of one rule; a create-only fork would
+            look harmless (a new zone has nothing stored, so two of the
+            three modes are unreachable) and would pass its own tests on
+            the day it was written. */}
+        <BackendForm
+          providers={providers}
+          busy={busy}
+          submitLabel="Add"
+          submitDisabled={trimmedZone === ''}
+          header={
+            <Stack gap={4}>
+              <Text size="sm" fw={500}>
+                Zone
+              </Text>
+              <input
+                className="ddns-data"
+                aria-label="Zone name"
+                value={zoneName}
+                onChange={(event) => setZoneName(event.currentTarget.value)}
+                data-testid="zone-name"
+              />
+              <Text size="xs" c="dimmed">
+                Stored lower-cased and without a trailing dot. Zone names are
+                unique across the whole installation — DNS is global — so a
+                name someone else already runs is refused.
+              </Text>
+            </Stack>
+          }
+          footer={
+            <Stack gap={4} data-testid="zone-later">
+              {/* A link, not a checkbox, and not the default (§10.1).
+                  A checkbox sits in the form's reading order as one more
+                  option; a link is a departure from it, and this one has
+                  its consequence attached before it can be taken. */}
+              <Anchor
+                component="button"
+                type="button"
                 size="xs"
-                variant="default"
-                disabled={busy}
-                onClick={() => setRenaming(null)}
-                data-testid="rename-zone-cancel"
+                onClick={() => setConfirmLater((current) => !current)}
+                data-testid="zone-later-link"
               >
-                Cancel
-              </Button>
-              <Button
-                size="xs"
-                disabled={
-                  busy ||
-                  newZoneName.trim() === '' ||
-                  newZoneName.trim() === renaming.name
-                }
-                onClick={() =>
-                  renameZone.mutate({
-                    id: renaming.id,
-                    name: newZoneName.trim(),
-                  })
-                }
-                data-testid="rename-zone-submit"
-              >
-                Rename
-              </Button>
-            </Group>
-          </Stack>
-        ) : null}
-      </Modal>
-
-      <Modal
-        opened={backendFor !== null}
-        onClose={() => setBackendFor(null)}
-        title={`Add a provider to ${backendFor?.name ?? ''}`}
-      >
-        {backendFor ? (
-          <BackendForm
-            providers={providers}
-            busy={busy}
-            onCancel={() => setBackendFor(null)}
-            onSubmit={(value) =>
-              addBackend.mutate({ domainId: backendFor.id, value })
-            }
-          />
-        ) : null}
-      </Modal>
-
-      <Modal
-        opened={editing !== null}
-        onClose={() => setEditing(null)}
-        title="Edit provider binding"
-      >
-        {editing ? (
-          <BackendForm
-            providers={providers}
-            existing={editing}
-            busy={busy}
-            onCancel={() => setEditing(null)}
-            onSubmit={(value) => editBackend.mutate({ id: editing.id, value })}
-          />
-        ) : null}
+                Add a provider later
+              </Anchor>
+              {confirmLater ? (
+                <Stack gap={4}>
+                  <ZoneLaterConsequence testId="zone-later-warning" />
+                  <Group>
+                    <Button
+                      size="xs"
+                      variant="default"
+                      disabled={busy || trimmedZone === ''}
+                      onClick={() =>
+                        addZone.mutate({ name: trimmedZone, backend: null })
+                      }
+                      data-testid="zone-later-submit"
+                    >
+                      Create it with no provider
+                    </Button>
+                  </Group>
+                </Stack>
+              ) : null}
+            </Stack>
+          }
+          onSubmit={(value) =>
+            addZone.mutate({ name: trimmedZone, backend: value })
+          }
+        />
       </Modal>
     </Stack>
   );

@@ -1585,8 +1585,45 @@ class DomainOut(BaseModel):
     hostname_count: int
 
 
+class DomainBackendCreateIn(_CredentialsField):
+    backend_type: str = Field(min_length=1, max_length=64)
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
 class DomainCreateIn(BaseModel):
+    """Claim a zone, and — the point of #88 — bind its first provider.
+
+    ``backend`` is optional in the schema and **not** optional in the
+    product's terms, which is a distinction worth writing down rather
+    than resolving.
+
+    A zone with no provider is not an incomplete draft. Every update for
+    a name under it answers ``911`` — *the service is broken, stop
+    asking* — and that is frozen in the wire table
+    (``update/no-backends-911``), not inferred. So a create path that
+    can only produce that state manufactures a broken zone in one click
+    and then renders it identically to a working one.
+
+    Two things follow, and they are why this field exists rather than a
+    second request from the browser:
+
+    - **One submission means one transaction.** With two requests, a
+      credential the provider adapter refuses leaves the zone behind —
+      the exact state the design says must never be arrived at by
+      accident. Here the binding is created before the commit, so a
+      refusal takes the zone with it.
+    - **The path stays open.** An operator staging a migration has a
+      real reason to claim a zone before its credentials exist, so
+      ``None`` is still accepted and still means *no provider yet*. It
+      is a deliberate act with its consequence written next to it (the
+      UI renders that zone diverged), not the thing that happens when
+      you fill in the only field on offer.
+    """
+
     name: str = Field(min_length=1, max_length=253)
+    #: The first provider binding, created in the same transaction.
+    #: ``None`` is the "add a provider later" path, taken deliberately.
+    backend: DomainBackendCreateIn | None = None
 
 
 class DomainRenameIn(BaseModel):
@@ -1611,11 +1648,6 @@ class DomainRenameIn(BaseModel):
     """
 
     name: str = Field(min_length=1, max_length=253)
-
-
-class DomainBackendCreateIn(_CredentialsField):
-    backend_type: str = Field(min_length=1, max_length=64)
-    config: dict[str, Any] = Field(default_factory=dict)
 
 
 class DomainBackendUpdateIn(_CredentialsField):
@@ -1895,6 +1927,27 @@ async def create_domain(
     reachable for a name *another* tenant owns, and it deliberately says
     nothing about who. "Already claimed" and "already claimed by you"
     are the same sentence here on purpose.
+
+    #88 — the first provider, in the same transaction
+    -------------------------------------------------
+    ``body.backend`` binds a provider before the commit. Not a
+    convenience: a zone with none answers ``911`` for every update under
+    it (``update/no-backends-911``, frozen), so a create endpoint that
+    could only ever produce that state was manufacturing a broken zone
+    per call.
+
+    **Atomic, and that is the whole reason it lives here rather than in
+    a second request from the browser.** Two requests can half-succeed —
+    the zone lands, the credential is refused, and the tenant is left
+    holding exactly the state this is meant to prevent, having been told
+    their submission failed. Here nothing is committed until both rows
+    exist, so a refusal takes the zone with it and the tenant's account
+    is unchanged.
+
+    ``None`` remains legal and remains the "add a provider later" path.
+    It is deliberate rather than default: staging a migration is a real
+    reason to claim a zone before its credentials exist, and the surface
+    that offers it renders the result diverged.
     """
     if scope.user_id is None:
         raise HTTPException(
@@ -1928,14 +1981,28 @@ async def create_domain(
         entity="ddns_domain",
         entity_id=domain.id,
         action="create",
-        diff={"name": name},
+        # Which of the two shapes this call was. `false` is a real
+        # measurement of a deliberate act — the operator took the "add a
+        # provider later" link — and it is the state an audit reader
+        # wants to be able to find, because it is the state that answers
+        # 911. Recording nothing for it would make the two
+        # indistinguishable after the fact.
+        diff={"name": name, "with_backend": body.backend is not None},
     )
+
+    backends: list[DomainBackendOut] = []
+    if body.backend is not None:
+        backend = await _bind_backend(
+            session, domain=domain, body=body.backend, actor_user_id=user.id
+        )
+        backends.append(_render_backend(backend))
+
     await session.commit()
     return DomainOut(
         id=domain.id,
         name=domain.name,
         created_at=_iso(domain.created_at) or "",
-        backends=[],
+        backends=backends,
         hostname_count=0,
     )
 
@@ -2237,26 +2304,27 @@ def _credential_audit(incoming: CredentialsIn, touched: bool) -> str:
     return "replaced"
 
 
-@router.post(
-    "/domains/{domain_id}/backends",
-    response_model=DomainBackendOut,
-    status_code=201,
-)
-async def create_backend(
-    domain_id: int,
+async def _bind_backend(
+    session: AsyncSession,
+    *,
+    domain: Domain,
     body: DomainBackendCreateIn,
-    user: User = Depends(require_perm(DOMAIN_MANAGE_PERMISSION)),
-    scope: DdnsScope = Depends(get_scope),
-    session: AsyncSession = Depends(get_session),
-) -> DomainBackendOut:
-    """Bind a provider to a zone, optionally with its credentials.
+    actor_user_id: int,
+) -> DomainBackend:
+    """Bind a provider to a zone. **Does not commit.**
+
+    Factored out of :func:`create_backend` when #88 gave
+    :func:`create_domain` a second caller, and factored rather than
+    copied for the reason the docstring below spends its length on: two
+    copies of this would be two chances to take the owner from the
+    wrong place.
 
     **The row's ``user_id`` is the domain's, never the caller's**, and
-    that is the single most consequential line in this handler. A caller
-    holding ``atrium_ddns.admin`` reaches every tenant's zones, so
-    taking the owner from the scope would encrypt the credential under
-    the *administrator's* key: ``/nic/update`` unlocks the device
-    owner's key and would fail to decrypt it, and
+    that is the single most consequential line here. A caller holding
+    ``atrium_ddns.admin`` reaches every tenant's zones, so taking the
+    owner from the scope would encrypt the credential under the
+    *administrator's* key: ``/nic/update`` unlocks the device owner's
+    key and would fail to decrypt it, and
     :class:`~atrium_ddns.scope.DdnsScope` would hide the row from the
     tenant who owns the zone it hangs under. Two silent failures from
     one plausible line.
@@ -2266,11 +2334,13 @@ async def create_backend(
     service nobody claims, and ``models.py`` says so — but a row minted
     through this endpoint could only ever answer ``911``, so refusing is
     the kinder answer.
-    """
-    domain = await scope.get(session, Domain, domain_id)
-    if domain is None:
-        raise _not_found("domain")
 
+    The commit belongs to the caller, and that is what makes #88's
+    one-submission create atomic: :func:`create_domain` calls this
+    between its own ``flush`` and its own ``commit``, so a refused
+    credential rolls the *zone* back too rather than leaving behind the
+    zero-provider zone the whole issue is about.
+    """
     if provider_class(body.backend_type) is None:
         raise HTTPException(
             status_code=UNPROCESSABLE,
@@ -2316,7 +2386,7 @@ async def create_backend(
 
     await record_audit(
         session,
-        actor_user_id=user.id,
+        actor_user_id=actor_user_id,
         entity="ddns_domain_backend",
         entity_id=backend.id,
         action="create",
@@ -2329,6 +2399,34 @@ async def create_backend(
             "config_keys": sorted(body.config),
             "credentials": _credential_audit(credentials, touched),
         },
+    )
+    return backend
+
+
+@router.post(
+    "/domains/{domain_id}/backends",
+    response_model=DomainBackendOut,
+    status_code=201,
+)
+async def create_backend(
+    domain_id: int,
+    body: DomainBackendCreateIn,
+    user: User = Depends(require_perm(DOMAIN_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> DomainBackendOut:
+    """Bind a provider to a zone, optionally with its credentials.
+
+    Everything this endpoint decides is in :func:`_bind_backend`, which
+    :func:`create_domain` also calls; this handler is the scoped lookup
+    and the commit.
+    """
+    domain = await scope.get(session, Domain, domain_id)
+    if domain is None:
+        raise _not_found("domain")
+
+    backend = await _bind_backend(
+        session, domain=domain, body=body, actor_user_id=user.id
     )
     await session.commit()
     return _render_backend(backend)
