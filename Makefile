@@ -97,7 +97,8 @@ endef
 	seed-admin seed-bundle seed-compat-fixture verify-compat-rehash \
 	test test-frontend test-backend test-compat \
 	check-fresh check-compat-fresh check-backend-fresh check-host-pkg-fresh \
-	test-backend-serial test-backend-file typecheck smoke
+	test-backend-serial test-backend-file typecheck smoke \
+	e2e-up e2e-deps e2e-down test-e2e check-bundle-fresh
 
 help:  ## show this help
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-21s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -305,6 +306,123 @@ typecheck:  ## tsc --noEmit on the host bundle
 
 smoke:  ## local smoke test (PASS=... [EMAIL=...] for the login checks)
 	./scripts/smoke.sh $(if $(EMAIL),--user '$(EMAIL)',) $(if $(PASS),--pass '$(PASS)',--no-login)
+
+# --- e2e (Playwright, in a real browser) ----------------------------------
+#
+# `make smoke` proves the stack answers over HTTP. It stays green through a
+# bundle that loads and renders nothing, a nav item atrium never registered,
+# and a board that throws in React — every one of which is invisible to curl
+# and obvious to a browser. Five defects came out of one operator session
+# against a stack whose smoke test was passing; this is the instrument that
+# was missing.
+#
+# Three specs, deliberately: nav renders, the ui-parity §3.3.1 walk through
+# the UI ending in a rendered resolution strip, and one negative. See
+# frontend/tests-e2e/.
+#
+# Playwright runs on the HOST, not in a container: the chromium build is
+# glibc-only and the frontend builder stage is node:26-alpine (musl). Same
+# arrangement as atrium's `make smoke`.
+E2E_EMAIL := admin@example.com
+E2E_PASSWORD := e2e-pw-12345
+# A fixed TOTP secret so the runner can compute valid codes without an
+# authenticator. NOT a credential: this admin exists only in the e2e
+# database, which `make e2e-down` deletes.
+E2E_TOTP_SECRET := JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP
+# The port comes from `.env`, the same way scripts/smoke.sh reads it, so a
+# worktree that moved off the default is followed rather than guessed. Not
+# `. ./.env` — that file holds unquoted values with spaces.
+E2E_API_HOST_PORT := $(shell sed -n 's/^API_HOST_PORT=//p' .env 2>/dev/null | tail -n1)
+E2E_BASE_URL ?= http://localhost:$(or $(E2E_API_HOST_PORT),8053)
+# The tag compose.yaml gives this project's image, resolved the same way
+# compose resolves it. Needed by check-bundle-fresh, which has to read the
+# image *as built* and not the container's copy of it.
+E2E_PROJECT := $(shell sed -n 's/^COMPOSE_PROJECT_NAME=//p' .env 2>/dev/null | tail -n1)
+E2E_IMAGE := $(or $(E2E_PROJECT),atrium-ddns):latest
+
+# ATRIUM_DDNS_COMPAT_STUB=1 is not optional here and its absence is quiet:
+# without it `stub1` resolves to no adapter, every update answers 911, and
+# the walk ends with a hostname and no strip — which reads like a UI bug.
+# Passed in the environment rather than written to `.env`, because compose
+# interpolation prefers the environment and this must not leak into a stack
+# someone raises later with a plain `make up`.
+# `--force-recreate` on api and worker is not belt-and-braces. Measured here
+# on 2026-08-16: a plain `up -d --build` built an image carrying the new host
+# bundle, tagged it, and left the containers running the previous one — six
+# specs failed against a UI that had been merged an hour earlier, and the
+# served bundle was 801,320 bytes where the freshly built image held 815,012.
+# The containers are cheap to replace and the confusion is not.
+e2e-up:  ## raise + migrate + seed the stack the e2e specs run against
+	@if [ ! -f .env ]; then echo "creating .env from .env.example"; cp .env.example .env; fi
+	ATRIUM_DDNS_COMPAT_STUB=1 $(COMPOSE) up -d --build
+	ATRIUM_DDNS_COMPAT_STUB=1 $(COMPOSE) up -d --force-recreate --no-deps api worker
+	@ready=0; for i in $$(seq 1 40); do \
+		if curl -fsS $(E2E_BASE_URL)/api/readyz >/dev/null 2>&1; then ready=1; break; fi; \
+		sleep 3; \
+	done; \
+	if [ "$$ready" != "1" ]; then \
+		echo "the api at $(E2E_BASE_URL) did not become ready in 120s"; \
+		$(COMPOSE) logs --tail 50 api; \
+		exit 1; \
+	fi
+	$(MAKE) --no-print-directory migrate
+	$(COMPOSE) exec -T api python -m app.scripts.seed_admin \
+		--email "$(E2E_EMAIL)" --password "$(E2E_PASSWORD)" \
+		--full-name 'E2E Admin' --super-admin --totp-secret "$(E2E_TOTP_SECRET)"
+	$(MAKE) --no-print-directory seed-bundle
+	$(MAKE) --no-print-directory check-bundle-fresh
+	@echo "e2e stack ready at $(E2E_BASE_URL)"
+
+# The frontend's `check-fresh`, and it is here for the same reason the three
+# backend guards are: the bundle is baked into the image at build time, and a
+# stack running a previous image serves a previous UI while every process
+# reports healthy. It cost this repo one confusing run — six specs red
+# against a merged, correct UI.
+#
+# Two readings of one artefact, by two instruments that cannot share a
+# mistake: the file inside the image compose just built, hashed by the
+# container's own interpreter, and the bytes a browser would actually be
+# served, hashed on the host after crossing the published port. A mismatch
+# names both digests rather than saying "stale".
+#
+# Deliberately NOT a comparison against a locally built `frontend/dist`:
+# that would require a host-side `pnpm build` on every gate run, and it
+# would be asserting about a tree the deployed stack never reads.
+check-bundle-fresh:  ## fail if the SERVED host bundle is not the one in this project's image
+	@img=$$(docker run --rm --entrypoint /opt/venv/bin/python $(E2E_IMAGE) -c \
+		"import hashlib,pathlib;p=pathlib.Path('/opt/atrium/static/host/main.js');b=p.read_bytes();print(hashlib.sha256(b).hexdigest(), len(b))"); \
+	served=$$(curl -fsS $(E2E_BASE_URL)/host/main.js | python3 -c \
+		"import hashlib,sys;b=sys.stdin.buffer.read();print(hashlib.sha256(b).hexdigest(), len(b))"); \
+	if [ -z "$$img" ] || [ -z "$$served" ]; then \
+		echo "check-bundle-fresh: could not read both bundles (image='$$img' served='$$served')"; \
+		exit 1; \
+	fi; \
+	if [ "$$img" != "$$served" ]; then \
+		echo "check-bundle-fresh: the stack is SERVING a different host bundle than the image it was built from."; \
+		echo "  image  ($(E2E_IMAGE))  $$img"; \
+		echo "  served ($(E2E_BASE_URL)/host/main.js)  $$served"; \
+		echo "  (sha256 / bytes)"; \
+		echo "  The containers are running an older image. Run: make e2e-up"; \
+		exit 1; \
+	fi; \
+	echo "check-bundle-fresh: served bundle matches the image ($$img)"
+
+e2e-deps:  ## host-side Playwright deps (idempotent no-op once present)
+	cd frontend && pnpm install --frozen-lockfile 2>/dev/null || (cd frontend && pnpm install)
+	cd frontend && pnpm exec playwright install chromium
+
+# The stack has to be up for these, and raising it is part of the target on
+# purpose: "runs from a clean checkout with no manual steps" is the
+# acceptance criterion, and a target that assumes a stack is one more manual
+# step written down somewhere else.
+test-e2e: e2e-up e2e-deps  ## Playwright specs against a real browser
+	cd frontend && E2E_BASE_URL=$(E2E_BASE_URL) \
+		E2E_ADMIN_EMAIL=$(E2E_EMAIL) E2E_ADMIN_PASSWORD=$(E2E_PASSWORD) \
+		E2E_ADMIN_TOTP_SECRET=$(E2E_TOTP_SECRET) \
+		pnpm exec playwright test $(PLAYWRIGHT_ARGS)
+
+e2e-down:  ## stop the e2e stack AND delete its database volume
+	$(COMPOSE) down -v
 
 # --- TLS (prod, "for now" measure) ----------------------------------------
 # The certificate is a COPY of one in the old service's ACME store. That store

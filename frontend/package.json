@@ -9,7 +9,8 @@
     "build:watch": "vite build --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "playwright": "playwright test"
   },
   "dependencies": {
     "@brendanbank/atrium-host-bundle-utils": "^0.28",
@@ -23,12 +24,14 @@
   },
   "devDependencies": {
     "@brendanbank/atrium-test-utils": "^0.28",
+    "@playwright/test": "^1.61.0",
     "@testing-library/jest-dom": "^7.0.1",
     "@testing-library/react": "^16.3.2",
     "@types/node": "^26.2.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "jsdom": "^30.0.1",
+    "otplib": "^13.4.1",
     "typescript": "^7.0.2",
     "vite": "^8.0.10",
     "vite-plugin-css-injected-by-js": "^5.0.2",

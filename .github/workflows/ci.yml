@@ -162,3 +162,91 @@ jobs:
       - name: Dump stack logs on failure
         if: failure()
         run: docker compose logs
+
+  e2e:
+    # The browser half. `smoke` above proves the stack answers; this
+    # proves something *renders* — the nav items atrium registers from the
+    # host bundle, the §3.3.1 walk driven by clicking, and the resolution
+    # strip at the end of it. Every defect the first operator session found
+    # (#88, #89, #90) was invisible to a green curl and visible in a
+    # browser within a minute.
+    #
+    # Same trigger as everything else in this file: `master` only. A PR
+    # into a milestone branch gets no CI at all, by design — the local gate
+    # (`make test-e2e`) is the only quality bar there, and it runs this
+    # same target against a stack it raises itself.
+    #
+    # Not folded into `smoke`: that job runs `make test-backend` against a
+    # stack WITHOUT the compat stub, and the e2e stack needs
+    # ATRIUM_DDNS_COMPAT_STUB=1 (see the Makefile's e2e-up). One job, one
+    # stack configuration.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.33.1
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      # Same shape as the smoke job's .env, and deliberately a copy rather
+      # than a shared file: these two jobs raise two differently configured
+      # stacks, and a shared file would hide that.
+      - name: Prepare e2e .env
+        run: |
+          cat > .env <<'EOF'
+          ENVIRONMENT=dev
+          APP_TIMEZONE=UTC
+          APP_SECRET_KEY=e2e-secret
+          API_HOST_PORT=8000
+          MYSQL_HOST_PORT=3306
+          APP_BASE_URL=http://localhost:8000
+          SECRET_ENCRYPTION_KEY=0000000000000000000000000000000000000000000000000000000000000000
+          MYSQL_ROOT_PASSWORD=e2e-root-pw
+          MYSQL_DATABASE=atrium_ddns
+          MYSQL_USER=atrium_ddns
+          MYSQL_PASSWORD=e2e-pw
+          DATABASE_URL=mysql+aiomysql://atrium_ddns:e2e-pw@mysql:3306/atrium_ddns
+          JWT_SECRET=e2e-jwt-secret
+          JWT_ACCESS_TOKEN_EXPIRE_MINUTES=10080
+          WEBAUTHN_RP_ID=localhost
+          WEBAUTHN_RP_NAME=Atrium Ddns
+          WEBAUTHN_ORIGIN=http://localhost:8000
+          MAIL_BACKEND=console
+          MAIL_FROM=no-reply@example.com
+          ATRIUM_IMAGE=ghcr.io/brendanbank/atrium:0.28
+          EOF
+
+      # `make test-e2e` raises the stack (with the compat stub), migrates
+      # both chains, seeds the admin and the bundle, installs chromium and
+      # runs the specs. `--with-deps` is the one thing the make target
+      # cannot assume: a GitHub runner needs the system libraries, a
+      # developer's laptop does not.
+      - name: Install chromium with system deps
+        run: cd frontend && pnpm install --frozen-lockfile && pnpm exec playwright install --with-deps chromium
+
+      - name: e2e
+        run: make test-e2e
+
+      - name: Upload the Playwright report
+        if: always()
+        # v7.0.1 is the current major (checked against the releases page,
+        # not remembered): actions/upload-artifact v6 and older are on an
+        # older runtime.
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: |
+            frontend/playwright-report/
+            frontend/test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Dump stack logs on failure
+        if: failure()
+        run: docker compose logs

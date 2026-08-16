@@ -101,6 +101,13 @@ test.describe('#88 — zones and providers are one object', () => {
     // reading order — §10.1's wireframe, rendered.
     await modal.getByTestId('zone-name').fill(zone);
     await expect(modal.getByTestId('backend-service')).toBeVisible();
+    // Pick the provider explicitly. `BackendForm` defaults to
+    // `providers[0]`, and `known_services()` is **sorted**, so the
+    // default is `hetzner` — whose one credential key is
+    // `hetzner_api_token`, not the route53 pair below. Adjusted by #91
+    // when this spec was first run: it is a fact about the catalogue's
+    // order, which nothing in the file could have known unrun.
+    await chooseFromSelect(page, 'backend-service', 'route53');
     // The credential fields come from `GET /providers`, i.e. from
     // `BaseProvider.REQUIRED_CREDENTIALS`. This is `BackendForm`, not a
     // create-only copy of it.
@@ -245,6 +252,9 @@ test.describe('#88 — zones and providers are one object', () => {
     const second = page.getByRole('dialog');
     await expect(second).toBeVisible();
     await second.getByTestId('zone-name').fill(zoneWorking);
+    // Same reason as above: the default provider is the catalogue's
+    // first, sorted, which is not route53.
+    await chooseFromSelect(page, 'backend-service', 'route53');
     for (const [key, value] of Object.entries(DEMO_CREDENTIAL)) {
       await second.getByTestId(`credential-${key}`).fill(value);
     }

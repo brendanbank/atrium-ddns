@@ -48,10 +48,17 @@ test.describe('the name field composes, and the server validates', () => {
     const created = await page.request.post(`${API_URL}/atrium_ddns/domains`, {
       data: { name: ZONE },
     });
+    // 201 the first time, 409 for every test after it: `ZONE` is
+    // file-scoped and `ddns_domain.name` is unique across the whole
+    // installation, so the second `beforeEach` re-claims a zone this
+    // file already owns. Both are the intended state; anything else
+    // (422, 403) still fails, and the body is named either way.
+    // Adjusted by #91 on this spec's first actual run — a defect that
+    // only exists once there is something to run it.
     expect(
-      created.status(),
-      `zone claim failed: ${await created.text()}`,
-    ).toBe(201);
+      [201, 409],
+      `zone claim failed: ${created.status()} ${await created.text()}`,
+    ).toContain(created.status());
     // `NAMES_PATH` in `src/HostnamesPage.tsx`. Written out rather than
     // imported: `tsconfig.json` scopes type checking to `src`, so a
     // spec importing from it would be the one file in the tree the gate
