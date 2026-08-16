@@ -115,14 +115,27 @@ test.describe('the device detail route', () => {
     // §12: "this adds a destination, it does not redraw the list." The
     // row's own name is the link, and it is the only way in — the route
     // carries a literal `:id`, so it cannot have a nav item.
-    await page.getByTestId(`open-${original}`).click();
+    //
+    // **Adjusted by #97.** The plain click now opens the card in a
+    // modal (Part III §17). The route survives on linkability and Back,
+    // which are properties of the URL, so this test reads the row's own
+    // `href` and goes there — it is about the *route*, and the modal
+    // has its own spec.
+    const detailHref = (await page
+      .getByTestId(`open-${original}`)
+      .getAttribute('href')) as string;
+    expect(detailHref).toMatch(new RegExp(`${DEVICES_PATH}/\\d+$`));
+    await page.goto(detailHref);
     await expect(page).toHaveURL(new RegExp(`${DEVICES_PATH}/\\d+$`));
     await expect(page.getByTestId('device-name')).toHaveText(original);
     await expect(page.getByTestId('detail-username')).toHaveText(
       created.username,
     );
 
-    // Edited **in place at the top of the route**, not in a modal.
+    // Edited **in place at the top of the card**, not behind a second
+    // overlay. §17 is about how the card is *reached*; it does not move
+    // this field into a modal of its own, which would hide the string
+    // being renamed while it is renamed.
     await page.getByTestId('device-rename').click();
     await expect(page.getByTestId('device-name-input')).toBeVisible();
     await expect(page.locator('[role="dialog"]')).toHaveCount(0);

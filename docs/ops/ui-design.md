@@ -1194,3 +1194,28 @@ avoid, and would be the worst of both decisions.
 3. One card component behind both the modal and the route (§17).
 4. The modal is sized for a strip at §3.1's 592px.
 5. No new palette value, no new typeface, no new signature element. Still.
+6. **A portal leaves this design behind, and #97 found it by measuring.**
+   Every selector in `ddns.css` is scoped by `[data-ddns-root]` — §5's rule, and
+   a correct one: the bundle's CSS arrives as a runtime `<style>` tag, so an
+   unscoped rule would restyle atrium's shell. The six palette values are custom
+   properties declared on that same attribute. A Mantine `Modal` renders through
+   a `<Portal>` into `document.body`, which is **outside** it. So the card §17
+   asks for, put in a modal and nothing else done, renders in the body face at
+   the body colour, `.ddns-label` loses its `;`, and **the strip has no rail**.
+
+   Measured rather than reasoned: the zone name in the list resolved to
+   `rgb(33, 37, 41)` (`--ddns-ink`) and the same class inside the card modal
+   resolved to `rgb(0, 0, 0)`. The assertion that caught it was written to catch
+   `.ddns-data` being dropped from an anchor.
+
+   The remedy is `DdnsPortalScope`, which re-establishes the attribute inside
+   the portal. Stated here as an inheritance because it applies to **any**
+   future portalled surface, not only to these two cards — and because it is the
+   sharper form of §17's own condition. A modal wide enough for the signature
+   element that draws it without its rail is worse than one that wraps it: it
+   looks finished.
+
+   The bundle's other modals — the create-zone form, the publishing modal —
+   still have this gap. They carry Mantine components and short `.ddns-data`
+   strings rather than a strip, so nothing in them is *wrong*, only unstyled.
+   Recorded rather than fixed inside #97's scope.

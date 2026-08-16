@@ -83,6 +83,38 @@ import '../ddns.css';
  *  for the real string rather than restating it. */
 export const DDNS_ROOT_ATTRIBUTE = 'data-ddns-root';
 
+/** Re-establish the host's CSS scope inside a portal.
+ *
+ * **Found by running #97's spec in a browser, not by reading code.** A
+ * Mantine `Modal` renders through `<Portal>`, which appends to
+ * `document.body` — *outside* the `data-ddns-root` div above. Every
+ * selector in `ddns.css` is scoped by that attribute (deliberately: the
+ * bundle's CSS arrives as a runtime `<style>` tag, so an unscoped rule
+ * would restyle atrium's shell), and the six palette values are custom
+ * properties declared on it. So inside a modal, with nothing else done,
+ * a `.ddns-data` value renders in the body face at the body colour, a
+ * `.ddns-label` loses its `;`, and **a resolution strip has no rail**.
+ *
+ * The measurement that caught it: the zone name in the list resolved to
+ * `rgb(33, 37, 41)` — `--ddns-ink` — and the same class inside the card
+ * modal resolved to `rgb(0, 0, 0)`. The assertion was written to catch
+ * `.ddns-data` being dropped from an anchor and it caught this instead,
+ * which is the argument for measuring rather than reasoning.
+ *
+ * That matters most for exactly the thing §17 attaches its condition to:
+ * a card modal carrying the signature element. A strip that fits the
+ * width and renders with no rail is a worse version of the failure §12
+ * was written to avoid.
+ *
+ * Applied here to the card modals (`ZoneCardModal`, `DeviceCardModal`).
+ * The bundle's other modals — the create-zone form, the publishing
+ * modal — have the same gap and are not in #97's scope; it is recorded
+ * in the PR rather than fixed silently alongside.
+ */
+export function DdnsPortalScope({ children }: { children: ReactNode }) {
+  return <div data-ddns-root="">{children}</div>;
+}
+
 export function DdnsRoot({ children }: { children: ReactNode }) {
   const scheme = useAtriumColorScheme();
   return (

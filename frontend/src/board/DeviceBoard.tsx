@@ -89,12 +89,44 @@ export function HostnameBlock({ hostname }: { hostname: BoardHostname }) {
   );
 }
 
+/** One device row.
+ *
+ * ## Two jobs were on one target, and it did neither visibly
+ *
+ * Until Part III the whole line was a single `<button>` whose job was
+ * *expand*, and the device name inside it was a bare
+ * `<span class="ddns-data">` — §16's third cause, and the only one of
+ * the three where the name was **not a link at all**. §18.2:
+ *
+ * > The board's device name becomes a way in. It is currently an expand
+ * > toggle and a name; those are two jobs on one target and it does
+ * > neither visibly.
+ *
+ * So the line is now a grid holding **two** controls, and they are two
+ * tab stops because they are two operations:
+ *
+ * 1. the **name**, a `button.ddns-data` that opens this device's card —
+ *    the same `DeviceCard` the route and the device list render, reached
+ *    here through `DeviceBoardPage`'s modal. It carries §2a's underline
+ *    at rest, so it says it is a way in without spending colour, which
+ *    §1.2 Rule 2 has already spent.
+ * 2. the **disclosure** at the end of the line, which expands the names
+ *    under the device and nothing else. `aria-expanded` and
+ *    `aria-controls` are on *it* now rather than on the row, which is
+ *    what makes the two reachable and distinguishable from a keyboard.
+ *
+ * A `button` and not an `<a>` for the name: this row has no URL of its
+ * own to offer — the board is one page — and `DeviceList`'s row is the
+ * surface that carries the pasteable address.
+ */
 function DeviceBlock({
   device,
   windowDays,
+  onOpen,
 }: {
   device: BoardDevice;
   windowDays: number;
+  onOpen: (id: number) => void;
 }) {
   // A device collapses only when everything under it agrees. Same rule
   // as §3.4's strips, applied one level up: nothing that hides a
@@ -108,24 +140,25 @@ function DeviceBlock({
         hostname.strips.some((strip) => !strip.collapsible),
     );
   const [expanded, setExpanded] = useState(anythingWrong);
+  const namesId = `ddns-device-${device.id}-names`;
 
   return (
     <section data-testid={`device-${device.name}`} data-liveness={device.liveness}>
-      <button
-        type="button"
-        className="ddns-device__line"
-        onClick={() => setExpanded((value) => !value)}
-        aria-expanded={expanded}
-      >
+      <div className="ddns-device__line">
         <span className="ddns-device__marker" aria-hidden="true">
           {device.marked ? '!' : ''}
         </span>
-        <span className="ddns-data">
+        <button
+          type="button"
+          className="ddns-data"
+          onClick={() => onOpen(device.id)}
+          data-testid={`board-open-${device.name}`}
+        >
           {device.name}
           {device.marked ? (
             <span className="ddns-sr"> — needs attention</span>
           ) : null}
-        </span>
+        </button>
         <span
           className="ddns-station__time"
           title={absoluteTitle(device.last_seen_at)}
@@ -139,9 +172,26 @@ function DeviceBlock({
         >
           {device.updates_display}
         </span>
-      </button>
+        <button
+          type="button"
+          className="ddns-device__expand"
+          onClick={() => setExpanded((value) => !value)}
+          aria-expanded={expanded}
+          aria-controls={namesId}
+          data-testid={`device-${device.name}-expand`}
+        >
+          {/* The glyph is decoration; the sentence beside it is the
+              accessible name. "▸" alone would announce as a character
+              nobody can act on, and two of these in a list would be
+              indistinguishable by name. */}
+          <span aria-hidden="true">{expanded ? '▾' : '▸'}</span>
+          <span className="ddns-sr">
+            {expanded ? 'Hide' : 'Show'} the names {device.name} updates
+          </span>
+        </button>
+      </div>
       {expanded ? (
-        <div className="ddns-device__hostnames">
+        <div id={namesId} className="ddns-device__hostnames">
           <LogLink
             params={{ device_id: device.id }}
             data-testid={`device-${device.name}-log`}
@@ -181,9 +231,17 @@ function DeviceBlock({
 
 export interface DeviceBoardProps {
   board: Board;
+  /** Raised when a device name is clicked.
+   *
+   * The board does not own the modal, and that is not fussiness: the
+   * card imports `HostnameBlock` from *this* module, so a `DeviceCard`
+   * import here would close a cycle. `DeviceBoardPage` holds it
+   * instead, which also keeps this component a pure rendering of a
+   * `Board` payload. */
+  onOpenDevice: (id: number) => void;
 }
 
-export function DeviceBoard({ board }: DeviceBoardProps) {
+export function DeviceBoard({ board, onOpenDevice }: DeviceBoardProps) {
   if (board.devices.length === 0 && board.unassigned_hostnames.length === 0) {
     return (
       <p data-testid="board-empty">
@@ -217,6 +275,10 @@ export function DeviceBoard({ board }: DeviceBoardProps) {
         <span className="ddns-label" data-testid="board-updates-head">
           updates / {board.window_days} d
         </span>
+        {/* The disclosure's column. Unlabelled on purpose — §2.4's rule
+            is that a `;` comment marks the head of a column of
+            machine-generated data, and a control is not that. */}
+        <span aria-hidden="true" />
       </div>
       {nothingChecked ? (
         <p data-testid="board-never-checked">
@@ -229,6 +291,7 @@ export function DeviceBoard({ board }: DeviceBoardProps) {
           key={device.id}
           device={device}
           windowDays={board.window_days}
+          onOpen={onOpenDevice}
         />
       ))}
       {board.unassigned_hostnames.length > 0 ? (
