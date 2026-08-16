@@ -428,6 +428,73 @@
 }
 
 /* --------------------------------------------------------------------- *
+ * 4a. The zone row — #88, Part II §10.1.
+ *
+ * A zone with no provider bound to it is drawn in the diverged
+ * treatment. **No new palette value**: this is `--ddns-diverge` and
+ * `--ddns-diverge-wash`, the same two the strip and the log use, at the
+ * same threshold — *this is true and it is wrong*.
+ *
+ * It qualifies under §1.2 Rule 2, and the qualification is worth stating
+ * because "a zone that is not finished yet" would not. This is not a
+ * draft. `tests/compat/protocol_cases.yaml:211` freezes it: a hostname
+ * that is owned, in a zone with zero backends, answers **911** — the
+ * DynDNS v2 code for *the service is broken, stop asking*, which a
+ * well-behaved router backs off on for hours. It is a measured
+ * consequence of the row, not a judgement about how complete it looks.
+ *
+ * Rule 1 still holds in the other direction: a zone that does publish is
+ * plain ink on the page background. Nothing about the healthy row is
+ * tinted, badged or filled, so the accent means one thing on this
+ * surface and does not have 500 rows to compete with.
+ *
+ * Rule 3, the three channels: the border and wash are the first, the
+ * `⚠` glyph is the second and the words "publishes nowhere" are the
+ * third. In dark the accent and the ink differ in luminance by 1.42:1,
+ * so a greyscale screenshot of this row is carried entirely by the
+ * second and third.
+ *
+ * Nothing here declares `cursor: pointer`, and that is load-bearing
+ * rather than incidental: §1.2 Rule 2 bans the accent from anything
+ * meaning "you can do this", and `design.test.ts` checks it by sweeping
+ * for a rule block carrying both. The zone name is a link and it is
+ * styled by Mantine, outside this file.
+ * --------------------------------------------------------------------- */
+
+[data-ddns-root] .ddns-zone {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border: 1px solid var(--ddns-edge);
+  border-radius: var(--mantine-radius-sm);
+  padding: var(--mantine-spacing-xs) var(--mantine-spacing-md);
+}
+
+[data-ddns-root] .ddns-zone[data-diverged='true'] {
+  background: var(--ddns-diverge-wash);
+  border-color: var(--ddns-diverge);
+}
+
+[data-ddns-root] .ddns-zone__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--mantine-spacing-sm);
+}
+
+/* The glyph and the word, together, in the accent. Set in the data face
+   because it is read beside the zone name and a body-face phrase at this
+   size would sit off the baseline the row is built on. */
+[data-ddns-root] .ddns-zone__nowhere {
+  font-family: var(--ddns-font-data);
+  font-size: var(--mantine-font-size-sm);
+  line-height: var(--mantine-line-height-sm);
+  font-weight: 700;
+  color: var(--ddns-diverge);
+  white-space: nowrap;
+}
+
+/* --------------------------------------------------------------------- *
  * 4b. The log search — a ledger of two-line entries.
  *
  * ARRANGEMENT, decided by §2.5's own width budget rather than by taste,

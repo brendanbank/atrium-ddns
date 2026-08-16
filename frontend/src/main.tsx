@@ -40,8 +40,14 @@ import { HELP_PATH, HelpPage } from './HelpPage';
 import { NAMES_PATH, HostnamesPage } from './HostnamesPage';
 import { LOG_PATH, LogSearchPage } from './LogSearchPage';
 import { SettingsPage } from './SettingsPage';
+import { ZoneDetailPage } from './ZoneDetailPage';
 import { CONFIG_PERMISSION } from './api/config';
-import { BOARD_PATH, DEVICES_PATH, DOMAINS_PATH } from './paths';
+import {
+  BOARD_PATH,
+  DEVICES_PATH,
+  DOMAINS_PATH,
+  ZONE_ROUTE_PATH,
+} from './paths';
 import {
   SETTINGS_GROUP_KEY,
   SETTINGS_GROUP_KEYS,
@@ -55,6 +61,11 @@ import {
  *  unchanged, so this file stays the one place a reader looks for
  *  "what paths does this bundle own". */
 export { BOARD_PATH, DEVICES_PATH, DOMAINS_PATH };
+
+/** #88's zone detail route, `/atrium-ddns/zones/:id`. Re-exported for
+ *  the same reason as its three neighbours: this file stays the one
+ *  place a reader looks for "what paths does this bundle own". */
+export { ZONE_ROUTE_PATH };
 
 /** #46's log search. Defined in `LogSearchPage` because `logHref` needs
  *  it too, and re-exported here for the same reason. */
@@ -121,6 +132,27 @@ if (!reg || !AtriumReact) {
     label: 'Zones and providers',
     to: DOMAINS_PATH,
     icon: AtriumReact.createElement(IconWorld, { size: 18 }),
+  });
+  // #88's zone detail — design Part II §10.2, and §12 for why it is a
+  // route rather than a drawer: a resolution strip needs 592px, atrium's
+  // shell gives 1168px, a 360/800 split leaves ~790px and Mantine's `lg`
+  // drawer is 620px. The drawer is the one below the one-strip minimum,
+  // so the signature element would wrap inside its own detail view.
+  //
+  // **Route, no nav item.** The other five surfaces are destinations;
+  // this one is reached from a row. A sidebar entry pointing at
+  // `/atrium-ddns/zones/:id` would be a link to a literal colon, which
+  // is the "a writer nothing calls" shape wearing a nav item's clothing.
+  //
+  // The path carries react-router's `:id`, which works because atrium
+  // drops a registered path straight into `<Route path=…>` (App.tsx).
+  // The host subtree cannot read it back through `useParams` — a second
+  // React root, no shared context — so the page parses the pathname via
+  // `useAtriumLocation`.
+  reg.registerRoute({
+    key: 'atrium-ddns-zone-detail',
+    path: ZONE_ROUTE_PATH,
+    render: () => makeWrapperElement(<ZoneDetailPage />),
   });
   reg.registerRoute({
     key: 'atrium-ddns-devices',

@@ -414,10 +414,10 @@ absent. Every other row here is confirmable by key.
 |---|---|---|
 | `GET /admin/` (dashboard) | `registerRoute atrium-ddns-board` `/atrium-ddns/board`, `registerRoute atrium-ddns-logs` `/atrium-ddns/logs`, `registerHomeWidget atrium-ddns-widget` | `GET /api/atrium_ddns/board`, `GET /api/atrium_ddns/events` |
 | `GET,POST /admin/domains` | `registerRoute atrium-ddns-domains` `/atrium-ddns/domains` + `registerNavItem atrium-ddns-domains-nav` ("Zones and providers") | `GET`/`POST /api/atrium_ddns/domains` |
-| `POST /admin/domains/<id>/delete` | same page | `DELETE /api/atrium_ddns/domains/{domain_id}` |
-| `GET,POST /admin/domains/<id>/backends/new` | same page | `POST /api/atrium_ddns/domains/{domain_id}/backends` |
-| `GET,POST /admin/domains/<id>/backends/<db>/config` | same page | `PATCH /api/atrium_ddns/backends/{backend_id}` |
-| `POST /admin/domains/<id>/backends/<db>/delete` | same page | `DELETE /api/atrium_ddns/backends/{backend_id}` |
+| `POST /admin/domains/<id>/delete` | **#88: moved** to `registerRoute atrium-ddns-zone-detail` `/atrium-ddns/zones/:id` | `DELETE /api/atrium_ddns/domains/{domain_id}` |
+| `GET,POST /admin/domains/<id>/backends/new` | **#88: moved** to the zone detail route — *and* the create-zone form, which now carries the first binding in the same submission | `POST /api/atrium_ddns/domains/{domain_id}/backends`, or `POST /api/atrium_ddns/domains` with a `backend` |
+| `GET,POST /admin/domains/<id>/backends/<db>/config` | **#88: moved** to the zone detail route | `PATCH /api/atrium_ddns/backends/{backend_id}` |
+| `POST /admin/domains/<id>/backends/<db>/delete` | **#88: moved** to the zone detail route | `DELETE /api/atrium_ddns/backends/{backend_id}` |
 | `GET /admin/events` | `registerRoute atrium-ddns-logs` `/atrium-ddns/logs` + `registerNavItem atrium-ddns-logs-nav` ("Log search") | `GET /api/atrium_ddns/events` |
 | `GET /admin/health-checks` (results list) | the `answered` station of the resolution strip on `atrium-ddns-board` | `GET /api/atrium_ddns/board` |
 | `GET /nic/checkip` | `router_nic.py`, frozen compat table | `200` (excluded from OpenAPI by design) |
@@ -429,7 +429,7 @@ absent. Every other row here is confirmable by key.
 | **`POST /admin/users/<uid>/hostnames/<hn>/delete`** (#69) | same | same |
 | **`POST /admin/health-checks/run`** (#75) | the *Check now* button on `atrium-ddns-board` (`board/HealthCheckActions.tsx`) | `POST /api/atrium_ddns/health-checks/run` — §3.3 G3 |
 | **`POST /admin/health-checks/clear`** (#75) | *Clear results*, same strip | `POST /api/atrium_ddns/health-checks/clear` — §3.3 G3 |
-| **`GET,POST /admin/domains/<id>`** (#75) | *Rename* on `registerRoute atrium-ddns-domains` | `PATCH /api/atrium_ddns/domains/{domain_id}` — §3.3 G4 |
+| **`GET,POST /admin/domains/<id>`** (#75, moved by #88) | *Rename* on `registerRoute atrium-ddns-zone-detail` `/atrium-ddns/zones/:id` — the legacy route was a **per-zone page**, and this is the first registration that is one | `PATCH /api/atrium_ddns/domains/{domain_id}` — §3.3 G4 |
 | **`GET /admin/help`** (#75) | `registerRoute atrium-ddns-help` `/atrium-ddns/help` + `registerNavItem atrium-ddns-help-nav` ("Help") | none — the page calls no endpoint, see §3.3 G5 |
 | **`GET,POST /admin/rate-limits`** (#73) | `registerSettingsGroup atrium-ddns-settings` → child `rate-limits`, backed by `registerRoute atrium-ddns-settings-rate-limits` `/atrium-ddns/settings/rate-limits` | `GET /api/admin/app-config` (values), `GET /api/atrium_ddns/config/schema` (shape), `PUT /api/admin/app-config/atrium_ddns` (write) |
 | **`GET,POST /admin/rate-limits/user/<id>`** (#73) | re-keyed to the device: `registerRoute atrium-ddns-devices`, the *Rate limit* control on each row | `PATCH /api/atrium_ddns/devices/{device_id}` |
@@ -460,6 +460,16 @@ Two registrations are real and have **no legacy counterpart**, so they appear
 nowhere above: `registerRoute atrium-ddns-devices` (`/atrium-ddns/devices`) and
 its nav item. The device is the object the rewrite added; §4 of the plan is
 right that it is what makes the rest cohere.
+
+**#88 adds a fourteenth registration and no eighth nav item.**
+`registerRoute atrium-ddns-zone-detail` serves `/atrium-ddns/zones/:id` — the
+first path this bundle registers that carries a react-router parameter, and the
+first that is deliberately *not* in the sidebar: it is reached from a zone row,
+and a nav item pointing at it would be a link to a literal colon. Four rows
+above moved onto it. `ui-design.md` §12 argues route over drawer over split
+pane on the measured width budget — one resolution strip needs ≈592px, atrium's
+shell gives 1168px, a 360/800 split leaves ~790px, and Mantine's `lg` drawer at
+620px is *below* the one-strip minimum.
 
 **Three registrations are still the scaffold.** `atrium-ddns-widget` (a counter
 with a *Bump counter* button), `atrium-ddns-page` (`/atrium-ddns`, *"Replace

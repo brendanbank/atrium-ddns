@@ -34,7 +34,12 @@
  */
 import { Anchor, List, Stack, Text, Title } from '@mantine/core';
 
-import { BOARD_PATH, DEVICES_PATH, DOMAINS_PATH } from './paths';
+import {
+  BOARD_PATH,
+  DEVICES_PATH,
+  DOMAINS_PATH,
+  ZONE_ROUTE_PATH,
+} from './paths';
 import { NAMES_PATH } from './HostnamesPage';
 import { LOG_PATH } from './LogSearchPage';
 import { SETTINGS_ROUTES } from './settings/settingsRoutes';
@@ -90,9 +95,34 @@ export const DOCUMENTS: { path: string; title: string; blurb: string }[] = [
   },
 ];
 
+/** A route this bundle registers that **has no address to link to**,
+ *  because its path carries a parameter.
+ *
+ *  `/atrium-ddns/zones/:id` is a real, registered, reachable surface,
+ *  and a `<a href="/atrium-ddns/zones/:id">` is a link to a literal
+ *  colon. So it is described rather than linked, under the surface it is
+ *  reached from — and it is still inside the sweep in
+ *  `HelpPage.test.tsx`, which requires every registered route to be
+ *  either linked here or named here. A route quietly exempted from that
+ *  guard is the *"a writer nothing calls"* shape one indirection along:
+ *  a surface that exists, that the help page does not mention, and that
+ *  nothing fails on.
+ */
+export interface NestedSurface {
+  /** The registered path, parameter and all. Never rendered as an href. */
+  path: string;
+  label: string;
+  blurb: string;
+}
+
 /** One row per surface this bundle registers. The path comes from the
  *  registration's own constant — see the module docstring. */
-export const SURFACES: { to: string; label: string; blurb: string }[] = [
+export const SURFACES: {
+  to: string;
+  label: string;
+  blurb: string;
+  within?: NestedSurface[];
+}[] = [
   {
     to: BOARD_PATH,
     label: 'Devices and names',
@@ -109,7 +139,15 @@ export const SURFACES: { to: string; label: string; blurb: string }[] = [
     to: DOMAINS_PATH,
     label: 'Zones and providers',
     blurb:
-      'Claim a zone, bind a DNS provider to it, and store that provider’s credential. Renaming a zone is refused if it would leave a name outside it.',
+      'Claim a zone and bind its first DNS provider, in one step. A zone with no provider publishes nowhere — every update for a name in it answers 911 — so the list marks one, and creating one is a deliberate choice rather than the default.',
+    within: [
+      {
+        path: ZONE_ROUTE_PATH,
+        label: 'One zone',
+        blurb:
+          'Opened by clicking a zone. Its providers and their credentials, renaming, deleting, and the names inside it.',
+      },
+    ],
   },
   {
     to: DEVICES_PATH,
@@ -176,6 +214,20 @@ export function HelpInner() {
               {surface.label}
             </Anchor>{' '}
             — {surface.blurb}
+            {surface.within ? (
+              <List spacing="xs" size="sm" withPadding>
+                {surface.within.map((nested) => (
+                  <List.Item
+                    key={nested.path}
+                    data-testid={`help-within-${nested.path}`}
+                  >
+                    {/* Named, not linked. The path carries a parameter,
+                        so there is no address to send anyone to. */}
+                    <strong>{nested.label}</strong> — {nested.blurb}
+                  </List.Item>
+                ))}
+              </List>
+            ) : null}
           </List.Item>
         ))}
       </List>

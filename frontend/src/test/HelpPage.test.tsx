@@ -97,7 +97,21 @@ test('every route this bundle registers is listed on the help page', async () =>
   vi.resetModules();
   const main = await import('../main');
 
-  const listed = new Set(SURFACES.map((s) => s.to));
+  // Two ways a route can appear on this page, and both count. `to` is a
+  // link; `within[].path` is a *named* entry for a route whose path
+  // carries a parameter and therefore has no address to link to.
+  //
+  // #88 is why the second exists. `/atrium-ddns/zones/:id` is a real,
+  // registered surface, and rendering it as an href would produce a link
+  // to a literal colon. The tempting fix — exempt anything containing a
+  // `:` — would have made this guard stop seeing an entire class of
+  // route, silently and forever, which is the shape this file was
+  // written against in the first place.
+  const linked = new Set(SURFACES.map((s) => s.to));
+  const named = new Set(
+    SURFACES.flatMap((s) => (s.within ?? []).map((n) => n.path)),
+  );
+  const covered = new Set([...linked, ...named]);
   // The scaffold's demo page and the help page itself are the two
   // registrations that are deliberately not in the list: one is the
   // template's placeholder and the other is this page.
@@ -106,7 +120,7 @@ test('every route this bundle registers is listed on the help page', async () =>
   const missing = handles.routes
     .map((route) => route.path)
     .filter((path): path is string => typeof path === 'string')
-    .filter((path) => !listed.has(path) && !exempt.has(path));
+    .filter((path) => !covered.has(path) && !exempt.has(path));
 
   expect(
     missing,
@@ -118,10 +132,18 @@ test('every route this bundle registers is listed on the help page', async () =>
   const served = new Set(
     handles.routes.map((route) => route.path).filter(Boolean),
   );
-  for (const to of listed) {
+  for (const to of covered) {
     expect(served.has(to), `${to} is on the help page and is not a route`).toBe(
       true,
     );
+  }
+  // …and the second channel is not vacuously satisfied. If `within` ever
+  // empties, this fails rather than the sweep quietly reverting to
+  // link-only coverage — and every entry in it must be a parameterised
+  // path, because a route that *could* be linked should be.
+  expect(named.size).toBeGreaterThan(0);
+  for (const path of named) {
+    expect(path, 'a named entry that could have been a link').toContain(':');
   }
 });
 
