@@ -51,6 +51,12 @@ EXPECTED_PARTICIPANTS = frozenset(
         "test_router_board.py",
         "test_router_events.py",
         "test_router_health_checks.py",
+        # #74. Named here because #78's derivation guard named it first:
+        # its `world` and `pre_migration_hostname` fixtures both write
+        # rows, so the derived set contained it and this list did not.
+        # That is the hole #78 closed doing its job on the very next
+        # branch to add a DB-heavy module.
+        "test_router_hostname_backends.py",
         "test_router_hostnames.py",
         "test_router_nic.py",
         "test_router_tenant.py",
