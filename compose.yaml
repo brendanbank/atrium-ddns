@@ -80,6 +80,13 @@ services:
       # drop this mapping entirely: atrium speaks plain HTTP, and DynDNS
       # clients authenticate with HTTP Basic, so an exposed plaintext port is
       # every device secret on the wire in base64.
+      #
+      # The explicit `${API_BIND}:` prefix forces this mapping to ONE family —
+      # Docker binds both only when no host address is given. That is correct
+      # here (prod pins it to 127.0.0.1) but it is why this port stays IPv4
+      # even with `enable_ipv6: true` on the network. The public path is the
+      # `proxy` below, whose mapping is deliberately unprefixed so it binds
+      # both.
       - "${API_BIND:-0.0.0.0}:${API_HOST_PORT:-8053}:8000"
     depends_on:
       mysql:
@@ -187,3 +194,24 @@ volumes:
   # re-run migrations and re-seed, or copy the data across first. Do not
   # discover this on a stack that matters.
   mysql_data:
+
+networks:
+  # IPv6 on purpose, and it is not cosmetic.
+  #
+  # Docker publishes a port on `[::]` only when the container's network has
+  # IPv6. Without this the stack listens on 0.0.0.0 alone and **refuses**
+  # IPv6 connections outright — measured on the deploy host: `:443` on the
+  # old service answered over IPv6, `:8443` here did not connect, and
+  # `ss -ltnp` showed `[::]:443` present while 8443 was bound to 0.0.0.0
+  # only.
+  #
+  # That matters more here than for a typical app: about 68% of this
+  # service's real update traffic arrives over IPv6 (305 of 448 events in a
+  # 24h window). Cutting over without this refuses roughly two thirds of the
+  # fleet — not degraded, refused — and a DynDNS client that cannot connect
+  # is silent, so the symptom appears hours later as hostnames going stale.
+  #
+  # The legacy stack already sets `enable_ipv6: true` on its own network.
+  # This is that fence, copied deliberately rather than rediscovered.
+  default:
+    enable_ipv6: true
