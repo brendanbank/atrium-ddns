@@ -60,6 +60,7 @@ import pytest_asyncio
 import sqlalchemy as sa
 from app.db import get_session_factory
 from app.models.auth import User
+from conftest import fixture_writes, purge_tenants, unusable_password_hash
 from cryptography.fernet import Fernet
 from fastapi import FastAPI
 from httpx import ASGITransport
@@ -864,26 +865,26 @@ def test_the_totp_secret_is_reported_and_never_carried(
 # ===================================================================== #
 
 
-async def _purge() -> None:
-    factory = get_session_factory()
-    async with factory() as session:
-        await session.execute(
-            sa.text("DELETE FROM ddns_event WHERE user_email = :e"), {"e": EMAIL}
-        )
-        await session.execute(
-            sa.text("DELETE FROM users WHERE email = :e"), {"e": EMAIL}
-        )
-        await session.commit()
+#: Who this module's guarded regions say they are, in the message
+#: :func:`conftest.fixture_writes` prints when a nesting bug or a
+#: timeout stops the run. A bare ``"?"`` names nothing.
+LOCK_OWNER = "test_import_legacy.imported"
 
 
 async def _make_owner() -> int:
-    from fastapi_users.password import PasswordHelper
+    """The account every migrated row hangs off.
 
-    factory = get_session_factory()
-    async with factory() as session:
+    Inside :func:`conftest.fixture_writes` because this is one of the
+    two inserts in ``conftest``'s logged deadlocks — ``ix_users_email``
+    — and the zone import below is the other, ``uq_ddns_domain_name``.
+    ``unusable_password_hash`` is the shared cached argon2 placeholder:
+    the input is a constant no test reads, and hashing it per module
+    per worker cost ~22 ms for nothing.
+    """
+    async with fixture_writes(LOCK_OWNER) as session:
         user = User(
             email=EMAIL,
-            hashed_password=PasswordHelper().hash("unusable-" + "x" * 24),
+            hashed_password=unusable_password_hash(),
             is_active=True,
             is_verified=True,
             full_name="Legacy owner",
@@ -891,9 +892,7 @@ async def _make_owner() -> int:
         )
         session.add(user)
         await session.flush()
-        owner_id = user.id
-        await session.commit()
-    return owner_id
+        return user.id
 
 
 @pytest_asyncio.fixture(scope="module")
@@ -902,21 +901,39 @@ async def imported(legacy_db: Path, fernet_key: str) -> Any:
 
     Module-scoped: the import is the subject, and re-running it per
     test would be re-running the thing under test rather than testing
-    it. The teardown deletes the owner, which cascades through
-    domains, devices, hostnames and backends and takes the
-    ``user_secret_keys`` row with it.
+    it.
+
+    Teardown is :func:`conftest.purge_tenants`, not the module-local
+    copy of it this fixture used to own. Removing the owner is what
+    does the work — domains, devices, hostnames and backends all
+    cascade off it — and the shared helper additionally clears the
+    tenant's ``ddns_event`` rows and its ``user_secret_keys`` row, in
+    the order that leaves the cascade nothing to do.
+
+    It is called at **both** ends, as it was before: the wire tests
+    below drive ``/nic/update`` against the migrated world, and
+    ``test_a_second_run_refuses_and_names_the_collisions`` asserts on
+    rows this fixture wrote. A teardown that silently stopped running
+    would surface as the *next* run's import refusing on 6 of 6 device
+    usernames, not as an error here.
+
+    Deliberately **no** ``unattributed_emails``: ``router_nic`` sets
+    ``ddns_event.user_id`` and ``ddns_event.user_email`` from the same
+    ``auth`` object, so a row carrying this owner's address always
+    carries its id too. Passing it would buy a full scan of an
+    unindexed column to look for rows that cannot exist — #14's defect,
+    re-added.
     """
     compat_stub.register_stub_providers(force=True)
-    await _purge()
+    await purge_tenants([EMAIL], owner=LOCK_OWNER)
     owner_id = await _make_owner()
 
     plan = plan_for(legacy_db, fernet_key)
     factory = get_session_factory()
-    async with factory() as session:
+    async with fixture_writes(LOCK_OWNER) as session:
         written = await il.apply(
             session, plan, owner_email=EMAIL, create_owner=False
         )
-        await session.commit()
     async with factory() as session:
         reading = await il.verify(session, written.owner_id)
 
@@ -943,7 +960,7 @@ async def imported(legacy_db: Path, fernet_key: str) -> Any:
         "reading": reading,
     }
 
-    await _purge()
+    await purge_tenants([EMAIL], owner=LOCK_OWNER)
 
 
 def test_both_instruments_agree_on_every_count(imported) -> None:

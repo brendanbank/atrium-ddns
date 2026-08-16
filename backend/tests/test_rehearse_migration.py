@@ -36,9 +36,9 @@ from typing import Any, Iterator
 import bcrypt
 import pytest
 import pytest_asyncio
-import sqlalchemy as sa
 from app.db import get_session_factory
 from app.models.auth import User
+from conftest import fixture_writes, purge_tenants
 from cryptography.fernet import Fernet, InvalidToken
 
 from atrium_ddns import compat_stub
@@ -183,31 +183,58 @@ def legacy_db(tmp_path_factory, fernet_key: str) -> Path:
     return path
 
 
+#: Who this module's guarded regions say they are, in the message
+#: :func:`conftest.fixture_writes` prints when a nesting bug or a
+#: timeout stops the run. A bare ``"?"`` names nothing.
+LOCK_OWNER = "test_rehearse_migration.imported"
+
+
 @pytest_asyncio.fixture(scope="module")
 async def imported(legacy_db: Path, fernet_key: str) -> Any:
-    """One import into the real database; every check reads it back."""
+    """One import into the real database; every check reads it back.
+
+    Teardown is :func:`conftest.purge_tenants`, not a copy of it kept
+    here. Removing the owner is enough on its own — domains, devices,
+    hostnames and backends all cascade off it — but the shared helper
+    also clears the tenant's ``ddns_event`` rows by ``user_id`` and its
+    ``user_secret_keys`` row, and does the two in the order that leaves
+    the cascade nothing to do. Called at **both** ends, which is the
+    shared helper's own documented contract: a worker killed mid-module
+    leaves this fixture's owner behind, and the next run's insert
+    collides on ``ix_users_email`` rather than reporting the leak.
+
+    The writes are inside :func:`conftest.fixture_writes` for the reason
+    ``conftest``'s docstring gives: what deadlocked this suite was never
+    a teardown, it was two fixtures inserting into
+    ``ix_users_email`` and ``uq_ddns_domain_name`` in opposite gap
+    order. This fixture does exactly that pair — an owner, then a
+    zone-and-hostnames import — so guarding only its teardown would be
+    guarding the statement that was never the problem. Measured at
+    0.35 s per worker per module, against a 30 s lock timeout.
+    """
     factory = get_session_factory()
-    async with factory() as session:
-        owner = User(
-            email=EMAIL,
-            hashed_password="$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHQ$x" * 1,
-            is_active=True,
-            is_verified=True,
-            full_name="Rehearsal Owner",
+    await purge_tenants([EMAIL], owner=LOCK_OWNER)
+
+    async with fixture_writes(LOCK_OWNER) as session:
+        session.add(
+            User(
+                email=EMAIL,
+                hashed_password="$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHQ$x" * 1,
+                is_active=True,
+                is_verified=True,
+                full_name="Rehearsal Owner",
+            )
         )
-        session.add(owner)
-        await session.commit()
 
     with il.open_source(legacy_db) as conn:
         il.assert_columns(conn)
         snapshot = il.read_snapshot(conn)
     plan = il.build_plan(snapshot, fernet_key=fernet_key)
 
-    async with factory() as session:
+    async with fixture_writes(LOCK_OWNER) as session:
         written = await il.apply(
             session, plan, owner_email=EMAIL, create_owner=False
         )
-        await session.commit()
     async with factory() as session:
         reading = await il.verify(session, written.owner_id)
 
@@ -220,11 +247,7 @@ async def imported(legacy_db: Path, fernet_key: str) -> Any:
         "fernet_key": fernet_key,
     }
 
-    async with factory() as session:
-        await session.execute(
-            sa.text("DELETE FROM users WHERE email = :e"), {"e": EMAIL}
-        )
-        await session.commit()
+    await purge_tenants([EMAIL], owner=LOCK_OWNER)
 
 
 # ===================================================================== #
