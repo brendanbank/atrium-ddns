@@ -37,6 +37,7 @@ import { Anchor, List, Stack, Text, Title } from '@mantine/core';
 import {
   BOARD_PATH,
   DEVICES_PATH,
+  DEVICE_DETAIL_PATH,
   DOMAINS_PATH,
   ZONE_ROUTE_PATH,
 } from './paths';
@@ -154,6 +155,14 @@ export const SURFACES: {
     label: 'Devices',
     blurb:
       'The credential a router authenticates with. The secret is shown once, at creation and at rotation, and cannot be displayed again.',
+    within: [
+      {
+        path: DEVICE_DETAIL_PATH,
+        label: 'One device',
+        blurb:
+          'Opened by clicking a device. Rename it in place, change its rate limit (or return it to the installation default), see the names it updates at full width, and rotate its secret. A rename is refused if you already have a device by that name — another account having one does not matter — and it never touches the credential, so the router keeps working.',
+      },
+    ],
   },
   {
     to: LOG_PATH,

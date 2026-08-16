@@ -58,12 +58,12 @@ import functools
 import secrets as secrets_module
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import anyio
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1706,13 +1706,49 @@ class DeviceSummaryOut(BaseModel):
     hostname_count: int
 
 
+def _clean_device_name(value: Any) -> Any:
+    """Strip, and refuse what is left when nothing is left.
+
+    One validator, on both the create and the rename path — §13.1's rule
+    ("one validator, still") applied one object along, because a second
+    implementation is where the two drift. Before this existed the
+    create route called ``body.name.strip()`` in the *handler* while
+    ``min_length=1`` was measured against the *unstripped* string, so
+    ``"   "`` created a device named ``""``: a row the list renders as
+    an empty cell and the uniqueness index treats as a real name.
+    Adding a rename without fixing that would have given the
+    installation a second way to reach the same unnamed row.
+
+    A non-string is handed straight through rather than coerced — the
+    core ``str`` schema behind this refuses it with the message pydantic
+    already writes for that, and inventing a second one here would make
+    ``{"name": 7}`` and ``{"name": " "}`` two flavours of the same
+    error.
+    """
+    if not isinstance(value, str):
+        return value
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError("a device name cannot be blank")
+    return cleaned
+
+
+#: A device name as the column stores it. A *before* validator, so the
+#: strip happens ahead of the length check rather than after it and 255
+#: characters of trailing whitespace is not a 422; ``max_length``
+#: matches ``ddns_device.name``.
+DeviceName = Annotated[
+    str, BeforeValidator(_clean_device_name), Field(max_length=255)
+]
+
+
 class DeviceCreateIn(BaseModel):
-    name: str = Field(min_length=1, max_length=255)
+    name: DeviceName
     rate_limit_per_minute: int | None = Field(default=None, ge=0)
 
 
 class DeviceUpdateIn(BaseModel):
-    """The per-device rate limit, and deliberately nothing else.
+    """The per-device rate limit and its name — and still no secret.
 
     ``rate_limit_per_minute`` is **required**, and that is not an
     oversight. ``None`` is a *value* on this field — it means *inherit
@@ -1722,14 +1758,34 @@ class DeviceUpdateIn(BaseModel):
     operator muted on purpose. Required means the omission is a 422 the
     caller can read instead of a mutation nobody asked for.
 
-    There is no ``name`` here and no secret. Renaming is a separate
-    change (the create path has a uniqueness conflict to handle and this
-    route does not), and the secret is the point of the route: #73 exists
-    because tightening an abusive device's limit meant delete-and-
-    recreate, which rotates the credential and breaks the device until
-    its owner reconfigures it. This model has no field that could carry
-    one and ``tests/test_router_tenant.py`` compares the stored hash
-    across the call.
+    ``name`` is **optional**, and the asymmetry with the field above is
+    deliberate rather than sloppy: **the column decides.**
+    ``ddns_device.rate_limit_per_minute`` is nullable and ``NULL`` names
+    a real state, so ``None`` there cannot mean *absent*.
+    ``ddns_device.name`` is ``NOT NULL``, so there is no state ``null``
+    could name and ``None`` is free to mean exactly one thing — *leave
+    the name alone*. A caller that sends ``{"name": null, …}`` is
+    therefore not renaming; it is not refused, because refusing it would
+    invent a fourth reading of a field that has three.
+
+    #73 wrote here that renaming was "a separate change (the create path
+    has a uniqueness conflict to handle and this route does not)". The
+    reasoning was sound and the conclusion has expired: the conflict is
+    ``uq_ddns_device_user_name`` — ``UNIQUE(user_id, name)`` — and
+    handling it is a 409 with the offending name in it, which is what
+    the create path already does. It is surfaced, not avoided: nothing
+    here appends a suffix and nothing here accepts a duplicate.
+
+    **The secret is still not on this model**, and that is the half #73
+    was actually about — tightening an abusive device's limit used to
+    mean delete-and-recreate, which rotates the credential and breaks
+    the device until its owner reconfigures it. Rotation has a different
+    consequence from fixing a typo and keeps its own route, its own
+    confirmation and its own once-only display. This model has no field
+    that could carry a secret and ``tests/test_router_tenant.py``
+    compares the stored hash across the call — across a rename as well
+    as across a limit change, because a rename is a write to the same
+    row and the byte comparison is only evidence on the path it covers.
     """
 
     #: ``0`` mutes the device; ``null`` returns it to the installation
@@ -1737,6 +1793,10 @@ class DeviceUpdateIn(BaseModel):
     #: ``le=10_000`` bounds the default, and a per-device override that
     #: could not exceed it would be a rule nobody wrote down.
     rate_limit_per_minute: int | None = Field(ge=0)
+    #: Absent or ``null`` leaves the name alone. Same validator as the
+    #: create path, so a name that could not be created cannot be
+    #: renamed into either.
+    name: DeviceName | None = None
 
 
 class DeviceSecretOut(BaseModel):
@@ -1774,6 +1834,25 @@ def _normalise_zone(name: str) -> str:
 
 def _conflict(detail: str) -> HTTPException:
     return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+
+
+def _device_name_conflict(name: str) -> HTTPException:
+    """409 for ``uq_ddns_device_user_name``, in the operator's words.
+
+    One sentence, one place, two call sites — create and rename — so the
+    form that renders the server's words verbatim renders the same
+    sentence whichever way the collision was reached.
+
+    **The offending name is in the message, and that is safe here
+    precisely because the constraint is ``UNIQUE(user_id, name)``.**
+    Compare ``_conflict("the zone … is already claimed")``: zone names
+    are unique across the whole installation, so naming the holder would
+    disclose another tenant's rows, and that refusal names nobody. This
+    one can only ever be about a device the caller already owns and can
+    already list, so withholding the name would withhold the one piece
+    of information that makes the refusal actionable.
+    """
+    return _conflict(f"you already have a device called {name!r}")
 
 
 def _not_found(what: str) -> HTTPException:
@@ -2563,6 +2642,43 @@ async def list_devices(
     ]
 
 
+@router.get("/devices/{device_id}", response_model=DeviceSummaryOut)
+async def get_device(
+    device_id: int,
+    _user: User = Depends(require_perm(DEVICE_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> DeviceSummaryOut:
+    """One device, for ``/atrium-ddns/devices/:id``.
+
+    The detail route exists because the list does not scale
+    (``ui-design.md`` §11.2), and a detail route that reads the whole
+    list and picks a row out of it would not have fixed that — it would
+    have moved the same ``SELECT *`` behind a URL that looks narrower.
+
+    ``hostname_count`` still comes from :func:`_hostname_counts`, which
+    counts every hostname the *scope* can see and then indexes by
+    device. That is one scoped query rather than a count restricted to
+    this id, and it is the same reading the list shows, which is the
+    point: two ways of counting one device's names is how the list and
+    the detail come to disagree about a number they both display.
+
+    Scoped like every other device route — another tenant's device is
+    ``None`` from :meth:`DdnsScope.get` and becomes the same 404 a
+    nonexistent id gets, because a 403 would confirm the row exists.
+    """
+    device = await scope.get(session, Device, device_id)
+    if device is None:
+        raise _not_found("device")
+    config = await load_config(session)
+    _, by_device = await _hostname_counts(session, scope)
+    return _render_device(
+        device,
+        by_device.get(device.id, 0),
+        default_per_minute=config.rate_limit_per_minute,
+    )
+
+
 @router.post("/devices", response_model=DeviceSecretOut, status_code=201)
 async def create_device(
     body: DeviceCreateIn,
@@ -2590,7 +2706,10 @@ async def create_device(
         user_id=scope.user_id,
         username=_generate_username(),
         password_hash=await hash_password(secret),
-        name=body.name.strip(),
+        # No `.strip()` here any more: `DeviceName` did it, and the
+        # handler doing it again is the second implementation §13.1
+        # forbids — the one that survives when the validator changes.
+        name=body.name,
         rate_limit_per_minute=body.rate_limit_per_minute,
     )
     session.add(device)
@@ -2598,9 +2717,7 @@ async def create_device(
         await session.flush()
     except IntegrityError as exc:
         await session.rollback()
-        raise _conflict(
-            f"you already have a device called {body.name.strip()!r}"
-        ) from exc
+        raise _device_name_conflict(body.name) from exc
 
     await session.refresh(device)
 
@@ -2689,7 +2806,7 @@ async def update_device(
     scope: DdnsScope = Depends(get_scope),
     session: AsyncSession = Depends(get_session),
 ) -> DeviceSummaryOut:
-    """Change a device's rate limit **without touching its credential**.
+    """Change a device's rate limit and its name — **not its credential**.
 
     The route #73 opened this issue for. Before it, the only way to
     tighten one device's limit was delete-and-recreate — which mints a
@@ -2699,6 +2816,20 @@ async def update_device(
     the credential are different decisions and only one of them was
     reachable.
 
+    **The name joined the body in #89.** #73's docstring said renaming
+    was a separate change because "the create path has a uniqueness
+    conflict to handle and this route does not"; the conflict is
+    ``uq_ddns_device_user_name`` and it is now handled here the way the
+    create path handles it — an explicit ``flush`` inside a ``try``, and
+    a 409 naming the device the caller already owns. Nothing appends a
+    suffix and nothing accepts a duplicate: a rename that collides is
+    refused, in words the form renders verbatim.
+
+    **The constraint is per user**, so a rename onto a name *another*
+    tenant holds succeeds and must. There is no cross-tenant device
+    namespace and inventing one here would leak the fact that some other
+    account owns something called ``router``.
+
     **Nothing in this function reads or writes ``password_hash``**, and
     that is asserted rather than asserted-about: ``test_router_tenant``
     captures the stored hash before and after and compares the bytes,
@@ -2706,7 +2837,11 @@ async def update_device(
     a rewrite that happened to produce an equal-length hash still fails.
     One of those two alone would be weaker — a byte comparison cannot
     tell a hash that still verifies from one that does not, and a
-    successful login cannot see a hash quietly upgraded in place.
+    successful login cannot see a hash quietly upgraded in place. #89
+    extended both instruments over the *rename* path rather than
+    trusting the limit path's reading to cover it: a rename is a
+    different write to the same row, and evidence taken on one path is
+    not evidence about the other.
 
     Scoped like every other device route: ``scope.get`` answers ``None``
     for another tenant's device, which becomes the same 404 a
@@ -2720,22 +2855,60 @@ async def update_device(
     before = device.rate_limit_per_minute
     device.rate_limit_per_minute = body.rate_limit_per_minute
 
+    # `None` is *absent* on this field and only on this field — see
+    # `DeviceUpdateIn`, where the column's nullability is what decides.
+    name_before = device.name
+    renaming = body.name is not None and body.name != name_before
+    if renaming:
+        device.name = body.name
+
+    # Explicit, so the conflict is caught here rather than by whatever
+    # runs next. A `commit()` that raises leaves the audit write already
+    # issued and the exception arriving from a line that says nothing
+    # about names.
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        await session.rollback()
+        if not renaming:
+            # The name is the only thing this route writes that carries
+            # a uniqueness constraint, so an IntegrityError without a
+            # rename in flight is something else entirely. Re-raise it
+            # rather than relabelling a real database fault as a name
+            # collision — a 409 saying "you already have a device
+            # called …" about a request that renamed nothing is the
+            # error message equivalent of a probe that cannot fail.
+            raise
+        # `body.name` and not `device.name`: the session is rolled back,
+        # so the attribute is expired and reading it would emit a SELECT
+        # inside the error path. The refused value is the one the caller
+        # sent.
+        raise _device_name_conflict(body.name or "") from exc
+
     _, by_device = await _hostname_counts(session, scope)
+    # Both readings on the limit, because `null` and `0` are different
+    # states and an audit row saying "rate_limit_per_minute changed"
+    # would not let a reader tell *muted* from *returned to the
+    # default*.
+    diff: dict[str, Any] = {
+        "rate_limit_per_minute": {
+            "before": before,
+            "after": device.rate_limit_per_minute,
+        }
+    }
+    # The key appears only when the name actually moved. A `{"before":
+    # x, "after": x}` row on every limit change would make "this device
+    # was renamed" unsearchable in the audit log, which is the question
+    # the key exists to answer.
+    if renaming:
+        diff["name"] = {"before": name_before, "after": device.name}
     await record_audit(
         session,
         actor_user_id=user.id,
         entity="ddns_device",
         entity_id=device.id,
         action="update",
-        # Both readings, because `null` and `0` are different states and
-        # an audit row saying "rate_limit_per_minute changed" would not
-        # let a reader tell *muted* from *returned to the default*.
-        diff={
-            "rate_limit_per_minute": {
-                "before": before,
-                "after": device.rate_limit_per_minute,
-            }
-        },
+        diff=diff,
     )
     await session.commit()
     return _render_device(

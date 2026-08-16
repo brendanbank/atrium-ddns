@@ -47,10 +47,18 @@ test('every registered surface still mounts through the wrapper element', async 
   await import('../main');
 
   // Vacuity guard: the sweep has to be over a non-empty population.
-  // Fourteen — the scaffold's four (home widget, demo page, admin tab,
+  // Fifteen — the scaffold's four (home widget, demo page, admin tab,
   // profile item), the board's one (#44), #45's two tenant pages, #46's
   // log search, #69's names page, #75's help page, #73's three settings
-  // pages, and #88's zone detail route.
+  // pages, #88's zone detail route and #89's device detail route.
+  //
+  // **This number was resolved as a union at #89's rebase**, and it is
+  // the fourth time that has been necessary. #88 and #89 were written
+  // against the same base, both added a route, and both edited this
+  // line to 14; the merged value is 15 and the named-key list below
+  // carries both keys. Keeping either side's 14 would have compiled,
+  // passed that side's half of the suite, and dropped one surface out
+  // of the sweep — the one thing the sweep exists to prevent.
   //
   // #75 and #73 were written against the same base and both edited this
   // number; the merged value is the **union** (9 + 1 + 3), not either
@@ -74,22 +82,17 @@ test('every registered surface still mounts through the wrapper element', async 
   // which is what turns that message from a puzzle into an instruction.
   // (#69 was the fourth issue to append here and the message did read as
   // an instruction; #75 read `expected 10 to be 9` and #73 read
-  // `expected 12 to be 9`, and #88 read `expected 14 to be 13`, which is
-  // the same evidence three times over.)
-  //
-  // #88 and #89 were both written against this base and both add a
-  // route. Same rule as #75/#73 above: the merged value is the **union**,
-  // and the count is checked against the registration list rather than
-  // one side's number being kept because it compiles.
+  // `expected 12 to be 9`, #88 read `expected 14 to be 13` and #89 read
+  // `expected 15 to be 14`, which is the same evidence four times over.)
   const rendered = [
     ...handles.homeWidgets,
     ...handles.routes,
     ...handles.adminTabs,
     ...handles.profileItems,
   ];
-  expect(rendered.length).toBe(14);
+  expect(rendered.length).toBe(15);
   // Keys are the registry's primary key: two registrations sharing one
-  // silently replace each other, so the count above would still read 13
+  // silently replace each other, so the count above would still read 15
   // while one surface never mounts. Added by #46 because three issues
   // have now appended to this file and the fourth will not have read
   // the other three.
@@ -104,6 +107,7 @@ test('every registered surface still mounts through the wrapper element', async 
     'atrium-ddns-settings-health-checks',
     'atrium-ddns-settings-retention',
     'atrium-ddns-zone-detail',
+    'atrium-ddns-device-detail',
   ]) {
     expect(
       rendered.find((entry) => entry.key === key),
@@ -151,6 +155,32 @@ test('the zone detail route is registered with a parameter, and no nav item', as
   expect(
     handles.navItems.filter((entry) => entry.to?.startsWith('/atrium-ddns/zones')),
   ).toEqual([]);
+});
+
+test('the device detail route is registered at the path the list links to', async () => {
+  const main = await import('../main');
+  const paths = await import('../paths');
+
+  const route = handles.routes.find(
+    (entry) => entry.key === 'atrium-ddns-device-detail',
+  );
+  expect(route, 'the device detail route was never registered').toBeDefined();
+  expect(route!.path).toBe(main.DEVICE_DETAIL_PATH);
+
+  // The two halves of one string, checked against each other rather
+  // than against a literal typed twice: the pattern registered with
+  // atrium, and the href the device list composes. A route registered
+  // at a path nothing produces is #75's defect — a surface that exists
+  // and nothing names — and no component test can see it.
+  const href = paths.deviceHref(42);
+  expect(paths.deviceIdFromPath(href)).toBe(42);
+  expect(href.startsWith(`${main.DEVICES_PATH}/`)).toBe(true);
+
+  // …and it deliberately has no nav item. A sidebar entry pointing at a
+  // literal `:id` is a dead link.
+  expect(
+    handles.navItems.find((entry) => entry.to === main.DEVICE_DETAIL_PATH),
+  ).toBeUndefined();
 });
 
 test('the nav item for the board is not permission-gated away', async () => {

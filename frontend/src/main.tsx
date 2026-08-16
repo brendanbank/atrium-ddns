@@ -34,6 +34,7 @@ import { AtriumDdnsPage } from './AtriumDdnsPage';
 import { AtriumDdnsProfileItem } from './AtriumDdnsProfileItem';
 import { AtriumDdnsWidget } from './AtriumDdnsWidget';
 import { DeviceBoardPage } from './DeviceBoardPage';
+import { DeviceDetailPage } from './DeviceDetailPage';
 import { DevicesPage } from './DevicesPage';
 import { DomainsPage } from './DomainsPage';
 import { HELP_PATH, HelpPage } from './HelpPage';
@@ -45,6 +46,7 @@ import { CONFIG_PERMISSION } from './api/config';
 import {
   BOARD_PATH,
   DEVICES_PATH,
+  DEVICE_DETAIL_PATH,
   DOMAINS_PATH,
   ZONE_ROUTE_PATH,
 } from './paths';
@@ -62,10 +64,11 @@ import {
  *  "what paths does this bundle own". */
 export { BOARD_PATH, DEVICES_PATH, DOMAINS_PATH };
 
-/** #88's zone detail route, `/atrium-ddns/zones/:id`. Re-exported for
- *  the same reason as its three neighbours: this file stays the one
- *  place a reader looks for "what paths does this bundle own". */
-export { ZONE_ROUTE_PATH };
+/** The two parameterised detail routes — #88's `/atrium-ddns/zones/:id`
+ *  and #89's `/atrium-ddns/devices/:id`. Re-exported for the same reason
+ *  as their three neighbours above: this file stays the one place a
+ *  reader looks for "what paths does this bundle own". */
+export { ZONE_ROUTE_PATH, DEVICE_DETAIL_PATH };
 
 /** #46's log search. Defined in `LogSearchPage` because `logHref` needs
  *  it too, and re-exported here for the same reason. */
@@ -164,6 +167,28 @@ if (!reg || !AtriumReact) {
     label: 'Devices',
     to: DEVICES_PATH,
     icon: AtriumReact.createElement(IconKey, { size: 18 }),
+  });
+  // #89's device detail — ui-design.md §11.2. A **route** and not a
+  // drawer, decided on §12's measured width budget: one resolution
+  // strip needs ≈592px, atrium's shell gives 1168px, and Mantine's `lg`
+  // drawer at 620px is below the one-strip minimum, so the signature
+  // element would wrap inside its own detail view.
+  //
+  // Registered with a route and deliberately **no nav item**: it is a
+  // destination reached from a device row, not a place in the sidebar,
+  // and a nav item pointing at a literal `:id` would be a dead link.
+  // §12: "the list rows stay as they are … this adds a destination, it
+  // does not redraw the list."
+  //
+  // The path carries react-router's `:id` because atrium's `App.tsx`
+  // hands every registered `path` straight to `<Route path=…>`. It is
+  // registered *after* `DEVICES_PATH`, which is not a subtlety
+  // react-router cares about — its ranked matcher prefers the static
+  // segment regardless — but the order reads the way the URLs nest.
+  reg.registerRoute({
+    key: 'atrium-ddns-device-detail',
+    path: DEVICE_DETAIL_PATH,
+    render: () => makeWrapperElement(<DeviceDetailPage />),
   });
   // #69's hostname lifecycle — the legacy `/admin/hostnames`, and the
   // registration whose absence made the resolution strip unreachable:
