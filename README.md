@@ -106,7 +106,22 @@ For the full backend extension surface see
 ```bash
 make test            # frontend unit tests + backend smoke tests
 make typecheck       # tsc --noEmit on the host bundle
+make smoke           # HTTP checks against a running stack
+make test-e2e        # Playwright, in a real browser (raises its own stack)
 ```
+
+`make test-e2e` is the only one of these that renders anything. It raises
+the stack (with `ATRIUM_DDNS_COMPAT_STUB=1`, which the walk needs),
+migrates it, seeds an admin and the host bundle, installs chromium and runs
+`frontend/tests-e2e/` — three specs: the nav items render, the
+`docs/ops/ui-parity.md` §3.3.1 walk driven by clicking and ending in a
+rendered resolution strip, and one negative. Add `PLAYWRIGHT_ARGS='--grep
+nav'` to narrow it, and `make e2e-down` to delete the stack and its
+database volume.
+
+The strip screenshot the walk writes on every run is
+`frontend/test-results/resolution-strip.png` (gitignored); the copy in
+`docs/ops/img/` is the one that was checked by eye and committed.
 
 ## Pinning atrium
 

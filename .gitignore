@@ -15,6 +15,16 @@ node_modules/
 dist/
 *.tsbuildinfo
 
+# Playwright artefacts. `test-results/` holds the strip screenshots the
+# specs write on every run, plus failure screenshots and traces — a failed
+# run's screenshot is a full page, so it can carry a session's email
+# address, and none of it belongs in the history. The one image that IS
+# committed is `docs/ops/img/resolution-strip.png`, checked by eye first.
+frontend/test-results/
+frontend/playwright-report/
+frontend/blob-report/
+frontend/.playwright/
+
 # Python
 __pycache__/
 *.py[cod]

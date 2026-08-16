@@ -1,0 +1,341 @@
+import { randomBytes } from 'crypto';
+
+import type { APIRequestContext, Page } from '@playwright/test';
+import { generate as generateTOTP } from 'otplib';
+
+import { BOARD_PATH, DEVICES_PATH, DOMAINS_PATH } from '../src/paths';
+
+/**
+ * Shared vocabulary for the atrium-ddns e2e specs.
+ *
+ * Modelled on atrium's `frontend/tests-e2e/helpers.ts` — same function
+ * names (`loginAsAdmin`, `loginAsUser`, `loginAndPassTOTP`), same
+ * `API_URL` constant, same "drive auth over the API and hand the cookie
+ * to the browser" shape — so someone who knows one harness can read the
+ * other. Everything below `--- atrium-ddns specifics ---` is this
+ * repo's own.
+ */
+
+// Fixture entropy. Not used to authenticate or sign anything — it keeps
+// zone names, device names and email local-parts unique so consecutive
+// runs against one long-lived stack do not collide on
+// `uq_ddns_device_user_name` or on the global uniqueness of a zone.
+function uniqueSuffix(): string {
+  return `${Date.now().toString(36)}${randomBytes(2).readUInt16BE(0).toString(36)}`;
+}
+
+export const BASE_URL = process.env.E2E_BASE_URL ?? 'http://localhost:8053';
+export const API_URL = process.env.E2E_API_URL ?? `${BASE_URL}/api`;
+
+/** RFC 5737 TEST-NET-3. Every address this harness types, publishes or
+ *  renders is documentation space, so a screenshot of the board can
+ *  never carry a real one. The IPv6 twin is RFC 3849 `2001:db8::/32`. */
+export const DOC_ADDRESS_V4 = '203.0.113.10';
+
+/** RFC 6761 reserves `.invalid`; it can never be delegated, so a zone
+ *  named under it cannot collide with anything real. Deliberately not
+ *  used for **email** — atrium's validator refuses special-use domains
+ *  in an address (`value is not a valid email address: The part after
+ *  the @-sign is a special-use or reserved name`), so accounts use
+ *  RFC 2606's `example.com`, which is atrium's own convention. */
+export function uniqueZoneName(): string {
+  return `z${uniqueSuffix()}.example.invalid`;
+}
+
+export function uniqueDeviceName(): string {
+  return `router-${uniqueSuffix()}`;
+}
+
+function requiredAdminEnv(): {
+  email: string;
+  password: string;
+  totpSecret: string;
+} {
+  const email = process.env.E2E_ADMIN_EMAIL;
+  const password = process.env.E2E_ADMIN_PASSWORD;
+  const totpSecret = process.env.E2E_ADMIN_TOTP_SECRET;
+  if (!email || !password || !totpSecret) {
+    throw new Error(
+      'E2E_ADMIN_EMAIL / E2E_ADMIN_PASSWORD / E2E_ADMIN_TOTP_SECRET must be ' +
+        'set. Run the suite through `make test-e2e`, which seeds that admin ' +
+        'and passes all three.',
+    );
+  }
+  return { email, password, totpSecret };
+}
+
+/**
+ * Log in and clear the TOTP challenge using the seeded secret.
+ *
+ * Drives `/auth/jwt/login` + `/auth/totp/verify` over the API rather
+ * than typing into the `PinInput`, exactly as atrium's helper does: the
+ * challenge widget has its own coverage upstream, and these specs are
+ * about the host bundle's surfaces.
+ */
+export async function loginAndPassTOTP(
+  page: Page,
+  email: string,
+  password: string,
+  totpSecret: string,
+): Promise<void> {
+  const loginResp = await page.request.post(`${API_URL}/auth/jwt/login`, {
+    form: { username: email, password },
+  });
+  if (!loginResp.ok() && loginResp.status() !== 204) {
+    throw new Error(`login failed: ${loginResp.status()}`);
+  }
+  const code = await generateTOTP({ secret: totpSecret });
+  const verifyResp = await page.request.post(`${API_URL}/auth/totp/verify`, {
+    data: { code },
+  });
+  if (!verifyResp.ok() && verifyResp.status() !== 204) {
+    throw new Error(
+      `totp verify failed: ${verifyResp.status()} ${await verifyResp.text()}`,
+    );
+  }
+  await syncCookies(page);
+}
+
+/** Surface the API context's cookie onto the browser jar. Playwright
+ *  keeps the two jars separate on some versions; atrium's helper does
+ *  the same dance and for the same reason. */
+async function syncCookies(page: Page): Promise<void> {
+  const cookies = await page.context().cookies();
+  if (!cookies.some((cookie) => cookie.name === 'atrium_auth')) {
+    const apiCookies = await page.request.storageState();
+    await page.context().addCookies(apiCookies.cookies);
+  }
+}
+
+/** Log in as the seeded super_admin. */
+export async function loginAsAdmin(page: Page): Promise<void> {
+  const { email, password, totpSecret } = requiredAdminEnv();
+  await loginAndPassTOTP(page, email, password, totpSecret);
+}
+
+export interface ProvisionedUser {
+  email: string;
+  password: string;
+  totpSecret: string;
+}
+
+/**
+ * Mint a fresh `user`-role tenant through atrium's own invite flow,
+ * enrol it in TOTP, and leave `page` logged in as that tenant.
+ *
+ * The `user` role carries `atrium_ddns.domain.manage`,
+ * `atrium_ddns.device.manage` and `atrium_ddns.hostname.manage`
+ * (`0002_ddns_core`) and **not** `atrium_ddns.write` or
+ * `app_setting.manage` — which is what makes it the right account both
+ * for the §3.3.1 walk and for the negative spec.
+ */
+export async function loginAsUser(page: Page): Promise<ProvisionedUser> {
+  const admin = requiredAdminEnv();
+  const context = page.context();
+  const request = context.request;
+
+  const adminLogin = await request.post(`${API_URL}/auth/jwt/login`, {
+    form: { username: admin.email, password: admin.password },
+  });
+  if (!adminLogin.ok() && adminLogin.status() !== 204) {
+    throw new Error(`admin login failed: ${adminLogin.status()}`);
+  }
+  const adminCode = await generateTOTP({ secret: admin.totpSecret });
+  const adminVerify = await request.post(`${API_URL}/auth/totp/verify`, {
+    data: { code: adminCode },
+  });
+  if (!adminVerify.ok() && adminVerify.status() !== 204) {
+    throw new Error(`admin totp verify failed: ${adminVerify.status()}`);
+  }
+
+  const email = `e2e-${uniqueSuffix()}@example.com`;
+  const password = 'Tenant-Pw-12345!';
+  const inviteResp = await request.post(`${API_URL}/invites`, {
+    data: { email, full_name: 'E2E Tenant', role_codes: ['user'] },
+  });
+  if (inviteResp.status() !== 201) {
+    throw new Error(
+      `invite create failed: ${inviteResp.status()} ${await inviteResp.text()}`,
+    );
+  }
+  const invite = (await inviteResp.json()) as { token: string };
+
+  // Drop the admin cookie before anything user-side, so the invite is
+  // not accepted under the admin's session.
+  await context.clearCookies();
+
+  const acceptResp = await request.post(`${API_URL}/invites/accept`, {
+    data: { token: invite.token, password },
+  });
+  if (!acceptResp.ok() && acceptResp.status() !== 201) {
+    throw new Error(
+      `invite accept failed: ${acceptResp.status()} ${await acceptResp.text()}`,
+    );
+  }
+  const userLogin = await request.post(`${API_URL}/auth/jwt/login`, {
+    form: { username: email, password },
+  });
+  if (!userLogin.ok() && userLogin.status() !== 204) {
+    throw new Error(`user login failed: ${userLogin.status()}`);
+  }
+
+  // Enrol TOTP and confirm, which flips `totp_passed=True` on the
+  // session row so the host's endpoints accept the cookie.
+  const setupResp = await request.post(`${API_URL}/auth/totp/setup`);
+  if (!setupResp.ok()) {
+    throw new Error(
+      `totp setup failed: ${setupResp.status()} ${await setupResp.text()}`,
+    );
+  }
+  const { secret } = (await setupResp.json()) as { secret: string };
+  const code = await generateTOTP({ secret });
+  const confirmResp = await request.post(`${API_URL}/auth/totp/confirm`, {
+    data: { code },
+  });
+  if (!confirmResp.ok() && confirmResp.status() !== 204) {
+    throw new Error(
+      `totp confirm failed: ${confirmResp.status()} ${await confirmResp.text()}`,
+    );
+  }
+
+  await syncCookies(page);
+  return { email, password, totpSecret: secret };
+}
+
+// --- atrium-ddns specifics ---------------------------------------- //
+
+/** The paths the bundle registers, imported from the module the
+ *  registrations themselves read (`src/paths.ts`) rather than typed a
+ *  second time here. `NAMES_PATH` and `LOG_PATH` live in their own
+ *  page modules — `.tsx`, so importing them would pull Mantine and
+ *  React into the test process — and are the two literals below. */
+export const NAMES_PATH = '/atrium-ddns/names';
+export const LOG_PATH = '/atrium-ddns/logs';
+export { BOARD_PATH, DEVICES_PATH, DOMAINS_PATH };
+
+/** Every nav item the bundle registers, label and destination.
+ *  `ui-parity.md` §3.2 reads the same seven out of the served bundle. */
+export const DDNS_NAV_ITEMS: ReadonlyArray<{ label: string; to: string }> = [
+  { label: 'Atrium Ddns', to: '/atrium-ddns' },
+  { label: 'Devices and names', to: BOARD_PATH },
+  { label: 'Zones and providers', to: DOMAINS_PATH },
+  { label: 'Devices', to: DEVICES_PATH },
+  { label: 'Names', to: NAMES_PATH },
+  { label: 'Log search', to: LOG_PATH },
+  { label: 'Help', to: '/atrium-ddns/help' },
+];
+
+/**
+ * Bind one of the compat fixture's scripted provider slots to a zone.
+ *
+ * **This is the one step of the §3.3.1 walk that is not driven through
+ * the UI, and the reason is a deliberate product decision rather than a
+ * gap in the harness.** A strip only renders once a name has been
+ * *published* (`router.py::_strips_for` — a family appears when
+ * `last_ip_*` or `dns_ip_*` is set), and `persist_updates` writes
+ * `last_ip_*` on `good` only. The only provider that can answer `good`
+ * without contacting a real nameserver is `compat_stub`'s scripted
+ * slot, and the catalogue behind the UI's provider `Select`
+ * (`GET /providers` -> `known_services()`) deliberately does not offer
+ * it: `backend/tests/test_compat_stub.py` asserts
+ * `set(SLOTS).isdisjoint(known_services())` under the heading
+ * *"`known_services()` is what a UI offers when creating a backend"*.
+ *
+ * So this call is `ui-parity.md` §3.3.1 step 4 verbatim — the same
+ * `POST /domains/{id}/backends` the parity walk makes — and every other
+ * step of the walk is a click. Widening the catalogue to make the click
+ * possible would delete a guard the product wrote on purpose.
+ *
+ * `credentials` matters: a slot with *no* stored credential is exactly
+ * how the frozen table manufactures `911`, so an empty object here
+ * produces a walk that ends in `911 <ip>` and no strip.
+ */
+export async function bindScriptedBackend(
+  request: APIRequestContext,
+  domainId: number,
+  options: { result?: string; ttl?: number } = {},
+): Promise<{ id: number; backend_type: string; credentials_set: boolean }> {
+  const resp = await request.post(
+    `${API_URL}/atrium_ddns/domains/${domainId}/backends`,
+    {
+      data: {
+        backend_type: 'stub1',
+        config: { result: options.result ?? 'good', ttl: options.ttl ?? 300 },
+        credentials: { stub_token: 'e2e-fixture-not-a-secret' },
+      },
+    },
+  );
+  if (resp.status() !== 201) {
+    throw new Error(
+      `binding the scripted backend failed: ${resp.status()} ` +
+        `${await resp.text()}\n` +
+        'The e2e stack must run with ATRIUM_DDNS_COMPAT_STUB=1 (and not ' +
+        'ENVIRONMENT=prod) or `stub1` resolves to no adapter. ' +
+        '`make e2e-up` sets it.',
+    );
+  }
+  return (await resp.json()) as {
+    id: number;
+    backend_type: string;
+    credentials_set: boolean;
+  };
+}
+
+/**
+ * The device calling in, over HTTP Basic, exactly as a router does —
+ * §3.3.1 step 8. Returns the wire body (`good 203.0.113.10`,
+ * `nochg …`, `911 …`, `badauth`, …).
+ *
+ * `X-Forwarded-For` is set on purpose and is not decoration.
+ * `auth_device.client_address` takes the rightmost forwarded element,
+ * so this pins the address recorded as *called from* — the strip's
+ * third station — to RFC 5737 documentation space. Without it the row
+ * carries whatever socket address the container saw, which is both
+ * machine-dependent (so the screenshot is not reproducible) and the one
+ * value on that surface that could be a real address.
+ */
+export async function deviceCallsIn(
+  request: APIRequestContext,
+  options: {
+    username: string;
+    secret: string;
+    hostname: string;
+    ip?: string;
+    clientIp?: string;
+  },
+): Promise<{ status: number; body: string }> {
+  const ip = options.ip ?? DOC_ADDRESS_V4;
+  const credentials = Buffer.from(
+    `${options.username}:${options.secret}`,
+  ).toString('base64');
+  const resp = await request.get(
+    `${BASE_URL}/nic/update?hostname=${encodeURIComponent(options.hostname)}` +
+      `&myip=${encodeURIComponent(ip)}`,
+    {
+      headers: {
+        Authorization: `Basic ${credentials}`,
+        'X-Forwarded-For': options.clientIp ?? DOC_ADDRESS_V4,
+      },
+    },
+  );
+  return { status: resp.status(), body: (await resp.text()).trim() };
+}
+
+/**
+ * Pick a value from a Mantine `Select`.
+ *
+ * A Mantine v9 `Select` is an input plus a portalled dropdown, not a
+ * native `<select>`: `selectOption()` does not apply, and the option
+ * text is the `label`, never the `value`. Anchoring on the testid the
+ * component was given keeps this off `getByLabel`, which matches the
+ * asterisk on required fields and matches two elements when a modal
+ * repeats a label the page already has.
+ */
+export async function chooseFromSelect(
+  page: Page,
+  testId: string,
+  optionLabel: string,
+): Promise<void> {
+  await page.getByTestId(testId).click();
+  await page.getByRole('option', { name: optionLabel, exact: true }).click();
+}
