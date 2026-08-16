@@ -43,6 +43,7 @@ from app.host_sdk.crypto import (
 from app.host_sdk.crypto import _USER_SECRETS  # noqa: PLC2701 — the registry is the point
 from app.host_sdk.db import INFO_KEY
 from app.models.auth import User
+from conftest import fixture_writes, purge_tenants, unusable_password_hash
 
 from atrium_ddns import models as m
 
@@ -64,12 +65,6 @@ W = _worker_id()
 HOST_TABLES = frozenset(m.HostBase.metadata.tables) - {"atrium_ddns_state"}
 
 
-def _password_hash() -> str:
-    from fastapi_users.password import PasswordHelper
-
-    return PasswordHelper().hash("unusable-" + "x" * 24)
-
-
 @pytest_asyncio.fixture
 async def tenants():
     """Two users with a domain, a backend, a device and a hostname each.
@@ -79,17 +74,17 @@ async def tenants():
     to prove the ``ON DELETE CASCADE``, and on a developer's own stack
     the two rows a ``LIMIT 2`` returns are real accounts.
     """
-    factory = get_session_factory()
     emails = [f"ddns-model-a-{W}@example.invalid", f"ddns-model-b-{W}@example.invalid"]
 
-    await _purge(emails)
+    await purge_tenants(emails, owner="test_host_models.tenants")
 
+    hashed = unusable_password_hash()
     ids: list[int] = []
-    async with factory() as s:
+    async with fixture_writes("test_host_models.tenants/users") as s:
         for email in emails:
             u = User(
                 email=email,
-                hashed_password=_password_hash(),
+                hashed_password=hashed,
                 is_active=True,
                 is_verified=True,
                 full_name=f"DDNS model probe {W}",
@@ -98,10 +93,9 @@ async def tenants():
             s.add(u)
             await s.flush()
             ids.append(u.id)
-        await s.commit()
 
     built: dict[str, dict] = {}
-    async with factory() as s:
+    async with fixture_writes("test_host_models.tenants/world") as s:
         for tag, uid, creds in (("a", ids[0], CREDS_A), ("b", ids[1], CREDS_B)):
             await unlock_user_secrets(s, uid, create=True)
             domain = m.Domain(user_id=uid, name=f"{tag}-{W}.example.invalid")
@@ -134,46 +128,10 @@ async def tenants():
                 "device_id": device.id,
                 "hostname_id": hostname.id,
             }
-        await s.commit()
 
     yield built
 
-    await _purge(emails)
-
-
-async def _purge(emails: list[str]) -> None:
-    """Remove anything a previous run left behind.
-
-    MySQL DDL and a killed worker do not cooperate, so teardown is not
-    guaranteed to have run. Deleting the users cascades to their
-    domains, backends and devices; the event rows only get their FKs
-    nulled, so they are cleared by their denormalised email.
-
-    **The orphan sweep of ``user_secret_keys`` was removed** (#14). It
-    read ``DELETE FROM user_secret_keys WHERE user_id NOT IN (SELECT id
-    FROM users)`` and could never delete a row: that table's foreign key
-    is ``ON DELETE CASCADE`` to ``users``, which is asserted by
-    ``test_deleting_a_user_destroys_their_domains_devices_and_credentials``
-    — so the orphan state it swept up is one the database does not
-    permit. What it *could* do is take a scan-wide lock over every
-    worker's key rows, and two workers running it at once deadlock
-    (``(1213, 'Deadlock found when trying to get lock')``). Harmless
-    with two test files sharing the database, 3 not-green runs in 20
-    with three.
-    """
-    factory = get_session_factory()
-    async with factory() as s:
-        await s.execute(
-            sa.text("DELETE FROM ddns_event WHERE user_email IN :e").bindparams(
-                sa.bindparam("e", expanding=True)
-            ),
-            {"e": emails},
-        )
-        for email in emails:
-            await s.execute(
-                sa.text("DELETE FROM users WHERE email = :e"), {"e": email}
-            )
-        await s.commit()
+    await purge_tenants(emails, owner="test_host_models.tenants")
 
 
 # --------------------------------------------------------------------- #

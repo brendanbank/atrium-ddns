@@ -53,6 +53,7 @@ import sqlalchemy as sa
 from app.auth.rbac import current_principal
 from app.db import get_engine, get_session_factory
 from app.models.auth import User
+from conftest import fixture_writes, purge_tenants, unusable_password_hash
 from sqlalchemy.dialects import mysql
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -92,12 +93,6 @@ ISOLATION_FIXTURE: dict[type[Any], str] = {
 }
 
 
-def _password_hash() -> str:
-    from fastapi_users.password import PasswordHelper
-
-    return PasswordHelper().hash("unusable-" + "x" * 24)
-
-
 @pytest_asyncio.fixture
 async def tenants():
     """Two tenants, one row of every host model each, plus an orphan event.
@@ -106,18 +101,26 @@ async def tenants():
     teardown hard-deletes them, and on a developer's own stack the rows
     a ``LIMIT 2`` returns are real accounts.
     """
-    factory = get_session_factory()
     emails = [f"ddns-scope-a-{W}@example.invalid", f"ddns-scope-b-{W}@example.invalid"]
     orphan_email = f"ddns-scope-orphan-{W}@example.invalid"
 
-    await _purge(emails + [orphan_email])
+    # The orphan row has `user_id IS NULL` by construction — that is the
+    # state under test — so nothing indexed can name it and a leftover
+    # from a killed run has to be swept by its denormalised email. See
+    # `conftest.purge_tenants`.
+    await purge_tenants(
+        emails,
+        unattributed_emails=[orphan_email],
+        owner="test_tenant_isolation.tenants",
+    )
 
+    hashed = unusable_password_hash()
     ids: list[int] = []
-    async with factory() as s:
+    async with fixture_writes("test_tenant_isolation.tenants/users") as s:
         for email in emails:
             u = User(
                 email=email,
-                hashed_password=_password_hash(),
+                hashed_password=hashed,
                 is_active=True,
                 is_verified=True,
                 full_name=f"DDNS scope probe {W}",
@@ -126,10 +129,9 @@ async def tenants():
             s.add(u)
             await s.flush()
             ids.append(u.id)
-        await s.commit()
 
     built: dict[str, dict[str, Any]] = {}
-    async with factory() as s:
+    async with fixture_writes("test_tenant_isolation.tenants/world") as s:
         for tag, uid, email in (("a", ids[0], emails[0]), ("b", ids[1], emails[1])):
             domain = m.Domain(user_id=uid, name=f"{tag}-scope-{W}.example.invalid")
             s.add(domain)
@@ -192,31 +194,16 @@ async def tenants():
         s.add(orphan)
         await s.flush()
         built["orphan_event_id"] = orphan.id
-        await s.commit()
 
     yield built
 
-    await _purge(emails + [orphan_email])
-
-
-async def _purge(emails: list[str]) -> None:
-    """Clear anything a killed worker left behind.
-
-    Deleting the users cascades to domains, backends, devices,
-    hostnames and rate-limit events; ``ddns_event`` only gets its FKs
-    nulled, so those rows are cleared by their denormalised email.
-    """
-    factory = get_session_factory()
-    async with factory() as s:
-        await s.execute(
-            sa.text("DELETE FROM ddns_event WHERE user_email IN :e").bindparams(
-                sa.bindparam("e", expanding=True)
-            ),
-            {"e": emails},
-        )
-        for email in emails:
-            await s.execute(sa.text("DELETE FROM users WHERE email = :e"), {"e": email})
-        await s.commit()
+    # By primary key on the way out: this process wrote the row, so it
+    # knows its id and does not need the scan the setup half used.
+    await purge_tenants(
+        emails,
+        event_ids=[built["orphan_event_id"]],
+        owner="test_tenant_isolation.tenants",
+    )
 
 
 # --------------------------------------------------------------------- #
