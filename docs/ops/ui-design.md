@@ -269,10 +269,27 @@ is exactly the job — and it does that without uppercase, without letter-spacin
 and without a rule underneath, all of which are the generic ways to make a label
 recede.
 
-**It appears in exactly two places** — the strip's three station labels and the
-device board's column heads. Not on form fields, not on section titles, not on
-empty states. One borrowed convention used twice is a motif; used everywhere it
-is a costume.
+**The rule is a kind, not a count: it marks the head of a column or station of
+machine-generated data, and nothing else.** Not form fields, not section titles,
+not empty states, not prose. A borrowed convention held to one kind of object is
+a motif; spread across every label it is a costume.
+
+That covers the strip's three station labels, the device board's column heads,
+and the log ledger's column heads — the ledger's heads are the same kind of
+object as the board's, and #46 took the convention there on that reading.
+
+> **Struck 2026-08-16 (#47):** this paragraph read *"It appears in exactly two
+> places — the strip's three station labels and the device board's column
+> heads."* It was written when those were the only two, and #46 correctly made
+> it three. #46 flagged the discrepancy and left it, this being #43's file.
+>
+> Restated as a rule rather than re-counted to three, because a count in prose
+> is wrong again at the next surface and nothing fails when it drifts. The
+> boundary the sentence was actually defending — *heads of machine-generated
+> columns, not labels in general* — is preserved above and is what #46 applied
+> when it declined the convention for the log's filter-bar form labels. This
+> also closes §7's open question about whether the log reuses the strip's
+> vocabulary: it does, for column heads, and not for anything else.
 
 ### 2.5 The width budget, computed
 
@@ -288,6 +305,28 @@ character**.
 | `; called from` label | 13 | 110px |
 
 **Budget 380px for one address cell.** Not 200. This one number decides §3.
+
+> **Reconciled 2026-08-16 (#47), recording #44's finding.** The label row above
+> is wrong twice, and neither error touches the 380px conclusion.
+>
+> 1. **Wrong character count.** §3.3 specifies two longer forms of the same
+>    label — `; called from (declared myip)` (29 chars) and
+>    `; called from (no update on record)` (**35**). The row budgets the
+>    13-character bare form.
+> 2. **Wrong size.** §2.4 sets labels in the data face at **12px**, where the
+>    advance is 0.6 × 12 = 7.2px per character, not the 8.4px this table's
+>    heading establishes for 14px body values.
+>
+> At the size §2.4 actually specifies: 13 chars → 94px, 35 chars → **252px**.
+> So the widest label is ~2.3× the budgeted width, and a rail whose label
+> column was sized from this row would clip the label that exists to explain
+> why nothing is being compared — the one label a reader most needs to finish.
+>
+> #44 found this by looking at a rendered screenshot rather than at the table,
+> which is the only way it was ever going to be found: the arithmetic in the
+> row is self-consistent, and both of its inputs are wrong. Left in place
+> rather than silently corrected, because the row is load-bearing for nothing
+> and the *method* that caught it is the part worth keeping.
 
 ---
 

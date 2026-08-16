@@ -1186,6 +1186,53 @@ the single accent appears nowhere except on a measured disagreement. The
 argument is a measurement, not a preference: 225 of 238 real updates are `nochg`,
 so a design that paints the healthy state paints 94.5% of the surface.
 
+### §4 was reconciled against the *built and deployed* UI by issue #47
+
+The block above reconciled §4 against the built **model**, before any UI
+existed. This one reconciles it against what a browser can reach on a running
+stack. The route-by-route evidence is `docs/ops/ui-parity.md`; this is the
+clause-by-clause verdict on §4's own sentences.
+
+**Verdict: 5 of §4's 8 direction clauses hold as written, 1 holds with its
+premise corrected, 2 are unbuilt.** The two unbuilt ones account for 10 of the
+15 routes the exit criterion leaves unaccounted for.
+
+| §4 clause | verdict | against what |
+|---|---|---|
+| *"The device is the primary object, the hostname is its detail… registered via `registerRoute` + `registerNavItem`"* | **holds** | `registerRoute atrium-ddns-board` + `registerNavItem atrium-ddns-board-nav` ("Devices and names"), both present in the bundle the stack serves |
+| *"A status board, not a CRUD list"* | **holds, and this is now the problem** | it is exactly a status board — see the clause below on hostname CRUD, which §4 never said had to exist and therefore nobody built |
+| *"The signature element: the resolution strip"* | **holds, with the arrangement corrected** | three rows on a vertical rail, not three columns; already recorded above by #43 |
+| *"Domains are a tenant surface, not an admin one. A user manages their own domains and provider credentials on their own page"* | **holds** | `registerRoute atrium-ddns-domains` `/atrium-ddns/domains`; `GET/POST /api/atrium_ddns/domains`, `POST …/backends`, `PATCH/DELETE /backends/{id}` |
+| *"Cross-tenant views live behind `atrium_ddns.admin` as an admin tab"* | **does not hold** | the admin tab is registered and is still the scaffold's counter widget. `atrium_ddns.admin` *does* widen the scope on every model (`scope.py:97,152`), so a holder silently sees every tenant's rows merged into their own board with **no owner column and no way to tell them apart**. The permission works; the view §4 promised does not exist. The one place cross-tenant was built properly is the log (#46), which uses a *different*, narrower permission and renders a `user` column |
+| *"Configuration collapses. Rate limits, health-check config, retention become one nested group via `registerSettingsGroup`"* | **unbuilt** | `registerSettingsGroup` appears nowhere in the shipped bundle. All 11 settings exist and are served at `GET /api/admin/app-config`; atrium has no generic namespace editor, so they are reachable only by `curl`. §5 opened no issue for this clause |
+| *"Logs are a first-class search surface… filter by device, domain, hostname, response code, and time range… Admins get a user filter on top"* | **holds in full** | `registerRoute atrium-ddns-logs`; every named filter is implemented (#46), and the admin filter is gated on `atrium_ddns.events.read.all` with an explicit 403 rather than a silent narrowing |
+| *"Users are atrium's, not ours. The old user-management pages disappear"* | **holds** | all 13 legacy auth/user/profile routes are covered by atrium surfaces that answer on the running stack |
+
+**The clause §4 never wrote is the one that cost the milestone.** §4 opens by
+listing the old UI's nine admin pages and arguing they are one object graph, and
+it is right. But in re-framing hostname management as *"the hostname is its
+detail"* it stopped describing hostnames as something a tenant **creates**, and
+no issue picked the capability up. The result is measurable on a deployed stack:
+a super_admin holding `atrium_ddns.hostname.manage` cannot make a hostname by
+any route, because **nothing in the shipped application constructs a `Hostname`**
+outside the compat-fixture seeder. The board, the strip and most of the log are
+built, tested, deployed and unreachable from a standing start.
+
+That is a seam of exactly the shape `overnight-template.md` warns about: every
+V1M3 issue was individually complete and correctly scoped, and only the exit
+criterion could see it. It is not visible from §4 either, which is why this
+paragraph is here rather than in a per-issue note.
+
+**One §4 sentence is now demonstrably false and should not be repeated:** *"The
+old pages were scattered because there was no object to hang them on; now there
+is."* The object exists and the pages hang off it correctly — and the count of
+distinct surfaces went from the old UI's 9 to 5 registered routes, which is the
+consolidation §4 wanted. But consolidation was never the binding constraint;
+**coverage** was, and §4 contains no clause about it. The next plan section that
+reframes an information architecture should carry an explicit list of the
+capabilities the old surface provided, so that "we replaced nine pages with
+five" cannot be read as "we kept what the nine pages did".
+
 ---
 
 ## 5. Milestones
