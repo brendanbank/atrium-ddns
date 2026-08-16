@@ -1193,18 +1193,24 @@ existed. This one reconciles it against what a browser can reach on a running
 stack. The route-by-route evidence is `docs/ops/ui-parity.md`; this is the
 clause-by-clause verdict on §4's own sentences.
 
-**Verdict: 5 of §4's 8 direction clauses hold as written, 1 holds with its
-premise corrected, 2 are unbuilt.** The two unbuilt ones account for 10 of the
-15 routes the exit criterion leaves unaccounted for.
+**Verdict: ~~5~~ 5 of §4's 8 direction clauses hold as written, 1 holds with its
+premise corrected, ~~2 are unbuilt~~ 1 does not hold and 1 is unbuilt.** ~~The two
+unbuilt ones account for 10 of the 15 routes the exit criterion leaves
+unaccounted for.~~ **Re-read against the deployed stack by #47's re-run: the
+unbuilt clause accounts for 4 of the 10 routes the criterion leaves unaccounted
+for; the clause that does not hold accounts for 0 under the counted reading and
+2 under the stricter one (`ui-parity.md` §4).** The row that moved is the
+hostname-CRUD one — #69 built it, and the paragraph below that called it "the
+clause §4 never wrote" is kept because the *lesson* outlived the defect.
 
 | §4 clause | verdict | against what |
 |---|---|---|
 | *"The device is the primary object, the hostname is its detail… registered via `registerRoute` + `registerNavItem`"* | **holds** | `registerRoute atrium-ddns-board` + `registerNavItem atrium-ddns-board-nav` ("Devices and names"), both present in the bundle the stack serves |
-| *"A status board, not a CRUD list"* | **holds, and this is now the problem** | it is exactly a status board — see the clause below on hostname CRUD, which §4 never said had to exist and therefore nobody built |
+| *"A status board, not a CRUD list"* | ~~**holds, and this is now the problem**~~ **holds** | ~~it is exactly a status board — see the clause below on hostname CRUD, which §4 never said had to exist and therefore nobody built~~ **Re-measured 2026-08-16 by #47's re-run:** it is still exactly a status board, and the CRUD list §4 never asked for is now a *separate* registration next to it — `registerRoute atrium-ddns-names` `/atrium-ddns/names` (#69). A plain `user`-role tenant goes from an empty account to a rendered resolution strip in six HTTP calls; `ui-parity.md` §3.3.1 is the transcript |
 | *"The signature element: the resolution strip"* | **holds, with the arrangement corrected** | three rows on a vertical rail, not three columns; already recorded above by #43 |
 | *"Domains are a tenant surface, not an admin one. A user manages their own domains and provider credentials on their own page"* | **holds** | `registerRoute atrium-ddns-domains` `/atrium-ddns/domains`; `GET/POST /api/atrium_ddns/domains`, `POST …/backends`, `PATCH/DELETE /backends/{id}` |
-| *"Cross-tenant views live behind `atrium_ddns.admin` as an admin tab"* | **does not hold** | the admin tab is registered and is still the scaffold's counter widget. `atrium_ddns.admin` *does* widen the scope on every model (`scope.py:97,152`), so a holder silently sees every tenant's rows merged into their own board with **no owner column and no way to tell them apart**. The permission works; the view §4 promised does not exist. The one place cross-tenant was built properly is the log (#46), which uses a *different*, narrower permission and renders a `user` column |
-| *"Configuration collapses. Rate limits, health-check config, retention become one nested group via `registerSettingsGroup`"* | **unbuilt** | `registerSettingsGroup` appears nowhere in the shipped bundle. All 11 settings exist and are served at `GET /api/admin/app-config`; atrium has no generic namespace editor, so they are reachable only by `curl`. §5 opened no issue for this clause |
+| *"Cross-tenant views live behind `atrium_ddns.admin` as an admin tab"* | **does not hold** | the admin tab is registered — key `atrium-ddns`, not `atrium-ddns-admin-tab` — and is still the scaffold's counter widget. `atrium_ddns.admin` *does* widen the scope on every model (`scope.py:97,152`), so a holder silently sees every tenant's rows merged into their own board with **no owner column and no way to tell them apart**. **Re-measured 2026-08-16 and now demonstrated rather than described:** an `atrium_ddns.admin` holder created and deleted a name inside another tenant's zone (201 / 204), and its own list endpoint returns rows whose keys contain no `owner` or `user` field at all. #69's hostname surface inherited the same shape. The permission works; the view §4 promised does not exist. The one place cross-tenant was built properly is the log (#46), which uses a *different*, narrower permission and renders a `user` column |
+| *"Configuration collapses. Rate limits, health-check config, retention become one nested group via `registerSettingsGroup`"* | **unbuilt** | `registerSettingsGroup` appears nowhere in the shipped bundle. All 11 settings exist and are served at `GET /api/admin/app-config`; atrium has no generic namespace editor, so they are reachable only by `curl`. §5 opened no issue for this clause. **Re-taken 2026-08-16 against the *served shell bundle* rather than atrium's source, and it holds:** one bundle, no lazy chunks, `atrium_ddns` appears 0 times in it, and the namespace-parameterised `PUT /admin/app-config/${e}` hook has exactly four call sites, every one a literal (`auth`, `brand`, `system`, `i18n`). Nothing derives a namespace from the admin API's own response, so a namespace no screen names is unreachable |
 | *"Logs are a first-class search surface… filter by device, domain, hostname, response code, and time range… Admins get a user filter on top"* | **holds in full** | `registerRoute atrium-ddns-logs`; every named filter is implemented (#46), and the admin filter is gated on `atrium_ddns.events.read.all` with an explicit 403 rather than a silent narrowing |
 | *"Users are atrium's, not ours. The old user-management pages disappear"* | **holds** | all 13 legacy auth/user/profile routes are covered by atrium surfaces that answer on the running stack |
 
@@ -1212,26 +1218,60 @@ premise corrected, 2 are unbuilt.** The two unbuilt ones account for 10 of the
 listing the old UI's nine admin pages and arguing they are one object graph, and
 it is right. But in re-framing hostname management as *"the hostname is its
 detail"* it stopped describing hostnames as something a tenant **creates**, and
-no issue picked the capability up. The result is measurable on a deployed stack:
-a super_admin holding `atrium_ddns.hostname.manage` cannot make a hostname by
-any route, because **nothing in the shipped application constructs a `Hostname`**
-outside the compat-fixture seeder. The board, the strip and most of the log are
-built, tested, deployed and unreachable from a standing start.
+no issue picked the capability up. The result was measurable on a deployed
+stack: a super_admin holding `atrium_ddns.hostname.manage` ~~cannot~~ *could
+not* make a hostname by any route, because **nothing in the shipped application
+constructed a `Hostname`** outside the compat-fixture seeder. The board, the
+strip and most of the log were built, tested, deployed and unreachable from a
+standing start.
 
 That is a seam of exactly the shape `overnight-template.md` warns about: every
 V1M3 issue was individually complete and correctly scoped, and only the exit
 criterion could see it. It is not visible from §4 either, which is why this
 paragraph is here rather than in a per-issue note.
 
+**The defect is closed; the paragraph stays.** #69 shipped the hostname
+lifecycle, and #47's re-run re-drove it end to end on a stack of its own — an
+invited `user`-role tenant, an empty account, and a rendered resolution strip
+six HTTP calls later (`ui-parity.md` §3.3.1). What outlived the defect is the
+lesson above, which is about how §4 was *written* rather than about what was
+built: a section that reframes an information architecture and never enumerates
+the capabilities the old one provided will produce this seam again, and no
+per-issue review will see it. Struck-through wording marks what changed; the
+argument is unamended.
+
 **One §4 sentence is now demonstrably false and should not be repeated:** *"The
 old pages were scattered because there was no object to hang them on; now there
 is."* The object exists and the pages hang off it correctly — and the count of
-distinct surfaces went from the old UI's 9 to 5 registered routes, which is the
-consolidation §4 wanted. But consolidation was never the binding constraint;
+distinct surfaces went from the old UI's 9 to ~~5~~ **6** registered routes
+(re-counted 2026-08-16 out of the served bundle: `atrium-ddns-board`,
+`-domains`, `-devices`, `-names`, `-logs`, plus the scaffold `-page`; #69's
+`-names` is the one that was not there when this line was first written), which
+is the consolidation §4 wanted. But consolidation was never the binding
+constraint;
 **coverage** was, and §4 contains no clause about it. The next plan section that
 reframes an information architecture should carry an explicit list of the
 capabilities the old surface provided, so that "we replaced nine pages with
 five" cannot be read as "we kept what the nine pages did".
+
+### The re-run, and the one thing §4 still owes
+
+`ui-parity.md` was re-derived end to end on 2026-08-16 rather than amended in
+place, because #69 had re-measured only G1 and said so. The result is
+**exit 2 — 10 of 39 routes in neither column, 7 of 22 pages**, with a third
+disposition added on the operator's decision: `POST /admin/events/clear` is
+recorded as **deliberately dropped**, superseded by the scheduled retention
+prune (`atrium_ddns-retention-prune`, registered on the deployed worker,
+`event_retention_days = 30`). That is a *host* feature, not atrium's, so it does
+not fit "deleted because atrium covers it" literally and is not filed there.
+
+**What §4 still owes is one clause and one page.** The unbuilt
+`registerSettingsGroup` clause is 4 of the 10 remaining routes and is the
+largest single block; §5 opened no issue for it and this re-run did not build
+it. The other honest remainder is the per-hostname *backend* screen (2 routes),
+which needs a schema change rather than a page: no per-hostname backend
+selection, no per-hostname TTL, no manual-update endpoint. Both are reported,
+neither is designed around.
 
 ---
 
