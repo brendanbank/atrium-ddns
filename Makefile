@@ -138,6 +138,23 @@ seed-admin:  ## seed a super_admin (EMAIL=... PASSWORD=... [FULL_NAME=...])
 seed-bundle:  ## point system.host_bundle_url at /host/main.js
 	$(COMPOSE) exec -T api python -m atrium_ddns.scripts.seed_host_bundle /host/main.js
 
+# The other promotion step. `0001_init` seeds `app_settings['brand']` so a
+# *fresh* database comes up named correctly, but an alembic revision runs
+# once per database: after it is stamped, correcting the name means either
+# editing an applied revision (which never re-runs) or an UPDATE typed at
+# the deployed database. This target is re-runnable, so the declared value
+# and the stored one can be reconciled at any point.
+#
+# BRAND_NAME / BRAND_PRIMARY_COLOR come from `.env` via compose, so the name
+# is declared beside the ports and secrets rather than passed by hand. The
+# recipe deliberately passes no `--name`: the container reads the
+# environment, which is the thing a fresh deploy reproduces.
+seed-brand:  ## write app_settings['brand'] from BRAND_NAME / BRAND_PRIMARY_COLOR
+	$(COMPOSE) exec -T api python -m atrium_ddns.scripts.seed_brand
+
+show-brand:  ## print the stored brand row without writing
+	$(COMPOSE) exec -T api python -m atrium_ddns.scripts.seed_brand --show
+
 # The frozen table's `fixture:` world, read out of protocol_cases.yaml
 # itself rather than restated — see the script's docstring for the four
 # schema mappings and why each is a decision.

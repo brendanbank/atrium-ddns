@@ -1,12 +1,7 @@
-import { MantineProvider, Stack, Text, Title } from '@mantine/core';
-import { QueryClientProvider } from '@tanstack/react-query';
-import {
-  AtriumProvider,
-  useAtriumColorScheme,
-} from '@brendanbank/atrium-host-bundle-utils/react';
+import { Stack, Text, Title } from '@mantine/core';
 
 import { AtriumDdnsWidget } from './AtriumDdnsWidget';
-import { queryClient } from './queryClient';
+import { DdnsRoot } from './host/DdnsRoot';
 
 function AtriumDdnsAdminTabInner() {
   return (
@@ -23,14 +18,9 @@ function AtriumDdnsAdminTabInner() {
 }
 
 export function AtriumDdnsAdminTab() {
-  const scheme = useAtriumColorScheme();
   return (
-    <MantineProvider defaultColorScheme={scheme}>
-      <QueryClientProvider client={queryClient}>
-        <AtriumProvider>
-          <AtriumDdnsAdminTabInner />
-        </AtriumProvider>
-      </QueryClientProvider>
-    </MantineProvider>
+    <DdnsRoot>
+      <AtriumDdnsAdminTabInner />
+    </DdnsRoot>
   );
 }

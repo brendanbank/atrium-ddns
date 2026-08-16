@@ -1,0 +1,674 @@
+/* atrium-ddns — the design pass, as values.
+ *
+ * Every colour and every type role in this file is `docs/ops/ui-design.md`
+ * §1 and §2. Nothing here is invented; where a value differs from the
+ * design's own spelling, the reason is written above it.
+ *
+ * Two rules the file holds to and a reviewer should check:
+ *
+ * 1. **Nothing writes a `--mantine-*` name.** `docs/theme.md` permits a
+ *    host to invent its own contract under its own prefix and forbids a
+ *    host shipping raw-CSS overrides for atrium's tokens. Every value
+ *    below is read *out* of atrium's tokens and written *into* `--ddns-*`.
+ *
+ * 2. **Everything is scoped by `[data-ddns-root]`**, the attribute
+ *    `DdnsRoot` puts on its wrapper div. The bundle's CSS reaches the
+ *    page as a runtime `<style>` tag (vite-plugin-css-injected-by-js), so
+ *    an unscoped selector here would apply to atrium's shell.
+ */
+
+/* --------------------------------------------------------------------- *
+ * 1. Palette — six values, and §7.1 says do not add a seventh.
+ *
+ * DEVIATION, argued: the design spells these with `light-dark()`. This
+ * file uses the explicit `[data-mantine-color-scheme="dark"]` form
+ * instead, which §5.3 already names as the equivalent.
+ *
+ * The reason is §5.3's own failure mode. `light-dark()` resolves against
+ * the `color-scheme` property, which reaches this subtree only because
+ * `@mantine/core/styles.css:3` sets `color-scheme: var(--mantine-color-scheme)`
+ * on `:root` and binds that variable off `[data-mantine-color-scheme]`.
+ * The host bundle does not load that stylesheet and does not control when
+ * atrium does. If that ordering ever changes, `light-dark()` silently
+ * resolves every colour to its *light* value in both schemes — a
+ * corruption with no error and no visible symptom in a light-mode
+ * screenshot.
+ *
+ * The explicit form depends on the attribute alone, which is the thing
+ * atrium is always right about and the thing this issue's acceptance
+ * criterion names. It is also the only one of the two that a jsdom test
+ * can observe, so the dark scheme is asserted rather than assumed.
+ * --------------------------------------------------------------------- */
+
+[data-ddns-root] {
+  /* Aliased onto atrium's stable tokens so an operator's brand change
+     moves them. Light values: gray-9 / gray-7 / gray-6 / gray-3. */
+  --ddns-ink: var(--mantine-color-gray-9);       /* #212529, 15.43:1 on white */
+  --ddns-quiet: var(--mantine-color-gray-7);     /* #495057,  8.18:1 */
+  --ddns-rule: var(--mantine-color-gray-6);      /* #868e96,  3.32:1 — WCAG 1.4.11 */
+  --ddns-edge: var(--mantine-color-gray-3);      /* #dee2e6 — decorative only */
+
+  /* Host-owned literals, not tokens, and §1.3 is the argument. The
+     darkest orange Mantine ships (`orange-9`, #d9480f) measures 4.30:1
+     on white — short of the 4.5:1 accent text at 14px needs — so no step
+     in the scale qualifies. And a status colour must not move when
+     someone rebrands: a learned signal that is re-themable is not a
+     signal. #B4500A is 5.13:1 on white and 4.61:1 on gray-1, the
+     lightest surface a Paper lands on. */
+  --ddns-diverge: #b4500a;
+  --ddns-diverge-wash: color-mix(in srgb, var(--ddns-diverge) 8%, transparent);
+}
+
+[data-mantine-color-scheme='dark'] [data-ddns-root] {
+  --ddns-ink: var(--mantine-color-dark-0);       /* #C9C9C9, 9.37:1 on #242424 */
+  --ddns-quiet: var(--mantine-color-dark-1);     /* #b8b8b8, 7.83:1 */
+  --ddns-rule: var(--mantine-color-dark-2);      /* #828282, 4.04:1 */
+  --ddns-edge: var(--mantine-color-dark-4);      /* #424242 */
+  --ddns-diverge: #f59042;                       /* 6.62:1 on #242424 */
+}
+
+/* --------------------------------------------------------------------- *
+ * 2. Type — three roles, §2.1.
+ * --------------------------------------------------------------------- */
+
+[data-ddns-root] {
+  /* `--mantine-font-family-monospace`'s stack with Courier New removed
+     and four better candidates inserted ahead of the generic fallback.
+     Courier New is markedly lighter in stroke than everything else in
+     the stack, so a column of addresses set in it reads as *disabled
+     text* — on a machine where it is the only hit, the design would
+     silently claim every value is inactive. */
+  --ddns-font-data: ui-monospace, 'SF Mono', SFMono-Regular, 'Cascadia Mono',
+    Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace;
+  --ddns-font-body: var(--mantine-font-family);
+  --ddns-font-head: var(--mantine-font-family-headings);
+}
+
+/* The boundary rule, §2.2: if you would paste it into a `dig` command it
+   is the data face; if you would say it out loud it is the body face.
+   There is no third case, and a paragraph set in mono is a review
+   comment. */
+[data-ddns-root] .ddns-data {
+  font-family: var(--ddns-font-data);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'zero' 1, 'ss01' 1;
+  font-size: var(--mantine-font-size-sm);
+  line-height: var(--mantine-line-height-sm);
+  color: var(--ddns-ink);
+}
+
+/* §2.3, the type idea: data outranks its label. The values are 14px and
+   the words naming them are 12px. That inversion is the whole
+   typographic statement and it needs no third typeface to make it. */
+[data-ddns-root] .ddns-label {
+  font-family: var(--ddns-font-data);
+  font-size: var(--mantine-font-size-xs);
+  line-height: var(--mantine-line-height-xs);
+  color: var(--ddns-quiet);
+  white-space: nowrap;
+}
+
+/* §2.4: labels are zone-file comments. `;` begins a comment in DNS
+   master-file format (RFC 1035 §5.1), so to this audience it reads
+   instantly as annotation rather than data — without uppercase, without
+   letter-spacing and without a rule underneath. It appears in exactly
+   two places: the strip's station labels and the board's column heads.
+   One borrowed convention used twice is a motif; used everywhere it is a
+   costume. The `;` is generated here rather than typed into every string
+   so it cannot drift, and it is `aria-hidden` by construction because a
+   screen reader saying "semicolon answered" is noise. */
+[data-ddns-root] .ddns-label::before {
+  content: '; ';
+}
+
+/* --------------------------------------------------------------------- *
+ * 3. The resolution strip — Arrangement B, §3.1.
+ *
+ * Three rows on a rail, not three columns. Three columns needs
+ * 3 x 380 + 2 x 16 + 200 + 24 = ~1436px; atrium's AppShell
+ * (header 60, navbar 240, padding md) leaves 1168px at a 1440px viewport
+ * and 1008px on a 1280px laptop. The overflow behaviour of the column
+ * layout is "silently show a different address", because a wrapped IPv6
+ * address breaks at an arbitrary character with no visual mark — which
+ * disqualifies it rather than making it tight.
+ *
+ * This arrangement's minimum is 110 label + 380 address + 50 time +
+ * 16 rail + 3 x 12 gutter = ~592px.
+ * --------------------------------------------------------------------- */
+
+[data-ddns-root] .ddns-strip {
+  border: 1px solid var(--ddns-edge);
+  border-radius: var(--mantine-radius-sm);
+  padding: var(--mantine-spacing-md);
+  background: transparent;
+}
+
+/* §1.2 Rule 1 — agreement has no colour. There is no green in this
+   design, and nothing about a healthy row is tinted, badged or filled.
+   M3 is the reason: 94.5% of real updates change nothing, so a design
+   that paints the healthy state paints almost the whole surface and the
+   accent that carries the entire product has to compete with it. The
+   wash below appears only on a strip carrying a real divergence. */
+[data-ddns-root] .ddns-strip[data-diverged='true'] {
+  background: var(--ddns-diverge-wash);
+  border-color: var(--ddns-diverge);
+}
+
+[data-ddns-root] .ddns-strip__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--mantine-spacing-sm);
+  margin-bottom: var(--mantine-spacing-xs);
+}
+
+[data-ddns-root] .ddns-strip__family {
+  color: var(--ddns-quiet);
+  font-size: var(--mantine-font-size-xs);
+}
+
+[data-ddns-root] .ddns-strip__body {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  column-gap: var(--mantine-spacing-sm);
+}
+
+/* The rail. Two segments for two joints — §3.2: the three values are not
+   peers, they stand in a causal order (the device called from -> we
+   published -> the world answers) and what matters is the two *joints*
+   between them. It is a chain of custody and not a timeline: there is no
+   time axis, the vertical spacing carries no duration, and nothing may
+   be added later that implies one. */
+[data-ddns-root] .ddns-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: stretch;
+}
+
+[data-ddns-root] .ddns-rail__joint {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  width: 100%;
+}
+
+[data-ddns-root] .ddns-rail__seg {
+  flex: 1 1 0;
+  width: 0;
+  /* Absence of a rail segment is a statement: *no comparison was made,
+     and none should have been.* It is not the same as a comparison that
+     came back equal (a solid hairline) and not the same as one we could
+     not make (dotted or dashed). */
+  border-left: 0 none transparent;
+}
+
+[data-ddns-root] .ddns-rail__joint[data-verdict='agreed'] .ddns-rail__seg {
+  border-left: 1px solid var(--ddns-rule);
+}
+
+[data-ddns-root] .ddns-rail__joint[data-verdict='diverged'] .ddns-rail__seg {
+  border-left: 2px solid var(--ddns-diverge);
+}
+
+[data-ddns-root]
+  .ddns-rail__joint[data-verdict='not_measured_never']
+  .ddns-rail__seg {
+  border-left: 1px dotted var(--ddns-rule);
+}
+
+[data-ddns-root]
+  .ddns-rail__joint[data-verdict='not_measured_failed']
+  .ddns-rail__seg {
+  border-left: 1px dashed var(--ddns-rule);
+}
+
+/* §1.2 Rule 3 — colour is never the only channel, and the dark scheme is
+   why. In light, accent and ink differ in luminance by 3.01:1, so a
+   greyscale render still separates them; in dark they differ by 1.42:1,
+   which means a dark-scheme screenshot converted to greyscale shows a
+   diverged address and an agreeing one as the same tone. So the glyph
+   below is not decoration — it is the second of the three redundant
+   channels (stroke style, glyph, word). */
+[data-ddns-root] .ddns-rail__glyph {
+  font-family: var(--ddns-font-data);
+  font-size: var(--mantine-font-size-xs);
+  line-height: 1;
+  color: var(--ddns-rule);
+  background: var(--mantine-color-body);
+  padding: 2px 0;
+}
+
+[data-ddns-root]
+  .ddns-rail__joint[data-verdict='diverged']
+  .ddns-rail__glyph {
+  color: var(--ddns-diverge);
+  font-weight: 700;
+}
+
+/* ONE grid for all three stations, not one grid per station.
+ *
+ * DEVIATION, and it was found by looking at a screenshot rather than by
+ * reading the design. §2.5 budgets **110px** for the label column, from
+ * `; called from` at 13 characters. §3.3 then specifies longer labels
+ * for the same column — `; called from (declared myip)` is 29
+ * characters and `; called from (no update on record)` is 35 — and the
+ * two sections never meet. Built literally, with a fixed 110px column
+ * and `white-space: nowrap`, the qualified labels overflow and are
+ * drawn *underneath the address*: measured at 1440px on the deployed
+ * stack, `; called from (no2001:0db8:0000…` — two strings occupying the
+ * same pixels, which is the one failure mode §3.1 disqualified an
+ * entire arrangement for.
+ *
+ * A per-station grid sized to `max-content` would fix the overlap and
+ * break the alignment instead: three rows with three different label
+ * widths, and the rail is a claim about rows that line up. So the grid
+ * moves up one level and the stations become `display: contents`. The
+ * label column is then `max-content` **across all three rows at once** —
+ * shared, aligned, and sized by whichever label is longest.
+ *
+ * What it costs, stated because §3.1's minimum-width figure moves:
+ * ~592px assumed a 110px label. The longest label measures 246px in the
+ * data face at 12px, so the qualified case's minimum is ~728px. Still
+ * one-up on a tablet and two-up at desktop; and below 640px the label
+ * column drops out entirely (see the media queries at the end), so the
+ * phone case is unaffected.
+ */
+[data-ddns-root] .ddns-strip__stations {
+  display: grid;
+  grid-template-columns: minmax(110px, max-content) minmax(0, 1fr) auto;
+  align-items: baseline;
+  column-gap: var(--mantine-spacing-sm);
+  row-gap: var(--mantine-spacing-xs);
+  min-width: 0;
+}
+
+[data-ddns-root] .ddns-station {
+  display: contents;
+}
+
+[data-ddns-root] .ddns-station__value {
+  min-width: 0;
+}
+
+[data-ddns-root] .ddns-station__time {
+  color: var(--ddns-quiet);
+  font-family: var(--ddns-font-data);
+  font-size: var(--mantine-font-size-xs);
+  white-space: nowrap;
+}
+
+/* §2.5's width budget, honoured: 380px for one address cell, not 200.
+   The widest real IPv6 seen in this estate is 39 characters (M2: 158 of
+   232 rows, and 7 colons on 232 of 232 — never `::`-compressed), and the
+   column ceiling is 45. At 8.4px per character that is 328px and 378px. */
+[data-ddns-root] .ddns-address {
+  min-width: 0;
+  /* §3.5: never `anywhere` or `break-all`, which split a hextet and make
+     `…:0db8:` and `…:0d` `b8:` look alike. The only break opportunities
+     are the `<wbr>` elements the renderer emits after each `:` or `.`. */
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+[data-ddns-root] .ddns-address[data-tone='diverge'] {
+  color: var(--ddns-diverge);
+}
+
+[data-ddns-root] .ddns-address[data-tone='quiet'] {
+  color: var(--ddns-quiet);
+}
+
+/* The differing groups, underlined. The third redundant channel, and the
+   one that survives a greyscale render at address level rather than at
+   rail level. */
+[data-ddns-root] .ddns-group[data-differs='true'] {
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 2px;
+}
+
+[data-ddns-root] .ddns-strip__error {
+  color: var(--ddns-quiet);
+  font-family: var(--ddns-font-data);
+  font-size: var(--mantine-font-size-xs);
+  grid-column: 2 / -1;
+}
+
+/* Collapsed form, §3.4. A strip whose every applicable joint is `agreed`
+   collapses to one line, and the line names its denominator. */
+[data-ddns-root] .ddns-strip--collapsed {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--mantine-spacing-sm);
+  width: 100%;
+  background: none;
+  border: 1px solid var(--ddns-edge);
+  border-radius: var(--mantine-radius-sm);
+  padding: var(--mantine-spacing-xs) var(--mantine-spacing-md);
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+
+/* §4.5: a loading strip has **no rail**, so it cannot be mistaken for an
+   agreed one. Deliberately a flat block and not a shimmer — §3.7 allows
+   exactly one transition in this design and it is on the rail. */
+[data-ddns-root] .ddns-strip--loading {
+  height: 96px;
+  border-radius: var(--mantine-radius-sm);
+  background: var(--ddns-edge);
+}
+
+/* --------------------------------------------------------------------- *
+ * 4. The device board — Arrangement B, §3.6. A ledger ordered by
+ * liveness, with no sort control in the default view: the ordering is
+ * the opinion. A device that has gone quiet is at the top of the page
+ * without anyone asking.
+ * --------------------------------------------------------------------- */
+
+[data-ddns-root] .ddns-board {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mantine-spacing-lg);
+}
+
+[data-ddns-root] .ddns-board__head,
+[data-ddns-root] .ddns-device__line {
+  display: grid;
+  grid-template-columns: 3ch minmax(0, 1fr) 12ch 14ch;
+  align-items: baseline;
+  column-gap: var(--mantine-spacing-sm);
+  width: 100%;
+  text-align: left;
+}
+
+[data-ddns-root] .ddns-board__head {
+  border-bottom: 1px solid var(--ddns-edge);
+  padding-bottom: var(--mantine-spacing-xs);
+}
+
+[data-ddns-root] .ddns-device__line {
+  background: none;
+  border: 0;
+  padding: var(--mantine-spacing-xs) 0;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  border-bottom: 1px solid var(--ddns-edge);
+}
+
+/* §3.6: only `never_seen` and `last_call_failed` are marked. `idle` is
+   not, and M3 is why — half the fleet produced zero events in a 24-hour
+   window, so marking idle would paint half the board and destroy the
+   marker. Idle is normal, and it renders as a measured `0`. */
+[data-ddns-root] .ddns-device__marker {
+  font-family: var(--ddns-font-data);
+  font-weight: 700;
+  color: var(--ddns-diverge);
+}
+
+[data-ddns-root] .ddns-device__hostnames {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mantine-spacing-sm);
+  padding-left: var(--mantine-spacing-md);
+  padding-top: var(--mantine-spacing-sm);
+}
+
+[data-ddns-root] .ddns-hostname__strips {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mantine-spacing-sm);
+}
+
+/* --------------------------------------------------------------------- *
+ * 4b. The log search — a ledger of two-line entries.
+ *
+ * ARRANGEMENT, decided by §2.5's own width budget rather than by taste,
+ * and the argument is §3.1's applied one level along.
+ *
+ * A log line carries TWO addresses: `client_ip` (where the call came
+ * from) and `ip` (what it was about). One address cell is budgeted at
+ * 380px — the widest real IPv6 in this estate is 39 characters and never
+ * `::`-compressed (M2), and the column ceiling is 45. A one-row table
+ * with both as columns needs 2 x 380 + 90 time + 140 device + 260 name +
+ * 80 result + 90 backend = ~1420px. Atrium's AppShell leaves 1168px at a
+ * 1440px viewport and 1008px on a 1280px laptop, so it does not fit —
+ * and the overflow behaviour of an address column is "silently show a
+ * different address", which §3.1 disqualified an entire arrangement for.
+ *
+ * So the entry is two lines: a fielded head line carrying the short
+ * columns, and an address line spanning the full width beneath it. One
+ * address then has 380px with room to spare and two have 760px inside
+ * 1168px. Minimum ~780px, which is one-up at tablet width.
+ *
+ * M3 pays for it twice: 94.5% of updates are `nochg` with no `myip`, so
+ * the second address is usually absent and the address line is short.
+ * --------------------------------------------------------------------- */
+
+[data-ddns-root] .ddns-log {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mantine-spacing-sm);
+}
+
+[data-ddns-root] .ddns-log__head {
+  display: grid;
+  /* when | device | name | event | result | via | user
+     `minmax(0, …)` on the two name columns so a long hostname shrinks
+     rather than pushing the result column off the edge. */
+  grid-template-columns:
+    10ch minmax(0, 1.2fr) minmax(0, 2fr) 8ch 10ch 10ch minmax(0, 1fr);
+  align-items: baseline;
+  column-gap: var(--mantine-spacing-sm);
+  width: 100%;
+  text-align: left;
+}
+
+[data-ddns-root] .ddns-log__columns {
+  border-bottom: 1px solid var(--ddns-edge);
+  padding-bottom: var(--mantine-spacing-xs);
+}
+
+[data-ddns-root] .ddns-log__entry {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-bottom: var(--mantine-spacing-xs);
+  border-bottom: 1px solid var(--ddns-edge);
+}
+
+/* §1.2 Rule 1 — agreement has no colour. A `good` or `nochg` line is
+   plain ink on the page background: not tinted, not badged, not filled.
+   M3 is why — 94.5% of real updates change nothing, so painting the
+   healthy state paints almost the whole log and the accent that carries
+   the product has to compete with it.
+
+   The wash appears only on a refused line. Same value, same meaning and
+   same threshold as the strip's: this is true and it is wrong. */
+[data-ddns-root] .ddns-log__entry[data-tone='diverge'] {
+  background: var(--ddns-diverge-wash);
+}
+
+[data-ddns-root] .ddns-log__result[data-tone='diverge'] {
+  color: var(--ddns-diverge);
+  font-weight: 700;
+}
+
+/* §1.2 Rule 3 — colour is never the only channel. In dark the accent
+   and the ink differ in luminance by 1.42:1, so a greyscale render shows
+   a refused line and an accepted one as the same tone. The glyph is the
+   second channel and `.ddns-sr` carries the third. */
+[data-ddns-root] .ddns-log__glyph {
+  font-family: var(--ddns-font-data);
+  font-weight: 700;
+}
+
+/* The address line. Full width by construction — it is a sibling of the
+   grid, not a cell in it — so §2.5's 380px is available without the
+   short columns having to give any of theirs up. */
+[data-ddns-root] .ddns-log__addresses {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--mantine-spacing-xs) var(--mantine-spacing-sm);
+  padding-left: 10ch;
+  min-width: 0;
+}
+
+[data-ddns-root] .ddns-log__message {
+  font-family: var(--ddns-font-data);
+  font-size: var(--mantine-font-size-xs);
+  color: var(--ddns-quiet);
+  padding-left: 10ch;
+}
+
+/* A deleted device keeps its name and loses its link. Quiet, not
+   accented: §4.1 already ruled that an unassigned hostname "is a
+   configuration state, not a fault, and must not be marked", and a
+   device somebody deleted is the same kind of fact. */
+[data-ddns-root] .ddns-log__gone {
+  font-family: var(--ddns-font-data);
+  font-size: var(--mantine-font-size-xs);
+  color: var(--ddns-quiet);
+}
+
+/* The pre-apply control. Interactive chrome belongs to
+   `--mantine-primary-color-*`, which the operator owns — §1.2 Rule 2
+   bans `--ddns-diverge` from anything that means "you can do this",
+   including a link and including a focus ring. The data face is kept
+   because the *content* is machine data even though the element is a
+   control (§2.2's boundary rule is about the string, not the tag). */
+[data-ddns-root] .ddns-log__filter {
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+  font-family: var(--ddns-font-data);
+  font-size: var(--mantine-font-size-sm);
+  line-height: var(--mantine-line-height-sm);
+  color: var(--mantine-primary-color-filled);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* §4.5 at ledger scale: a static grey block, no shimmer. */
+[data-ddns-root] .ddns-log__skeleton {
+  height: 44px;
+  border-radius: var(--mantine-radius-sm);
+  background: var(--ddns-edge);
+}
+
+/* --------------------------------------------------------------------- *
+ * 5. Motion — §3.7. One transition and nothing else. No page-load
+ * sequence, no scroll reveal, no hover animation, no skeleton shimmer.
+ * An operations board that animates is a board people stop trusting, and
+ * the restraint is the point of spending the boldness on the rail.
+ *
+ * The log adds none. It was tempting to fade a row in as a page loads;
+ * §3.7's rule is "one transition", not "one transition per surface", and
+ * a second one here would make the count a per-file convention rather
+ * than a design decision. `design.test.ts` counts them off the shipped
+ * stylesheet, so adding one fails there rather than in a review.
+ * --------------------------------------------------------------------- */
+
+[data-ddns-root] .ddns-rail__seg {
+  transition: border-color 120ms ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-ddns-root] * {
+    transition: none;
+  }
+}
+
+/* --------------------------------------------------------------------- *
+ * 6. Below 640px the address cell has to give, and below 480px the
+ * labels move above their values. The rail stays in both, because the
+ * rail is the content. §3.5.
+ * --------------------------------------------------------------------- */
+
+@media (max-width: 640px) {
+  [data-ddns-root] .ddns-strip__stations {
+    grid-template-columns: minmax(110px, max-content) minmax(0, 1fr);
+  }
+
+  [data-ddns-root] .ddns-station__time {
+    grid-column: 2;
+  }
+
+  [data-ddns-root] .ddns-strip__error {
+    grid-column: 2;
+  }
+}
+
+@media (max-width: 480px) {
+  /* The labels move above their values; the rail stays, because the
+     rail is the content. §3.5. */
+  [data-ddns-root] .ddns-strip__stations {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 0;
+  }
+
+  [data-ddns-root] .ddns-station {
+    display: block;
+    margin-bottom: var(--mantine-spacing-xs);
+  }
+
+  [data-ddns-root] .ddns-station__time,
+  [data-ddns-root] .ddns-strip__error {
+    grid-column: 1;
+  }
+
+  [data-ddns-root] .ddns-board__head,
+  [data-ddns-root] .ddns-device__line {
+    grid-template-columns: 3ch minmax(0, 1fr);
+  }
+}
+
+/* The log's own breakpoint. Below 900px the seven-column head line
+   cannot hold a hostname and two names at legible widths, so it stacks:
+   the fields wrap and the column head is dropped entirely rather than
+   left pointing at columns that no longer line up. A header whose
+   columns have stopped being columns is worse than no header — it is a
+   label attached to the wrong value. */
+@media (max-width: 900px) {
+  [data-ddns-root] .ddns-log__head {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--mantine-spacing-xs) var(--mantine-spacing-sm);
+  }
+
+  [data-ddns-root] .ddns-log__columns {
+    display: none;
+  }
+
+  [data-ddns-root] .ddns-log__addresses,
+  [data-ddns-root] .ddns-log__message {
+    padding-left: 0;
+  }
+}
+
+/* Screen-reader-only. Used for the word channel where the visible
+   rendering already carries stroke and glyph — never as a substitute for
+   one of the three. */
+[data-ddns-root] .ddns-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}

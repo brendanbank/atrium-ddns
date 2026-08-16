@@ -12,6 +12,15 @@
     "moduleDetection": "force",
     "noEmit": true,
     "jsx": "react-jsx",
+    // `@types/node` is not picked up automatically under TypeScript 7 +
+    // `moduleResolution: bundler`: `--traceResolution` reports
+    // *"Skipping module 'node:fs' that looks like an absolute URI"* and
+    // the import fails with TS2591 even with the package installed.
+    // Naming it here is what makes the `node:` specifiers resolve. Only
+    // the tests reach for them — `src/test/design.test.ts` reads
+    // `ddns.css` off disk, because vitest's default `css: false` stubs
+    // CSS modules and `?raw` would hand the guards an empty string.
+    "types": ["node"],
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,

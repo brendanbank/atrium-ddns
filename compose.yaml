@@ -54,6 +54,15 @@ services:
       MAIL_BACKEND: ${MAIL_BACKEND:-console}
       MAIL_FROM: ${MAIL_FROM:-no-reply@example.com}
       ATRIUM_HOST_MODULE: atrium_ddns.bootstrap
+      # Declarative branding, read by `make seed-brand`
+      # (atrium_ddns.scripts.seed_brand). Listed here for the reason the
+      # SECRET_ENCRYPTION_KEY comment above gives: `.env` only feeds
+      # ${...} interpolation, so a variable the container itself reads has
+      # to be named in this block as well. Omitted, the script would fall
+      # back to its own default and cheerfully report having written the
+      # name the operator did not ask for.
+      BRAND_NAME: ${BRAND_NAME:-Atrium Ddns}
+      BRAND_PRIMARY_COLOR: ${BRAND_PRIMARY_COLOR:-blue}
       # The frozen compat table's scripted DNS backends. Unset by
       # default and unset in .env.example, so a stack that has not been
       # told to run the table does not resolve them. Passed through

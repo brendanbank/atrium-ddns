@@ -112,6 +112,49 @@ _REVERSE_ZONE_MARKERS = ("in-addr.arpa", "ip6.arpa")
 _MASK = "<redacted>"
 
 
+def zone_contains(zone: str, hostname: str) -> bool:
+    """Whether ``hostname`` sits inside ``zone``.
+
+    **One function, two callers, and that is the whole reason it is a
+    module-level function rather than three lines inside
+    :meth:`BaseProvider.domaininhostname` where it used to live.**
+
+    - ``/nic/update`` reaches it through ``domaininhostname`` ->
+      ``hostnameperzone``, and answers ``nohost`` when it is false.
+    - ``POST /api/atrium_ddns/hostnames`` reaches it directly, and
+      refuses the row when it is false.
+
+    Those are the two places a hostname's zone membership is decided.
+    Two implementations of that rule would diverge the first time one of
+    them was edited, and the divergence is silent and asymmetric: a name
+    the CRUD accepts and the wire rejects is permanently un-updatable
+    and looks to the owner like a broken router, and the reverse looks
+    like the interface lying. Neither raises anywhere a maintainer would
+    see it. So the extraction is not tidiness — it is the only reason
+    the two answers cannot drift apart.
+
+    **Preserved quirk, recorded so a later "fix" is a decision.** The
+    test is ``rfind`` plus an end-offset check, with **no label boundary
+    check**: with ``example.com`` configured, ``notexample.com``
+    matches. It is not a tenancy hole under the rewrite — the zone set
+    comes from the hostname's own owning row, not from the request — but
+    it is wrong, and ``test_providers.py`` pins it so that changing it
+    shows up as a deliberate edit rather than as a behaviour change
+    nobody proposed. Adding the boundary check here now changes what
+    ``/nic/update`` answers, which is precisely the property that makes
+    sharing worth the extraction.
+
+    Case-insensitive on both sides, matching the legacy spelling
+    (``hostname.lower().rfind(domain.lower())``). Note the asymmetry the
+    legacy code carries and this preserves: the *offset* arithmetic uses
+    the unlowered lengths, which is harmless because ``str.lower()``
+    only changes length for a handful of non-ASCII code points that
+    ``_LABEL`` rejects anyway.
+    """
+    position = hostname.lower().rfind(zone.lower())
+    return position >= 0 and position + len(zone) == len(hostname)
+
+
 @dataclass(frozen=True)
 class ProviderAccount:
     """Everything an adapter is allowed to know about a backend row.
@@ -468,21 +511,15 @@ class BaseProvider:
     def domaininhostname(self, hostname: str) -> Any:
         """The configured domain ``hostname`` sits under, or ``False``.
 
-        **Preserved quirk, recorded so a later "fix" is a decision.**
-        The test is ``rfind`` plus an end-offset check, with no label
-        boundary: with ``example.com`` configured, ``notexample.com``
-        matches. It is not a tenancy hole under the rewrite — the domain
-        set comes from the hostname's own owning row, not from the
-        request — but it is wrong, and ``test_providers.py`` pins it so
-        that changing it shows up as a deliberate edit rather than as a
-        behaviour change nobody proposed.
+        The per-zone test is :func:`zone_contains`, called rather than
+        spelled out here — see that function for the preserved quirk and
+        for who else calls it.
 
         Iteration order is insertion order, i.e. the order the row's
         domains were listed; the first match wins, not the longest.
         """
         for domain in self._zones:
-            position = hostname.lower().rfind(domain.lower())
-            if position >= 0 and position + len(domain) == len(hostname):
+            if zone_contains(domain, hostname):
                 return domain
         return False
 
