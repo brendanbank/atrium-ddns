@@ -381,3 +381,104 @@ describe('the credential form', () => {
     expect(screen.getByTestId('credential-mode-clear')).toBeDisabled();
   });
 });
+
+describe('the zone rename (#75, ui-parity §3.3 G4)', () => {
+  test('the form sends a PATCH, and nothing else', async () => {
+    // `PATCH`, not `PUT`. The server leaves `PUT` at 405 deliberately,
+    // so a client that sent one would get a method-not-allowed that
+    // reads to an operator as "renaming does not work".
+    await mount(OPERATOR);
+    await waitFor(() =>
+      expect(
+        screen.getByTestId('rename-domain-example.net'),
+      ).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByTestId('rename-domain-example.net'));
+
+    await waitFor(() =>
+      expect(screen.getByTestId('rename-zone-name')).toBeInTheDocument(),
+    );
+    // The box opens on the current name, so a rename is an edit rather
+    // than a re-type — and the submit is disabled until it changes.
+    expect(screen.getByTestId('rename-zone-name')).toHaveValue('example.net');
+    expect(screen.getByTestId('rename-zone-submit')).toBeDisabled();
+
+    fireEvent.change(screen.getByTestId('rename-zone-name'), {
+      target: { value: '  example.org  ' },
+    });
+    fireEvent.click(screen.getByTestId('rename-zone-submit'));
+
+    await waitFor(() => expect(sent.length).toBe(1));
+    expect(sent[0].method).toBe('PATCH');
+    expect(sent[0].url).toContain('/atrium_ddns/domains/1');
+    expect(sent[0].body).toEqual({ name: 'example.org' });
+  });
+
+  test('the form warns about the names before the server has to refuse', async () => {
+    // The count is the server's own `hostname_count` for this zone, so
+    // the warning cannot claim a number the row does not show.
+    await mount(OPERATOR);
+    fireEvent.click(screen.getByTestId('rename-domain-example.net'));
+    await waitFor(() =>
+      expect(screen.getByTestId('rename-zone-warning')).toHaveTextContent(
+        '3 names',
+      ),
+    );
+    expect(screen.getByTestId('rename-zone-warning')).toHaveTextContent(
+      'refused rather than rewriting them',
+    );
+  });
+
+  test('a zone with no names says so instead of warning about nothing', async () => {
+    domainsPayload = [domain({ hostname_count: 0 })];
+    await mount(OPERATOR);
+    fireEvent.click(screen.getByTestId('rename-domain-example.net'));
+    await waitFor(() =>
+      expect(screen.getByTestId('rename-zone-warning')).toHaveTextContent(
+        'no names in it',
+      ),
+    );
+  });
+
+  test("the server's refusal is shown verbatim, counts and all", async () => {
+    // The 409 detail carries the number of names that would be orphaned
+    // and a sample of them. Rewording it here would throw away the only
+    // thing that makes the refusal actionable — and this bundle has no
+    // second copy of `zone_contains` with which to predict it.
+    const detail =
+      "renaming 'example.net' to 'example.org' would leave 3 of 3 " +
+      "hostnames outside the zone: 'box.example.net'";
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const method = init?.method ?? 'GET';
+        if (url.endsWith('/users/me/context')) return json(OPERATOR);
+        if (url.endsWith('/atrium_ddns/providers'))
+          return json({ providers: PROVIDERS });
+        if (url.endsWith('/atrium_ddns/domains') && method === 'GET')
+          return json([domain()]);
+        if (method === 'PATCH') return json({ detail }, 409);
+        return json({});
+      }),
+    );
+    await mount(OPERATOR);
+    fireEvent.click(screen.getByTestId('rename-domain-example.net'));
+    await waitFor(() =>
+      expect(screen.getByTestId('rename-zone-name')).toBeInTheDocument(),
+    );
+    fireEvent.change(screen.getByTestId('rename-zone-name'), {
+      target: { value: 'example.org' },
+    });
+    fireEvent.click(screen.getByTestId('rename-zone-submit'));
+
+    await waitFor(() =>
+      expect(screen.getByTestId('domain-error')).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId('domain-error')).toHaveTextContent(
+      '3 of 3 hostnames outside the zone',
+    );
+    expect(screen.getByTestId('domain-error')).toHaveTextContent(
+      'box.example.net',
+    );
+  });
+});

@@ -94,6 +94,24 @@ export async function createDomain(name: string): Promise<Domain> {
   return apiSend<Domain>('/atrium_ddns/domains', 'POST', { name });
 }
 
+/** `PATCH /api/atrium_ddns/domains/{id}` — the rename, #75 / §3.3 G4.
+ *
+ * `PATCH`, not `PUT`: `PUT` is still `405` and that is the server's
+ * decision rather than an omission — every partial mutation on this
+ * surface is a `PATCH`, and a second spelling of one operation is how a
+ * divergent validation path starts.
+ *
+ * The server refuses (`409`) a rename that would leave any hostname
+ * outside the zone, rather than rewriting the names. **Nothing here
+ * pre-checks that**, deliberately: containment is decided by
+ * `zone_contains`, the same function object `/nic/update` reaches, and
+ * a second copy of the rule in TypeScript would be a copy that could
+ * disagree with the wire. The form shows the server's refusal.
+ */
+export async function renameDomain(id: number, name: string): Promise<Domain> {
+  return apiSend<Domain>(`/atrium_ddns/domains/${id}`, 'PATCH', { name });
+}
+
 export async function deleteDomain(id: number): Promise<void> {
   await apiSend<void>(`/atrium_ddns/domains/${id}`, 'DELETE');
 }

@@ -5,6 +5,11 @@
 - ``GET /api/atrium_ddns/board`` — the device board and the resolution
   strips, gated by ``atrium_ddns.device.manage`` and scoped by
   :class:`~atrium_ddns.scope.DdnsScope`.
+- ``POST /api/atrium_ddns/health-checks/run`` and ``…/clear`` — the
+  board's two on-demand operator actions (#75, ui-parity §3.3 G3), same
+  permission and same scope. ``run`` **is** the scheduled job, called
+  with ``due_only=False``; it is debounced per actor because it fans out
+  to real nameservers.
 - ``GET /api/atrium_ddns/events`` — the log search. Authenticated, and
   scoped: a tenant sees their own rows and ``atrium_ddns.events.read.all``
   widens that and nothing else. Every filter is an indexed query.
@@ -14,6 +19,11 @@
   writer the board and the wire protocol were both missing; see the
   Hostnames section for why its two validators are *imported* rather
   than written.
+- ``PATCH /api/atrium_ddns/domains/{id}`` — the zone rename (#75,
+  ui-parity §3.3 G4). Refuses a rename that would leave a hostname
+  outside its zone rather than rewriting the names; see
+  :func:`rename_domain` for the argument, which is one the model had
+  already made about :class:`HostnameAssignIn`.
 
 Atrium mounts every JSON route under ``/api/...`` so the SPA owns
 un-prefixed URL space (atrium issue #89); host routes follow the same
@@ -63,6 +73,13 @@ from app.auth.users import current_user
 from app.db import get_session
 from app.host_sdk.crypto import apply_secret_update, unlock_user_secrets
 from app.models.auth import User
+
+# atrium's own audit table, read (never written) directly by the
+# health-check debounce. `record_audit` is the writer; this is the same
+# rows read back, and it is the only place host code reads an atrium
+# model. See `_last_manual_run` for why the debounce lives here rather
+# than in a table of its own.
+from app.models.ops import AuditLog
 from app.services.audit import record as record_audit
 
 from .auth_device import hash_password
@@ -99,8 +116,13 @@ from .worker_jobs import (
     SUCCESS_RESPONSE_CODES,
     DnsCheckStatus,
     Liveness,
+    clear_health_check_results,
     device_statuses,
     load_config,
+    # The scheduled job's own function object. `POST /health-checks/run`
+    # calls *this*, with `due_only=False` — see #75's section below for
+    # why a second sweep in this module was not an option.
+    run_health_checks,
     stored_dns_status,
 )
 
@@ -786,6 +808,295 @@ async def get_board(
 
 
 # ===================================================================== #
+# On-demand health-check actions — the legacy `/admin/health-checks/*`
+#
+# ui-parity §3.3 G3, closed by #75. Two routes, and the reason they are
+# worth having is a wait rather than a capability: the check is
+# scheduled, so an operator who has just fixed a provider outage watches
+# a stale board for up to `health_check_interval_minutes` (default 15)
+# with no way to say "look again". The board is the surface this
+# milestone is built around, and it was the one surface with no refresh.
+#
+# **Neither of these is a second implementation, and that is the design
+# constraint rather than a tidiness preference.** `run` is
+# `worker_jobs.run_health_checks` — the scheduled job's own function
+# object — called with `due_only=False` and the caller's scope, so the
+# batch ceiling, the concurrency semaphore, the timeout, the canonical
+# address comparison, the five-state classification and the accounting
+# assertion are reached by exactly one path. A hand-rolled "check these
+# names now" in this module would be a sixth reading of the columns and
+# the first thing it would lose is the ERROR/MISSING distinction.
+#
+# **The third disposition next door is not extended to these.**
+# `POST /admin/events/clear` was struck by operator decision (ui-parity
+# §3.4) and named that route and only that route. `clear` here resets
+# *health-check results* — four columns on `ddns_hostname` — and touches
+# no `ddns_event` row. Clearing a result and clearing a log are different
+# operations on different tables; the legacy service had them as two
+# routes for that reason, and inventing a disposition by analogy is the
+# one thing the parity table is not allowed to do.
+# ===================================================================== #
+
+
+class HealthCheckRunOut(BaseModel):
+    """What one manual run did, with every denominator named.
+
+    Mirrors :class:`~atrium_ddns.worker_jobs.HealthCheckSummary` rather
+    than summarising it: an operator who pressed the button is owed the
+    same accounting the scheduled tick logs, including the slices that
+    were **not** checked. ``hostnames_considered`` is the population,
+    ``hostnames_never_written`` is the slice with nothing to compare
+    against, ``hostnames_checked`` is what was resolved, and the four
+    record counters sum to ``records_checked`` — asserted server-side by
+    ``HealthCheckSummary.assert_consistent`` before this is built.
+    """
+
+    #: ``False`` when ``health_check_enabled`` is off. The run then
+    #: resolves nothing and every count below is zero — which is a
+    #: refusal, not a clean sweep, and the flag is what tells them apart.
+    enabled: bool
+    #: Always ``True`` on this route: a manual run is by definition not
+    #: the scheduled one. Carried so a client rendering the summary does
+    #: not have to know which endpoint produced it.
+    forced: bool
+    hostnames_considered: int
+    hostnames_never_written: int
+    hostnames_checked: int
+    records_checked: int
+    ok: int
+    mismatch: int
+    missing: int
+    error: int
+    #: Names whose aggregate verdict *changed* on this run. The number an
+    #: operator who just fixed something is actually looking for.
+    transitions: int
+    #: ``True`` when there was more in reach than ``batch_size`` allowed.
+    #: A summary that cannot say so reads identically whether it swept
+    #: everything or one percent.
+    truncated: bool
+    batch_size: int
+
+
+class HealthCheckClearOut(BaseModel):
+    """What one clear reset, over the population it could have reached.
+
+    ``cleared`` on its own reads identically whether it reset the right
+    rows or every row in the installation. ``in_scope`` is read back
+    after the write and printed beside it, so a zero is a measurement.
+    """
+
+    cleared: int
+    in_scope: int
+
+
+def _cooldown_remaining(
+    last_run: datetime | None, cooldown_seconds: int, now: datetime
+) -> int:
+    """Whole seconds left on the debounce, or ``0``.
+
+    Separate from the handler and pure, so the arithmetic is testable
+    without a database and without a clock. ``last_run is None`` — never
+    run — is the state that must not collapse into "ran a long time
+    ago"; both permit the run, and only one of them is a measurement.
+    """
+    if cooldown_seconds <= 0 or last_run is None:
+        return 0
+    elapsed = (now - last_run).total_seconds()
+    remaining = cooldown_seconds - elapsed
+    # `ceil`, not `round`: reporting 0 while still refusing would send a
+    # client straight back into another 429.
+    return max(0, -int(-remaining // 1))
+
+
+async def _last_manual_run(session: AsyncSession, actor_user_id: int) -> datetime | None:
+    """When this actor last triggered a manual run, or ``None``.
+
+    Read out of **atrium's ``audit_log``**, which is where the trigger
+    already writes: the manual run is an operator action and gets an
+    audit row whether or not anything debounces it, so the debounce
+    reads a row that exists rather than needing a table of its own.
+    Three properties that a module-level dict would not have, and
+    ``models.RateLimitEvent``'s docstring is the local precedent for
+    caring: api and worker are separate containers and api may be
+    several processes, so an in-memory window is per-process, resets on
+    every deploy, and lets a caller multiply its allowance by the number
+    of workers.
+
+    It is also deliberately not a new table. This chain admits one
+    revision author at a time and a debounce is not worth the slot;
+    ``audit_log`` indexes ``entity`` and ``actor_user_id``, and the
+    query is bounded by ``created_at`` on top of those.
+
+    Per **actor**, not per tenant and not installation-wide. An admin
+    holding ``atrium_ddns.admin`` reaches every tenant's names, so a
+    per-tenant key would let one admin fan out once per tenant per
+    cooldown; and an installation-wide key would let one operator's
+    press block every other tenant's own board.
+    """
+    return (
+        await session.execute(
+            select(sa.func.max(AuditLog.created_at)).where(
+                AuditLog.entity == AUDIT_ENTITY_HEALTH_CHECK,
+                AuditLog.action == AUDIT_ACTION_RUN,
+                AuditLog.actor_user_id == actor_user_id,
+            )
+        )
+    ).scalar_one_or_none()
+
+
+#: The ``audit_log.entity`` these two routes write. Not ``ddns_hostname``
+#: — the action is about the check, not about one row — and not
+#: ``ddns_domain``, which would put operator actions in a zone's history.
+AUDIT_ENTITY_HEALTH_CHECK = "ddns_health_check"
+AUDIT_ACTION_RUN = "run"
+AUDIT_ACTION_CLEAR = "clear"
+
+# `audit_log.entity_id` is NOT NULL and these two actions name no row.
+# The actor's own id is written instead of a magic `0`: it is true, it is
+# the thing the debounce keys on, and a sentinel in a
+# foreign-key-shaped column is how a later reader joins it to the wrong
+# table.
+
+#: Spelled through ``fastapi.status`` rather than as a literal, the same
+#: way :data:`UNPROCESSABLE`'s neighbours are.
+TOO_MANY_REQUESTS = status.HTTP_429_TOO_MANY_REQUESTS
+
+
+@router.post("/health-checks/run", response_model=HealthCheckRunOut)
+async def run_health_checks_now(
+    user: User = Depends(require_perm(BOARD_READ_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> HealthCheckRunOut:
+    """Re-check every name this caller can see, now. Debounced per actor.
+
+    Reach is the **scope's**, not a parameter: a tenant re-checks their
+    own names and a holder of ``atrium_ddns.admin`` re-checks every
+    tenant's, because that is what the scope already means everywhere
+    else on this surface. Gated on ``atrium_ddns.device.manage`` — the
+    board's own permission — rather than on ``atrium_ddns.admin``, for
+    the reason #14 recorded about the log: *reading your own* and
+    *reading everyone's* are different reaches, and collapsing them into
+    one permission takes the surface away from the people it was built
+    for. A caller with no tenant identity gets the scope's third state,
+    a literal ``false``, and checks nothing.
+
+    **Bounded by the scheduled path's own settings.** ``batch_size``,
+    ``concurrency`` and ``timeout`` come from the same ``atrium_ddns``
+    namespace the worker reads on every tick; nothing here is a second
+    knob. The honest consequence, stated rather than discovered: this is
+    a synchronous request that resolves up to ``health_check_batch_size``
+    names × two record types at ``health_check_concurrency``, so on a
+    large estate whose nameservers are all timing out it is a long
+    request, and ``truncated`` in the response says when the ceiling was
+    the thing that stopped it.
+
+    The debounce, and why the claim is committed first
+    --------------------------------------------------
+    The audit row is written **and committed before the fan-out starts**,
+    not after it. A debounce that records the run on the way out is not a
+    debounce: two requests that arrive together both read "nothing
+    recent", both start, and the limit is enforced only against a caller
+    slow enough to wait. Claim first, then work.
+
+    A consequence worth naming: a run that then fails still consumed its
+    cooldown. That is the correct direction for a control whose purpose
+    is to bound outbound DNS traffic — the queries were sent either way.
+    """
+    config = await load_config(session)
+    now = datetime.now(UTC).replace(tzinfo=None)
+
+    remaining = _cooldown_remaining(
+        await _last_manual_run(session, user.id),
+        config.health_check_manual_cooldown_seconds,
+        now,
+    )
+    if remaining:
+        raise HTTPException(
+            status_code=TOO_MANY_REQUESTS,
+            detail=(
+                f"a manual health check was run less than "
+                f"{config.health_check_manual_cooldown_seconds}s ago; "
+                f"{remaining}s remaining. This button resolves every name in "
+                f"reach against real nameservers, so it is debounced per "
+                f"operator. The scheduled check keeps running regardless."
+            ),
+            headers={"Retry-After": str(remaining)},
+        )
+
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity=AUDIT_ENTITY_HEALTH_CHECK,
+        entity_id=user.id,
+        action=AUDIT_ACTION_RUN,
+        diff={"cross_tenant": scope.reaches_all_tenants(Hostname)},
+    )
+    await session.commit()
+
+    summary = await run_health_checks(scope=scope, due_only=False)
+    return HealthCheckRunOut(
+        enabled=summary.enabled,
+        forced=summary.forced,
+        hostnames_considered=summary.hostnames_considered,
+        hostnames_never_written=summary.hostnames_never_written,
+        hostnames_checked=summary.hostnames_checked,
+        records_checked=summary.records_checked,
+        ok=summary.ok,
+        mismatch=summary.mismatch,
+        missing=summary.missing,
+        error=summary.error,
+        transitions=summary.transitions,
+        truncated=summary.truncated,
+        batch_size=summary.batch_size,
+    )
+
+
+@router.post("/health-checks/clear", response_model=HealthCheckClearOut)
+async def clear_health_checks_now(
+    user: User = Depends(require_perm(BOARD_READ_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> HealthCheckClearOut:
+    """Reset every health-check result in reach to ``never_checked``.
+
+    The legacy ``POST /admin/health-checks/clear``. What it is *for*: a
+    board carrying stale ``error`` and ``mismatch`` verdicts from an
+    outage that is over reads as a broken estate until the next
+    scheduled sweep replaces each one. Clearing says *we do not know
+    yet*, which is a true statement and a different one from *it is
+    wrong*.
+
+    **Not rate-limited, and the asymmetry is the point.** ``run`` fans
+    out to other people's nameservers; this is one scoped ``UPDATE``
+    against our own database. Debouncing it would be a control with no
+    cost to bound.
+
+    It writes ``NULL`` into all four columns — see
+    :func:`~atrium_ddns.worker_jobs.clear_health_check_results` for why
+    ``NEVER_CHECKED`` and not ``MISSING`` is the honest reset — and it
+    deletes nothing. No hostname, no published address, and in
+    particular no ``ddns_event`` row: the log has its own retention and
+    the route that cleared *it* is the one the operator struck.
+    """
+    summary = await clear_health_check_results(scope=scope)
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity=AUDIT_ENTITY_HEALTH_CHECK,
+        entity_id=user.id,
+        action=AUDIT_ACTION_CLEAR,
+        diff={
+            "cleared": summary.cleared,
+            "in_scope": summary.in_scope,
+            "cross_tenant": scope.reaches_all_tenants(Hostname),
+        },
+    )
+    await session.commit()
+    return HealthCheckClearOut(cleared=summary.cleared, in_scope=summary.in_scope)
+
+
+# ===================================================================== #
 # The tenant CRUD surface — domains, provider credentials, devices
 #
 # Everything below is #45. Three resources, one rule each that is not
@@ -1221,6 +1532,30 @@ class DomainCreateIn(BaseModel):
     name: str = Field(min_length=1, max_length=253)
 
 
+class DomainRenameIn(BaseModel):
+    """The body of ``PATCH /domains/{id}`` — the legacy rename (#75).
+
+    One field, and the operation is *rename the zone*. Ownership is not
+    spellable here for the reason :func:`create_domain` gives about its
+    own body: a ``user_id`` in a payload is a way to write into another
+    tenant's account through an endpoint whose read side is correctly
+    scoped.
+
+    **The rename does not rewrite hostnames, and the refusal is the
+    feature.** The two options were reject-or-rewrite and this model
+    picks reject; :func:`rename_domain` argues it, and
+    ``tests/test_router_hostnames.py`` asserts it in both directions.
+
+    ``PUT`` stays ``405`` deliberately. Every mutation on this surface
+    that changes part of a row is a ``PATCH``
+    (``/backends/{id}``, ``/hostnames/{id}``); a ``PUT`` alias would be a
+    second spelling of one operation, and the first thing a second
+    spelling grows is a divergent validation path.
+    """
+
+    name: str = Field(min_length=1, max_length=253)
+
+
 class DomainBackendCreateIn(_CredentialsField):
     backend_type: str = Field(min_length=1, max_length=64)
     config: dict[str, Any] = Field(default_factory=dict)
@@ -1492,6 +1827,176 @@ async def create_domain(
         created_at=_iso(domain.created_at) or "",
         backends=[],
         hostname_count=0,
+    )
+
+
+#: How many orphaned names a refusal names before it stops listing them.
+#: The count is always exact; the list is a sample, and the message says
+#: which is which. A refusal that printed 4,000 names would be unreadable
+#: and one that printed none would be unactionable.
+RENAME_ORPHAN_SAMPLE = 5
+
+
+@router.patch("/domains/{domain_id}", response_model=DomainOut)
+async def rename_domain(
+    domain_id: int,
+    body: DomainRenameIn,
+    user: User = Depends(require_perm(DOMAIN_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> DomainOut:
+    """Rename a zone. **Refuses rather than orphaning a name.**
+
+    The legacy ``GET,POST /admin/domains/<id>`` (ui-parity §3.3 G4).
+    Delete-and-recreate was never an equivalent — ``DELETE`` cascades and
+    takes the hostnames and the provider bindings with it — so until this
+    existed, correcting a typo in a zone name cost the tenant every name
+    under it and every stored credential.
+
+    Reject or rewrite: this rejects, and here is the argument
+    ---------------------------------------------------------
+    A rename is not a string swap. Every ``ddns_hostname`` under the zone
+    has to satisfy :func:`zone_contains` afterwards or it becomes a row
+    that ``POST /hostnames`` would refuse to create and ``/nic/update``
+    answers ``nohost`` for — creatable once, updatable never. There were
+    two ways to keep that true, and only one of them is available here:
+
+    - **Rewrite the names transactionally**, replacing the old zone
+      suffix on each. This is *already decided against*, one model along:
+      :class:`HostnameAssignIn` says in as many words that a hostname's
+      name is not editable, because *"a hostname is the DNS name — it is
+      what /nic/update looks the row up by and what a provider has
+      already published a record under. Renaming the row would leave the
+      old record in the zone with nothing pointing at it and no way to
+      reach it again."* A rename that rewrote names would do exactly that
+      to every name at once, silently, as a side effect of correcting a
+      spelling — and it would do it to records already published at a
+      provider this endpoint is not going to call.
+    - **Refuse the rename that would orphan a name.** The tenant keeps
+      the choice the model already gives them: delete the affected names
+      deliberately, seeing what they are giving up, and recreate them.
+
+    So this endpoint refuses, with ``409`` and the count of names that
+    would be orphaned. A rename to a zone that still contains every
+    existing name — narrowing ``example.invalid`` to
+    ``sub.example.invalid`` when every name is already under ``sub`` — is
+    allowed and rewrites nothing, because there is nothing to rewrite.
+    A zone with no names is renameable to anything free.
+
+    The containment test is :func:`zone_contains`, the **same function
+    object** ``/nic/update`` and ``POST /hostnames`` reach, with all
+    three of its preserved legacy quirks. A second copy here would agree
+    on the day it was written and diverge silently afterwards, and the
+    direction it diverges in decides whether a tenant ends up with names
+    the wire cannot update.
+
+    ``409`` twice, for two different conflicts
+    ------------------------------------------
+    A name another tenant already claims and a rename that would orphan
+    names are both ``409`` — both are refusals about rows that exist
+    rather than about a malformed body — and the details say which. The
+    first deliberately says nothing about *who* holds the name, for the
+    reason :func:`create_domain` records.
+    """
+    domain = await scope.get(session, Domain, domain_id)
+    if domain is None:
+        raise _not_found("domain")
+
+    name = _normalise_zone(body.name)
+    if not name:
+        raise HTTPException(
+            status_code=UNPROCESSABLE,
+            detail="a zone name cannot be empty once normalised",
+        )
+
+    previous = domain.name
+    if name == previous:
+        # Not an error: a form that submits an unchanged field is a
+        # normal thing for a form to do. It writes nothing and audits
+        # nothing, so an unchanged submit cannot manufacture history.
+        return await _render_domain(session, scope, domain)
+
+    # The names under this zone, read through the scope. Not
+    # `domain.hostnames`: a relationship load here is a lazy load in an
+    # async session, and the collection would not carry the scope.
+    names = list(
+        (
+            await session.execute(
+                scope.select(Hostname, Hostname.name)
+                .where(Hostname.domain_id == domain.id)
+                .order_by(Hostname.name)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    orphans = [existing for existing in names if not zone_contains(name, existing)]
+    if orphans:
+        sample = ", ".join(repr(o) for o in orphans[:RENAME_ORPHAN_SAMPLE])
+        more = len(orphans) - min(len(orphans), RENAME_ORPHAN_SAMPLE)
+        raise _conflict(
+            f"renaming {previous!r} to {name!r} would leave "
+            f"{len(orphans)} of {len(names)} hostname"
+            f"{'' if len(orphans) == 1 else 's'} outside the zone: {sample}"
+            + (f" and {more} more" if more else "")
+            + ". /nic/update answers nohost for a hostname outside its "
+            "domain's zone, so those rows would exist and never be "
+            "updatable again. The rename is refused rather than rewriting "
+            "them: a hostname is the DNS name a provider has already "
+            "published a record under. Delete the names you no longer "
+            "want, then rename."
+        )
+
+    domain.name = name
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise _conflict(f"the zone {name} is already claimed") from exc
+
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity="ddns_domain",
+        entity_id=domain.id,
+        action="rename",
+        # Both sides. An audit row carrying only the new value cannot
+        # answer "what was it before", which is the only question anyone
+        # reads a rename audit for.
+        diff={"name": {"from": previous, "to": name}, "hostnames": len(names)},
+    )
+    await session.commit()
+    return await _render_domain(session, scope, domain)
+
+
+async def _render_domain(
+    session: AsyncSession, scope: DdnsScope, domain: Domain
+) -> DomainOut:
+    """One zone in :class:`DomainOut`'s shape, backends and count included.
+
+    Shares :func:`_render_backend` and :func:`_hostname_counts` with
+    :func:`list_domains` rather than assembling a second, thinner
+    rendering — a single-row shape that drifts from the list's is how a
+    page ends up showing different facts before and after an edit.
+    """
+    backends = list(
+        (
+            await session.execute(
+                scope.select(DomainBackend)
+                .where(DomainBackend.domain_id == domain.id)
+                .order_by(DomainBackend.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_domain, _ = await _hostname_counts(session, scope)
+    return DomainOut(
+        id=domain.id,
+        name=domain.name,
+        created_at=_iso(domain.created_at) or "",
+        backends=[_render_backend(backend) for backend in backends],
+        hostname_count=by_domain.get(domain.id, 0),
     )
 
 

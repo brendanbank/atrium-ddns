@@ -19,7 +19,7 @@
  */
 import { queryOptions } from '@tanstack/react-query';
 
-import { apiGet } from './http';
+import { apiGet, apiSend } from './http';
 
 /** #17's `DnsCheckStatus`, verbatim. Three of the five carry a null
  *  address and they are three different facts. */
@@ -142,4 +142,61 @@ export function boardQuery(options: { enabled: boolean }) {
     queryFn: getBoard,
     enabled: options.enabled,
   });
+}
+
+/** `POST /api/atrium_ddns/health-checks/run` — #75, ui-parity §3.3 G3.
+ *
+ * The server's `HealthCheckRunOut`, restated field for field. The same
+ * rule the `Board` types above follow applies here and is worth
+ * restating because a summary is exactly the shape somebody would be
+ * tempted to recompute: **the shapes are restated, the arithmetic is
+ * not.** `ok + mismatch + missing + error === records_checked` is
+ * asserted server-side by `HealthCheckSummary.assert_consistent` before
+ * the response is built; nothing under `src/` re-derives it.
+ *
+ * Three fields exist so a zero can be read:
+ * - `enabled` — `false` means the operator turned the check off, and
+ *   every count below it is a refusal rather than a clean sweep.
+ * - `hostnames_never_written` — names with nothing published, counted
+ *   rather than silently dropped out of the denominator.
+ * - `truncated` — the batch ceiling was reached, so there is more due
+ *   work than this run did.
+ */
+export interface HealthCheckRun {
+  enabled: boolean;
+  /** Always `true` from this endpoint: a manual run is by definition
+   *  not the scheduled one, and the flag says so rather than leaving a
+   *  reader to infer it from the URL that produced the payload. */
+  forced: boolean;
+  hostnames_considered: number;
+  hostnames_never_written: number;
+  hostnames_checked: number;
+  records_checked: number;
+  ok: number;
+  mismatch: number;
+  missing: number;
+  error: number;
+  /** Names whose aggregate verdict changed. The number an operator who
+   *  has just fixed something is actually looking for. */
+  transitions: number;
+  truncated: boolean;
+  batch_size: number;
+}
+
+/** `POST /api/atrium_ddns/health-checks/clear`.
+ *
+ * `cleared` alone reads identically whether it reset the right rows or
+ * every row in the installation, so the denominator travels with it.
+ */
+export interface HealthCheckClear {
+  cleared: number;
+  in_scope: number;
+}
+
+export async function runHealthChecks(): Promise<HealthCheckRun> {
+  return apiSend<HealthCheckRun>('/atrium_ddns/health-checks/run', 'POST');
+}
+
+export async function clearHealthChecks(): Promise<HealthCheckClear> {
+  return apiSend<HealthCheckClear>('/atrium_ddns/health-checks/clear', 'POST');
 }

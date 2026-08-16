@@ -617,3 +617,220 @@ describe('empty states', () => {
     expect(screen.queryByTestId('board-empty')).toBeNull();
   });
 });
+
+describe('the on-demand health-check actions (#75, ui-parity §3.3 G3)', () => {
+  /** A run summary in the server's shape. Defaults are a clean, small
+   *  sweep; each test overrides only the fields it is about. */
+  function runSummary(overrides: Record<string, unknown> = {}) {
+    return {
+      enabled: true,
+      forced: true,
+      hostnames_considered: 4,
+      hostnames_never_written: 1,
+      hostnames_checked: 3,
+      records_checked: 4,
+      ok: 3,
+      mismatch: 0,
+      missing: 1,
+      error: 0,
+      transitions: 1,
+      truncated: false,
+      batch_size: 200,
+      ...overrides,
+    };
+  }
+
+  /** Replaces the module-level stub so a POST can be scripted. Returns
+   *  the recorder for the requests that actually left. */
+  function stubWith(
+    responder: (url: string, init?: RequestInit) => Response,
+  ): { url: string; method: string }[] {
+    const sent: { url: string; method: string }[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const method = init?.method ?? 'GET';
+        if (method !== 'GET') sent.push({ url, method });
+        if (url.endsWith('/users/me/context')) {
+          return new Response(JSON.stringify(currentMe), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        if (url.endsWith('/atrium_ddns/board') && method === 'GET') {
+          return new Response(JSON.stringify(boardPayload), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return responder(url, init);
+      }),
+    );
+    return sent;
+  }
+
+  function json(body: unknown, status = 200) {
+    return new Response(JSON.stringify(body), {
+      status,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  test('the cadence sentence quotes the board payload, not a constant', async () => {
+    // The button exists because of a wait, and the wait is
+    // `health_check_interval_minutes`. Rendering a hardcoded 15 would be
+    // right today and silently wrong after an operator changed it — the
+    // "derive, don't hardcode" rule aimed at a sentence.
+    boardPayload = { ...board(), health_check_interval_minutes: 45 };
+    renderBoard(OPERATOR);
+    expect(await screen.findByTestId('health-check-cadence')).toHaveTextContent(
+      'every 45 minutes',
+    );
+  });
+
+  test('a run posts once and reports every denominator it was given', async () => {
+    const sent = stubWith(() => json(runSummary()));
+    renderBoard(OPERATOR);
+    fireEvent.click(await screen.findByTestId('health-check-run'));
+
+    await waitFor(() =>
+      expect(screen.getByTestId('health-check-ran')).toBeInTheDocument(),
+    );
+    expect(sent).toEqual([
+      { url: '/api/atrium_ddns/health-checks/run', method: 'POST' },
+    ]);
+    const text = screen.getByTestId('health-check-ran').textContent ?? '';
+    // The population, the slice that could not be checked, and the
+    // verdicts — not just "done".
+    expect(text).toContain('3 of 4 names checked');
+    expect(text).toContain('1 never published');
+    expect(text).toContain('1 changed');
+  });
+
+  test('a run that resolved nothing says why, and does not read as clean', async () => {
+    // `0 checked` over a population of 2 that has never published is a
+    // measurement. Rendering it as "checked" with no numbers would be
+    // the same string a healthy sweep produces.
+    stubWith(() =>
+      json(
+        runSummary({
+          hostnames_considered: 2,
+          hostnames_never_written: 2,
+          hostnames_checked: 0,
+          records_checked: 0,
+          ok: 0,
+          missing: 0,
+          transitions: 0,
+        }),
+      ),
+    );
+    renderBoard(OPERATOR);
+    fireEvent.click(await screen.findByTestId('health-check-run'));
+    await waitFor(() =>
+      expect(screen.getByTestId('health-check-ran')).toHaveTextContent(
+        'nothing to check: 0 of 2 names has published an address',
+      ),
+    );
+  });
+
+  test('a run against a disabled check is a refusal, not an empty sweep', async () => {
+    stubWith(() =>
+      json(
+        runSummary({
+          enabled: false,
+          hostnames_considered: 0,
+          hostnames_never_written: 0,
+          hostnames_checked: 0,
+          records_checked: 0,
+          ok: 0,
+          missing: 0,
+          transitions: 0,
+        }),
+      ),
+    );
+    renderBoard(OPERATOR);
+    fireEvent.click(await screen.findByTestId('health-check-run'));
+    await waitFor(() =>
+      expect(screen.getByTestId('health-check-ran')).toHaveTextContent(
+        'switched off',
+      ),
+    );
+  });
+
+  test('the batch ceiling is said out loud when it was reached', async () => {
+    stubWith(() => json(runSummary({ truncated: true, batch_size: 200 })));
+    renderBoard(OPERATOR);
+    fireEvent.click(await screen.findByTestId('health-check-run'));
+    await waitFor(() =>
+      expect(screen.getByTestId('health-check-ran')).toHaveTextContent(
+        'stopped at the 200-name batch',
+      ),
+    );
+  });
+
+  test('a 429 is the debounce, and is not rendered as a failure', async () => {
+    // The whole reason `ApiError` carries a numeric status. Rendering
+    // "that did not work" here would send an operator looking for a
+    // fault in their DNS when the server simply refused to repeat work
+    // it did a moment ago.
+    stubWith(() =>
+      json(
+        {
+          detail:
+            'a manual health check was run less than 60s ago; 42s remaining.',
+        },
+        429,
+      ),
+    );
+    renderBoard(OPERATOR);
+    fireEvent.click(await screen.findByTestId('health-check-run'));
+    await waitFor(() =>
+      expect(screen.getByTestId('health-check-debounced')).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId('health-check-error')).toBeNull();
+    // The server's own words, including the seconds remaining.
+    expect(screen.getByTestId('health-check-debounced')).toHaveTextContent(
+      '42s remaining',
+    );
+  });
+
+  test('a real failure is still a failure, with the diagnosis intact', async () => {
+    // The control for the test above: without it, a component that
+    // rendered *every* error as "already just checked" would pass.
+    stubWith(() => json({ detail: 'no such thing' }, 500));
+    renderBoard(OPERATOR);
+    fireEvent.click(await screen.findByTestId('health-check-run'));
+    await waitFor(() =>
+      expect(screen.getByTestId('health-check-error')).toHaveTextContent(
+        'no such thing',
+      ),
+    );
+    expect(screen.queryByTestId('health-check-debounced')).toBeNull();
+  });
+
+  test('clear reports its denominator and says the log is untouched', async () => {
+    const sent = stubWith(() => json({ cleared: 3, in_scope: 4 }));
+    renderBoard(OPERATOR);
+    fireEvent.click(await screen.findByTestId('health-check-clear'));
+    await waitFor(() =>
+      expect(screen.getByTestId('health-check-cleared')).toBeInTheDocument(),
+    );
+    expect(sent).toEqual([
+      { url: '/api/atrium_ddns/health-checks/clear', method: 'POST' },
+    ]);
+    const text = screen.getByTestId('health-check-cleared').textContent ?? '';
+    expect(text).toContain('3 of 4 names');
+    // `POST /admin/events/clear` is the route the operator struck; this
+    // one is not it, and the interface says so rather than leaving an
+    // operator to wonder what a "clear" removed.
+    expect(text).toContain('the log is untouched');
+  });
+
+  test('the actions are absent for a user who cannot read the board', async () => {
+    // They post to an endpoint gated on the same permission, so
+    // offering them would be a button that answers 403.
+    renderBoard(OUTSIDER);
+    await screen.findByTestId('board-refused');
+    expect(screen.queryByTestId('health-check-actions')).toBeNull();
+  });
+});

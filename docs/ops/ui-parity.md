@@ -3,8 +3,8 @@
 > **every legacy page either exists as a registration or is deleted because
 > atrium covers it — demonstrated against the deployed stack**
 
-**Verdict: exit 2. ~~15~~ ~~11~~ 10 of 39 legacy routes are in neither column**,
-in five capability groups, counted apart and never averaged.
+**Verdict: exit 2. ~~15~~ ~~11~~ ~~10~~ 6 of 39 legacy routes are in neither
+column**, in ~~five~~ two capability groups, counted apart and never averaged.
 
 This file is the route-by-route walk. Every verdict in it is a live response
 from a stack the run that wrote it stood up. Reproduction commands are inline so
@@ -12,23 +12,54 @@ the table can be re-run rather than believed.
 
 ---
 
-## 0. Three readings, and what moved between them
+## 0. Four readings, and what moved between them
 
 A verdict is amended **visibly** here, never replaced. Changed cells are struck
 through and the reasoning is kept.
 
-| | #47 (2026-08-16) | #69 (2026-08-16) | **this re-run (2026-08-16)** |
-|---|---|---|---|
-| deleted — atrium covers it | 13 (33.3%) | 13 (33.3%) | 13 (33.3%) |
-| registered | 11 (28.2%) | 15 (38.5%) | 15 (38.5%) |
-| **deliberately dropped** — *a third disposition, see §3.4* | — | — | **1 (2.6%)** |
-| **neither — the finding** | **15 (38.5%)** | **11 (28.2%)** | **10 (25.6%)** |
-| gaps restricted to the 22 *pages* | 9 (40.9%) | 7 (31.8%) | 7 (31.8%) |
+| | #47 (2026-08-16) | #69 (2026-08-16) | #47-rerun (2026-08-16) | **#75 (2026-08-16)** |
+|---|---|---|---|---|
+| deleted — atrium covers it | 13 (33.3%) | 13 (33.3%) | 13 (33.3%) | 13 (33.3%) |
+| registered | 11 (28.2%) | 15 (38.5%) | 15 (38.5%) | **19 (48.7%)** |
+| **deliberately dropped** — *a third disposition, see §3.4* | — | — | 1 (2.6%) | 1 (2.6%) |
+| **neither — the finding** | **15 (38.5%)** | **11 (28.2%)** | **10 (25.6%)** | **6 (15.4%)** |
+| gaps restricted to the 22 *pages* | 9 (40.9%) | 7 (31.8%) | 7 (31.8%) | **5 (22.7%)** |
 
 Both denominators were re-derived from the legacy source at each reading and
 have not moved: 39 routes, 22 pages, `dyndns-route53` still pinned at
 `5d1c941`. **The counts moved; the divisors did not** — a shrinking gap over a
 shrinking denominator would not be the same result.
+
+### What #75 changed, and what it deliberately did not
+
+Four routes, three unrelated groups, all previously `405`. Each is now
+registered **and demonstrated over HTTP** against a stack this run stood up
+(`COMPOSE_PROJECT_NAME=ddns75`, API on `:8175`), migrated on both chains, admin
+seeded, host bundle promoted with `make seed-bundle` — see §3.3 G3/G4/G5 for
+the responses.
+
+Every absence probe in those three sections is a **mutation**, never a `GET`,
+and each carries §2.1's control taken in the same session:
+
+```
+POST /api/atrium_ddns/made-up-dddeef -> 405 application/json   <- control: absent
+GET  /api/atrium_ddns/made-up-dddeef -> 200 text/html          <- the same path, off the SPA catch-all
+```
+
+**One thing #75 declined to do, and it is the boundary the issue drew.**
+`POST /admin/events/clear` stays in §3.4 as a struck route. G3's `clear` resets
+*health-check results* — four columns on `ddns_hostname` — and deletes nothing;
+`tests/test_router_health_checks.py` asserts that a clear leaves the
+`ddns_event` rows in place, because the cheapest wrong implementation of
+"clear the health checks" is a `DELETE` and it would look tidy in review.
+Clearing a result and clearing a log are different operations on different
+tables. The operator's decision named one route; extending it by analogy would
+be inventing a disposition.
+
+**And one it left open.** G5 asked whether the help entry should be registered
+or struck as a third-disposition route, and said the call is the operator's.
+The entry is registered — the issue's own default, and the cheap thing — but
+the question it raises is recorded under G5 rather than answered.
 
 ### What this re-run did, and why it was not a formality
 
@@ -272,10 +303,11 @@ Atrium's audit log (`GET /api/admin/audit -> 200`) and notifications are
 additional surfaces with no legacy counterpart. They are not in the table
 because the criterion runs legacy→atrium, not the reverse.
 
-### 3.2 Registered — name the registration (~~11~~ 15 routes)
+### 3.2 Registered — name the registration (~~11~~ ~~15~~ 19 routes)
 
-All 15 registrations were confirmed **in the bundle the running stack serves** —
-`GET /host/main.js -> 200, 748,893 bytes` — not in `frontend/src/`.
+All ~~15~~ 19 registrations were confirmed **in the bundle the running stack
+serves** — ~~`GET /host/main.js -> 200, 748,893 bytes`~~
+`GET /host/main.js -> 200, 763,680 bytes` at #75 — not in `frontend/src/`.
 
 | legacy route | registration | backing endpoint on the running stack |
 |---|---|---|
@@ -294,9 +326,13 @@ All 15 registrations were confirmed **in the bundle the running stack serves** �
 | **`POST /admin/hostnames/<id>/delete`** (#69) | same page | `DELETE /api/atrium_ddns/hostnames/{hostname_id}` |
 | **`GET,POST /admin/users/<uid>/hostnames`** (#69) | same page, under `atrium_ddns.admin` — see the stricter reading in §4 | same endpoints, scope widened |
 | **`POST /admin/users/<uid>/hostnames/<hn>/delete`** (#69) | same | same |
+| **`POST /admin/health-checks/run`** (#75) | the *Check now* button on `atrium-ddns-board` (`board/HealthCheckActions.tsx`) | `POST /api/atrium_ddns/health-checks/run` — §3.3 G3 |
+| **`POST /admin/health-checks/clear`** (#75) | *Clear results*, same strip | `POST /api/atrium_ddns/health-checks/clear` — §3.3 G3 |
+| **`GET,POST /admin/domains/<id>`** (#75) | *Rename* on `registerRoute atrium-ddns-domains` | `PATCH /api/atrium_ddns/domains/{domain_id}` — §3.3 G4 |
+| **`GET /admin/help`** (#75) | `registerRoute atrium-ddns-help` `/atrium-ddns/help` + `registerNavItem atrium-ddns-help-nav` ("Help") | none — the page calls no endpoint, see §3.3 G5 |
 
-The six nav items in the served bundle, read out of the bundle rather than out
-of `main.tsx`:
+The ~~six~~ seven nav items in the served bundle, read out of the bundle rather
+than out of `main.tsx`:
 
 ```
 key=atrium-ddns-nav            label=Atrium Ddns          to=/atrium-ddns
@@ -305,6 +341,7 @@ key=atrium-ddns-domains-nav    label=Zones and providers
 key=atrium-ddns-devices-nav    label=Devices
 key=atrium-ddns-names-nav      label=Names
 key=atrium-ddns-logs-nav       label=Log search
+key=atrium-ddns-help-nav       label=Help                 to=/atrium-ddns/help   (#75)
 ```
 
 Two registrations are real and have **no legacy counterpart**, so they appear
@@ -321,7 +358,7 @@ They are counted as registrations because they *are* registrations and the
 criterion asks for a registration; a reader should know that the dashboard row
 above rests on the board and the log page, not on the home widget.
 
-### 3.3 In neither column — the finding (~~15~~ ~~11~~ 10 routes, 5 groups)
+### 3.3 In neither column — the finding (~~15~~ ~~11~~ ~~10~~ 6 routes, ~~5~~ 2 groups)
 
 Counted apart, never averaged.
 
@@ -562,39 +599,144 @@ means delete-and-recreate, which rotates the credential.
 PATCH /api/atrium_ddns/devices/1 -> 405 {'detail': 'Method Not Allowed'}
 ```
 
-#### G3 — on-demand operator actions (~~3~~ 2 routes) · severity: low
+#### ~~G3~~ — on-demand operator actions (~~3~~ ~~2~~ 0 routes) · **closed by #75**
 
-| legacy route | status |
-|---|---|
-| `POST /admin/health-checks/run` | `POST -> 405`. No manual trigger; the check is scheduled only. |
-| `POST /admin/health-checks/clear` | `POST -> 405`. |
-| ~~`POST /admin/events/clear`~~ | **moved to §3.4 — deliberately dropped**, on the operator's decision |
+| legacy route | ~~#47-rerun~~ | this re-measurement (#75) |
+|---|---|---|
+| ~~`POST /admin/health-checks/run`~~ | ~~`POST -> 405`. No manual trigger; the check is scheduled only.~~ | **`POST -> 200`** — registered, §3.2 |
+| ~~`POST /admin/health-checks/clear`~~ | ~~`POST -> 405`.~~ | **`POST -> 200`** — registered, §3.2 |
+| ~~`POST /admin/events/clear`~~ | **moved to §3.4 — deliberately dropped**, on the operator's decision | unchanged; see §0 for why it was *not* extended to the two above |
 
-`/admin/health-checks/run` and `/admin/health-checks/clear` stay here. The
-operator's decision named `/admin/events/clear` and only that; extending it to
-its two neighbours by analogy would be inventing a disposition, which is the
-thing this table is not allowed to do.
-
-#### G4 — domain rename (1 route) · severity: low
-
-`GET,POST /admin/domains/<id>` renamed a domain. Re-measured on this stack:
+Re-measured with `POST` against the running stack, beside the §2.1 control taken
+in the same session (`POST` to a made-up path answers `405`; `GET` to the same
+path answers `200 text/html` off the catch-all):
 
 ```
-PATCH /api/atrium_ddns/domains/1 -> 405 {'detail': 'Method Not Allowed'}
-PUT   /api/atrium_ddns/domains/1 -> 405 {'detail': 'Method Not Allowed'}
+POST /api/atrium_ddns/health-checks/run -> 200 application/json
+  {"batch_size": 200, "enabled": true, "error": 0, "forced": true,
+   "hostnames_checked": 3, "hostnames_considered": 12,
+   "hostnames_never_written": 9, "mismatch": 0, "missing": 5, "ok": 0,
+   "records_checked": 5, "transitions": 0, "truncated": false}
+
+POST /api/atrium_ddns/health-checks/run -> 429 application/json
+  Retry-After: '60'
+  "a manual health check was run less than 60s ago; 60s remaining. …"
+
+POST /api/atrium_ddns/health-checks/clear -> 200 application/json
+  {"cleared": 3, "in_scope": 12}
 ```
 
-The stack serves `GET`/`POST /api/atrium_ddns/domains` and
-`DELETE /api/atrium_ddns/domains/{id}` and no rename verb. Delete-and-recreate
-is not equivalent: the delete cascades.
+The population above is the compat fixture's twelve names, cross-tenant because
+the probing account holds `atrium_ddns.admin`; nine had never published an
+address and are counted rather than dropped. **No resolved address is printed
+here and none is on the wire** — `HealthCheckRunOut` carries counts only.
 
-#### G5 — help (1 route) · severity: low
+**`run` is the scheduled job, not a second sweep.** It calls
+`worker_jobs.run_health_checks` — the same function object the scheduler
+registers, asserted by identity in `tests/test_router_health_checks.py` — with
+`due_only=False` and the caller's `DdnsScope`. The batch ceiling, the
+concurrency semaphore and the timeout are the namespace's own
+(`health_check_batch_size`, `health_check_concurrency`,
+`health_check_timeout_seconds`), so there is no second set of knobs.
 
-`GET /admin/help` rendered `help.html`. **Swept to a negative result across both
-deployed bundles** — the shell and the host bundle, seven spellings each:
+`due_only=False` is the one difference, and dropping it would have made the
+button a probe that could not fail in the inverse direction: with the staleness
+clause kept, an operator who has just watched a check run presses the button,
+nothing is due, the run reports `0 checked` — and that is indistinguishable
+from a working button against a healthy estate. The test drives both paths over
+one row whose `dns_checked_at` is *now* and demands they disagree.
+
+**The debounce is per actor and it is persisted.** The claim is an
+`audit_log` row written *and committed before* the fan-out starts — a debounce
+recorded on the way out admits two simultaneous presses — keyed on
+`(entity='ddns_health_check', action='run', actor_user_id)`, with the window in
+`health_check_manual_cooldown_seconds` (default 60, `0` disables it). A
+process-local counter was rejected for the reason `models.RateLimitEvent`
+already records: api and worker are separate containers and api may be several
+processes. A new table was rejected because the migration chain admits one
+author at a time and a debounce is not worth the slot. Per *actor* rather than
+installation-wide, so one operator's press cannot block every other tenant's
+board — asserted in both directions.
+
+**`clear` is not rate-limited, and the asymmetry is deliberate**: `run` fans out
+to other people's nameservers, `clear` is one scoped `UPDATE` against our own
+database. It writes `NULL` into all four health-check columns, which reads back
+as `NEVER_CHECKED` — not `MISSING`, which would assert a measurement nobody
+took. It deletes nothing: no hostname, no published address, no `ddns_event`
+row.
+
+A defect this section found in its own first implementation, kept because the
+class recurs: `cleared` was the driver's `rowcount`, which on this driver counts
+rows **matched** rather than rows **changed**, so a second clear of the same row
+reported `cleared: 1` about a row that carried nothing. Pressing the button once
+agrees with either implementation; the test presses it twice.
+
+#### ~~G4~~ — domain rename (1 route) · **closed by #75**
+
+`GET,POST /admin/domains/<id>` renamed a domain. ~~Re-measured on this stack:~~
 
 ```
-                shell   host
+PATCH /api/atrium_ddns/domains/1 -> 405 {'detail': 'Method Not Allowed'}   <- #47-rerun
+PUT   /api/atrium_ddns/domains/1 -> 405 {'detail': 'Method Not Allowed'}   <- #47-rerun
+```
+
+Re-measured at #75, end to end — claim a zone, register a name under it, then
+try both a rename that would orphan the name and one that would not:
+
+```
+POST   /api/atrium_ddns/domains   {"name": "g4-….example.invalid"}      -> 201
+POST   /api/atrium_ddns/hostnames {"name": "box.g4-….example.invalid"}  -> 201
+
+PATCH  /api/atrium_ddns/domains/896 {"name": "other-….example.invalid"} -> 409
+  renaming 'g4-….example.invalid' to 'other-….example.invalid' would leave
+  1 of 1 hostname outside the zone: 'box.g4-….example.invalid'. /nic/update
+  answers nohost for a hostname outside its domain's zone, so those rows
+  would exist and never be updatable again. …
+
+PATCH  /api/atrium_ddns/domains/896 {"name": "BOX.g4-….example.invalid."} -> 200
+  {"id": 896, "name": "box.g4-….example.invalid", "hostname_count": 1}
+  hostnames under the renamed zone, read back: ['box.g4-….example.invalid']
+
+PUT    /api/atrium_ddns/domains/896 -> 405
+DELETE /api/atrium_ddns/domains/896 -> 204
+```
+
+**The disposition, stated: it rejects, it does not rewrite.** A rename is not a
+string swap — every hostname under the zone must still satisfy `zone_contains`
+afterwards or the rename has minted rows that are creatable once and updatable
+never. The two options were rewrite-transactionally and reject, and the model
+had already decided against the first one route along: `HostnameAssignIn` says
+a hostname's name is not editable, because *"a hostname is the DNS name — it is
+what /nic/update looks the row up by and what a provider has already published
+a record under. Renaming the row would leave the old record in the zone with
+nothing pointing at it and no way to reach it again."* A rename that rewrote
+names would do that to every name at once, silently, as a side effect of
+correcting a spelling. So the rename is refused, with the count and a sample of
+the offending names, and the tenant keeps the choice the model already gives
+them.
+
+Both directions are asserted, and the second one is not decoration: without it,
+an endpoint hardcoded to refuse everything would pass the refusal test. The
+`200` above is a *narrowing* rename — the new zone still contains the existing
+name — and the hostname row is read back afterwards to prove nothing was
+rewritten. Containment is decided by `zone_contains`, the **same function
+object** `/nic/update` and `POST /hostnames` reach, quirks included; there is no
+second copy, in Python or in TypeScript.
+
+`PUT` stays `405` and that is the decision rather than an omission — recorded as
+a test, because "we chose `PATCH`" and "we forgot `PUT`" look identical from
+outside. Every partial mutation on this surface is a `PATCH`
+(`/backends/{id}`, `/hostnames/{id}`), and a second spelling of one operation is
+how a divergent validation path starts.
+
+#### ~~G5~~ — help (1 route) · **closed by #75 — with a question left open**
+
+`GET /admin/help` rendered `help.html`. ~~**Swept to a negative result across
+both deployed bundles** — the shell and the host bundle, seven spellings
+each:~~
+
+```
+                shell   host        <- #47-rerun
 /help             0      0
 helpHref          0      0
 HelpPage          0      0
@@ -602,8 +744,42 @@ IconHelp          0      0
 'help' "help" `help`   0 0 0   /  0 0 0
 ```
 
-Zero help surfaces in the deployed system, host side or shell side. The six nav
-items the host registers are listed in §3.2 and none is a help entry.
+Re-measured at #75, in the bundle the running stack serves:
+
+```
+GET /host/main.js -> 200, 763,680 bytes
+  'atrium-ddns-help'      occurrences in the served bundle: 2
+  'atrium-ddns-help-nav'  occurrences in the served bundle: 1
+  '/atrium-ddns/help'     occurrences in the served bundle: 1
+  'docs/ops/ui-design.md' occurrences in the served bundle: 1
+```
+
+`registerRoute atrium-ddns-help` at `/atrium-ddns/help`, plus a nav item
+(§3.2's seventh). The page lists the surfaces this bundle registers and links
+the operator documentation in `docs/`.
+
+Two decisions on it. **The documentation is linked, not embedded**: `docs/` is
+not copied into the image, so a page that read a Markdown file at run time would
+work in a checkout and 404 in the container — the template's own *"a file read
+at runtime must be copied into the image"* trap. **The surface list is derived,
+not typed**: each row imports the path constant its registration uses, and
+`HelpPage.test.tsx` sweeps the registry to a negative result — *every* route
+this bundle registers has an entry, with two named exemptions (the scaffold's
+demo page, and the help page itself).
+
+**The question the issue asked, left open for the operator.** G5's genuine
+question was whether help should be registered at all or struck as a
+third-disposition route the way `/admin/events/clear` was. The entry is
+registered, which is the issue's own default and the cheap thing. The argument
+that could be made for striking it, recorded rather than acted on: **everything
+in `docs/` is engineering documentation** — design notes, a migration plan, an
+operations contract, this file — written for the people building the service.
+There is no end-user handbook to point at, so what shipped is a page of
+in-product orientation plus links to developer material. If the operator's
+view is that a help entry is only worth having once a real operator handbook
+exists, striking it and reopening it with that handbook is a defensible call and
+it is theirs to make. Nothing below depends on which way it goes: the route is
+registered either way until it is not.
 
 ### 3.4 Deliberately dropped — a third disposition (1 route)
 
@@ -668,23 +844,27 @@ job fire.
 | column | routes | share |
 |---|---|---|
 | deleted — atrium covers it | 13 | 33.3% |
-| registered | 15 | 38.5% |
+| registered | ~~15~~ 19 | ~~38.5%~~ 48.7% |
 | deliberately dropped (§3.4) | 1 | 2.6% |
-| **neither — the finding** | **10** | **25.6%** |
+| **neither — the finding** | ~~**10**~~ **6** | ~~**25.6%**~~ **15.4%** |
 | | **39** | **100%** |
 
 Restricted to the 22 *pages* — the criterion's own word — the gaps are
 `/admin/hostnames/<id>/backends`, `/admin/users/<uid>/hostnames/<hn>/backends`,
-`/admin/rate-limits`, `/admin/rate-limits/user/<id>`,
-`/admin/health-checks/config`, `/admin/domains/<id>` and `/admin/help` — **7 of
-22, 31.8%**. **The page figure did not move from #69's**, because the one route
-that left the gap column since — `POST /admin/events/clear` — is a `POST` and
-renders no template. The three other non-page gaps are
-`/admin/rate-limits/user/<id>/delete` and the two `health-checks` actions. The
-narrower denominator does not flatter the result, which is why both are given.
+`/admin/rate-limits`, `/admin/rate-limits/user/<id>` and
+`/admin/health-checks/config` — ~~**7 of 22, 31.8%**~~ **5 of 22, 22.7%**.
+~~**The page figure did not move from #69's**, because the one route that left
+the gap column since — `POST /admin/events/clear` — is a `POST` and renders no
+template.~~ **It moved at #75**: `/admin/domains/<id>` and `/admin/help` were
+both pages and both are now registered. The one remaining non-page gap is
+`/admin/rate-limits/user/<id>/delete`; the two `health-checks` actions left with
+#75. The narrower denominator does not flatter the result, which is why both are
+given — and note that it flatters it *less* here than the route figure does
+(22.7% against 15.4%), because what #75 closed was three pages' worth of
+capability and the remaining gap is disproportionately pages.
 
-**A stricter reading gives 12, not 10**, and it changes the headline, so it is
-stated rather than assumed. Two of the four routes #69 closed are the *admin
+**A stricter reading gives ~~12~~ 8, not ~~10~~ 6**, and it changes the
+headline, so it is stated rather than assumed. Two of the four routes #69 closed are the *admin
 acting on another tenant's names* pair, and they are served by the **same**
 endpoints under a widened scope (`atrium_ddns.admin`) rather than by a distinct
 per-user page. Demonstrated above — and with one real difference from the legacy
@@ -701,7 +881,8 @@ row keys: ['created_at', 'device_id', 'device_name', 'domain_id',
 The admin sees a single merged list with no tenant column and no tenant filter,
 so *"whose name is this"* is answerable only from the zone. A reader who
 requires the admin variant to be its own surface should count those two as still
-open, giving **12 of 39 (30.8%)** and **8 of 22 pages (36.4%)**. The looser count
+open, giving ~~**12 of 39 (30.8%)**~~ **8 of 39 (20.5%)** and
+~~**8 of 22 pages (36.4%)**~~ **6 of 22 pages (27.3%)**. The looser count
 is the one in the table because the criterion's own word is *capability*
 ("either exists as a registration") and the capability is reachable; the
 stricter count is here so the choice is visible.
@@ -719,15 +900,25 @@ Stated so a later reader does not take the table for more than it is.
   stricter reading that required a registration to be *product* UI would move
   `GET /admin/` into the gap column and make it 11.
 - It says nothing about the `/nic/*` wire protocol beyond "the route exists" —
-  that is the frozen 131-case compat table's job, not this file's, and the gate
-  run that accompanies this reading executed **0 of 131** wire cases by design
-  (`compat: NO --target GIVEN`).
-- `/admin/health-checks/run|clear` and the domain rename are still counted as
+  that is the frozen 131-case compat table's job, not this file's. The
+  ~~gate run that accompanies this reading executed **0 of 131** wire cases by
+  design (`compat: NO --target GIVEN`)~~ **#75 ran it explicitly against its own
+  stack — `make test-compat TARGET=host BASE_URL=http://api:8000` — and the
+  accounting block reads `executable 124 … 124 passed, 3 skipped` out of 131 in
+  the table (4 excluded by `targets:`, 3 with unmet preconditions). It is still
+  not in the gate, and running it stays an explicit act.**
+- ~~`/admin/health-checks/run|clear` and the domain rename are still counted as
   gaps on the criterion's literal wording. Striking them is the milestone
   owner's call to record, not a reader's to assume; the counts stand above
-  either way.
+  either way.~~ **All three are registered as of #75 and the question of
+  striking them does not arise.** The one disposition question still open is
+  G5's, and it is stated there rather than decided.
 - **A prune tick was not observed** (§3.4). Registration was.
-- **Every group was re-measured for this reading.** #69's note that G2–G5 were
-  carried forward no longer applies, and the next re-run should extend the same
-  suspicion to this one: nothing here is a measurement after the estate moves
-  again.
+- ~~**Every group was re-measured for this reading.**~~ **#75 re-measured G3, G4
+  and G5 only** — the three groups it changed — with `POST`-based probes and
+  §2.1's control taken in the same session. **G1 and G2 are carried forward from
+  the #47 re-run and were not re-taken here.** That is the same
+  carried-forward exposure that re-run was written to close, said out loud
+  rather than left to be discovered: the next reader should treat the G1 and G2
+  cells as older than the rest of this file, and the whole file as older than
+  the estate.
