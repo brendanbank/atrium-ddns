@@ -14,6 +14,19 @@
  * screen. A query parameter never changes the route, so the mount and
  * its portal survive.
  *
+ * **An empty `main` on this page is not evidence of that bug coming
+ * back.** #122 looked exactly like it from the other side — dialog and
+ * list gone together mid-interaction, the landmark empty — and no route
+ * swapped. `ZoneModal`'s credential field read
+ * `event.currentTarget.value` from inside a functional `setState`, which
+ * React defers to the render phase whenever an update is already
+ * pending; the synthetic event is detached by then, the read throws
+ * *during render*, and with no error boundary over the host tree React
+ * unmounts the whole root. Same picture, unrelated cause — so read the
+ * page's uncaught-error channel before suspecting the address bar.
+ * `src/test/eventInUpdater.test.ts` is the guard that keeps that
+ * spelling out of the tree.
+ *
  * ## Four states, not two
  *
  * *Refused*, *loading*, *failed* and *loaded* are different, and the

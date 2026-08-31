@@ -453,3 +453,49 @@ export interface SeededName {
   secret: string;
   family: 'A';
 }
+
+/**
+ * Watch the page's uncaught-error channel and assert it empty on demand.
+ *
+ * **#122 is why this exists, and the shape is the lesson.** An uncaught
+ * throw inside the host bundle's React tree is not a local failure: with
+ * no error boundary over the host root, React unmounts *the entire root*
+ * and leaves the wrapper `<div>` inside `main` empty. Every subsequent
+ * locator in the spec then fails with `element(s) not found`, naming the
+ * dialog or the strip it was looking for and saying nothing at all about
+ * the crash that removed it. Three separate readers of that report filed
+ * it as a one-off and reached for a longer timeout.
+ *
+ * A spec that only checks `pageerror` at the end reports the same way,
+ * because it never gets there. So the returned assertion is meant to be
+ * called *between steps*: the first one that fires names the step, which
+ * is the difference between "the app threw while you were typing into
+ * the credential field" and "a select was missing".
+ *
+ * The `label` describes the interaction that has already run, not the
+ * one about to start — the throw belongs to what came before it.
+ */
+export function watchPageErrors(page: Page): (label: string) => Promise<void> {
+  const errors: Error[] = [];
+  page.on('pageerror', (error) => errors.push(error));
+  return async (label: string) => {
+    if (errors.length === 0) return;
+    // Read `main` before asserting. An empty landmark is the signature
+    // of the whole root having gone rather than of one component having
+    // failed, and the two want different fixes — so the message says
+    // which one this is instead of leaving it to be guessed.
+    const main = await page
+      .locator('main')
+      .innerHTML()
+      .catch(() => '<no main landmark>');
+    const rootGone = main.trim().length < 50;
+    expect(
+      errors.map((e) => e.message),
+      `the page threw ${label}` +
+        (rootGone
+          ? ' — and the `main` landmark is empty, so React unmounted the ' +
+            'host root. Nothing arrived late; waiting longer cannot help.'
+          : ''),
+    ).toEqual([]);
+  };
+}
