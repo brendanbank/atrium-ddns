@@ -471,7 +471,7 @@ gate:  ## run exactly the checks this diff can reach (auto-scoped; GATE_BASE=...
 	git rev-parse --verify -q "origin/$$base" >/dev/null 2>&1 && base="origin/$$base"; \
 	changed=$$( { git diff --name-only "$$base"...HEAD 2>/dev/null; git diff --name-only; git ls-files -o --exclude-standard; } | sort -u ); \
 	if [ -z "$$changed" ]; then echo "gate: no changes against $$base — nothing to check"; exit 0; fi; \
-	fe=$$(printf '%s\n' "$$changed" | grep -c '^frontend/src/' || true); \
+	fe=$$(printf '%s\n' "$$changed" | grep -cE '^frontend/(src/|tests-e2e/|[^/]+\.(json|ts|cts|mts))' || true); \
 	be=$$(printf '%s\n' "$$changed" | grep -cE '^(backend/|tests/|scripts/.*\.py)' || true); \
 	echo "gate: $$(printf '%s\n' "$$changed" | wc -l | tr -d ' ') file(s) changed against $$base"; \
 	printf '%s\n' "$$changed" | sed 's/^/  /'; \
@@ -480,7 +480,7 @@ gate:  ## run exactly the checks this diff can reach (auto-scoped; GATE_BASE=...
 		echo "gate: frontend touched ($$fe file(s)) -> typecheck + vitest"; \
 		( cd frontend && pnpm install --frozen-lockfile >/dev/null && pnpm typecheck && pnpm test --run ); \
 	else \
-		echo "gate: SKIP typecheck + vitest — no frontend/src/ file changed"; \
+		echo "gate: SKIP typecheck + vitest — no frontend source, spec or config changed"; \
 	fi; \
 	echo; \
 	if [ "$$be" -gt 0 ]; then \
