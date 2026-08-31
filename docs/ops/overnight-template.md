@@ -47,12 +47,21 @@ agent **measures its own baseline** — do not inherit these numbers.
 ```bash
 cd frontend && pnpm install --frozen-lockfile
 pnpm typecheck                     # tsc --noEmit — 0 errors
-pnpm test                          # vitest — 2 passed (2)
+pnpm test                          # vitest — 200 passed (17 files)
 cd .. && make up && make migrate    # both alembic chains to head
-make test-backend                  # host tests 532 passed + compat 31 passed, 3 skipped
+make test-backend                  # host tests 833 passed + compat 31 passed, 3 skipped
 make smoke PASS=<pw> EMAIL=<addr>  # scripts/smoke.sh — 11 passed (11)
-make test-e2e                      # Playwright — 16 passed (5 spec files), ~35s once the stack is up
+make test-e2e                      # Playwright — 20 passed (7 spec files)
 ```
+
+**Re-measured 2026-08-31 on the V1M7 tip.** The figures above were the
+2026-08-15 scaffold's and had drifted badly — vitest read `2 passed` against a
+real 200, and the backend `532` against a real 833. Nobody was misled, because
+every brief says *measure your own baseline* and #85's agent did exactly that
+and reported the discrepancy. That is the rule working, not the numbers being
+harmless: a stale figure in the contract is the same **inherited number** the
+gate section warns about, one indirection further back, and the contract is the
+one document every agent reads.
 
 **`make test-e2e` is in the gate from #91, and it is the only instrument
 here that renders anything.** Everything above it is HTTP: the endpoints,
@@ -144,7 +153,16 @@ against 800 rather than against today's suite.
 **Parallel agents need distinct host ports.** Compose isolation now covers the
 image tag and the volume, but `API_HOST_PORT` / `MYSQL_HOST_PORT` come from
 `.env`, which each worktree copies from the same example. Two agents on the
-defaults collide. Docker fails loudly on the bind (`port is already allocated`),
+defaults collide.
+
+**`COMPOSE_PROJECT_NAME` in `.env` is inert — set `COMPOSE_PROJECT` instead.**
+The Makefile now passes `-p $(COMPOSE_PROJECT)` explicitly, derived from the
+*resolved* directory basename so a symlinked path and its target address one
+project. An explicit `-p` beats compose's own `COMPOSE_PROJECT_NAME`, so the
+`.env` key does nothing. Isolation still holds for parallel agents, but by
+worktree basename rather than by the name anyone set — which means it holds by
+accident and reads as if it holds by instruction. Found by #85's agent while
+this very brief was telling agents to set the inert key. Docker fails loudly on the bind (`port is already allocated`),
 so this is a stall rather than a silent corruption — but pick your own pair and
 set `COMPOSE_PROJECT_NAME` too. If you find a stack you did not create, stop and
 report it; do not reuse it and do not tear it down.
