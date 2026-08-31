@@ -64,15 +64,28 @@ if grep -qE '^\s*tags:' "$CI_FILE"; then
   echo "  Either drop it, or exclude dev tags explicitly, then re-run." >&2
   exit 1
 fi
-# Every branch the workflow reacts to. If a dev branch ever appears
-# here, the premise of this script is false and it should stop.
-CI_BRANCHES="$(awk '/branches:/{print}' "$CI_FILE" | tr -d ' ')"
-if ! printf '%s\n' "$CI_BRANCHES" | grep -q 'branches:\[master\]'; then
-  echo "refusing: cannot confirm CI is master-only. Triggers found:" >&2
-  printf '  %s\n' "$CI_BRANCHES" >&2
-  echo "  Read $CI_FILE and docs/ops/dev-releases.md before releasing." >&2
+# EVERY branch list the workflow reacts to must be exactly `[master]`.
+#
+# Note the quantifier. An earlier version asked whether *any* line said
+# `[master]` — which a widened allowlist passes, because the
+# `pull_request` line still says it while `push` has grown `dev/**`.
+# That version was written, tested against a mutation that silently
+# failed to apply, and declared working. The mutation test now asserts
+# it applied.
+CI_BRANCHES="$(sed -n 's/^[[:space:]]*branches:[[:space:]]*//p' "$CI_FILE" | tr -d ' ')"
+if [ -z "$CI_BRANCHES" ]; then
+  echo "refusing: no branch triggers found in $CI_FILE — cannot prove CI is" >&2
+  echo "  master-only. A workflow with no 'branches:' key fires on every push." >&2
   exit 1
 fi
+while IFS= read -r line; do
+  if [ "$line" != "[master]" ]; then
+    echo "refusing: CI is no longer master-only. Found trigger: $line" >&2
+    echo "  A dev release assumes pushes outside master run nothing." >&2
+    echo "  Read $CI_FILE and docs/ops/dev-releases.md before releasing." >&2
+    exit 1
+  fi
+done <<< "$CI_BRANCHES"
 case "$BRANCH" in
   dev/*|staging/*) ;;
   *)
