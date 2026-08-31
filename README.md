@@ -124,16 +124,87 @@ The strip screenshot the walk writes on every run is
 
 ## Pinning atrium
 
-`compose.yaml` reads `ATRIUM_IMAGE` from `.env` (default
-`ghcr.io/brendanbank/atrium:0.27`). Override to test
-against a specific release:
+`compose.yaml` reads `ATRIUM_IMAGE` from `.env`, and the pinned default is
+`ghcr.io/brendanbank/atrium:0.28.0`. Override it to try another release
+without editing anything:
 
 ```bash
-ATRIUM_IMAGE=ghcr.io/brendanbank/atrium:0.27.0 make build up
+ATRIUM_IMAGE=ghcr.io/brendanbank/atrium:X.Y.Z make build up
 ```
 
-The frontend SDK packages
-(`@brendanbank/atrium-host-types`, `@brendanbank/atrium-host-bundle-utils`,
-`@brendanbank/atrium-test-utils`) version in lockstep with the image
-— a pin of `^0.27` matches any patch of the
-`0.27.x` line.
+Always a three-part tag, never a floating `X.Y`: the pin is what the
+release watcher below compares against an upstream release tag, and it
+reads exact versions.
+
+The pin is not in one place. The same tag appears in `.env.example`
+(canonical), `Dockerfile`, `compose.yaml`, `.github/workflows/ci.yml` and
+this file, and the frontend SDK packages —
+`@brendanbank/atrium-host-types`, `@brendanbank/atrium-host-bundle-utils`,
+`@brendanbank/atrium-test-utils` — carry the matching version in
+`frontend/package.json`. **They are not independently upgradable.** A host
+running image X with SDK packages from Y fails at runtime, not at build
+time: the served bundle calls endpoints the image does not serve. Anything
+that moves one of them moves all of them, or refuses.
+
+### The release watcher
+
+`.github/workflows/atrium-watch.yml` polls atrium once a day and opens a
+single PR moving every pin above together, with the upstream release notes
+inlined. The editing rules are atrium's
+`.github/actions/host-atrium-bump` — one implementation shared by every
+host, rather than a copy per repo that drifts.
+
+To bump ahead of the poll, or to adopt a version it skipped:
+
+```bash
+make atrium-bump                  # latest release
+make atrium-bump version=0.29.0   # a specific one
+```
+
+It polls; atrium never pushes. Atrium holds no credential for this repo,
+so adding a host costs it nothing and grants it nothing.
+
+CI on the bump PR builds the smoke and e2e stacks against the *new* image,
+which is the point of opening a PR rather than committing to `master`.
+What CI cannot tell you is in the PR checklist: new alembic migrations, a
+breaking `__ATRIUM_REGISTRY__` change, or a new **required** env var.
+0.27.0 is the worked example of the last one — it made
+`SECRET_ENCRYPTION_KEY` mandatory, and a stack that took the bump without
+reading anything would come back up only as far as atrium's startup
+validation.
+
+Merging moves the pin in the source tree. It does not deploy: the running
+stack keeps its old image until it is rebuilt.
+
+### One thing to know before you set it up
+
+The watcher needs `ATRIUM_BUMP_TOKEN` — a fine-grained PAT, resource owner
+`brendanbank`, scoped to this repository alone, with **Contents**, **Pull
+requests** and **Workflows** all at read-and-write:
+
+```bash
+gh secret set ATRIUM_BUMP_TOKEN
+```
+
+It cannot be `GITHUB_TOKEN`. A PR opened by `GITHUB_TOKEN` does not trigger
+`pull_request` workflows, so CI would never exercise the new image. And
+Workflows write is needed because `.github/workflows/ci.yml` is one of the
+pinned files — GitHub rejects a PAT push touching a workflow file without
+it, which is a failure that only shows up on the first real release.
+
+## Merging the automated PRs
+
+`.github/workflows/auto-merge.yml` squash-merges an `atrium-bump/X.Y.Z` PR,
+and Dependabot's grouped minor, patch and security PRs, once **every**
+check on the PR's head commit is green. Majors are excluded by
+construction: `.github/dependabot.yml` splits them into their own
+`*-major-updates` PR, and the gate's allow-list does not name it.
+
+It is a `workflow_run` gate rather than `gh pr merge --auto` because this
+repository has no branch protection available to gate on, and native
+auto-merge armed on an unprotected branch merges immediately — before CI
+starts. The gate reads the checks on the exact commit CI ran against, so a
+push landing after a green run cannot inherit that run's success.
+
+A red PR is left open rather than blocked. Nothing here prevents merging
+one by hand.

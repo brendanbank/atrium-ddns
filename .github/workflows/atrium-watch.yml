@@ -1,0 +1,115 @@
+# Watch upstream atrium for a new release and open the lockstep bump PR.
+#
+# The logic lives in atrium's host-atrium-bump composite action, not here
+# (atrium PR #238). What stays local is what is genuinely local: the cron
+# time, the token secret name, and this host's pin layout.
+#
+# Poll, not push. Atrium holds no credential for this repo and fires
+# nothing at it — this workflow reaches out on a schedule over the public
+# API, so the trust arrow points one way, atrium-ddns -> atrium, read-only.
+#
+# What it does NOT do: merge (that is auto-merge.yml, and only once every
+# check on the PR is green) and deploy (merging moves the pin in the source
+# tree; the running stack keeps its old image until it is rebuilt).
+#
+# Caveat: GitHub disables `schedule` on a repo with 60 days of no activity.
+# If this repo goes quiet the poll stops silently — re-enable it from the
+# Actions tab, or run `make atrium-bump` / `gh workflow run atrium-watch.yml`.
+
+name: Atrium release watch
+
+on:
+  schedule:
+    # Off the hour on purpose: GitHub queues cron heavily at :00 and
+    # delays or drops runs scheduled there.
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "atrium version to adopt (e.g. 0.29.0). Blank = latest release."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# One watcher at a time — a slow run must not race a later one into
+# pushing the same branch twice.
+concurrency:
+  group: atrium-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    name: Check for a new atrium release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require ATRIUM_BUMP_TOKEN
+        env:
+          BUMP_TOKEN: ${{ secrets.ATRIUM_BUMP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BUMP_TOKEN:-}" ]; then
+            echo "::error::ATRIUM_BUMP_TOKEN is not set. Create a fine-grained PAT with resource owner brendanbank, scoped to this repo only, with Contents + Pull requests + Workflows set to read and write, then: gh secret set ATRIUM_BUMP_TOKEN"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+        with:
+          # The PAT, not GITHUB_TOKEN. A branch pushed and a PR opened with
+          # GITHUB_TOKEN do not trigger `pull_request` workflows, so CI would
+          # never exercise the new image — the entire point of the bump PR.
+          # The token also needs the Workflows permission, because this repo
+          # pins the tag inside .github/workflows/ci.yml and GitHub rejects a
+          # PAT push touching a workflow file without it.
+          token: ${{ secrets.ATRIUM_BUMP_TOKEN }}
+
+      # The lockfile must be regenerated with the same pnpm the frontend CI
+      # job uses, or the relock churns. That is why the action does not set
+      # this up itself. Keep this version in step with ci.yml.
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.33.1
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          # Deliberately no `cache: pnpm`. This job runs daily and does
+          # nothing on almost every one of those days, so the pnpm store is
+          # usually never populated — and setup-node's post step fails the
+          # whole run when the path it was told to cache does not exist.
+          # That turns every quiet day red, which is the noise that teaches
+          # you to ignore the workflow. There is nothing worth caching
+          # either: the one install this job ever performs is a
+          # lockfile-only relock on a bump day.
+
+      - uses: brendanbank/atrium/.github/actions/host-atrium-bump@master
+        with:
+          token: ${{ secrets.ATRIUM_BUMP_TOKEN }}
+          version: ${{ inputs.version }}
+          # This repo's default branch is master, not the action's default.
+          base-branch: master
+          # Every file carrying the image tag. Two more than the scaffolded
+          # default: CI writes the tag into the .env it builds the smoke and
+          # e2e stacks from (so a bump PR exercises the new image), and the
+          # README documents the pin. Add to this list the moment the tag is
+          # pinned somewhere new — the bump refuses to run when these
+          # disagree with each other, which is the point.
+          #
+          # Prose mentions of the tag elsewhere (backend/pyproject.toml,
+          # the provider modules, docs/ops/) are deliberately absent: those
+          # record which image was inspected when a claim was checked, and
+          # rewriting them would turn a verified statement into a guess.
+          pin-files: |
+            .env.example
+            Dockerfile
+            compose.yaml
+            .github/workflows/ci.yml
+            README.md
+          # Three, not the action's default two: this host also builds its
+          # frontend tests against @brendanbank/atrium-test-utils, which is
+          # published from the same release and version-locked with the rest.
+          npm-packages: |
+            @brendanbank/atrium-host-bundle-utils
+            @brendanbank/atrium-host-types
+            @brendanbank/atrium-test-utils

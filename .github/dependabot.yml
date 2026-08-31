@@ -1,20 +1,45 @@
 version: 2
-# Each ecosystem declares two groups:
-#   - *-version-updates   (applies-to: version-updates)
+# Each ecosystem declares three groups:
+#   - *-major-updates     (applies-to: version-updates, majors only)
+#   - *-version-updates   (applies-to: version-updates, minor + patch)
 #   - *-security-updates  (applies-to: security-updates)
 #
 # Without the explicit security-updates group, Dependabot opens one
 # PR per advisory even when the `groups` block is set for version
 # updates.
+#
+# Majors are split off into their own PR rather than riding along in the
+# ecosystem's weekly bump, because .github/workflows/auto-merge.yml merges
+# a green `*-version-updates` or `*-security-updates` PR unattended and
+# leaves `*-major-updates` for a human. The branch name is the only signal
+# that gate has, so the split is what makes "majors get read" enforceable
+# rather than aspirational. Renaming a group here silently takes its PRs
+# off auto-merge — the gate allow-lists these names.
+#
+# A group only claims a dependency when both its patterns and its
+# update-types match, so the major group is listed first and the
+# catch-all below it deliberately does not list "major".
+#
+# Grouping is about the lockfile, not tidiness: several single-package PRs
+# against one pnpm-lock.yaml are several conflicting relocks of the same
+# file, and merging any one invalidates the rest. The cost is that a
+# grouped PR is all-or-nothing — if one package in the group breaks CI the
+# whole PR is blocked, and the fix is a targeted `ignore` for that package
+# rather than ungrouping the ecosystem.
 updates:
   - package-ecosystem: "pip"
     directory: "/backend"
     schedule:
       interval: "weekly"
     groups:
+      pip-major-updates:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["major"]
       pip-version-updates:
         applies-to: version-updates
         patterns: ["*"]
+        update-types: ["minor", "patch"]
       pip-security-updates:
         applies-to: security-updates
         patterns: ["*"]
@@ -23,10 +48,27 @@ updates:
     directory: "/frontend"
     schedule:
       interval: "weekly"
+    ignore:
+      # The three atrium SDK packages are version-locked to the image tag:
+      # a host running image X with SDK packages from Y fails at runtime,
+      # not at build time, when the served bundle calls endpoints the image
+      # does not serve. .github/workflows/atrium-watch.yml owns that pair
+      # now and moves them with the image in one PR, so a Dependabot PR for
+      # the npm half alone is a PR that can never be merged as-is — and
+      # from npm's side nothing looks wrong, which is exactly why it would
+      # keep proposing one.
+      - dependency-name: "@brendanbank/atrium-host-bundle-utils"
+      - dependency-name: "@brendanbank/atrium-host-types"
+      - dependency-name: "@brendanbank/atrium-test-utils"
     groups:
+      npm-major-updates:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["major"]
       npm-version-updates:
         applies-to: version-updates
         patterns: ["*"]
+        update-types: ["minor", "patch"]
       npm-security-updates:
         applies-to: security-updates
         patterns: ["*"]
@@ -36,9 +78,14 @@ updates:
     schedule:
       interval: "weekly"
     groups:
+      actions-major-updates:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["major"]
       actions-version-updates:
         applies-to: version-updates
         patterns: ["*"]
+        update-types: ["minor", "patch"]
       actions-security-updates:
         applies-to: security-updates
         patterns: ["*"]
@@ -47,10 +94,21 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    ignore:
+      # Same lockstep rule as the npm SDK packages above: the atrium tag
+      # lives in five files at once (.env.example, Dockerfile, compose.yaml,
+      # ci.yml, README.md) and atrium-watch.yml bumps all five in one PR. A
+      # Dockerfile-only bump would fail the bump script's own lockstep check.
+      - dependency-name: "ghcr.io/brendanbank/atrium"
     groups:
+      docker-major-updates:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["major"]
       docker-version-updates:
         applies-to: version-updates
         patterns: ["*"]
+        update-types: ["minor", "patch"]
       docker-security-updates:
         applies-to: security-updates
         patterns: ["*"]
