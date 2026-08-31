@@ -698,6 +698,40 @@ forever if the condition *errors* rather than turning true, and the run looks
 hung for no reason anyone can see. Bound every wait with a maximum number of
 attempts and fail loudly when they are exhausted.
 
+### Gate tiers — run the cheapest one that could fail
+
+The full gate is six commands, but only two of them are expensive, and the
+expense is not the tests. Measured on the V1M7 tip: `make test-backend` is
+**833 tests in 16.66s** and `make test-e2e` is **20 specs in 40.3s**. What
+costs is the scaffolding around them — `pnpm install`, `make up` building an
+image, and `make test-e2e` running a whole `e2e-up` (image build,
+force-recreate, both alembic chains, seed admin, seed bundle,
+`check-bundle-fresh`) before the first spec executes. That happens on every
+invocation.
+
+So pick the tier by what the diff can reach. **The orchestrator picks it and
+names it in the dispatch brief**; an agent that thinks the tier is wrong says
+so with the file and the mechanism rather than silently escalating.
+
+| tier | when the diff touches | run |
+|---|---|---|
+| **1 — none** | only docs, `.gitignore`, CI yaml, `scripts/` not imported by the app | `git diff --stat` proving no code path, plus the direct proof of the behaviour changed. **No stack.** |
+| **2 — backend** | `backend/`, `tests/`, python under `scripts/` | `make test-backend` + `make smoke`. **No `pnpm`, no e2e.** |
+| **3 — frontend** | `frontend/src/` | `pnpm typecheck`, `pnpm test`, `make test-e2e` |
+| **4 — cross-cutting** | routes, migrations, the host bundle contract, anything in two of the above | everything |
+
+Tier 1 is not a skipped gate, and the PR body must not read like one. It is
+`git diff --stat` showing the change cannot reach a test, plus the proof that
+the thing actually changed — for an ignore pattern, `git check-ignore -v` and a
+`git add -A` that stages nothing. That is *stronger* evidence about the change
+than a green Playwright run, which says only that something unrelated still
+works.
+
+**A tier is a floor, not a ceiling, and re-running is not free.** One agent ran
+the full gate eight times on a two-line ignore change, then deadlocked waiting
+for it. Re-run a tier when your diff changed, not to gain confidence in a
+result you already have.
+
 **Scope the gate to what the change can reach — and say who scoped it.**
 The gate is mandatory, not ceremonial, and those are different claims. A
 change confined to `.gitignore` and `docs/` cannot be reached by a Playwright
