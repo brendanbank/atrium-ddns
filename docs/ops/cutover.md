@@ -640,17 +640,20 @@ two instruments — rows read from the source vs rows in the target:
 
   owner: <…> (atrium user N, adopted)
   hostname -> device: 11 of 11 compared as a whole set, IDENTICAL
-  provider credentials: route53=b1cceaf6ff7875a7
+  provider credentials: route53=<digest>
   device password hashes: 6 of 6 byte-identical to the legacy rows
 
 both instruments agree on every count.
 ```
 
-**The credential digest is the thing to check by eye.** `b1cceaf6ff7875a7` is
-the sha256[:16] of the decrypted Route 53 credential. It has now been arrived at
+**The credential digest is the thing to check by eye.** It is the sha256[:16] of
+the decrypted Route 53 credential, and the literal value is deliberately not
+written down here — it is a fingerprint of live production material, and this
+repository is public. On the real run it was arrived at
 five independent times — by #49, by #50 through the legacy repo's own
 `decrypt_value`, and three times in this issue from a copy taken hours later
-along both owner paths. **If it differs, stop.** It means the credential
+along both owner paths. **Compare it against what the earlier steps printed; if
+it differs, stop.** It means the credential
 decrypted to something other than what the old service reads, and an
 empty-looking-but-migrated credential is the failure mode this milestone was
 built to refuse.

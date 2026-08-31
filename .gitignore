@@ -43,3 +43,9 @@ certs/
 # the deployment whose loss means re-issuing and whose disclosure means
 # somebody else can speak as the service.
 letsencrypt/
+
+# Conductor's per-workspace scratch directory: agent notes, todo lists,
+# whatever is mid-thought. It was ignored through `.git/info/exclude`, which
+# is machine-local — so it protected this checkout and nobody else's. Tracked
+# here instead now that the repository is public and clones are other people's.
+.context/
