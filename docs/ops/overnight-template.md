@@ -727,10 +727,24 @@ the thing actually changed — for an ignore pattern, `git check-ignore -v` and 
 than a green Playwright run, which says only that something unrelated still
 works.
 
-**A tier is a floor, not a ceiling, and re-running is not free.** One agent ran
-the full gate eight times on a two-line ignore change, then deadlocked waiting
-for it. Re-run a tier when your diff changed, not to gain confidence in a
-result you already have.
+**A tier is a floor, not a ceiling, and re-running is not free.** Re-run a
+tier when your diff changed, not to gain confidence in a result you already
+have.
+
+**Never wait with `until`, and never `pgrep -f` a string your own command
+contains.** The real cost of the #76 incident was neither the gate nor its
+repetition: the agent backgrounded a gate script and then spawned **nine**
+waiters shaped like
+
+    until ! pgrep -f "76_gate.sh" >/dev/null; do sleep 30; done
+
+`pgrep -f` matches full command lines, so each waiter matched *itself* and its
+siblings and could never exit — while the script it waited on had already
+finished with `exit=0`. Each stall prompted another waiter. Run the thing in
+the foreground and let it block, or bound the poll with
+`for i in $(seq 1 N)` and fail loudly when the attempts run out. `until` cannot
+tell *not yet true* from *errored*, so it hangs where a bounded loop would
+report.
 
 **Scope the gate to what the change can reach — and say who scoped it.**
 The gate is mandatory, not ceremonial, and those are different claims. A
@@ -740,11 +754,21 @@ code path between them. Running them anyway does not raise confidence, it
 manufactures a **probe that cannot fail** and puts it in the gate, which is the
 defect family this file is most insistent about.
 
-Measured, on #76 of V1M7: an agent told to "run the full gate" on a two-line
-ignore-pattern change invoked `make test-e2e` **36 times** — fighting an
-unrelated flake in a suite its diff could not touch — and had still pushed no
-branch and opened no PR when the orchestrator stopped it. The brief was wrong,
-not the agent; it did exactly as instructed.
+Measured, on #76 of V1M7: an agent told to "run the full gate" on a
+two-line ignore-pattern change ran the whole suite — including Playwright —
+against a diff that could not reach any of it, and had pushed no branch and
+opened no PR long after the gate had passed. The brief was wrong, not the
+agent; it did exactly as instructed.
+
+**And the first write-up of this incident was itself wrong, which is the more
+useful half.** The orchestrator reported "invoked `make test-e2e` 36 times"
+from a `grep -c` over the agent's transcript. Counted properly — parsing the
+transcript's `tool_use` records instead of grepping its text — the real figure
+is **1 direct invocation** out of 180 Bash calls, plus two inside a gate script
+it ran once. The 36 were occurrences of the *string*: in prose, in the script's
+own source, and in the waiters that referenced it. An assertion about a report
+rather than about the thing being reported, made by the orchestrator, in the
+act of documenting that very family. Count invocations, not mentions.
 
 So: run the cheapest gate that could conceivably fail because of *this* diff,
 and put the reasoning in the PR body where a reader sees a decision on the
