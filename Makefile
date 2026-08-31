@@ -121,7 +121,7 @@ define CHECK_FRESH
 	echo "$(1): container matches worktree ($$hd)"
 endef
 
-.PHONY: help dev-bootstrap dev-up dev-down up down build logs ps migrate \
+.PHONY: help dev-bootstrap dev-up dev-down up down build logs ps migrate gate \
 	seed-admin seed-bundle seed-compat-fixture verify-compat-rehash \
 	test test-frontend test-backend test-compat \
 	check-fresh check-compat-fresh check-backend-fresh check-host-pkg-fresh \
@@ -436,6 +436,60 @@ test-backend-serial: check-fresh  ## same, one worker — for bisecting a failin
 # It makes no suite-wide claim, so there is nothing for staleness to falsify.
 test-backend-file:  ## one file, verbose — the way to diagnose a hang (FILE=tests/x.py)
 	$(COMPOSE) exec -T api /opt/venv/bin/python -m pytest $(HOST_APP)/$(FILE) -n 0 -v
+
+# The whole gate, as one command that decides for itself what to run.
+#
+# It replaces a checklist an agent executed by hand. That checklist had to be
+# conditional — a Playwright run cannot fail because of a `.gitignore` edit —
+# and every place the condition lived was a place to get it wrong: the
+# orchestrator's brief said "run the full gate" for an issue that touched no
+# code, an agent improvised where the brief was silent, and a two-line change
+# spent half an hour in the suite. The judgement was the defect, not the
+# commands.
+#
+# So the judgement moves here, where it is read from the diff rather than from
+# a person, and it prints what it ran AND what it skipped and why — the output
+# is the PR-body evidence, so a skip is a visible decision instead of a silent
+# absence.
+#
+# BASE is what "changed" is measured against — the milestone branch during a
+# run, trunk otherwise.
+GATE_BASE ?= $(or $(OVERNIGHT_MILESTONE_BRANCH),$(OVERNIGHT_TRUNK),master)
+
+gate:  ## run exactly the checks this diff can reach (auto-scoped; GATE_BASE=...)
+	@set -e; \
+	base="$(GATE_BASE)"; \
+	git rev-parse --verify -q "origin/$$base" >/dev/null 2>&1 && base="origin/$$base"; \
+	changed=$$( { git diff --name-only "$$base"...HEAD 2>/dev/null; git diff --name-only; git ls-files -o --exclude-standard; } | sort -u ); \
+	if [ -z "$$changed" ]; then echo "gate: no changes against $$base — nothing to check"; exit 0; fi; \
+	fe=$$(printf '%s\n' "$$changed" | grep -c '^frontend/src/' || true); \
+	be=$$(printf '%s\n' "$$changed" | grep -cE '^(backend/|tests/|scripts/.*\.py)' || true); \
+	echo "gate: $$(printf '%s\n' "$$changed" | wc -l | tr -d ' ') file(s) changed against $$base"; \
+	printf '%s\n' "$$changed" | sed 's/^/  /'; \
+	echo; \
+	if [ "$$fe" -gt 0 ]; then \
+		echo "gate: frontend touched ($$fe file(s)) -> typecheck + vitest"; \
+		( cd frontend && pnpm install --frozen-lockfile >/dev/null && pnpm typecheck && pnpm test --run ); \
+	else \
+		echo "gate: SKIP typecheck + vitest — no frontend/src/ file changed"; \
+	fi; \
+	echo; \
+	if [ "$$be" -gt 0 ]; then \
+		echo "gate: backend touched ($$be file(s)) -> stack + backend tests + smoke"; \
+		$(MAKE) --no-print-directory up migrate; \
+		$(MAKE) --no-print-directory test-backend; \
+		$(MAKE) --no-print-directory smoke; \
+	else \
+		echo "gate: SKIP stack + backend tests + smoke — no backend/, tests/ or python script changed"; \
+	fi; \
+	echo; \
+	if [ "$$fe" -eq 0 ] && [ "$$be" -eq 0 ]; then \
+		echo "gate: this diff reaches no test. That is the result, not a skipped step."; \
+		echo "gate: evidence for such a change is the diff itself plus a direct"; \
+		echo "gate: demonstration of the behaviour it changes."; \
+	fi; \
+	echo "gate: e2e is NOT run here — it runs once on the release PR into $(or $(OVERNIGHT_TRUNK),master)."; \
+	echo "gate: PASS"
 
 typecheck:  ## tsc --noEmit on the host bundle
 	cd frontend && pnpm typecheck
