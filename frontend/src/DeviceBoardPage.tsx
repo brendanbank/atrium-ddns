@@ -27,7 +27,8 @@ import { usePerm } from '@brendanbank/atrium-host-bundle-utils/react';
 
 import { BOARD_PERMISSION, boardQuery } from './api/board';
 import { HOSTNAME_PERMISSION } from './api/hostnames';
-import { BoardSkeleton, DeviceBoard } from './board/DeviceBoard';
+import { BoardSkeleton } from './board/DeviceBoard';
+import { BoardTable } from './board/BoardTable';
 import { HealthCheckActions } from './board/HealthCheckActions';
 import { NAMES_PATH } from './HostnamesPage';
 import { DdnsRoot } from './host/DdnsRoot';
@@ -99,7 +100,7 @@ export function DeviceBoardInner() {
           <HealthCheckActions
             intervalMinutes={data.health_check_interval_minutes}
           />
-          <DeviceBoard board={data} onOpenDevice={setOpenDevice} />
+          <BoardTable board={data} onOpenDevice={setOpenDevice} />
           {/* §18.2 — the board's device name is now a way in, and this
               is where it goes. The same `DeviceCard` the route renders
               and the device list opens: one definition, asserted by

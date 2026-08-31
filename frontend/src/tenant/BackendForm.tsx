@@ -139,6 +139,15 @@ export function BackendForm({
   const [service, setService] = useState(
     existing?.backend_type ?? providers[0]?.service ?? '',
   );
+  /** Offered providers, plus whatever this row already uses. The second
+   *  half only ever adds something when the catalogue has stopped
+   *  offering a provider that existing rows still point at — which is
+   *  exactly when hiding it would be worst. */
+  const offered = providers.map((provider) => provider.service);
+  const selectOptions =
+    existing && existing.backend_type && !offered.includes(existing.backend_type)
+      ? [existing.backend_type, ...offered]
+      : offered;
   const [mode, setMode] = useState<CredentialMode>(
     defaultCredentialMode(existing?.credentials_set ?? false),
   );
@@ -187,7 +196,7 @@ export function BackendForm({
 
       <Select
         label="Provider"
-        data={providers.map((provider) => provider.service)}
+        data={selectOptions}
         value={service}
         // Editing a binding cannot change its provider: the row is
         // UNIQUE(domain_id, backend_type), so a change is a different

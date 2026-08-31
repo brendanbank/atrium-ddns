@@ -10,6 +10,11 @@
 # .overnight.conf).
 .overnight.local.conf
 
+# Which 1Password item holds your dev admin login, for `make dev-up`. Same
+# arrangement as .overnight.local.conf above: the item's title is a hostname,
+# so it is named here and nowhere tracked. See scripts/dev-admin.sh.
+.devstack.local.conf
+
 # Node
 node_modules/
 dist/

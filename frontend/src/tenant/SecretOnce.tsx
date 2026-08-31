@@ -109,12 +109,12 @@ export function SecretOnce({
           issues a new one and stops the old one working.
         </Text>
         <div className="ddns-strip__stations">
-          <span className="ddns-label">username</span>
+          <span className="ddns-th">Username</span>
           <span className="ddns-data" data-testid="issued-username">
             {issued.device.username}
           </span>
           <span />
-          <span className="ddns-label">secret</span>
+          <span className="ddns-th">Secret</span>
           <Code className="ddns-data" data-testid="issued-secret">
             {issued.secret}
           </Code>

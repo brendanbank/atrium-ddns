@@ -1,53 +1,110 @@
-/** The route atrium registers at `/atrium-ddns/domains`.
+/** Zones and providers — the list, and the modal drawn over it.
  *
- * Four states kept four, the same table `DeviceBoardPage` keeps and for
- * the same reason:
+ * ## The modal is the URL
  *
- * | state | what it means | what it must not be confused with |
- * |---|---|---|
- * | refused | the caller lacks `atrium_ddns.domain.manage` | an empty list |
- * | loading | the request is in flight | an empty list |
- * | failed | the request errored | an empty list |
- * | empty | the tenant genuinely owns no zones | any of the above |
+ * One route, and `?zone=` decides whether a modal is over it. Reload,
+ * Back and a pasted link all work, because the address carries the
+ * state and nothing else remembers it.
  *
- * *Not measured*, *measured as zero*, *refused* and *never ran* are four
- * states, and rendering them in one type is the single most common way
- * that family arises. Telling a refused user "you have no zones yet"
- * states a fact about their account that is not true.
+ * **It was two routes and that was a bug.** `/atrium-ddns/zones/:id` was
+ * registered separately, so opening and closing swapped atrium's route
+ * element — which unmounts the host's React root. The modal is portalled
+ * to `document.body`, so closing orphaned the portal: the zone was
+ * deleted, the list refreshed underneath, and the dialog stayed on
+ * screen. A query parameter never changes the route, so the mount and
+ * its portal survive.
  *
- * The refusal branch does not fire either query, so a user without the
- * permission does not generate a 403 on every page load.
+ * ## Four states, not two
+ *
+ * *Refused*, *loading*, *failed* and *loaded* are different, and the
+ * refusal branch fires no query — so a user without the permission does
+ * not generate a 403 on every page load. Telling a refused user "you
+ * have no zones yet" states a fact about their account that is untrue.
  */
-import { Alert, Anchor, Group, Stack, Text, Title } from '@mantine/core';
+import { useState } from 'react';
+import { Alert, Button, Group, Stack, Text, TextInput, Title } from '@mantine/core';
 import { useQuery } from '@tanstack/react-query';
-import { usePerm } from '@brendanbank/atrium-host-bundle-utils/react';
+import {
+  useAtriumLocation,
+  useAtriumNavigate,
+  usePerm,
+} from '@brendanbank/atrium-host-bundle-utils/react';
 
-import { DOMAIN_PERMISSION, domainsQuery, providersQuery } from './api/domains';
-import { HOSTNAME_PERMISSION } from './api/hostnames';
-import { NAMES_PATH } from './HostnamesPage';
+import { DOMAIN_PERMISSION, domainsQuery } from './api/domains';
 import { DdnsRoot } from './host/DdnsRoot';
 import { DomainList } from './tenant/DomainList';
+import { ZoneModal } from './tenant/ZoneModal';
+import {
+  ZONES_LIST_PATH,
+  zoneFromSearch,
+  zoneHrefParam,
+  zoneNewHref,
+} from './paths';
 
 export function DomainsInner() {
   const hasPerm = usePerm();
   const canRead = hasPerm(DOMAIN_PERMISSION);
   const domains = useQuery(domainsQuery({ enabled: canRead }));
-  const providers = useQuery(providersQuery({ enabled: canRead }));
+  const [query, setQuery] = useState('');
+  const { search } = useAtriumLocation();
+  const navigate = useAtriumNavigate();
+
+  /** The modal's state, read from `?zone=`. Never mirrored into
+   *  `useState`: two sources of truth is how the modal and the address
+   *  bar came to disagree in the first place. */
+  const zone = zoneFromSearch(search);
+  const modalOpen = zone.open;
+  const zoneId = zone.open ? zone.id : null;
+  /** Closing drops the parameter. `replace` so opening and closing does
+   *  not leave a Back step that reopens it. */
+  const closeModal = () => navigate(ZONES_LIST_PATH, { replace: true });
+
+  /** Filtering starts at two characters, as asked. One character matches
+   *  most of the list and is more likely a keystroke on the way to a
+   *  real query than a query; below the threshold the list is whole
+   *  rather than empty, so the field never looks broken while you type.
+   *  Matches the zone name and the provider, because those are the two
+   *  columns you can see. */
+  const needle = query.trim().toLowerCase();
+  const filtered =
+    needle.length < 2
+      ? (domains.data ?? [])
+      : (domains.data ?? []).filter(
+          (d) =>
+            d.name.toLowerCase().includes(needle) ||
+            (d.backends[0]?.backend_type ?? '').toLowerCase().includes(needle),
+        );
 
   return (
     <Stack gap="md">
-      <Group justify="space-between" align="baseline">
+      <Group justify="space-between" align="center">
         <Title order={3}>Zones and providers</Title>
-        {/* The other half of #69's "reachable from the device board and
-            the domain page". A zone with no names in it is the state
-            this page leaves you in, and until now there was nowhere to
-            go from there. */}
-        {hasPerm(HOSTNAME_PERMISSION) ? (
-          <Anchor href={NAMES_PATH} size="sm" data-testid="domains-names-link">
-            Manage names
-          </Anchor>
+        {/* "Manage names" is gone from here: every row links to the
+            names for its own zone, which is the useful version of the
+            same trip, and a second global link beside the primary action
+            competed with it for the same corner. */}
+        {canRead ? (
+          <Group gap="sm" align="flex-end">
+            <Button
+              size="xs"
+              onClick={() => navigate(zoneNewHref())}
+              data-testid="add-domain"
+            >
+              Add a zone
+            </Button>
+            <TextInput
+              size="xs"
+              label="Search"
+              placeholder="zone or provider"
+              value={query}
+              onChange={(event) => setQuery(event.currentTarget.value)}
+              data-testid="domains-search"
+              style={{ width: 220 }}
+            />
+          </Group>
         ) : null}
       </Group>
+
       {!canRead ? (
         <Alert
           color="gray"
@@ -61,11 +118,11 @@ export function DomainsInner() {
             permission rather than assuming you own no zones.
           </Text>
         </Alert>
-      ) : domains.isLoading || providers.isLoading ? (
+      ) : domains.isLoading ? (
         <Text size="sm" data-testid="domains-loading">
           Loading…
         </Text>
-      ) : domains.error || providers.error ? (
+      ) : domains.error ? (
         <Alert
           color="gray"
           variant="light"
@@ -73,12 +130,21 @@ export function DomainsInner() {
           data-testid="domains-error"
         >
           <Text size="sm" ff="monospace">
-            {((domains.error ?? providers.error) as Error).message}
+            {(domains.error as Error).message}
           </Text>
         </Alert>
-      ) : domains.data && providers.data ? (
-        <DomainList domains={domains.data} providers={providers.data} />
+      ) : domains.data ? (
+        <DomainList
+          domains={filtered}
+          total={domains.data.length}
+          onOpen={(id) => navigate(zoneHrefParam(id))}
+        />
       ) : null}
+
+      {/* One modal for both jobs, and its open-ness is the address bar.
+          `zoneId` is `null` on the create address, which is what
+          `ZoneModal` reads as *create*. */}
+      <ZoneModal zoneId={zoneId} opened={modalOpen} onClose={closeModal} />
     </Stack>
   );
 }

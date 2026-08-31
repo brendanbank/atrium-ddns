@@ -23,11 +23,13 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 import dns.query
+import dns.tsig
 import dns.tsigkeyring
 import dns.update
 import structlog
 
 from .base import (
+    SettingField,
     DEFAULT_TTL,
     RTYPE_A,
     STATUS_DNSERR,
@@ -53,9 +55,64 @@ REQUIRED_SETTINGS: tuple[str, ...] = (
 SECRET_SETTINGS: frozenset[str] = frozenset({"nsupdate_secret"})
 
 
+#: The TSIG algorithms dnspython will actually accept, read off
+#: ``dns.tsig`` rather than typed from memory — a name this list gets
+#: wrong is a publish-time failure from a value the form offered.
+#: ``HMAC-MD5`` is deliberately last: BIND still accepts it and legacy
+#: keys exist, but it should not be the one anybody reaches for first.
+TSIG_ALGORITHMS: tuple[str, ...] = (
+    str(dns.tsig.HMAC_SHA256),
+    str(dns.tsig.HMAC_SHA512),
+    str(dns.tsig.HMAC_SHA384),
+    str(dns.tsig.HMAC_SHA224),
+    str(dns.tsig.HMAC_SHA1),
+    str(dns.tsig.HMAC_MD5),
+)
+
+
 class NsUpdateProvider(BaseProvider):
     SERVICE = "nsupdate"
     REQUIRED_CREDENTIALS = ("nsupdate_secret",)
+    CREDENTIAL_LABELS = {
+        "nsupdate_secret": (
+            "TSIG secret",
+            "The base64 secret from the same `key` block as the name and "
+            "algorithm above. Stored encrypted and never shown again.",
+        ),
+    }
+    #: The three non-secret halves of a TSIG configuration. All required:
+    #: ``settings()`` already treats every one of ``REQUIRED_SETTINGS`` as
+    #: mandatory and ``has_credentials`` returns False without them, so a
+    #: binding missing any of these contributes ``911`` on the wire. The
+    #: form refusing it is the same rule stated where it can be acted on.
+    SETTING_FIELDS = (
+        SettingField(
+            key="nsupdate_nameserver",
+            label="Nameserver",
+            help=(
+                "Address of the server that accepts the dynamic update — "
+                "the machine running BIND or Knot, not the zone name."
+            ),
+            required=True,
+        ),
+        SettingField(
+            key="nsupdate_key",
+            label="TSIG key name",
+            help=(
+                "The key's name as the nameserver knows it, without the "
+                "trailing dot. From the `key \"...\" { }` block in named.conf."
+            ),
+            required=True,
+        ),
+        SettingField(
+            key="nsupdate_algo",
+            label="TSIG algorithm",
+            help="Must match the algorithm in the nameserver's key block.",
+            choices=TSIG_ALGORITHMS,
+            required=True,
+            default=str(dns.tsig.HMAC_SHA256),
+        ),
+    )
 
     def settings(self) -> dict[str, Any]:
         """The four values an update needs, resolved from row + config."""

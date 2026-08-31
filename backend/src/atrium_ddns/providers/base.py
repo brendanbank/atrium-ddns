@@ -218,6 +218,30 @@ class ProviderAccount:
         )
 
 
+@dataclass(frozen=True)
+class SettingField:
+    """One non-secret provider setting, as a form needs to know it.
+
+    ``choices`` is what makes this more than a list of key names: an
+    algorithm is an enum with a fixed set of values the DNS library will
+    accept, and a free-text box for it produces a runtime failure at
+    publish time from a typo the form could have refused.
+    """
+
+    key: str
+    label: str
+    #: Rendered under the field. The operator does not know what a TSIG
+    #: key name is unless something says so.
+    help: str = ""
+    #: Non-empty makes this a select rather than a text box.
+    choices: tuple[str, ...] = ()
+    #: Refused at the API, not merely marked in the UI — see
+    #: ``_reject_missing_settings``.
+    required: bool = False
+    #: Prefilled on a new binding.
+    default: str = ""
+
+
 class BaseProvider:
     """One DNS backend, for one tenant, for one set of zones.
 
@@ -236,6 +260,22 @@ class BaseProvider:
     #: Credential keys that must all be present and truthy before the
     #: adapter will talk to the provider at all.
     REQUIRED_CREDENTIALS: ClassVar[tuple[str, ...]] = ()
+    #: ``key -> (label, help)`` for credential fields. A form that
+    #: labels a box ``nsupdate_secret`` is showing the operator a column
+    #: name; the provider knows what the thing is called and should say.
+    CREDENTIAL_LABELS: ClassVar[dict[str, tuple[str, str]]] = {}
+    #: Non-secret settings this provider needs, described well enough for
+    #: a form to render them.
+    #:
+    #: These live in the plaintext ``config`` column. They were reachable
+    #: only by typing raw JSON, which meant nsupdate — which needs three
+    #: of them, one of which is an enum — could not be configured by
+    #: anyone who did not already know the key names. A settings field
+    #: list belongs next to the class that consumes it for the same
+    #: reason ``REQUIRED_CREDENTIALS`` does: a provider that gains a
+    #: setting grows the field, and a list retyped in TypeScript is the
+    #: identical defect one release later.
+    SETTING_FIELDS: ClassVar[tuple["SettingField", ...]] = ()
 
     def __init__(self, account: ProviderAccount) -> None:
         self._account = account

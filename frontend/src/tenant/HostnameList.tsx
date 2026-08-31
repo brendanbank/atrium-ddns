@@ -39,36 +39,28 @@
  * shows, and that string is what leaves the browser. Whether it is a
  * legal name is answered by the server, once, in its own words.
  */
-import { useState } from 'react';
 import {
-  Alert,
+  Anchor,
   Button,
   Group,
-  Modal,
-  Select,
   Stack,
   Text,
-  TextInput,
 } from '@mantine/core';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
 
 import type { Device } from '../api/devices';
 import type { Domain } from '../api/domains';
 import {
-  HOSTNAMES_QUERY_KEY,
-  assignDevice,
-  createHostname,
-  deleteHostname,
   type Hostname,
 } from '../api/hostnames';
 import { absoluteTitle, formatAge } from '../board/format';
-import { HostnamePublishingModal } from './HostnamePublishingModal';
+import { opensInThisTab } from '../cards';
+import { namesHrefForName } from '../paths';
+import { NAMES_PATH } from '../HostnamesPage';
 
 /** The `value` a Mantine `Select` uses for *no device*. `Select` speaks
  *  `string | null`, and `null` is already how it spells "nothing
  *  chosen" — which is a different fact from "chosen: unassigned". Two
  *  facts, two values. */
-const UNASSIGNED = 'unassigned';
 
 /** Join what was typed to the zone that was selected. Two rules, and
  *  deliberately no third.
@@ -111,6 +103,11 @@ const UNASSIGNED = 'unassigned';
  *  Exported so the table in `HostnamesPage.test.tsx` can drive it
  *  directly. It has exactly one caller.
  */
+/** The sentinel the create form is reached by. `NameModal` reads a
+ *  `null` id as create; this list only knows "open something", so it
+ *  hands the page a value the page maps. */
+export const NEW_NAME = -1;
+
 export function composeHostname(typed: string, zone: string | null): string {
   const entered = typed.trim();
   // Nothing typed is nothing to send — not the zone apex. An empty
@@ -122,84 +119,84 @@ export function composeHostname(typed: string, zone: string | null): string {
   return `${entered}.${zone}`;
 }
 
-function deviceOptions(devices: Device[]) {
-  return [
-    { value: UNASSIGNED, label: 'Not assigned yet' },
-    ...devices.map((device) => ({
-      value: String(device.id),
-      label: device.name,
-    })),
-  ];
+/** The inverse: the label a name carries under its zone.
+ *
+ * `NameModal` seeds its Name box from a stored row, and the box holds
+ * the label rather than the FQDN — so it has to answer the same question
+ * `composeHostname` does, backwards: *does this name already end with
+ * its zone?*
+ *
+ * It lives here, beside the composer, because that question having two
+ * homes is exactly the drift `HostnamesPage.test.tsx` sweeps for — and
+ * the sweep found it, in `NameModal` with a `.${zone}` suffix while the
+ * composer matched on the bare zone. Two spellings of one rule disagree
+ * on the apex: `example.net` under zone `example.net` is the zone
+ * itself, which the composer leaves alone and the modal's copy did not.
+ *
+ * Round-trips with `composeHostname`: `compose(decompose(n, z), z) === n`
+ * for any `n` that ends with `z`.
+ */
+export function decomposeHostname(name: string, zone: string | null): string {
+  if (zone === null || zone === '') return name;
+  if (!name.toLowerCase().endsWith(zone.toLowerCase())) return name;
+  if (name.length === zone.length) return name;
+  // Strip the separating dot too, but only if that is what is there —
+  // `notexample.net` ends with `example.net` and is not under it.
+  const label = name.slice(0, name.length - zone.length);
+  return label.endsWith('.') ? label.slice(0, -1) : name;
 }
+
 
 function HostnameLine({
   hostname,
-  devices,
-  onAssign,
-  onDelete,
-  onPublishing,
-  busy,
+  index,
+  deviceName,
+  onOpen,
 }: {
   hostname: Hostname;
-  devices: Device[];
-  onAssign: (hostname: Hostname, deviceId: number | null) => void;
-  onDelete: (hostname: Hostname) => void;
-  onPublishing: (hostname: Hostname) => void;
-  busy: boolean;
+  /** Stripe parity, stated rather than counted — the head is a sibling
+   *  in the same grid, and the selector that would count correctly is
+   *  rejected by lightningcss. */
+  index: number;
+  /** Resolved by the caller, which already holds the device list. The
+   *  row does not fetch and does not mutate; it renders. */
+  deviceName: string | null;
+  onOpen: (id: number) => void;
 }) {
   return (
-    <Stack gap="xs" data-testid={`hostname-${hostname.name}`}>
-      <div className="ddns-device__line" style={{ cursor: 'default' }}>
-        <span />
-        <span className="ddns-data">{hostname.name}</span>
-        <span
-          className="ddns-station__time"
-          title={absoluteTitle(hostname.last_updated_at)}
-        >
-          {/* `never` for a null, never an epoch-derived age. Nothing has
-              been published until a `good` aggregate lands. */}
-          {formatAge(hostname.last_updated_at)}
-        </span>
-        <span className="ddns-station__time">{hostname.domain_name}</span>
-      </div>
-      <Group gap="xs">
-        <Select
-          size="xs"
-          aria-label={`Device for ${hostname.name}`}
-          data={deviceOptions(devices)}
-          value={
-            hostname.device_id === null ? UNASSIGNED : String(hostname.device_id)
-          }
-          disabled={busy}
-          allowDeselect={false}
-          onChange={(value) =>
-            onAssign(
-              hostname,
-              value === null || value === UNASSIGNED ? null : Number(value),
-            )
-          }
-          data-testid={`assign-${hostname.name}`}
-        />
-        <Button
-          size="xs"
-          variant="default"
-          disabled={busy}
-          onClick={() => onPublishing(hostname)}
-          data-testid={`publishing-${hostname.name}`}
-        >
-          Publishing
-        </Button>
-        <Button
-          size="xs"
-          variant="default"
-          disabled={busy}
-          onClick={() => onDelete(hostname)}
-          data-testid={`delete-hostname-${hostname.name}`}
-        >
-          Delete
-        </Button>
-      </Group>
-    </Stack>
+    <div
+      className="ddns-names__row"
+      data-stripe={index % 2 === 1 ? 'on' : 'off'}
+      data-testid={`hostname-${hostname.name}`}
+    >
+      {/* The name opens the one modal that holds every setting for it.
+          The row used to carry a device dropdown and a gear: the list
+          could mutate data while looking like a list, and the settings
+          for one object lived in three places. */}
+      <a
+        className="ddns-data"
+        href={namesHrefForName(hostname.id)}
+        onClick={(event) => {
+          if (!opensInThisTab(event.nativeEvent)) return;
+          event.preventDefault();
+          onOpen(hostname.id);
+        }}
+        data-testid={`hostname-${hostname.name}-link`}
+      >
+        {hostname.name}
+      </a>
+      <span className="ddns-cell">{hostname.domain_name}</span>
+      <span className="ddns-cell" data-testid={`assigned-${hostname.name}`}>
+        {deviceName ?? 'Not assigned'}
+      </span>
+      <span
+        className="ddns-cell"
+        title={absoluteTitle(hostname.last_updated_at)}
+      >
+        {/* `never` for a null, never an epoch-derived age. */}
+        {formatAge(hostname.last_updated_at)}
+      </span>
+    </div>
   );
 }
 
@@ -207,84 +204,36 @@ export function HostnameList({
   hostnames,
   domains,
   devices,
+  zoneFilter = null,
+  nameFilter = null,
+  onOpen,
 }: {
   hostnames: Hostname[];
   domains: Domain[];
   devices: Device[];
+  /** Set by `?zone=` — the zone list's "N names" link. */
+  zoneFilter?: number | null;
+  /** Set by `?name=` — the device card's link to one name. */
+  nameFilter?: number | null;
+  /** Opens the one modal that holds every setting for a name. The list
+   *  does not own it: `HostnamesPage` does, so the address bar decides
+   *  what is open and a reload restores it. */
+  onOpen: (id: number) => void;
 }) {
-  const client = useQueryClient();
-  const [creating, setCreating] = useState(false);
-  const [name, setName] = useState('');
-  const [zone, setZone] = useState<string | null>(null);
-  const [device, setDevice] = useState<string>(UNASSIGNED);
-  const [confirmDelete, setConfirmDelete] = useState<Hostname | null>(null);
-  //: The name whose publishing settings are open, or `null`. Held as
-  //: the row rather than as its id so the modal can render the device
-  //: name and the assignment state without a second lookup.
-  const [publishing, setPublishing] = useState<Hostname | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  /** Filtering is a view, so it is applied here rather than by refetching
+   *  a narrower query: the list is already loaded, and a second query
+   *  keyed by filter would give this page two caches of the same rows
+   *  that could disagree after a mutation. */
+  const shown = hostnames.filter(
+    (h) =>
+      (zoneFilter === null || h.domain_id === zoneFilter) &&
+      (nameFilter === null || h.id === nameFilter),
+  );
 
-  const invalidate = () =>
-    client.invalidateQueries({ queryKey: HOSTNAMES_QUERY_KEY });
-  const fail = (err: Error) => setError(err.message);
-  const done = () => {
-    setError(null);
-    setCreating(false);
-    setConfirmDelete(null);
-    setName('');
-    setDevice(UNASSIGNED);
-    void invalidate();
-  };
-
-  const create = useMutation({
-    mutationFn: createHostname,
-    onSuccess: done,
-    onError: fail,
-  });
-  const assign = useMutation({
-    mutationFn: (input: { id: number; deviceId: number | null }) =>
-      assignDevice(input.id, input.deviceId),
-    onSuccess: done,
-    onError: fail,
-  });
-  const remove = useMutation({
-    mutationFn: deleteHostname,
-    onSuccess: done,
-    onError: fail,
-  });
-
-  const busy = create.isPending || assign.isPending || remove.isPending;
-
-  const selectedZone = domains.find((d) => String(d.id) === zone) ?? null;
-  // Composed and trimmed, because the form does both and the API does
-  // neither. Shown to the user rather than applied behind their back —
-  // this one string is the only thing that leaves the browser.
-  const willSend = composeHostname(name, selectedZone?.name ?? null);
 
   return (
     <Stack gap="md">
-      {error ? (
-        <Alert
-          color="gray"
-          variant="light"
-          title="That did not work"
-          data-testid="hostname-error"
-        >
-          {/* Diagnostics in full — the server's own words, including its
-              explanation of *why* a name was refused and which wire
-              status the same name would have produced. */}
-          <Text size="sm" ff="monospace">
-            {error}
-          </Text>
-        </Alert>
-      ) : null}
 
-      <div className="ddns-board__head">
-        <span />
-        <span className="ddns-label">name</span>
-        <span className="ddns-label">last published</span>
-        <span className="ddns-label">zone</span>
-      </div>
 
       {domains.length === 0 ? (
         <Text size="sm" data-testid="hostnames-no-zone">
@@ -300,175 +249,56 @@ export function HostnameList({
           board draws a resolution strip once that device has published an
           address.
         </Text>
+      ) : shown.length === 0 ? (
+        /* Filtered to nothing is not the same as owning nothing.
+           Telling someone with twelve names that they have none is
+           a claim about their account that is untrue. */
+        <Text size="sm" data-testid="hostnames-no-match">
+          No name matches that filter. {hostnames.length} name
+          {hostnames.length === 1 ? '' : 's'} in total —{' '}
+          <Anchor href={NAMES_PATH} data-testid="hostnames-clear-filter">
+            show all
+          </Anchor>
+          .
+        </Text>
       ) : (
-        hostnames.map((hostname) => (
-          <HostnameLine
-            key={hostname.id}
-            hostname={hostname}
-            devices={devices}
-            busy={busy}
-            onAssign={(target, deviceId) =>
-              assign.mutate({ id: target.id, deviceId })
-            }
-            onDelete={setConfirmDelete}
-            onPublishing={setPublishing}
-          />
-        ))
+        <div className="ddns-names" data-testid="names-table">
+          {/* Sentence-case headings on the shared `.ddns-th`, and no
+              `; ` marker — the same table treatment as zones and
+              devices, sharing their classes rather than copying the
+              declarations. */}
+          <div className="ddns-names__head">
+            <span className="ddns-th">Name</span>
+            <span className="ddns-th">Zone</span>
+            <span className="ddns-th">Device</span>
+            <span className="ddns-th">Last published</span>
+            <span className="ddns-th" />
+            <span className="ddns-th" />
+          </div>
+          {shown.map((hostname, index) => (
+            <HostnameLine
+              key={hostname.id}
+              hostname={hostname}
+              index={index}
+              deviceName={
+                devices.find((d) => d.id === hostname.device_id)?.name ?? null
+              }
+              onOpen={onOpen}
+            />
+          ))}
+        </div>
       )}
 
       <Group>
         <Button
           size="xs"
           disabled={domains.length === 0}
-          onClick={() => setCreating(true)}
+          onClick={() => onOpen(NEW_NAME)}
           data-testid="add-hostname"
         >
           Register a name
         </Button>
       </Group>
-
-      <Modal
-        opened={creating}
-        onClose={() => setCreating(false)}
-        title="Register a name"
-      >
-        <Stack gap="sm">
-          <Select
-            label="Zone"
-            description="The name has to sit inside this zone, or updates for it answer nohost."
-            data={domains.map((d) => ({ value: String(d.id), label: d.name }))}
-            value={zone}
-            onChange={setZone}
-            data-testid="hostname-zone"
-          />
-          <TextInput
-            label="Name"
-            description={
-              selectedZone
-                ? 'Just the part in front of the zone — for example home. Pasting the whole name works too; the zone is not added twice.'
-                : 'Pick a zone above, and this becomes just the part in front of it.'
-            }
-            value={name}
-            onChange={(event) => setName(event.currentTarget.value)}
-            /* The zone, fixed, inside the field — §13's whole point. It
-               is never editable and never focusable: it is the row
-               above, restated where it is being used, not a second
-               place to change it. */
-            rightSection={
-              selectedZone ? (
-                <Text
-                  span
-                  size="sm"
-                  c="dimmed"
-                  /* The declared data face, not `ff="monospace"` and not
-                     `className="ddns-data"`. `ff="monospace"` resolves to
-                     Mantine's stack, which is the one §2.1 removed
-                     Courier New from — so it would reintroduce a face the
-                     design rejected. `.ddns-data` carries
-                     `color: var(--ddns-ink)`, which beats `c="dimmed"` and
-                     would paint a value the operator did not type as
-                     loudly as the one they did. No new token either way. */
-                  style={{ fontFamily: 'var(--ddns-font-data)' }}
-                  data-testid="hostname-suffix"
-                >
-                  .{selectedZone.name}
-                </Text>
-              ) : null
-            }
-            rightSectionPointerEvents="none"
-            /* Sized from the string itself rather than from a constant,
-               because the zone is whatever the tenant owns. `ch` is the
-               width of a `0` in the current font and the suffix renders
-               in the mono face, so this is the real width and not an
-               estimate — the input's own padding follows this variable. */
-            rightSectionWidth={
-              selectedZone ? `${selectedZone.name.length + 2.5}ch` : undefined
-            }
-            data-testid="hostname-name"
-          />
-          {willSend === '' ? null : (
-            <Text size="xs" c="dimmed" data-testid="hostname-preview">
-              {/* The exact bytes, and now the one line that shows what
-                  composition did — whether the suffix was appended or
-                  recognised as already there. The server lower-cases on
-                  the way in — `/nic/update` looks the row up
-                  lower-cased, so an upper-cased row would be
-                  unreachable — and refuses anything else it would
-                  refuse on the wire. */}
-              will send: <code data-testid="hostname-will-send">{willSend}</code>{' '}
-              — stored lower-cased, because that is how{' '}
-              <code>/nic/update</code> looks it up.
-            </Text>
-          )}
-          <Select
-            label="Device"
-            description="Optional. A name can be registered now and assigned later, and it survives the device being deleted."
-            data={deviceOptions(devices)}
-            value={device}
-            allowDeselect={false}
-            onChange={(value) => setDevice(value ?? UNASSIGNED)}
-            data-testid="hostname-device"
-          />
-          <Group justify="flex-end">
-            <Button
-              size="xs"
-              disabled={willSend === '' || zone === null || busy}
-              onClick={() =>
-                zone === null
-                  ? undefined
-                  : create.mutate({
-                      name: willSend,
-                      domain_id: Number(zone),
-                      device_id:
-                        device === UNASSIGNED ? null : Number(device),
-                    })
-              }
-              data-testid="hostname-submit"
-            >
-              Register
-            </Button>
-          </Group>
-        </Stack>
-      </Modal>
-
-      <Modal
-        opened={confirmDelete !== null}
-        onClose={() => setConfirmDelete(null)}
-        title="Delete this name?"
-      >
-        <Stack gap="sm">
-          {/* Said before the button is pressed, not after. Deleting the
-              row does not withdraw the record — that is what
-              `/nic/delete` is for, and it needs the row in order to find
-              the backend. */}
-          <Text size="sm" data-testid="delete-hostname-warning">
-            This removes the name from this service. It does{' '}
-            <strong>not</strong> remove whatever your DNS provider has already
-            published for it — that record stays in the zone with nothing
-            pointing at it. Withdraw it first if you need it gone.
-          </Text>
-          <Group justify="flex-end">
-            <Button
-              size="xs"
-              disabled={busy}
-              onClick={() =>
-                confirmDelete ? remove.mutate(confirmDelete.id) : undefined
-              }
-              data-testid="delete-hostname-confirm"
-            >
-              Delete
-            </Button>
-          </Group>
-        </Stack>
-      </Modal>
-
-      {/* #74. The three things the legacy `/admin/hostnames/<id>/
-          backends` page did, on the surface the criterion counts as
-          this route's registration. */}
-      <HostnamePublishingModal
-        hostname={publishing}
-        onClose={() => setPublishing(null)}
-      />
     </Stack>
   );
 }

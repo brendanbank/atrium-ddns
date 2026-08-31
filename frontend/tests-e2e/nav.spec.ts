@@ -1,7 +1,6 @@
 import { expect, test } from '@playwright/test';
 
 import {
-  BOARD_PATH,
   DDNS_NAV_ITEMS,
   loginAsUser,
 } from './helpers';
@@ -22,7 +21,7 @@ import {
  * clicked through to a host route that draws its own surface.
  */
 test.describe('atrium-ddns nav', () => {
-  test.describe.configure({ timeout: 60_000 });
+  test.describe.configure({ timeout: 30_000 });
 
   test('a user-role tenant sees every registered nav item', async ({
     page,
@@ -36,7 +35,7 @@ test.describe('atrium-ddns nav', () => {
     const nav = page.getByRole('navigation');
     await expect(
       nav.getByRole('link', { name: DDNS_NAV_ITEMS[0].label, exact: true }),
-    ).toBeVisible({ timeout: 15_000 });
+    ).toBeVisible({ timeout: 8_000 });
 
     for (const item of DDNS_NAV_ITEMS) {
       const link = nav.getByRole('link', { name: item.label, exact: true });
@@ -59,10 +58,13 @@ test.describe('atrium-ddns nav', () => {
       name: 'Devices and names',
       exact: true,
     });
-    await expect(boardLink).toBeVisible({ timeout: 15_000 });
+    await expect(boardLink).toBeVisible({ timeout: 8_000 });
     await boardLink.click();
 
-    await expect(page).toHaveURL(new RegExp(`${BOARD_PATH}$`));
+    // The item points at the host root now, which renders the board.
+    // `BOARD_PATH` still resolves and renders the same page — it is
+    // simply no longer where the sidebar sends you.
+    await expect(page).toHaveURL(/\/atrium-ddns$/);
     await expect(
       page.getByRole('heading', { name: 'Devices and names' }),
     ).toBeVisible();

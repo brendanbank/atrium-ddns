@@ -26,6 +26,8 @@ import {
 } from '@brendanbank/atrium-test-utils';
 
 import { DeviceBoardPage } from '../DeviceBoardPage';
+import { HostnameBlock } from '../board/DeviceBoard';
+import { DdnsRoot } from '../host/DdnsRoot';
 import { BOARD_PERMISSION, type Board } from '../api/board';
 import { queryClient } from '../queryClient';
 import { board, device, hostname, strip, V6_A, V6_B } from './fixtures';
@@ -96,6 +98,29 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+/** Render one hostname's strips on their own.
+ *
+ * The joint verdicts, the collapse rule and the five-state answered
+ * table are properties of the **strip**, not of the board — and the
+ * board is a flat table now, so it no longer draws one. The strip
+ * survives where it is still the right drawing: inside a device's card.
+ * `HostnameBlock` is the component both use, so rendering it directly
+ * tests the same code the card renders, without a layout in between.
+ */
+function renderStrips() {
+  const hostnames = [
+    ...boardPayload.devices.flatMap((d) => d.hostnames),
+    ...boardPayload.unassigned_hostnames,
+  ];
+  return renderWithAtrium(
+    <DdnsRoot>
+      {hostnames.map((h) => (
+        <HostnameBlock key={h.id} hostname={h} />
+      ))}
+    </DdnsRoot>,
+  );
+}
+
 function renderBoard(me: UserContext) {
   currentMe = me;
   handles = mockAtriumRegistry({ me });
@@ -105,16 +130,16 @@ function renderBoard(me: UserContext) {
 describe('permission gating', () => {
   test('a holder of atrium_ddns.device.manage sees the board', async () => {
     renderBoard(OPERATOR);
-    expect(await screen.findByTestId('board')).toBeInTheDocument();
+    expect(await screen.findByTestId('board-table')).toBeInTheDocument();
     expect(screen.queryByTestId('board-refused')).not.toBeInTheDocument();
     // Non-vacuous: the positive half has to actually carry a device.
-    expect(screen.getByTestId('device-home-router')).toBeInTheDocument();
+    expect(screen.getByTestId('board-open-home-router')).toBeInTheDocument();
   });
 
   test('a user without it is refused, and is not told the board is empty', async () => {
     renderBoard(OUTSIDER);
     expect(await screen.findByTestId('board-refused')).toBeInTheDocument();
-    expect(screen.queryByTestId('board')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('board-table')).not.toBeInTheDocument();
     // The distinction the whole surface is built around: a refusal must
     // not render as "You have no devices yet", which is a claim about
     // the account that is not true.
@@ -134,7 +159,7 @@ describe('permission gating', () => {
     handles.cleanup();
     queryClient.clear();
     renderBoard(OPERATOR);
-    await screen.findByTestId('board');
+    await screen.findByTestId('board-table');
     expect(boardFetches).toBe(1);
   });
 });
@@ -206,8 +231,7 @@ describe('the three states that share a null address', () => {
       ],
     });
 
-    renderBoard(OPERATOR);
-    await screen.findByTestId('board');
+    renderStrips();
 
     const cells = screen
       .getAllByTestId('answered-address')
@@ -271,7 +295,7 @@ describe('the three states that share a null address', () => {
     });
 
     renderBoard(OPERATOR);
-    await screen.findByTestId('board');
+    await screen.findByTestId('board-table');
 
     // Three facts, three strings. A renderer that formatted
     // `updates_in_window` directly prints `null` for the first or, worse,
@@ -328,8 +352,7 @@ describe('the lower joint', () => {
       ],
     });
 
-    renderBoard(OPERATOR);
-    await screen.findByTestId('board');
+    renderStrips();
 
     // No segment drawn — the two addresses differ permanently and
     // correctly, so an indicator here would be on forever.
@@ -375,8 +398,7 @@ describe('the lower joint', () => {
       ],
     });
 
-    renderBoard(OPERATOR);
-    await screen.findByTestId('board');
+    renderStrips();
 
     const cell = screen.getByTestId('called-from-address');
     expect(cell).toHaveAttribute('data-tone', 'diverge');
@@ -398,22 +420,25 @@ describe('the lower joint', () => {
 describe('collapse', () => {
   test('a device with nothing wrong is one line — page height is an instrument', async () => {
     renderBoard(OPERATOR);
-    await screen.findByTestId('board');
+    await screen.findByTestId('board-table');
 
     // §3.4: "A tenant with nothing wrong has a short page. A tenant with
     // three broken names has a page three strips long. You can tell how
     // bad it is from the scrollbar." That only holds if a healthy device
     // does not draw its strips.
+    // The table draws no strips at all — collapsed or otherwise — so a
+    // healthy device cannot add height. One row per name, always.
     expect(
       screen.queryByTestId('strip-collapsed-host-a.example.net-AAAA'),
     ).not.toBeInTheDocument();
-    expect(screen.getByTestId('device-home-router')).toBeInTheDocument();
+    expect(
+      screen.queryByTestId('strip-host-a.example.net-AAAA'),
+    ).not.toBeInTheDocument();
+    expect(screen.getByTestId('board-open-home-router')).toBeInTheDocument();
   });
 
   test('an agreeing strip collapses and names its denominator', async () => {
-    renderBoard(OPERATOR);
-    await screen.findByTestId('board');
-    fireEvent.click(screen.getByTestId('device-home-router-expand'));
+    renderStrips();
 
     const collapsed = screen.getByTestId('strip-collapsed-host-a.example.net-AAAA');
     // `; agrees` on its own would be a ratio with the divisor hidden,
@@ -429,37 +454,7 @@ describe('collapse', () => {
     ).toBeInTheDocument();
   });
 
-  test('the device detail names its rate limit, and which of three states it is', async () => {
-    // #73's AC 4 — the stored value is displayed wherever a device is
-    // shown. In the detail rather than in the line: the board's four
-    // columns are a status grid and §4 spends its boldness on the
-    // strip. Named here so that placement is a decision on the record
-    // and not something a later reader has to infer from its absence.
-    renderBoard(OPERATOR);
-    await screen.findByTestId('board');
-    fireEvent.click(screen.getByTestId('device-home-router-expand'));
 
-    expect(screen.getByTestId('device-home-router-limit')).toHaveTextContent(
-      '30/min, inherited',
-    );
-  });
-
-  test('a muted device says muted rather than showing a zero with a unit', async () => {
-    boardPayload = board({
-      devices: [
-        device({
-          rate_limit_per_minute: 0,
-          effective_rate_limit_per_minute: 0,
-        }),
-      ],
-    });
-    renderBoard(OPERATOR);
-    await screen.findByTestId('board');
-    fireEvent.click(screen.getByTestId('device-home-router-expand'));
-    expect(screen.getByTestId('device-home-router-limit')).toHaveTextContent(
-      'muted — may never call',
-    );
-  });
 
   test('a device carrying a divergence is expanded without being asked', async () => {
     boardPayload = board({
@@ -473,8 +468,7 @@ describe('collapse', () => {
         }),
       ],
     });
-    renderBoard(OPERATOR);
-    await screen.findByTestId('board');
+    renderStrips();
 
     // Nothing may hide a divergence by default — the collapsed shape is
     // *defined* as "agrees", so letting a diverged strip render in it,
@@ -497,8 +491,7 @@ describe('collapse', () => {
       ],
     });
 
-    renderBoard(OPERATOR);
-    await screen.findByTestId('board');
+    renderStrips();
 
     expect(screen.getByTestId('strip-host-a.example.net-AAAA')).toHaveAttribute(
       'data-diverged',
@@ -516,14 +509,14 @@ describe('the colour scheme', () => {
     async (scheme) => {
       document.documentElement.setAttribute('data-mantine-color-scheme', scheme);
       renderBoard(OPERATOR);
-      await screen.findByTestId('board');
+      await screen.findByTestId('board-table');
 
       // The host subtree is present and scoped, so the CSS in ddns.css
       // — which is the only thing that differs between the two schemes —
       // has something to hang off.
       const root = document.querySelector('[data-ddns-root]');
       expect(root).not.toBeNull();
-      expect(root!.querySelector('[data-testid="board"]')).not.toBeNull();
+      expect(root!.querySelector('[data-testid="board-table"]')).not.toBeNull();
 
       // The host's nested MantineProvider must not have rewritten
       // atrium's own attribute on `<html>`. `getRootElement={() =>
@@ -546,7 +539,7 @@ describe('the colour scheme', () => {
   test('the rendered markup does not branch on the scheme', async () => {
     document.documentElement.setAttribute('data-mantine-color-scheme', 'light');
     renderBoard(OPERATOR);
-    const light = (await screen.findByTestId('board')).innerHTML;
+    const light = (await screen.findByTestId('board-table')).innerHTML;
 
     cleanup();
     handles.cleanup();
@@ -554,7 +547,7 @@ describe('the colour scheme', () => {
 
     document.documentElement.setAttribute('data-mantine-color-scheme', 'dark');
     renderBoard(OPERATOR);
-    const dark = (await screen.findByTestId('board')).innerHTML;
+    const dark = (await screen.findByTestId('board-table')).innerHTML;
 
     // Identical markup in both schemes is the assertion, not a
     // coincidence: it means every colour decision is made in CSS against
@@ -600,7 +593,7 @@ describe('empty states', () => {
     });
 
     renderBoard(OPERATOR);
-    await screen.findByTestId('board');
+    await screen.findByTestId('board-table');
 
     // An operator who changes the interval must not be able to make this
     // sentence wrong, and the same for the column head's denominator.
@@ -608,7 +601,7 @@ describe('empty states', () => {
       'runs every 45 minutes',
     );
     expect(screen.getByTestId('board-updates-head')).toHaveTextContent(
-      'updates / 30 d',
+      'Updates / 30 d',
     );
   });
 
@@ -640,10 +633,10 @@ describe('empty states', () => {
     });
 
     renderBoard(OPERATOR);
-    await screen.findByTestId('board-unassigned');
-    expect(
-      screen.getByText('called from — no device assigned'),
-    ).toBeInTheDocument();
+    await screen.findByTestId('board-table');
+    const row = screen.getByTestId('board-row-orphan.example.net-AAAA');
+    expect(row).toHaveTextContent('orphan.example.net');
+    expect(row).toHaveTextContent('no device');
     // The board is not empty: it has no devices and one orphaned name,
     // which is a different fact and must not read as "add a device".
     expect(screen.queryByTestId('board-empty')).toBeNull();

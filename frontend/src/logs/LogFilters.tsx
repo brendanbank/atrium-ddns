@@ -144,7 +144,7 @@ export function LogFilters({
           value={query.backend_type || null}
           onChange={(value) => onChange('backend_type', cleared(value))}
           data-testid="filter-backend-type"
-          w={200}
+          w={170}
         />
         <TextInput
           label="Called from"
@@ -156,7 +156,7 @@ export function LogFilters({
              IPv6 in this estate is 39 characters and never
              `::`-compressed (M2), so a 200px input truncates what the
              user just pasted out of a log line. */
-          w={340}
+          w={220}
         />
         <TextInput
           label="Since"

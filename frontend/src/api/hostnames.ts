@@ -85,6 +85,23 @@ export async function createHostname(body: {
 /** Assign, reassign or unassign. `null` unassigns, and the key is always
  *  sent — the endpoint requires it, so "omitted" cannot be mistaken for
  *  "cleared". */
+/** Rename, move zone, reassign device — or any combination.
+ *
+ * `device_id` is required and `null` means *unassign*. `name` and
+ * `domain_id` are optional and omitting them means *leave alone*: they
+ * have no second meaning for `null`, so absence is free to carry it.
+ */
+export async function updateHostname(
+  id: number,
+  body: {
+    device_id: number | null;
+    name?: string;
+    domain_id?: number;
+  },
+): Promise<Hostname> {
+  return apiSend<Hostname>(`/atrium_ddns/hostnames/${id}`, 'PATCH', body);
+}
+
 export async function assignDevice(
   id: number,
   deviceId: number | null,

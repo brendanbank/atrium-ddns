@@ -47,9 +47,29 @@ export interface Domain {
   hostname_count: number;
 }
 
+/** One non-secret provider setting, described by the server.
+ *
+ * Same rule as `credential_keys`: the field list is derived, never
+ * retyped here. nsupdate needs a nameserver, a TSIG key name and an
+ * algorithm, and until the server described them they were reachable
+ * only by typing raw JSON into a textarea. */
+export interface SettingField {
+  key: string;
+  label: string;
+  help: string;
+  /** Non-empty renders a select rather than a text box. */
+  choices: string[];
+  required: boolean;
+  default: string;
+}
+
 export interface Provider {
   service: string;
   credential_keys: string[];
+  /** `key -> {label, help}` where the provider names its credential.
+   *  Missing keys fall back to the key itself. */
+  credential_labels: Record<string, SettingField>;
+  setting_fields: SettingField[];
 }
 
 export const DOMAINS_QUERY_KEY = ['atrium_ddns', 'domains'] as const;

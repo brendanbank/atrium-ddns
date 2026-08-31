@@ -1,5 +1,6 @@
 import { randomBytes } from 'crypto';
 
+import { expect } from '@playwright/test';
 import type { APIRequestContext, Page } from '@playwright/test';
 import { generate as generateTOTP } from 'otplib';
 
@@ -233,12 +234,17 @@ export { BOARD_PATH, DEVICES_PATH, DOMAINS_PATH };
 
 /** Every nav item the bundle registers, label and destination.
  *  `ui-parity.md` §3.2 reads the same seven out of the served bundle. */
+/** Every nav item the bundle registers, and where each goes.
+ *
+ * Four, not seven. The board became the landing surface, so its own item
+ * and the root's collapsed into one; `Devices` and `Names` lost their
+ * entries because a device is reached from the board and a name from its
+ * zone. **The routes still exist** — this list is the sidebar, not the
+ * set of addresses that resolve, and a spec that conflated the two would
+ * fail the day a page became reachable only by link. */
 export const DDNS_NAV_ITEMS: ReadonlyArray<{ label: string; to: string }> = [
-  { label: 'Atrium Ddns', to: '/atrium-ddns' },
-  { label: 'Devices and names', to: BOARD_PATH },
+  { label: 'Devices and names', to: '/atrium-ddns' },
   { label: 'Zones and providers', to: DOMAINS_PATH },
-  { label: 'Devices', to: DEVICES_PATH },
-  { label: 'Names', to: NAMES_PATH },
   { label: 'Log search', to: LOG_PATH },
   { label: 'Help', to: '/atrium-ddns/help' },
 ];
@@ -354,6 +360,71 @@ export async function chooseFromSelect(
   testId: string,
   optionLabel: string,
 ): Promise<void> {
-  await page.getByTestId(testId).click();
-  await page.getByRole('option', { name: optionLabel, exact: true }).click();
+  const input = page.getByTestId(testId);
+  const option = page.getByRole('option', { name: optionLabel, exact: true });
+
+  // Open, choose, and **verify** — then retry once if the value did not
+  // land.
+  //
+  // Mantine's `Select` renders its options into a portal after the click,
+  // and the catalogue behind this one arrives from `GET /providers`. When
+  // that response is warm the list can paint a beat after the dropdown
+  // opens, so the click lands on a list that is still empty and the
+  // helper returns having done nothing. The caller then clicks a submit
+  // that is disabled, and waits for it — which is why this surfaced as a
+  // thirty-second timeout naming a button rather than a select.
+  //
+  // Asserting the value here is what makes the failure legible; the retry
+  // is what makes it rare. Both, not either: a retry alone would hide a
+  // genuinely missing option behind a second attempt that also fails.
+  for (const attempt of [1, 2]) {
+    await input.click();
+    await option.waitFor({ state: 'visible', timeout: 5_000 });
+    await option.click();
+    try {
+      await expect(input).toHaveValue(optionLabel, { timeout: 2_000 });
+      return;
+    } catch (error) {
+      if (attempt === 2) throw error;
+    }
+  }
+}
+
+/** Seed a zone, a scripted provider, a device and a published name.
+ *
+ * Written because three specs were each doing this by hand, in slightly
+ * different orders, and the board rewrite broke all three at once. The
+ * publish goes through `deviceCallsIn` — the wire, as a router drives it
+ * — because a name only gains a strip once a `good` aggregate has landed
+ * (`persist_updates` writes `last_ip_*` on `good` only).
+ */
+export async function seedZoneDeviceAndName(
+  page: Page,
+  opts: { zone: string; deviceName: string },
+): Promise<{ hostname: string; deviceId: number; family: 'A' }> {
+  const api = page.request;
+  const zoneRes = await api.post(`${API_URL}/atrium_ddns/domains`, {
+    data: { name: opts.zone },
+  });
+  const domainId = (await zoneRes.json()).id as number;
+  await bindScriptedBackend(api, domainId);
+
+  const devRes = await api.post(`${API_URL}/atrium_ddns/devices`, {
+    data: { name: opts.deviceName, rate_limit_per_minute: null },
+  });
+  const issued = await devRes.json();
+  const deviceId = (issued.device ?? issued).id as number;
+
+  const hostname = `home.${opts.zone}`;
+  await api.post(`${API_URL}/atrium_ddns/hostnames`, {
+    data: { name: hostname, domain_id: domainId, device_id: deviceId },
+  });
+
+  await deviceCallsIn(api, {
+    username: (issued.device ?? issued).username as string,
+    secret: (issued.secret ?? issued.password) as string,
+    hostname,
+    ip: DOC_ADDRESS_V4,
+  });
+  return { hostname, deviceId, family: 'A' };
 }

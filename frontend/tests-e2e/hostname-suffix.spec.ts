@@ -83,7 +83,10 @@ test.describe('the name field composes, and the server validates', () => {
     await openFormAndPickZone(page);
     // The defect, gone: the zone is on screen beside the field, so
     // there is nothing to retype.
-    await expect(page.getByTestId('hostname-suffix')).toHaveText(`.${ZONE}`);
+    // The  echo beside the field is gone — it repeated the zone
+    // select next to it, and `will send:` below already shows the
+    // composed result, which is the string that actually leaves the
+    // browser. That preview is what this spec asserts instead.
 
     await page.getByTestId('hostname-name').fill('home');
     // The preview is read as its own node, not as a substring of the
@@ -94,7 +97,7 @@ test.describe('the name field composes, and the server validates', () => {
       `home.${ZONE}`,
     );
 
-    await page.getByTestId('hostname-submit').click();
+    await page.getByTestId('name-submit').click();
     // The row the list draws carries the composed name, which is the
     // only reading that proves the composition survived the round trip
     // rather than merely being rendered.
@@ -108,7 +111,7 @@ test.describe('the name field composes, and the server validates', () => {
     await expect(page.getByTestId('hostname-will-send')).toHaveText(
       `attic.${ZONE}`,
     );
-    await page.getByTestId('hostname-submit').click();
+    await page.getByTestId('name-submit').click();
     await expect(page.getByTestId(`hostname-attic.${ZONE}`)).toBeVisible();
     // …and the doubled form is not what was stored. Named explicitly
     // rather than left to the positive assertion, because "the right
@@ -131,10 +134,10 @@ test.describe('the name field composes, and the server validates', () => {
       `bad_label.${ZONE}`,
     );
     // Nothing in the browser blocked it.
-    await expect(page.getByTestId('hostname-submit')).toBeEnabled();
-    await page.getByTestId('hostname-submit').click();
+    await expect(page.getByTestId('name-submit')).toBeEnabled();
+    await page.getByTestId('name-submit').click();
 
-    const refusal = page.getByTestId('hostname-error');
+    const refusal = page.getByTestId('name-error');
     await expect(refusal).toBeVisible();
     // The server's own words, verbatim — including the wire status the
     // same name would have produced.

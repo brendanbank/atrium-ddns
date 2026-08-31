@@ -23,41 +23,124 @@ export const BOARD_PATH = '/atrium-ddns/board';
 export const DOMAINS_PATH = '/atrium-ddns/domains';
 export const DEVICES_PATH = '/atrium-ddns/devices';
 
-/** #88's zone detail route — design §10.2, and §12 for why it is a route.
+/** The names surface, filtered to one zone.
  *
- * The pattern as react-router matches it. Atrium drops a registered
- * `path` straight into `<Route path=…>` (`App.tsx`), so `:id` is an
- * ordinary segment parameter there. It is **not** available to the host
- * subtree through `useParams`: `makeWrapperElement` mounts a second
- * React root, and react-router's context does not cross it. The id is
- * read off the pathname instead, by :func:`zoneIdFromPath`, which is
- * the only place that parse exists.
+ * A query parameter and not a path segment: the names page is a list
+ * with filters, and "the names in zone 7" is one of those filters rather
+ * than a different page. This is a view of another thing — and the zone
+ * modal itself is `?zone=` for a different reason (a second route
+ * unmounts the host root under the portal; see `DomainsPage`).
+ *
+ * The zone card used to render this list inline. It does not any more —
+ * that is a different interface, and a form is not where you browse.
  */
-export const ZONE_ROUTE_PATH = '/atrium-ddns/zones/:id';
+/** Filters the names page honours. Read by `HostnamesPage`, written by
+ *  the zone list and the device card — one spelling, so a link cannot
+ *  point at a parameter nobody parses.
+ *
+ *  That is not hypothetical: `namesHrefForZone` shipped before the page
+ *  read anything, so every "N names" link on the zone list landed on an
+ *  unfiltered page and looked like it had worked. */
+export const NAME_ZONE_PARAM = 'zone';
+export const NAME_ID_PARAM = 'name';
 
-/** The href for one zone. Used by the list page and by the e2e spec, so
- *  the string is built once rather than concatenated at each call site. */
-export function zoneHref(id: number): string {
-  return `/atrium-ddns/zones/${id}`;
+export function namesHrefForZone(zoneId: number): string {
+  return `/atrium-ddns/names?${NAME_ZONE_PARAM}=${zoneId}`;
 }
 
-/** The id in `/atrium-ddns/zones/:id`, or `null` when the pathname is
- *  not that route.
+/** The names surface, focused on one name. Same query-parameter shape:
+ *  the names list is a list with filters, and "the name with id 7" is
+ *  one of those rather than a page of its own. */
+export function namesHrefForName(hostnameId: number): string {
+  return `/atrium-ddns/names?${NAME_ID_PARAM}=${hostnameId}`;
+}
+
+/** The zone list, which is also where a zone modal is drawn over. */
+export const ZONES_LIST_PATH = DOMAINS_PATH;
+
+/** The open zone, as a **query parameter on the list route**.
  *
- * Returns `null` rather than `NaN` for a non-numeric segment, and the
- * distinction is the point: `NaN` would flow into a lookup that finds
- * nothing and render as *"no such zone"*, which is a claim about the
- * tenant's data. A pathname that does not carry an id is a fact about
- * the URL, and the page says so with different words.
+ * Not a path segment, and the reason is a bug rather than a preference.
+ * `/atrium-ddns/zones/:id` was a separate registered route, so opening
+ * and closing the modal swapped atrium's route element — which unmounts
+ * the host's React root. The modal is portalled to `document.body`, so
+ * on close the root went away and **the portal was orphaned**: the zone
+ * was deleted, the list refreshed underneath, and the dialog stayed on
+ * screen with nothing behind it.
+ *
+ * A query parameter never changes the route. Same mount, same portal,
+ * only `search` moves — which is also the pattern the host SDK's own
+ * `useAtriumLocation` docs use for exactly this shape. Reload, Back and
+ * paste all still work, because the address still carries the state.
  */
-export function zoneIdFromPath(pathname: string): number | null {
-  const match = /^\/atrium-ddns\/zones\/([^/]+)\/?$/.exec(pathname);
-  if (!match) return null;
-  // `Number('')` is 0 and `Number('1x')` is NaN; only an all-digits
-  // segment is an id here, and a leading `+`, a decimal point or an
-  // exponent are all things `Number` would accept and a row id is not.
-  if (!/^\d+$/.test(match[1])) return null;
-  return Number(match[1]);
+/** A modal whose open-ness is a query parameter on a list route.
+ *
+ * Not a path segment, and the reason is a bug rather than a preference.
+ * `/atrium-ddns/zones/:id` was a separate registered route, so opening
+ * and closing the modal swapped atrium's route element — which unmounts
+ * the host's React root. The modal is portalled to `document.body`, so
+ * on close the root went away and the portal was orphaned.
+ *
+ * A query parameter never changes the route. Same mount, same portal,
+ * only `search` moves — which is also the pattern the host SDK's own
+ * `useAtriumLocation` docs use for exactly this shape. Reload, Back and
+ * paste all still work, because the address still carries the state.
+ *
+ * Written once and shared by zones and devices. The second surface is
+ * where a copy would have started to drift — the first one to gain, say,
+ * a `?tab=` would have taught only its own parser about it.
+ */
+export type ModalTarget = { open: false } | { open: true; id: number | null };
+
+/** `new`. A literal the id parser rejects, so "create" and "row N"
+ *  cannot be confused for one another. */
+export const NEW_VALUE = 'new';
+
+/** What `?<param>=` means, in three states.
+ *
+ * Absent — no modal. `new` — the create form. A number — that row.
+ * Three states and not two, because *closed* and *creating* are
+ * different and a single nullable id cannot hold both.
+ */
+export function targetFromSearch(search: string, param: string): ModalTarget {
+  const raw = new URLSearchParams(search).get(param);
+  if (raw === null) return { open: false };
+  if (raw === NEW_VALUE) return { open: true, id: null };
+  // Only all-digits is an id. A junk value opens nothing rather than
+  // opening "row NaN".
+  if (!/^\d+$/.test(raw)) return { open: false };
+  return { open: true, id: Number(raw) };
+}
+
+export function hrefWithTarget(
+  path: string,
+  param: string,
+  value: number | typeof NEW_VALUE,
+): string {
+  return `${path}?${param}=${value}`;
+}
+
+export const ZONE_PARAM = 'zone';
+export const DEVICE_PARAM = 'device';
+
+export function zoneFromSearch(search: string): ModalTarget {
+  return targetFromSearch(search, ZONE_PARAM);
+}
+
+export function zoneHrefParam(id: number): string {
+  return hrefWithTarget(DOMAINS_PATH, ZONE_PARAM, id);
+}
+
+export function zoneNewHref(): string {
+  return hrefWithTarget(DOMAINS_PATH, ZONE_PARAM, NEW_VALUE);
+}
+
+export function deviceFromSearch(search: string): ModalTarget {
+  return targetFromSearch(search, DEVICE_PARAM);
+}
+
+export function deviceHrefParam(id: number): string {
+  return hrefWithTarget(DEVICES_PATH, DEVICE_PARAM, id);
 }
 
 /** #89's device detail — `ui-design.md` §11.2.
@@ -78,13 +161,11 @@ export function zoneIdFromPath(pathname: string): number | null {
  * out of the pathname with `deviceIdFromPath` below. One string, two
  * readings, and they are kept in one module so they cannot drift.
  *
- * #88 landed `zoneIdFromPath` above against the same base, and the two
- * parsers are deliberately **not** merged into one generic helper. They
- * answer the same shape of question and the reasoning behind each is
- * written where it applies; a shared `idFromPath(pattern, path)` would
- * be a third thing to read before either page's URL handling made
- * sense. If a third detail route appears, that is the point to
- * generalise — two is not a pattern.
+ * `deviceIdFromPath` is now the only pathname parser here. #88 added a
+ * second for zones, and the note that lived here argued against merging
+ * them; that argument expired when the zone route did — the zone modal
+ * reads `?zone=` through the generic `targetFromSearch`, which is where
+ * a third surface should go too.
  */
 export const DEVICE_DETAIL_PATH = '/atrium-ddns/devices/:id';
 

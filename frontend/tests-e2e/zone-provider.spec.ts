@@ -1,15 +1,9 @@
 import { expect, test } from '@playwright/test';
 
 import {
-  API_URL,
-  DEVICES_PATH,
-  DOC_ADDRESS_V4,
   DOMAINS_PATH,
-  NAMES_PATH,
   chooseFromSelect,
-  deviceCallsIn,
   loginAsUser,
-  uniqueDeviceName,
   uniqueZoneName,
 } from './helpers';
 
@@ -64,7 +58,7 @@ const DEMO_CREDENTIAL = {
 };
 
 test.describe('#88 — zones and providers are one object', () => {
-  test.describe.configure({ timeout: 120_000 });
+  test.describe.configure({ timeout: 30_000 });
 
   test('a zone and its first provider arrive in one submission', async ({
     page,
@@ -100,31 +94,45 @@ test.describe('#88 — zones and providers are one object', () => {
     // The zone field and the provider fields are in one modal, in one
     // reading order — §10.1's wireframe, rendered.
     await modal.getByTestId('zone-name').fill(zone);
-    await expect(modal.getByTestId('backend-service')).toBeVisible();
+    await expect(modal.getByTestId('zone-provider')).toBeVisible();
     // Pick the provider explicitly. `BackendForm` defaults to
     // `providers[0]`, and `known_services()` is **sorted**, so the
     // default is `hetzner` — whose one credential key is
     // `hetzner_api_token`, not the route53 pair below. Adjusted by #91
     // when this spec was first run: it is a fact about the catalogue's
     // order, which nothing in the file could have known unrun.
-    await chooseFromSelect(page, 'backend-service', 'route53');
+    await chooseFromSelect(page, 'zone-provider', 'route53');
+    // Assert the select took before touching the submit.
+    //
+    // `zone-submit` is disabled until a provider is chosen, so a click
+    // on it after a select that silently missed does not fail — it
+    // waits for the button to become actionable and times out thirty
+    // seconds later, naming the button instead of the cause. This
+    // only showed up in the full run, where the providers query is
+    // warm and the option list can render a beat after the click.
+    await expect(modal.getByTestId('zone-provider')).toHaveValue(
+      'route53',
+    );
+    await expect(modal.getByTestId('zone-submit')).toBeEnabled();
     // The credential fields come from `GET /providers`, i.e. from
     // `BaseProvider.REQUIRED_CREDENTIALS`. This is `BackendForm`, not a
     // create-only copy of it.
     for (const [key, value] of Object.entries(DEMO_CREDENTIAL)) {
-      await modal.getByTestId(`credential-${key}`).fill(value);
+      await modal.getByTestId(`zone-credential-field-${key}`).fill(value);
     }
-    await modal.getByTestId('backend-submit').click();
+    await modal.getByTestId('zone-submit').click();
 
     const row = page.getByTestId(`domain-${zone}`);
-    await expect(row).toBeVisible({ timeout: 15_000 });
+    await expect(row).toBeVisible({ timeout: 8_000 });
     // Not diverged. §1.2 Rule 1 — agreement has no colour, so a working
     // zone carries no mark at all.
     await expect(row).toHaveAttribute('data-diverged', 'false');
     await expect(row).not.toContainText('publishes nowhere');
     await expect(row).not.toContainText('911');
-    await expect(page.getByTestId(`providers-${zone}`)).toContainText(
-      '1 provider',
+    // The row shows the provider itself now, not a count — the count
+    // restated what the card would show and named nothing actionable.
+    await expect(page.getByTestId(`provider-${zone}`)).toContainText(
+      'route53',
     );
 
     // One request, and it is the zone's. A second POST to `/backends`
@@ -149,23 +157,34 @@ test.describe('#88 — zones and providers are one object', () => {
         .getAttribute('href')) as string,
       page.url(),
     ).toString();
-    expect(detailUrl).toMatch(/\/atrium-ddns\/zones\/\d+$/);
+    // The address is a query parameter on the list route now, not a
+    // path segment. §17: two registered routes meant opening and closing
+    // swapped atrium's route element, which unmounts the host root and
+    // orphaned the portalled modal.
+    expect(detailUrl).toMatch(/\/atrium-ddns\/domains\?zone=\d+$/);
     await page.goto(detailUrl);
-    await expect(page).toHaveURL(/\/atrium-ddns\/zones\/\d+$/);
+    await expect(page).toHaveURL(/\/atrium-ddns\/domains\?zone=\d+$/);
 
-    await expect(page.getByTestId(`zone-${zone}`)).toBeVisible({
+    const card = page.getByTestId('zone-modal-body');
+    await expect(card).toBeVisible({
       timeout: 15_000,
     });
     // The provider is listed *inside* the zone, which is the whole of
     // §10.2: the previous build nested it in an accordion on a shared
     // list page, three clicks from the thing it describes.
-    await expect(page.getByTestId('backend-route53')).toBeVisible();
-    await expect(page.getByTestId(`zone-${zone}`)).toContainText(
-      '1 provider',
+    // One provider per zone, so it is the Provider field's value rather
+    // than a list entry — the per-name checkbox list is gone with the
+    // model that made a zone hold several.
+    await expect(card.getByTestId('zone-provider')).toHaveValue('route53');
+    await expect(card.getByTestId('zone-name')).toHaveValue(
+      zone,
     );
     // The credential is a word, never a masked value, and never a
     // prefix — "a prefix of an API token is still a disclosure".
-    await expect(page.locator('body')).toContainText('credential stored');
+    // The wording moved with the rewrite; what is asserted is the
+    // property, not the sentence — a credential is acknowledged and never
+    // echoed. Pinning the exact prose made this fail on a copy edit.
+    await expect(page.locator('body')).toContainText(/credential is stored/i);
     await expect(page.locator('body')).not.toContainText('AKIA-E2E');
 
     // The width the route exists to preserve (§12). Asserted rather
@@ -175,7 +194,7 @@ test.describe('#88 — zones and providers are one object', () => {
     // its own signature element is the failure the drawer was rejected
     // for.
     const contentWidth = await page
-      .getByTestId(`zone-${zone}`)
+      .getByTestId('zone-modal-body')
       .evaluate((el) => el.getBoundingClientRect().width);
     expect(contentWidth).toBeGreaterThan(592);
 
@@ -188,236 +207,34 @@ test.describe('#88 — zones and providers are one object', () => {
     expect(pageErrors, 'the page threw while rendering').toEqual([]);
   });
 
-  test('"add a provider later" is a link, and the zone it makes answers 911', async ({
-    page,
-  }, testInfo) => {
-    const pageErrors: string[] = [];
-    page.on('pageerror', (error) => pageErrors.push(error.message));
+  test('a zone cannot be created without a provider', async ({ page }) => {
+    // The inverse of the test this replaces.
+    //
+    // §10.1 kept an "add a provider later" link on the argument that
+    // staging a migration is a real reason to want a zone before its
+    // credentials exist. The operator overruled it: a zone with no
+    // provider answers `911` for every update under it, and a form whose
+    // only escape hatch produces that state is offering a trap.
+    //
+    // So the assertion is that the hatch is gone — and that the submit
+    // refuses rather than silently creating the zone alone. A spec that
+    // only checked the link's absence would pass against a form that had
+    // simply hidden it while still posting `backend: null`.
+    const pageErrors: Error[] = [];
+    page.on('pageerror', (error) => pageErrors.push(error));
 
     await loginAsUser(page);
-    const zoneBroken = uniqueZoneName();
-    const zoneWorking = uniqueZoneName();
-    const deviceName = uniqueDeviceName();
-    const fqdnBroken = `home.${zoneBroken}`;
-    const fqdnWorking = `home.${zoneWorking}`;
-
-    // --- 1. the link, and what it is not ---------------------------
     await page.goto(DOMAINS_PATH);
-    await expect(page.getByTestId('domains-empty')).toBeVisible({
-      timeout: 15_000,
-    });
     await page.getByTestId('add-domain').click();
+
     const modal = page.getByRole('dialog');
     await expect(modal).toBeVisible();
-
-    // "a link, not a checkbox, and not the default" — all three,
-    // checked before it is taken.
-    const later = modal.getByTestId('zone-later-link');
-    await expect(later).toBeVisible();
-    await expect(modal.locator('input[type="checkbox"]')).toHaveCount(0);
-    await expect(modal.getByTestId('zone-later-warning')).toHaveCount(0);
+    await expect(modal.getByTestId('zone-later-link')).toHaveCount(0);
     await expect(modal.getByTestId('zone-later-submit')).toHaveCount(0);
 
-    await modal.getByTestId('zone-name').fill(zoneBroken);
-    await later.click();
-    // The consequence, next to the act, before it can be taken.
-    await expect(modal.getByTestId('zone-later-warning')).toContainText(
-      'publishes nowhere',
-    );
-    await expect(modal.getByTestId('zone-later-warning')).toContainText('911');
-    await modal.getByTestId('zone-later-submit').click();
-
-    // --- 2. the zone renders diverged ------------------------------
-    const brokenRow = page.getByTestId(`domain-${zoneBroken}`);
-    await expect(brokenRow).toBeVisible({ timeout: 15_000 });
-    await expect(brokenRow).toHaveAttribute('data-diverged', 'true');
-    await expect(brokenRow).toContainText('publishes nowhere');
-    await expect(brokenRow).toContainText(
-      'every update for a name in this zone answers 911',
-    );
-    // The operator's terms, never the protocol's. §10.1: "The operator
-    // does not own a backend; they own a zone that does or does not
-    // work."
-    await expect(brokenRow).not.toContainText(/backend/i);
-
-    // The treatment is `--ddns-diverge` — **no new palette value**.
-    // Resolved off the live stylesheet rather than asserted as a class
-    // name, so a rule that stopped applying fails here.
-    //
-    // Both scheme values are accepted because atrium owns the colour
-    // scheme and a spec that pinned the light one would be asserting
-    // which theme the browser happened to boot in. The pair is the
-    // design's own (`ddns.css`, §1.3), so a *seventh* value still fails.
-    const accent = await brokenRow.evaluate((el) =>
-      getComputedStyle(el).getPropertyValue('--ddns-diverge').trim(),
-    );
-    expect(['#b4500a', '#f59042']).toContain(accent);
-
-    // --- 3. a control zone, with a provider ------------------------
-    await page.getByTestId('add-domain').click();
-    const second = page.getByRole('dialog');
-    await expect(second).toBeVisible();
-    await second.getByTestId('zone-name').fill(zoneWorking);
-    // Same reason as above: the default provider is the catalogue's
-    // first, sorted, which is not route53.
-    await chooseFromSelect(page, 'backend-service', 'route53');
-    for (const [key, value] of Object.entries(DEMO_CREDENTIAL)) {
-      await second.getByTestId(`credential-${key}`).fill(value);
-    }
-    await second.getByTestId('backend-submit').click();
-    const workingRow = page.getByTestId(`domain-${zoneWorking}`);
-    await expect(workingRow).toBeVisible({ timeout: 15_000 });
-    await expect(workingRow).toHaveAttribute('data-diverged', 'false');
-
-    // The two rows side by side, and the border is the channel that
-    // separates them. Compared to each other rather than to a literal,
-    // so this holds in either colour scheme — and it is the assertion
-    // §8.1 is about: "the exceptional row … drawn in the same ink as
-    // the other 500".
-    const brokenBorder = await brokenRow.evaluate(
-      (el) => getComputedStyle(el).borderTopColor,
-    );
-    const workingBorder = await workingRow.evaluate(
-      (el) => getComputedStyle(el).borderTopColor,
-    );
-    expect(brokenBorder).not.toBe(workingBorder);
-
-    // The screenshot of the two rows together. The whole argument of
-    // §8.1 is that these two were drawn in the same ink; this image is
-    // the evidence that they no longer are. Everything on it is
-    // documentation space: both zones are under RFC 6761 `.invalid`.
-    await testInfo.attach('zone-list-diverged.png', {
-      body: await page.screenshot(),
-      contentType: 'image/png',
-    });
-
-    // --- 4. a device, through the UI -------------------------------
-    await page.goto(DEVICES_PATH);
-    await page.getByTestId('add-device').click();
-    const deviceModal = page.getByRole('dialog');
-    await expect(deviceModal).toBeVisible();
-    await deviceModal.getByTestId('device-name').fill(deviceName);
-    await deviceModal.getByTestId('device-submit').click();
-    await expect(page.getByTestId('device-secret-once')).toBeVisible();
-    const username = (
-      await page.getByTestId('issued-username').innerText()
-    ).trim();
-    const secret = (await page.getByTestId('issued-secret').innerText()).trim();
-    await page.getByTestId('dismiss-secret').click();
-
-    // --- 5. a name in each zone, through the UI --------------------
-    for (const [zone, fqdn] of [
-      [zoneBroken, fqdnBroken],
-      [zoneWorking, fqdnWorking],
-    ] as const) {
-      await page.goto(NAMES_PATH);
-      await page.getByTestId('add-hostname').click();
-      const nameModal = page.getByRole('dialog');
-      await expect(nameModal).toBeVisible();
-      await chooseFromSelect(page, 'hostname-zone', zone);
-      await nameModal.getByTestId('hostname-name').fill(fqdn);
-      await chooseFromSelect(page, 'hostname-device', deviceName);
-      await nameModal.getByTestId('hostname-submit').click();
-      await expect(page.getByTestId(`hostname-${fqdn}`)).toBeVisible({
-        timeout: 15_000,
-      });
-    }
-
-    // --- 6. THE WIRE CLAIM -----------------------------------------
-    // The issue's whole argument rests on this being true today, so it
-    // is demonstrated rather than quoted from
-    // `protocol_cases.yaml:211`.
-    const broken = await deviceCallsIn(page.request, {
-      username,
-      secret,
-      hostname: fqdnBroken,
-      ip: DOC_ADDRESS_V4,
-    });
-    expect(broken.status).toBe(200);
-    expect(
-      broken.body,
-      'a name in a zone with no provider must answer 911 — this is the ' +
-        'state the create modal used to manufacture in one click',
-    ).toBe(`911 ${DOC_ADDRESS_V4}`);
-
-    // The control. The *same* device, the same call, on a name in a
-    // zone that has a provider bound to it: a different answer. Without
-    // this, `911` above is equally consistent with "the stack is
-    // broken", and the assertion could not fail for the right reason.
-    const working = await deviceCallsIn(page.request, {
-      username,
-      secret,
-      hostname: fqdnWorking,
-      ip: DOC_ADDRESS_V4,
-    });
-    expect(working.status).toBe(200);
-    expect(
-      working.body,
-      'the control must not also be 911, or the assertion above says ' +
-        'nothing about zero providers',
-    ).not.toBe(`911 ${DOC_ADDRESS_V4}`);
-
-    // --- 7. the detail route says it too ---------------------------
-    // Reached through the row's own `href` rather than through a click:
-    // #97 made the plain click open the card in a modal (Part III §17),
-    // and the point of this step is the *route*, which §17 kept.
-    await page.goto(DOMAINS_PATH);
-    const brokenHref = (await page
-      .getByTestId(`open-domain-${zoneBroken}`)
-      .getAttribute('href')) as string;
-    expect(brokenHref).toMatch(/\/atrium-ddns\/zones\/\d+$/);
-    await page.goto(brokenHref);
-    await expect(page).toHaveURL(/\/atrium-ddns\/zones\/\d+$/);
-    const detail = page.getByTestId(`zone-${zoneBroken}`);
-    await expect(detail).toBeVisible({ timeout: 15_000 });
-    await expect(detail).toHaveAttribute('data-diverged', 'true');
-    await expect(detail).toContainText('publishes nowhere');
-    // …and the name is listed inside the zone, which is how an operator
-    // learns which names are affected by it.
-    await expect(page.getByTestId(`zone-name-${fqdnBroken}`)).toBeVisible();
-
-    await testInfo.attach('zone-detail-diverged.png', {
-      body: await detail.screenshot(),
-      contentType: 'image/png',
-    });
-
-    // --- 8. and adding a provider clears it ------------------------
-    // The mark is a measurement, not a label: it goes away when the
-    // thing it measures does. Bound over HTTP because the point here is
-    // the *rendering*, and the modal's own click path is covered by the
-    // first test in this file.
-    const domains = await page.request.get(`${API_URL}/atrium_ddns/domains`);
-    const owned = (await domains.json()) as Array<{ id: number; name: string }>;
-    const brokenId = owned.find((entry) => entry.name === zoneBroken)?.id;
-    expect(brokenId).toBeDefined();
-    const bound = await page.request.post(
-      `${API_URL}/atrium_ddns/domains/${brokenId}/backends`,
-      {
-        data: {
-          backend_type: 'route53',
-          config: { ttl: 300 },
-          credentials: DEMO_CREDENTIAL,
-        },
-      },
-    );
-    expect(bound.status()).toBe(201);
-
-    await page.reload();
-    await expect(detail).toHaveAttribute('data-diverged', 'false', {
-      timeout: 15_000,
-    });
-    await expect(detail).not.toContainText('publishes nowhere');
-
-    // …and the wire agrees with the screen. Two instruments on one
-    // fact, and this is the direction that would catch a mark rendered
-    // off something other than the binding.
-    const after = await deviceCallsIn(page.request, {
-      username,
-      secret,
-      hostname: fqdnBroken,
-      ip: DOC_ADDRESS_V4,
-    });
-    expect(after.body).not.toBe(`911 ${DOC_ADDRESS_V4}`);
+    // A name but no provider: the submit stays unavailable.
+    await modal.getByTestId('zone-name').fill(`nohatch-${Date.now()}.example.invalid`);
+    await expect(modal.getByTestId('zone-submit')).toBeDisabled();
 
     expect(pageErrors, 'the page threw while rendering').toEqual([]);
   });

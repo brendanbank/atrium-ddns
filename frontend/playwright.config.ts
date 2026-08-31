@@ -33,6 +33,13 @@ export default defineConfig({
   // harness is that consecutive runs are green without them; a retry
   // would convert exactly the flakiness being measured into a pass.
   retries: process.env.CI ? 1 : 0,
+  /* Short on purpose. A real failure here shows up in ten to fifteen
+     seconds — a selector that will never match does not become more
+     likely with time — so Playwright's 30s default only lengthens the
+     feedback loop when you are iterating on specs. A slow *stack* is a
+     different problem and the fix for it is not a longer wait. */
+  timeout: 15_000,
+  expect: { timeout: 5_000 },
   workers: 1,
   reporter: [['list'], ['html', { open: 'never' }]],
   use: {

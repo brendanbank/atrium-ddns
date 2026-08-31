@@ -20,7 +20,7 @@ import { loginAsAdmin, loginAsUser } from './helpers';
  * permission, draws the form.
  */
 test.describe('DDNS configuration is admin-only', () => {
-  test.describe.configure({ timeout: 60_000 });
+  test.describe.configure({ timeout: 30_000 });
 
   const RATE_LIMITS_PATH = '/atrium-ddns/settings/rate-limits';
 
@@ -29,7 +29,7 @@ test.describe('DDNS configuration is admin-only', () => {
     await page.goto(RATE_LIMITS_PATH);
 
     const refusal = page.getByTestId('settings-refused');
-    await expect(refusal).toBeVisible({ timeout: 15_000 });
+    await expect(refusal).toBeVisible({ timeout: 8_000 });
     await expect(refusal).toContainText('app_setting.manage');
     // The form itself is absent, not merely hidden behind the alert.
     await expect(page.getByTestId('settings-blurb')).toHaveCount(0);

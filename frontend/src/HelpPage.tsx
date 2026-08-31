@@ -39,7 +39,6 @@ import {
   DEVICES_PATH,
   DEVICE_DETAIL_PATH,
   DOMAINS_PATH,
-  ZONE_ROUTE_PATH,
 } from './paths';
 import { NAMES_PATH } from './HostnamesPage';
 import { LOG_PATH } from './LogSearchPage';
@@ -99,8 +98,8 @@ export const DOCUMENTS: { path: string; title: string; blurb: string }[] = [
 /** A route this bundle registers that **has no address to link to**,
  *  because its path carries a parameter.
  *
- *  `/atrium-ddns/zones/:id` is a real, registered, reachable surface,
- *  and a `<a href="/atrium-ddns/zones/:id">` is a link to a literal
+ *  `/atrium-ddns/devices/:id` is a real, registered, reachable surface,
+ *  and a `<a href="/atrium-ddns/devices/:id">` is a link to a literal
  *  colon. So it is described rather than linked, under the surface it is
  *  reached from — and it is still inside the sweep in
  *  `HelpPage.test.tsx`, which requires every registered route to be
@@ -140,15 +139,7 @@ export const SURFACES: {
     to: DOMAINS_PATH,
     label: 'Zones and providers',
     blurb:
-      'Claim a zone and bind its first DNS provider, in one step. A zone with no provider publishes nowhere — every update for a name in it answers 911 — so the list marks one, and creating one is a deliberate choice rather than the default.',
-    within: [
-      {
-        path: ZONE_ROUTE_PATH,
-        label: 'One zone',
-        blurb:
-          'Opened by clicking a zone. Its providers and their credentials, renaming, deleting, and the names inside it.',
-      },
-    ],
+      'Claim a zone and bind its first DNS provider, in one step. A zone with no provider publishes nowhere — every update for a name in it answers 911 — so the list marks one, and creating one is a deliberate choice rather than the default. Clicking a zone opens it in place, at ?zone=<id> — one modal for creating and for editing, and the address is what holds it open, so a reload or a pasted link brings it back.',
   },
   {
     to: DEVICES_PATH,

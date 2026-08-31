@@ -8,15 +8,30 @@
  */
 import { Alert, Stack, Text, Title } from '@mantine/core';
 import { useQuery } from '@tanstack/react-query';
-import { usePerm } from '@brendanbank/atrium-host-bundle-utils/react';
+import {
+  useAtriumLocation,
+  useAtriumNavigate,
+  usePerm,
+} from '@brendanbank/atrium-host-bundle-utils/react';
 
 import { DEVICE_PERMISSION, devicesQuery } from './api/devices';
 import { DdnsRoot } from './host/DdnsRoot';
 import { DeviceList } from './tenant/DeviceList';
+import { DeviceCardModal } from './tenant/DeviceCard';
+import { DEVICES_PATH, deviceFromSearch, deviceHrefParam } from './paths';
 
 export function DevicesInner() {
   const hasPerm = usePerm();
   const canRead = hasPerm(DEVICE_PERMISSION);
+  const { search } = useAtriumLocation();
+  const navigate = useAtriumNavigate();
+  /** The open device, read from `?device=`. Never mirrored into
+   *  `useState`: the modal used to live in `DeviceList`'s state, so a
+   *  reload — or a pasted link, or Back — landed on the bare list. The
+   *  address is the only thing that knows, so nothing can disagree with
+   *  it. Same helper the zones page uses. */
+  const target = deviceFromSearch(search);
+
   const { data, isLoading, error } = useQuery(
     devicesQuery({ enabled: canRead }),
   );
@@ -54,8 +69,19 @@ export function DevicesInner() {
           </Text>
         </Alert>
       ) : data ? (
-        <DeviceList devices={data} />
+        <DeviceList
+          devices={data}
+          onOpen={(id) => navigate(deviceHrefParam(id))}
+        />
       ) : null}
+
+      {/* Open-ness is the address bar. `target.id` is `null` only on a
+          `?device=new`, which this surface does not issue — creation has
+          its own modal in `DeviceList` because it returns a secret. */}
+      <DeviceCardModal
+        deviceId={target.open ? target.id : null}
+        onClose={() => navigate(DEVICES_PATH, { replace: true })}
+      />
     </Stack>
   );
 }

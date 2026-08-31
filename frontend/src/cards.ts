@@ -83,3 +83,33 @@ export function opensInThisTab(event: {
     !event.altKey
   );
 }
+
+/** The header a card modal wears.
+ *
+ * Set here rather than per modal because the title is rendered by
+ * Mantine *outside* `[data-ddns-root]` — the dialog is portalled to
+ * `document.body`, so `ddns.css` cannot reach it and a stylesheet rule
+ * would silently do nothing. A shared constant is the only way four
+ * dialogs keep one heading.
+ */
+export const CARD_MODAL_STYLES = {
+  title: { fontSize: 'var(--mantine-font-size-xl)', fontWeight: 700 },
+} as const;
+
+/** Props every card modal shares.
+ *
+ * `closeOnClickOutside: false` for two reasons that point the same way.
+ *
+ * The bug: Mantine renders a `Select`'s option list into a portal
+ * *outside* the dialog, so picking a provider could register as a click
+ * outside it and dismiss the whole form. It showed up as one e2e run in
+ * three failing on a select that "did not take" — the value never landed
+ * because the modal holding it had gone.
+ *
+ * The design: these dialogs hold unsaved edits. A stray click discarding
+ * a half-typed credential is a bad trade even when it works correctly,
+ * and Escape and Cancel are both still there.
+ */
+export const CARD_MODAL_PROPS = {
+  closeOnClickOutside: false,
+} as const;

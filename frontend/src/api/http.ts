@@ -44,7 +44,22 @@ async function jsonOrThrow<T>(res: Response): Promise<T> {
     const body = await res.text().catch(() => '');
     throw new ApiError(res.status, body);
   }
-  return (await res.json()) as T;
+  // **A success with no body is a success.** `DELETE` answers `204 No
+  // Content`, and `res.json()` on an empty body throws `Unexpected end
+  // of JSON input` — which surfaced as *"That did not work"* over a
+  // delete that had in fact worked. The row was gone, the list never
+  // refreshed, and the modal stayed open because the mutation's
+  // `onSuccess` never ran.
+  //
+  // Checked on the response rather than at each call site: every
+  // `DELETE` in this client hits it, so a per-caller fix would be three
+  // copies of one rule and a fourth endpoint away from the same bug.
+  if (res.status === 204 || res.headers.get('content-length') === '0') {
+    return undefined as T;
+  }
+  const text = await res.text();
+  if (text === '') return undefined as T;
+  return JSON.parse(text) as T;
 }
 
 /** GET `path` under the API base and parse JSON. */

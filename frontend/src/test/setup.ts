@@ -56,3 +56,23 @@ if (typeof window !== 'undefined' && !window.matchMedia) {
     }),
   });
 }
+
+// jsdom doesn't ship `document.fonts` (the CSS Font Loading API), and
+// Mantine's autosize `Textarea` subscribes to it unguarded —
+// `document.fonts.addEventListener('loadingdone', …)` in a `useEffect`,
+// so the throw lands in React's passive-effect commit and surfaces as
+// "Cannot read properties of undefined (reading 'addEventListener')"
+// with no mention of fonts, textareas or Mantine anywhere in it.
+//
+// A no-op FontFaceSet is enough: nothing here asserts on font loading,
+// and the listener exists only to re-measure after a webfont swaps in.
+if (typeof document !== 'undefined' && !document.fonts) {
+  Object.defineProperty(document, 'fonts', {
+    writable: true,
+    value: {
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      ready: Promise.resolve(),
+    },
+  });
+}

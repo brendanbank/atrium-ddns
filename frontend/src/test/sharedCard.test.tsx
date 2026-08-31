@@ -28,8 +28,11 @@
  * - `DeviceCard`: the route (`DeviceDetailPage`), the device list's row
  *   (`DevicesPage` → `DeviceList`), and the board's row
  *   (`DeviceBoardPage` → `DeviceBoard`).
- * - `ZoneCard`: the route (`ZoneDetailPage`) and the zones list's row
- *   (`DomainsPage` → `DomainList`).
+ * - `ZoneModal`: `DomainsPage` renders it, and both zone addresses
+ *   (`/atrium-ddns/zones/:id` and `/atrium-ddns/zones/new`) route to that
+ *   same page — so there is one entrance, and the URL decides what it
+ *   shows. The substitution still holds: a second zone editor grown
+ *   anywhere would not be this mock.
  *
  * Each is driven the way an operator drives it — a click on the name —
  * rather than by rendering the modal component directly, because a
@@ -46,6 +49,7 @@ import {
 } from '@brendanbank/atrium-test-utils';
 
 import { queryClient } from '../queryClient';
+import { zoneHrefParam, zoneNewHref } from '../paths';
 import { board, device as boardDevice } from './fixtures';
 
 /** The substitutes. Each renders a string that exists nowhere else in
@@ -83,24 +87,22 @@ vi.mock('../tenant/DeviceCard', async () => {
   };
 });
 
-vi.mock('../tenant/ZoneCard', async () => {
+vi.mock('../tenant/ZoneModal', async () => {
   const { Modal } = await import('@mantine/core');
-  const ZoneCard = ({ zoneId }: { zoneId: number }) => (
-    <div data-testid="zone-card-substitute">
-      {ZONE_SENTINEL} {zoneId}
-    </div>
-  );
   return {
-    ZoneCard,
-    ZoneCardModal: ({
+    ZoneModal: ({
       zoneId,
+      opened,
       onClose,
     }: {
       zoneId: number | null;
+      opened: boolean;
       onClose: () => void;
     }) => (
-      <Modal opened={zoneId !== null} onClose={onClose} title="Zone">
-        {zoneId === null ? null : <ZoneCard zoneId={zoneId} />}
+      <Modal opened={opened} onClose={onClose} title="Zone">
+        <div data-testid="zone-card-substitute">
+          {ZONE_SENTINEL} {zoneId ?? 'new'}
+        </div>
       </Modal>
     ),
   };
@@ -110,7 +112,6 @@ const { DeviceBoardPage } = await import('../DeviceBoardPage');
 const { DeviceDetailPage } = await import('../DeviceDetailPage');
 const { DevicesPage } = await import('../DevicesPage');
 const { DomainsPage } = await import('../DomainsPage');
-const { ZoneDetailPage } = await import('../ZoneDetailPage');
 
 const TENANT: UserContext = {
   id: 1,
@@ -213,27 +214,39 @@ describe('DeviceCard has one definition and three call sites', () => {
 
   test('the board opens it from the device name', async () => {
     renderWithAtrium(<DeviceBoardPage />);
-    await screen.findByTestId('board');
+    await screen.findByTestId('board-table');
     fireEvent.click(screen.getByTestId(`board-open-${DEVICE_ROW.name}`));
     const found = await screen.findByTestId('device-card-substitute');
     expect(found).toHaveTextContent(`${DEVICE_SENTINEL} ${DEVICE_ROW.id}`);
   });
 });
 
-describe('ZoneCard has one definition and two call sites', () => {
-  test('the route renders it', async () => {
-    window.history.pushState({}, '', `/atrium-ddns/zones/${ZONE_ROW.id}`);
-    renderWithAtrium(<ZoneDetailPage />);
+describe('ZoneModal has one definition, and the URL decides what it shows', () => {
+  test('a zone address opens it with that zone, before any click', async () => {
+    // The operator's requirement, asserted directly: land on the address
+    // — as a reload, a pasted link or a Back — and the modal is already
+    // open on the right zone. A test that clicked first would pass
+    // against the old `useState` version too.
+    window.history.pushState({}, '', zoneHrefParam(ZONE_ROW.id));
+    renderWithAtrium(<DomainsPage />);
     const found = await screen.findByTestId('zone-card-substitute');
     expect(found).toHaveTextContent(`${ZONE_SENTINEL} ${ZONE_ROW.id}`);
   });
 
-  test('the zones list opens it in a modal, and the id travels with it', async () => {
+  test('the create address opens the same modal with no zone', async () => {
+    window.history.pushState({}, '', zoneNewHref());
     renderWithAtrium(<DomainsPage />);
-    const name = await screen.findByTestId(`open-domain-${ZONE_ROW.name}`);
-    fireEvent.click(name);
     const found = await screen.findByTestId('zone-card-substitute');
-    expect(found).toHaveTextContent(`${ZONE_SENTINEL} ${ZONE_ROW.id}`);
+    expect(found).toHaveTextContent(`${ZONE_SENTINEL} new`);
+  });
+
+  test('the list is bare at the list address', async () => {
+    // The other direction, and the one that catches a modal wired to
+    // render unconditionally: no zone in the URL, no modal.
+    window.history.pushState({}, '', '/atrium-ddns/domains');
+    renderWithAtrium(<DomainsPage />);
+    await screen.findByTestId(`open-domain-${ZONE_ROW.name}`);
+    expect(screen.queryByTestId('zone-card-substitute')).toBeNull();
   });
 });
 

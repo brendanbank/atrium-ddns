@@ -531,10 +531,32 @@ describe('the rendering rules the design fixes', () => {
     expect(screen.getByTestId('log-row-1-client-ip')).toBeInTheDocument();
     expect(screen.queryByTestId('log-row-1-ip')).not.toBeInTheDocument();
 
-    // The NAT'd update, which is the interesting one — and it is
-    // labelled, because two addresses with no label read as a typo.
-    expect(screen.getByTestId('log-row-2-ip')).toHaveTextContent(V4_DECLARED);
-    expect(screen.getByText('declared myip')).toBeInTheDocument();
+    // The NAT'd update, which is the interesting one. The second
+    // address itself moved into the detail a click opens — it was a
+    // second line under every row, and on a ledger the point of which is
+    // scanning, one wrapped row per event costs more than it returns.
+    // What stays in the row is a marker saying the two differ, labelled
+    // in its `title`, because two addresses with no label read as a typo
+    // and an unlabelled glyph reads as decoration.
+    const marker = screen
+      .getByTestId('log-row-2-client-ip')
+      .querySelector('.ddns-log__declared');
+    expect(marker, 'the row does not mark that the addresses differ').not.toBeNull();
+    expect(marker).toHaveAttribute('title', `declared myip ${V4_DECLARED}`);
+    // Row 1's two addresses are the same fact, so it carries no marker.
+    expect(
+      screen
+        .getByTestId('log-row-1-client-ip')
+        .querySelector('.ddns-log__declared'),
+    ).toBeNull();
+
+    // …and the address itself is one click away, stated in full and
+    // labelled, on both rows — in a detail view "same as called from" is
+    // itself worth being able to read.
+    fireEvent.click(screen.getByTestId('log-row-2'));
+    expect(
+      await screen.findByTestId('log-detail-Declared myip'),
+    ).toHaveTextContent(V4_DECLARED);
   });
 
   test('a null backend is a meaning, not a dash', async () => {

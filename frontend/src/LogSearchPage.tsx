@@ -37,10 +37,16 @@ import { activeFilterCount, eventsQuery, type LogQuery } from './api/events';
 import { DdnsRoot } from './host/DdnsRoot';
 import { LogEmpty } from './logs/LogEmpty';
 import { LogFilters } from './logs/LogFilters';
+import type { EventRow } from './api/events';
+import { LogDetail } from './logs/LogDetail';
 import { LogLedger, LogSkeleton } from './logs/LogLedger';
 import { useLogQuery } from './logs/useLogQuery';
 
 export function LogSearchInner() {
+  /** The row whose full detail is open, if any. Local state and not
+   *  the URL: a log row is a transient thing you glance at, unlike a
+   *  zone or a device, and nobody pastes one into a ticket. */
+  const [detail, setDetail] = useState<EventRow | null>(null);
   const { query, setFilter, clear } = useLogQuery();
   // Paging state is *not* in the URL. A cursor is a position in one
   // ordering of one filter set — paste it into a ticket a day later and
@@ -104,7 +110,8 @@ export function LogSearchInner() {
           />
         ) : (
           <>
-            <LogLedger page={data} onFilter={onFilter} />
+            <LogLedger page={data} onOpen={setDetail}
+          onFilter={onFilter} />
             <Group gap="sm" align="center">
               {cursor !== null ? (
                 <Button
@@ -141,6 +148,8 @@ export function LogSearchInner() {
           </>
         )
       ) : null}
+
+      <LogDetail row={detail} onClose={() => setDetail(null)} />
     </Stack>
   );
 }

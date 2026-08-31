@@ -1297,6 +1297,26 @@ def credential_origin(password_hash: str | None) -> CredentialOrigin:
 # --------------------------------------------------------------------- #
 
 
+class SettingFieldOut(BaseModel):
+    """One non-secret provider setting, as the form needs it.
+
+    Mirrors :class:`~atrium_ddns.providers.base.SettingField`. Shipped
+    rather than hardcoded for the reason ``ProviderOut`` gives about
+    ``credential_keys``: a provider that gains a setting grows the field
+    the next time the page loads.
+    """
+
+    key: str
+    label: str
+    help: str = ""
+    #: Non-empty renders a select instead of a text box. An algorithm is
+    #: an enum the DNS library will accept or refuse, and a free-text box
+    #: for it turns a typo into a publish-time failure.
+    choices: list[str] = []
+    required: bool = False
+    default: str = ""
+
+
 class ProviderOut(BaseModel):
     """One DNS provider this build ships, and its field list.
 
@@ -1317,6 +1337,14 @@ class ProviderOut(BaseModel):
     #: present and non-empty before the adapter will talk to the
     #: provider at all. These go in the **encrypted** column.
     credential_keys: list[str]
+    #: ``key -> {label, help}`` for the credential boxes, where the
+    #: provider has bothered to name them. Missing keys fall back to
+    #: the key itself, which is what every provider did before.
+    credential_labels: dict[str, SettingFieldOut] = {}
+    #: ``BaseProvider.SETTING_FIELDS`` — the non-secret settings, with
+    #: enough shape for a form. These go in the **plaintext** ``config``
+    #: column, and were previously reachable only by typing raw JSON.
+    setting_fields: list[SettingFieldOut] = []
 
 
 class ProviderCatalogueOut(BaseModel):
@@ -1334,6 +1362,23 @@ def _credential_keys(backend_type: str) -> tuple[str, ...]:
     """
     cls = provider_class(backend_type)
     return () if cls is None else tuple(cls.REQUIRED_CREDENTIALS)
+
+
+def _credential_labels(backend_type: str) -> dict[str, tuple[str, str]]:
+    """``CREDENTIAL_LABELS`` for a stored ``backend_type``, or ``{}``."""
+    cls = provider_class(backend_type)
+    return {} if cls is None else dict(cls.CREDENTIAL_LABELS)
+
+
+def _setting_fields(backend_type: str):
+    """``SETTING_FIELDS`` for a stored ``backend_type``, or ``()``.
+
+    Same shape and same reasoning as :func:`_credential_keys`: a service
+    nobody claims has no opinion about its settings, and that is a real
+    state rather than an error.
+    """
+    cls = provider_class(backend_type)
+    return () if cls is None else tuple(cls.SETTING_FIELDS)
 
 
 def _all_secret_keys() -> frozenset[str]:
@@ -1431,7 +1476,23 @@ async def list_providers(
     return ProviderCatalogueOut(
         providers=[
             ProviderOut(
-                service=service, credential_keys=list(_credential_keys(service))
+                service=service,
+                credential_keys=list(_credential_keys(service)),
+                credential_labels={
+                    key: SettingFieldOut(key=key, label=label, help=help_)
+                    for key, (label, help_) in _credential_labels(service).items()
+                },
+                setting_fields=[
+                    SettingFieldOut(
+                        key=f.key,
+                        label=f.label,
+                        help=f.help,
+                        choices=list(f.choices),
+                        required=f.required,
+                        default=f.default,
+                    )
+                    for f in _setting_fields(service)
+                ],
             )
             for service in known_services()
         ]
@@ -3061,16 +3122,38 @@ class HostnameAssignIn(BaseModel):
     tell them apart (see :class:`DomainBackendUpdateIn`, which does need
     one), and there is nothing here to preserve.
 
-    The name is deliberately **not** editable. A hostname *is* the DNS
-    name — it is what ``/nic/update`` looks the row up by and what a
+    ``name`` and ``domain_id`` are **optional** here, and omitting them
+    means *leave alone* — which is why they are optional rather than
+    nullable like ``device_id``. That field cannot use omission for
+    "leave alone" because ``null`` is already *unassign*; these two have
+    no such second meaning, so absence is free to carry it.
+
+    Renaming was refused for a long time, on the argument below. The
+    argument is still true and the refusal was still wrong: it made a
+    typo permanent and pushed operators into delete-and-recreate, which
+    destroys the published-address history the board renders and leaves
+    exactly the same orphaned record at the provider. Renaming now works
+    and the UI states the consequence; the reasoning it replaces is kept
+    because it is what the consequence *is*:
+
+    A hostname *is* the DNS name — it is what ``/nic/update`` looks the row
+    up by and what a
     provider has already published a record under. Renaming the row
     would leave the old record in the zone with nothing pointing at it
     and no way to reach it again; delete-and-create is the honest
     spelling of that operation, and it is one the owner can see the
-    consequences of.
+    consequences of. That is still what happens — the difference is that
+    the operator is told, rather than being made to do it by hand.
     """
 
     device_id: int | None
+    #: Omitted = leave alone. A new label, validated against whichever
+    #: zone the row ends up in — the *target* zone, not the current one,
+    #: so a rename and a move in the same request are checked together
+    #: rather than against a state that never exists.
+    name: str | None = Field(default=None, min_length=1, max_length=253)
+    #: Omitted = leave alone. Scoped, so another tenant's zone is a 404.
+    domain_id: int | None = None
 
 
 def _validated_hostname(raw: str, zone: str) -> str:
@@ -3315,12 +3398,42 @@ async def assign_hostname(
         if device is None:
             raise _not_found("device")
 
-    domain = await scope.get(session, Domain, hostname.domain_id)
-    if domain is None:  # pragma: no cover — the scope reached the hostname
+    # The *target* zone: the one the row will be in after this request,
+    # which is what the new name has to be inside. Validating against the
+    # current zone would accept a name that is legal today and orphaned
+    # the moment the move lands.
+    target_domain_id = (
+        hostname.domain_id if body.domain_id is None else body.domain_id
+    )
+    domain = await scope.get(session, Domain, target_domain_id)
+    if domain is None:
         raise _not_found("domain")
 
     before = hostname.device_id
+    before_name = hostname.name
+    before_domain = hostname.domain_id
     hostname.device_id = device.id if device is not None else None
+
+    if body.domain_id is not None:
+        hostname.domain_id = domain.id
+    if body.name is not None:
+        # The same function the create path calls, so one rule decides
+        # what "inside its zone" means here, at create, and on the wire.
+        hostname.name = _validated_hostname(body.name, domain.name)
+    elif body.domain_id is not None:
+        # Moved but not renamed: the existing name still has to be inside
+        # the zone it moved to, or the row would be unreachable by
+        # `/nic/update` — creatable, never updatable, silent.
+        hostname.name = _validated_hostname(hostname.name, domain.name)
+
+    if hostname.name != before_name or hostname.domain_id != before_domain:
+        try:
+            await session.flush()
+        except IntegrityError as exc:
+            await session.rollback()
+            raise _conflict(
+                f"the hostname {hostname.name} is already registered"
+            ) from exc
 
     await record_audit(
         session,

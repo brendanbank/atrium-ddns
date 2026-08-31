@@ -51,11 +51,9 @@ import {
   Group,
   Modal,
   NumberInput,
-  Radio,
   Stack,
   Text,
   TextInput,
-  Title,
 } from '@mantine/core';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { usePerm } from '@brendanbank/atrium-host-bundle-utils/react';
@@ -74,7 +72,7 @@ import {
 import { ApiError } from '../api/http';
 import { HostnameBlock } from '../board/DeviceBoard';
 import { absoluteTitle, formatAge, rateLimitSummary } from '../board/format';
-import { CARD_MODAL_PADDING_PX, CARD_MODAL_WIDTH_PX } from '../cards';
+import { CARD_MODAL_PADDING_PX, CARD_MODAL_WIDTH_PX, CARD_MODAL_PROPS, CARD_MODAL_STYLES } from '../cards';
 import { DdnsPortalScope } from '../host/DdnsRoot';
 import { MigratedNotice, SecretOnce } from './SecretOnce';
 
@@ -108,14 +106,12 @@ function DeviceName({
   device: Device;
   onSaved: (next: Device) => void;
 }) {
-  const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(device.name);
   const [refusal, setRefusal] = useState<string | null>(null);
 
   const rename = useMutation({
     mutationFn: renameDevice,
     onSuccess: (next) => {
-      setEditing(false);
       setRefusal(null);
       onSaved(next);
     },
@@ -127,11 +123,6 @@ function DeviceName({
     onError: (error: Error) => setRefusal(refusalText(error)),
   });
 
-  const start = () => {
-    setDraft(device.name);
-    setRefusal(null);
-    setEditing(true);
-  };
 
   const submit = () => {
     const name = draft.trim();
@@ -146,58 +137,42 @@ function DeviceName({
     });
   };
 
-  if (!editing) {
-    return (
-      <Stack gap={4}>
-        <Group gap="sm" align="baseline">
-          <Title order={3} className="ddns-data" data-testid="device-name">
-            {device.name}
-          </Title>
-          <Button
-            size="compact-xs"
-            variant="subtle"
-            onClick={start}
-            data-testid="device-rename"
-          >
-            Rename
-          </Button>
-        </Group>
-      </Stack>
-    );
-  }
+  /* Always an input with Save beside it. No read mode, no Rename link.
 
+     The toggle existed to keep the name looking like a heading until you
+     asked to change it. The cost was a click before the most common edit
+     on the page, and two states that had to agree about what the name
+     currently is. A field that is always a field cannot disagree with
+     itself, and `Save` stays disabled until the draft differs from the
+     stored name — so the affordance still says whether there is anything
+     to do. */
   return (
     <Stack gap="xs">
       <Group gap="sm" align="flex-end">
         <TextInput
           label="Name"
-          description="What you call it. The username and the secret are not affected."
           value={draft}
-          autoFocus
           disabled={rename.isPending}
           onChange={(event) => setDraft(event.currentTarget.value)}
           onKeyDown={(event) => {
             if (event.key === 'Enter') submit();
-            if (event.key === 'Escape') setEditing(false);
+            // Escape restores the stored name. There is nothing to close.
+            if (event.key === 'Escape') setDraft(device.name);
           }}
           data-testid="device-name-input"
+          style={{ minWidth: 280 }}
         />
         <Button
           size="xs"
-          disabled={draft.trim() === '' || rename.isPending}
+          disabled={
+            draft.trim() === '' ||
+            draft.trim() === device.name ||
+            rename.isPending
+          }
           onClick={submit}
           data-testid="device-name-save"
         >
           Save
-        </Button>
-        <Button
-          size="xs"
-          variant="default"
-          disabled={rename.isPending}
-          onClick={() => setEditing(false)}
-          data-testid="device-name-cancel"
-        >
-          Cancel
         </Button>
       </Group>
       {refusal ? (
@@ -225,9 +200,18 @@ function RateLimit({
   device: Device;
   onSaved: (next: Device) => void;
 }) {
-  const [inherit, setInherit] = useState(device.rate_limit_per_minute === null);
+  /* One field, prefilled with the limit actually in force — the
+     per-device value if there is one, otherwise the installation default
+     the server reports. So the box always opens showing the number the
+     device is really being held to, which is what you came to read.
+
+     **Clearing the box is how you go back to inheriting.** The checkbox
+     that used to say so is gone at the operator's request, so empty is
+     the only way `null` still reaches the API — and `null` is a value on
+     this column, not an omission (#73). Without that mapping a device,
+     once opened, could never inherit again. */
   const [value, setValue] = useState<number | ''>(
-    device.rate_limit_per_minute === null ? '' : device.rate_limit_per_minute,
+    device.rate_limit_per_minute ?? device.effective_rate_limit_per_minute ?? '',
   );
   const [refusal, setRefusal] = useState<string | null>(null);
 
@@ -240,46 +224,34 @@ function RateLimit({
     onError: (error: Error) => setRefusal(refusalText(error)),
   });
 
+  /* One line: heading, field, checkbox, Save.
+     The field is **prefilled with the effective limit** rather than left
+     blank when the device inherits. A blank box next to the words
+     "inherit the installation default (30)" made the operator read the
+     number off the label and type it back in to change it by one.
+
+     `inheriting` still travels as `null` on the wire — #73's rule that
+     `null` is a value on this column and not an omission. Prefilling is
+     a display choice; it does not turn an inheriting device into a
+     pinned one unless the box is ticked off. */
   return (
     <Stack gap="xs">
-      <span className="ddns-label">rate limit</span>
-      <Group gap="lg" align="flex-end">
+      <Group gap="md" align="center" wrap="nowrap">
+        <span className="ddns-th">Rate limit</span>
         <NumberInput
-          label="Updates per minute"
+          aria-label="Updates per minute"
           value={value}
           min={0}
-          disabled={inherit || save.isPending}
+          disabled={save.isPending}
+          placeholder="inherit"
           onChange={(next) => setValue(typeof next === 'number' ? next : '')}
           data-testid="detail-limit-input"
+          styles={{ input: { width: 110 } }}
+          w={110}
         />
-        <Radio.Group
-          value={inherit ? 'inherit' : 'own'}
-          onChange={(next) => setInherit(next === 'inherit')}
-          data-testid="detail-limit-choice"
-        >
-          <Stack gap={4}>
-            <Radio
-              value="own"
-              label="set on this device"
-              data-testid="detail-limit-own"
-            />
-            <Radio
-              value="inherit"
-              /* The number is named only when it is knowable. With a
-                 per-device value set, the installation default lives
-                 behind `app_setting.manage` and this browser does not
-                 hold it — a number here would be one the page invented.
-                 `n/a` is never `0`, and it is never a plausible 30
-                 either. */
-              label={
-                device.rate_limit_per_minute === null
-                  ? `inherit the installation default (${device.effective_rate_limit_per_minute})`
-                  : 'inherit the installation default'
-              }
-              data-testid="detail-limit-inherit"
-            />
-          </Stack>
-        </Radio.Group>
+        <Text size="sm" c="dimmed">
+          per minute
+        </Text>
         <Button
           size="xs"
           disabled={save.isPending}
@@ -287,9 +259,10 @@ function RateLimit({
             save.mutate({
               id: device.id,
               // `null` is the *inherit* choice, made explicitly. `0`
-              // is a different state — may never call — and reachable
-              // only by typing it.
-              rate_limit_per_minute: inherit ? null : value === '' ? null : value,
+              // would mute the device, which is a different thing.
+              // Empty means inherit. `0` would mute the device, which is
+              // a different thing and is why this is not `|| 0`.
+              rate_limit_per_minute: value === '' ? null : value,
             })
           }
           data-testid="detail-limit-save"
@@ -422,22 +395,26 @@ export function DeviceCard({ deviceId }: DeviceCardProps) {
       <Stack gap={4}>
         <DeviceName device={data} onSaved={refresh} />
         <Group gap="md">
-          <span className="ddns-label" data-testid="detail-username">
-            {data.username}
+          {/* Prefixed: on a line that also carries "seen" and "created",
+              a bare `ddns-…` string was the one item that did not say
+              what it is — and it is the half of the credential that has
+              to be typed into a router. */}
+          <span className="ddns-cell" data-testid="detail-username">
+            <strong>Username:</strong> {data.username}
           </span>
           <span
-            className="ddns-station__time"
+            className="ddns-cell"
             title={absoluteTitle(data.last_seen_at)}
             data-testid="detail-last-seen"
           >
             seen {formatAge(data.last_seen_at)}
           </span>
           <span
-            className="ddns-station__time"
+            className="ddns-cell"
             title={absoluteTitle(data.created_at)}
             data-testid="detail-created"
           >
-            created {absoluteTitle(data.created_at)}
+            created {formatAge(data.created_at)}
           </span>
         </Group>
       </Stack>
@@ -447,7 +424,7 @@ export function DeviceCard({ deviceId }: DeviceCardProps) {
       <RateLimit device={data} onSaved={refresh} />
 
       <Stack gap="xs">
-        <span className="ddns-label">names this device updates</span>
+        <span className="ddns-th">Names this device updates</span>
         {board.isLoading ? (
           <Text size="sm" data-testid="detail-strips-loading">
             Loading…
@@ -474,7 +451,23 @@ export function DeviceCard({ deviceId }: DeviceCardProps) {
       <Divider />
 
       <Stack gap="xs">
-        <span className="ddns-label">credential</span>
+        {/* Rotate sits beside the heading. The sentence it used to
+            carry — "the device stops working until it is reconfigured" —
+            was a warning shown before anyone had asked for anything, on a
+            screen you open to read a rate limit. It now lives in the
+            confirmation, answering the question you have just asked. */}
+        <Group gap="sm" align="center">
+          <span className="ddns-th">Credential</span>
+          <Button
+            size="xs"
+            variant="default"
+            disabled={rotate.isPending}
+            onClick={() => setConfirmRotate(true)}
+            data-testid="detail-rotate"
+          >
+            Rotate
+          </Button>
+        </Group>
         {issued ? (
           <SecretOnce issued={issued} onDismiss={() => setIssued(null)} />
         ) : null}
@@ -490,21 +483,6 @@ export function DeviceCard({ deviceId }: DeviceCardProps) {
             </Text>
           </Alert>
         ) : null}
-        <Group gap="sm">
-          <Text size="sm" data-testid="detail-rotate-consequence">
-            Rotate the secret — the device stops working until it is
-            reconfigured.
-          </Text>
-          <Button
-            size="xs"
-            variant="default"
-            disabled={rotate.isPending}
-            onClick={() => setConfirmRotate(true)}
-            data-testid="detail-rotate"
-          >
-            Rotate
-          </Button>
-        </Group>
       </Stack>
 
       <Modal
@@ -563,6 +541,8 @@ export function DeviceCardModal({
       title="Device"
       size={CARD_MODAL_WIDTH_PX}
       padding={CARD_MODAL_PADDING_PX}
+      {...CARD_MODAL_PROPS}
+      styles={CARD_MODAL_STYLES}
       data-testid="device-card-modal"
     >
       {/* Portalled to `document.body`, outside `data-ddns-root`. Without

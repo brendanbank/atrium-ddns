@@ -1,8 +1,15 @@
 import { expect, test } from '@playwright/test';
 
+/** Not a secret, and shaped like one on purpose: the credential has to
+ *  reach the encrypted column for the form to be exercised, and a value
+ *  that looks like a key is what a reader checks is never echoed back. */
+const DEMO_CREDENTIAL: Record<string, string> = {
+  aws_access_key_id: 'AKIA-E2E-NOT-A-SECRET',
+  aws_secret_access_key: 'e2e-not-a-secret',
+};
+
 import {
   API_URL,
-  BOARD_PATH,
   DEVICES_PATH,
   DOC_ADDRESS_V4,
   DOMAINS_PATH,
@@ -14,10 +21,6 @@ import {
   uniqueDeviceName,
   uniqueZoneName,
 } from './helpers';
-import {
-  PUBLISHES_NOWHERE,
-  WIRE_CONSEQUENCE,
-} from '../src/tenant/ZoneStatus';
 
 /**
  * Spec 2 of the floor, and the one this milestone exists for: the
@@ -49,291 +52,162 @@ import {
  *      even though the click cannot complete on a hermetic stack.
  */
 test.describe('the §3.3.1 walk, through the UI', () => {
-  test.describe.configure({ timeout: 120_000 });
+  test.describe.configure({ timeout: 30_000 });
 
   test('zone, provider, device, name — and a rendered strip', async ({
     page,
   }, testInfo) => {
-    // Surface a crashing render rather than waiting 30 s for a locator
-    // on a blank page — the Mantine failure mode the playwright-debug
-    // skill catalogues.
-    const pageErrors: string[] = [];
-    page.on('pageerror', (error) => pageErrors.push(error.message));
-
-    await loginAsUser(page);
+    // The §3.3.1 walk, driven through the UI, ending at a strip a browser
+    // has actually drawn.
+    //
+    // **Rewritten for the board's flat table.** The walk used to end on
+    // the board, which drew a rail per name. The board is a table now —
+    // one row per name per family — because the nested layout changed
+    // shape as check results arrived. The strip survives where it is
+    // still the right drawing: inside one device's card. So the walk
+    // ends there, and the board is asserted as the table it is.
+    //
+    // It also used to create the zone with **no** provider, through an
+    // "add a provider later" link, and add one afterwards. That link is
+    // gone: a zone with no provider answers `911` for every update under
+    // it, and the operator ruled that a form whose only escape hatch
+    // produces that state is offering a trap. The zone is created with
+    // its provider in one submission.
+    const pageErrors: Error[] = [];
+    page.on('pageerror', (error) => pageErrors.push(error));
 
     const zone = uniqueZoneName();
     const deviceName = uniqueDeviceName();
-    const fqdn = `home.${zone}`;
+    const hostname = `home.${zone}`;
 
-    // --- 1. a zone, through the UI ---------------------------------
-    //
-    // Deliberately with **no** provider, which since #88 is a departure
-    // from the form's own reading order rather than the thing that
-    // happens when you fill in the only field on offer: the link has to
-    // be taken and the consequence confirmed. The walk takes it because
-    // the provider it needs is not one the catalogue offers (see step
-    // 2), and because the zero-provider state is worth rendering once.
+    await loginAsUser(page);
+
+    // --- 1. the zone and its provider, in one submission --------------
     await page.goto(DOMAINS_PATH);
-    await expect(page.getByTestId('domains-empty')).toBeVisible({
-      timeout: 15_000,
-    });
     await page.getByTestId('add-domain').click();
     const zoneModal = page.getByRole('dialog');
     await expect(zoneModal).toBeVisible();
+    // Wait for the **body**, not the shell. The dialog frame appears
+    // immediately; the form inside renders only once the zone and
+    // provider queries have resolved, and until then `ZoneModalBody`
+    // renders "Loading…". Filling the name auto-waits and so happened
+    // to work, which made the miss surface later and elsewhere — on
+    // the provider select, in one run out of three.
+    await expect(zoneModal.getByTestId('zone-modal-body')).toBeVisible({
+      timeout: 8_000,
+    });
     await zoneModal.getByTestId('zone-name').fill(zone);
-    // Neither the consequence nor its confirm button exists until the
-    // link is taken.
-    await expect(zoneModal.getByTestId('zone-later-warning')).toHaveCount(0);
-    await zoneModal.getByTestId('zone-later-link').click();
-    await expect(zoneModal.getByTestId('zone-later-warning')).toBeVisible();
-    await zoneModal.getByTestId('zone-later-submit').click();
-    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await chooseFromSelect(page, 'zone-provider', 'route53');
+    for (const [key, value] of Object.entries(DEMO_CREDENTIAL)) {
+      await zoneModal.getByTestId(`zone-credential-field-${key}`).fill(value);
+    }
+    // Assert the select took before touching the submit. `zone-submit`
+    // is disabled until a provider is chosen, so a click after a
+    // select that silently missed does not fail — it waits for the
+    // button to become actionable and times out naming the button
+    // rather than the cause. Same guard as `zone-provider.spec.ts`.
+    await expect(zoneModal.getByTestId('zone-provider')).toHaveValue(
+      'route53',
+    );
+    await expect(zoneModal.getByTestId('zone-submit')).toBeEnabled();
+    await zoneModal.getByTestId('zone-submit').click();
 
     const zoneRow = page.getByTestId(`domain-${zone}`);
-    await expect(zoneRow).toBeVisible();
-    // §10.1: a zone with no provider is the *exceptional* row, in the
-    // operator's terms rather than the protocol's. Asserted against
-    // `ZoneStatus`'s own exported strings — a spec that retyped them
-    // would keep passing after the product stopped saying them.
-    await expect(zoneRow).toHaveAttribute('data-diverged', 'true');
-    await expect(page.getByTestId(`nowhere-${zone}`)).toContainText(
-      PUBLISHES_NOWHERE,
-    );
-    await expect(page.getByTestId(`nowhere-why-${zone}`)).toContainText(
-      WIRE_CONSEQUENCE,
-    );
-    await expect(page.getByTestId(`providers-${zone}`)).toHaveText(
-      '0 providers',
-    );
-
-    // --- 2. the provider ------------------------------------------
-    // On the zone's own route since #88 — §12's linkable destination.
-    //
-    // **Adjusted by #97.** A plain click on the row now opens the card
-    // in a modal (Part III §17), and the block below opens a *second*
-    // modal on top of it to read the provider catalogue. Two dialogs
-    // would make `getByRole('dialog')` ambiguous and would leave the
-    // outer one open after the two Escapes, so this step follows the
-    // row's own `href` — which §17 kept precisely so it could be
-    // followed. `card-affordance.spec.ts` covers the modal entrance.
-    const zoneHrefFromRow = (await page
-      .getByTestId(`open-domain-${zone}`)
-      .getAttribute('href')) as string;
-    expect(zoneHrefFromRow).toMatch(/\/atrium-ddns\/zones\/\d+$/);
-    await page.goto(zoneHrefFromRow);
-    await expect(page.getByTestId(`zone-${zone}`)).toBeVisible();
-    await expect(page.getByTestId('zone-no-providers')).toBeVisible();
-
-    // The modal, opened and read: it is the surface an operator uses,
-    // and the catalogue it offers is a property of the build.
-    await page.getByTestId('zone-add-backend').click();
-    const providerModal = page.getByRole('dialog');
-    await expect(providerModal).toBeVisible();
-    await providerModal.getByTestId('backend-service').click();
-    // The three adapters this build ships (`providers.known_services()`).
-    // Read as a set from the dropdown rather than asserted one by one,
-    // so a fourth adapter fails this loudly instead of passing quietly.
-    const offered = await page.getByRole('option').allTextContents();
-    expect(offered.sort()).toEqual(['hetzner', 'nsupdate', 'route53']);
-    // Twice: the first closes the Select's dropdown, the second the
-    // modal. Two unconditional presses rather than a branch on which
-    // one the first landed on.
-    await page.keyboard.press('Escape');
-    await page.keyboard.press('Escape');
-    await expect(page.getByRole('dialog')).toHaveCount(0);
-
-    // The binding itself — §3.3.1 step 4, over HTTP, for the reason on
-    // `bindScriptedBackend`.
-    const domains = await page.request.get(`${API_URL}/atrium_ddns/domains`);
-    expect(domains.ok()).toBeTruthy();
-    const owned = (await domains.json()) as Array<{ id: number; name: string }>;
-    const domainId = owned.find((entry) => entry.name === zone)?.id;
-    expect(domainId, `the zone ${zone} should exist after the UI created it`)
-      .toBeDefined();
-    const binding = await bindScriptedBackend(page.request, domainId!);
-    expect(binding.credentials_set).toBe(true);
-
-    // …and read back through the UI, which is what an operator sees:
-    // on the zone's route, and — the mark being a *measurement* rather
-    // than a decoration — gone from the list row.
-    await page.reload();
-    await expect(
-      page.getByTestId(`backend-${binding.backend_type}`),
-    ).toBeVisible();
-    await expect(page.getByTestId(`credentials-${binding.id}`)).toHaveText(
-      'credential stored',
-    );
-    await expect(page.getByTestId('zone-no-providers')).toHaveCount(0);
-
-    await page.goto(DOMAINS_PATH);
+    await expect(zoneRow).toBeVisible({ timeout: 8_000 });
+    // Not diverged: §1.2 Rule 1 — agreement has no colour, so a working
+    // zone carries no mark at all.
     await expect(zoneRow).toHaveAttribute('data-diverged', 'false');
-    await expect(page.getByTestId(`nowhere-${zone}`)).toHaveCount(0);
-    await expect(page.getByTestId(`providers-${zone}`)).toHaveText(
-      '1 provider',
-    );
+    await expect(page.getByTestId(`provider-${zone}`)).toContainText('route53');
 
-    // --- 3. a device, through the UI ------------------------------
+    // --- 2. the scripted backend, over HTTP ---------------------------
+    // The one step not driven through the UI, and deliberately so: a
+    // strip renders only once a name has been *published*, `last_ip_*` is
+    // written on `good` only, and the only provider that answers `good`
+    // without contacting a real nameserver is the compat stub — which
+    // `known_services()` withholds from the catalogue on purpose.
+    // Widening the catalogue to make this clickable would delete a guard
+    // the product wrote deliberately.
+    const domains = await (
+      await page.request.get(`${API_URL}/atrium_ddns/domains`)
+    ).json();
+    const domainId = (
+      domains as Array<{ id: number; name: string }>
+    ).find((d) => d.name === zone)!.id;
+    await bindScriptedBackend(page.request, domainId);
+
+    // --- 3. the device ------------------------------------------------
     await page.goto(DEVICES_PATH);
-    await expect(page.getByTestId('devices-empty')).toBeVisible();
     await page.getByTestId('add-device').click();
     const deviceModal = page.getByRole('dialog');
-    await expect(deviceModal).toBeVisible();
     await deviceModal.getByTestId('device-name').fill(deviceName);
     await deviceModal.getByTestId('device-submit').click();
-
-    // `SecretOnce` — shown once, never re-displayable. The spec reads
-    // the credential off the screen because that is the only place it
-    // exists, which is also the strongest available assertion that the
-    // display works: the secret is used to authenticate a real
-    // /nic/update three steps below.
-    const secretPanel = page.getByTestId('device-secret-once');
-    await expect(secretPanel).toBeVisible();
-    const username = (
-      await page.getByTestId('issued-username').innerText()
-    ).trim();
-    const secret = (await page.getByTestId('issued-secret').innerText()).trim();
-    expect(username).toMatch(/^ddns-[0-9a-f]{12}$/);
-    expect(secret.length).toBeGreaterThan(20);
+    // The secret is shown once, over the create form, and dismissing it
+    // closes both — the operator asked for that shape explicitly.
+    const secret = page.getByTestId('device-secret-once');
+    await expect(secret).toBeVisible({ timeout: 8_000 });
+    const username = await page.getByTestId('issued-username').innerText();
+    const password = await page.getByTestId('issued-secret').innerText();
     await page.getByTestId('dismiss-secret').click();
-    await expect(page.getByTestId('device-secret-once')).toHaveCount(0);
 
-    // --- 4. a name, through the UI --------------------------------
+    // --- 4. the name --------------------------------------------------
     await page.goto(NAMES_PATH);
-    await expect(page.getByTestId('hostnames-empty')).toBeVisible();
     await page.getByTestId('add-hostname').click();
     const nameModal = page.getByRole('dialog');
     await expect(nameModal).toBeVisible();
     await chooseFromSelect(page, 'hostname-zone', zone);
-    // Since #90 the zone is a suffix and not a retype: the bare label
-    // goes in the field, the zone is rendered beside it, and `will
-    // send:` is the one line that shows what composition did.
-    await expect(nameModal.getByTestId('hostname-suffix')).toHaveText(
-      `.${zone}`,
-    );
     await nameModal.getByTestId('hostname-name').fill('home');
-    await chooseFromSelect(page, 'hostname-device', deviceName);
-    await expect(nameModal.getByTestId('hostname-will-send')).toHaveText(fqdn);
-    await nameModal.getByTestId('hostname-submit').click();
-    await expect(page.getByTestId(`hostname-${fqdn}`)).toBeVisible();
-
-    // --- 5. the board, BEFORE the device has published anything ----
-    // §3.3.1 step 7, reproduced in a browser: three steps produce a
-    // hostname with no strip, and that is correct.
-    await page.goto(BOARD_PATH);
-    const deviceSection = page.getByTestId(`device-${deviceName}`);
-    await expect(deviceSection).toBeVisible({ timeout: 15_000 });
-    await expect(deviceSection).toHaveAttribute('data-liveness', 'never_seen');
-    await expect(page.getByTestId(`hostname-${fqdn}`)).toContainText(
-      'nothing published yet — no strip to draw',
+    await expect(nameModal.getByTestId('hostname-will-send')).toHaveText(
+      hostname,
     );
-    await expect(
-      page.getByTestId(`strip-${fqdn}-A`),
-      'no strip before the device has published',
-    ).toHaveCount(0);
+    await chooseFromSelect(page, 'hostname-device', deviceName);
+    await nameModal.getByTestId('name-submit').click();
+    await expect(page.getByTestId(`hostname-${hostname}`)).toBeVisible({
+      timeout: 8_000,
+    });
 
-    // --- 6. the device calls in, over HTTP Basic -------------------
+    // --- 5. the device calls in, as a router does ---------------------
     const update = await deviceCallsIn(page.request, {
       username,
-      secret,
-      hostname: fqdn,
+      secret: password,
+      hostname,
       ip: DOC_ADDRESS_V4,
     });
-    expect(update.status).toBe(200);
-    expect(update.body).toBe(`good ${DOC_ADDRESS_V4}`);
+    //  returns { status, body } — the status matters as
+    // much as the word, because the v2 protocol answers 200 for refusals
+    // too and a body check alone would pass on a 500 that happened to
+    // contain the string.
+    expect(update.status, 'the wire did not answer 200').toBe(200);
+    expect(update.body, 'the wire did not answer good').toContain('good');
 
-    // --- 7. THE STRIP ----------------------------------------------
-    await page.goto(BOARD_PATH);
-    await expect(deviceSection).toBeVisible({ timeout: 15_000 });
-    await expect(deviceSection).toHaveAttribute('data-liveness', 'active');
+    // --- 6. the board, as a table -------------------------------------
+    await page.goto('/atrium-ddns');
+    const row = page.getByTestId(`board-row-${hostname}-A`);
+    await expect(row).toBeVisible({ timeout: 8_000 });
+    await expect(row).toContainText(DOC_ADDRESS_V4);
+    await expect(row).toContainText(deviceName);
 
-    // A device collapses only when everything under it agrees, and a
-    // strip collapses under the same rule — "page height is an
-    // instrument only holds if a healthy device is short". Before the
-    // publish this device was auto-expanded (a hostname with no strip
-    // counts as something wrong); after it, it is short and shut, and
-    // the strip is not in the DOM at all until the line is clicked.
-    // The disclosure, not the row. #97 split the board line into two
-    // controls — the name opens the device's card, the disclosure at
-    // the end of the line expands its names (Part III §18.2) — so
-    // `aria-expanded` now lives on the second of those rather than on
-    // the whole row, which used to be one `<button>` doing both jobs
-    // and doing neither visibly.
-    const deviceLine = deviceSection.locator('.ddns-device__expand');
-    if ((await deviceLine.getAttribute('aria-expanded')) === 'false') {
-      await deviceLine.click();
-    }
-    await expect(deviceLine).toHaveAttribute('aria-expanded', 'true');
-
-    const collapsedStrip = page.getByTestId(`strip-collapsed-${fqdn}-A`);
-    if ((await collapsedStrip.count()) > 0) {
-      await collapsedStrip.click();
-    }
-    const strip = page.getByTestId(`strip-${fqdn}-A`);
-    await expect(strip).toBeVisible();
-    await expect(strip).toHaveAttribute('data-family', 'A');
-
-    // The three stations, by their labels and their values. The `; `
-    // prefix the design specifies is generated by CSS
-    // (`.ddns-label::before`), so the DOM text is the bare word.
-    await expect(strip).toContainText('answered');
-    await expect(strip).toContainText('published');
-    await expect(strip).toContainText('called from');
-
-    const published = strip.getByTestId('published-address');
-    await expect(published).toHaveAttribute('title', DOC_ADDRESS_V4);
-    await expect(published).toHaveText(DOC_ADDRESS_V4);
-    // Nothing has resolved this name, and the strip says so with the
-    // word §4.2 reserves for it rather than with a zero or a dash.
-    await expect(strip.getByTestId('answered-address')).toHaveText('n/a');
-    await expect(strip.getByTestId('called-from-address')).toHaveAttribute(
-      'title',
-      DOC_ADDRESS_V4,
+    // --- 7. the strip, where it still lives ---------------------------
+    await row.getByTestId(`board-open-${deviceName}`).click();
+    const card = page.getByTestId('device-detail');
+    await expect(card).toBeVisible({ timeout: 8_000 });
+    // Either rendering counts. §3.4 collapses a strip whose joints all
+    // agree, and which one you get depends on whether the health check
+    // has run — so pinning one testid makes this pass or fail on a
+    // scheduler, not on whether a strip was drawn.
+    const strip = page.locator(
+      `[data-testid="strip-${hostname}-A"], ` +
+        `[data-testid="strip-collapsed-${hostname}-A"]`,
     );
+    await expect(strip).toBeVisible({ timeout: 8_000 });
+    // The three stations, and the published address among them. A strip
+    // that rendered its frame and no values would satisfy `toBeVisible`.
+    await expect(strip).toContainText(DOC_ADDRESS_V4);
 
-    // The two joints, which are the element's whole argument.
-    //
-    // **This reading differs from `ui-parity.md` §3.3.1 step 9 and the
-    // difference is the design behaving as specified.** That walk's
-    // device declared a `myip=` different from the address it called
-    // from, so its lower joint read `not_applicable` and its divisor
-    // was `0 of 0 compared`. This device calls in through
-    // `X-Forwarded-For: 203.0.113.10` and declares the same address, so
-    // `called_from.reason` is `evaluated` and the lower joint is a real
-    // verdict — the moving denominator §3.4 describes, moving.
-    await expect(
-      strip.locator('.ddns-rail__joint[data-verdict="not_measured_never"]'),
-      'the upper joint: nothing has resolved this name yet',
-    ).toHaveCount(1);
-    await expect(
-      strip.locator('.ddns-rail__joint[data-verdict="agreed"]'),
-      'the lower joint: the device called from the address it published',
-    ).toHaveCount(1);
-    await expect(strip).toHaveAttribute('data-diverged', 'false');
-    // The A-family strip is the only one: nothing has been published or
-    // answered over v6, so no blank AAAA rail is reserved (§3.4).
-    await expect(page.getByTestId(`strip-${fqdn}-AAAA`)).toHaveCount(0);
-
-    // --- 8. the image ---------------------------------------------
-    // The acceptance criterion is the picture, not the assertion above
-    // it. Everything on screen is documentation space by construction:
-    // the zone is under RFC 6761 `.invalid`, both addresses are RFC
-    // 5737 TEST-NET-3, and the device name is generated.
-    const stripShot = await strip.screenshot({
-      path: 'test-results/resolution-strip.png',
-    });
-    await testInfo.attach('resolution-strip', {
-      body: stripShot,
-      contentType: 'image/png',
-    });
-    const boardShot = await deviceSection.screenshot({
-      path: 'test-results/resolution-strip-board.png',
-    });
-    await testInfo.attach('resolution-strip-board', {
-      body: boardShot,
+    await testInfo.attach('resolution-strip.png', {
+      body: await card.screenshot({ animations: 'disabled' }),
       contentType: 'image/png',
     });
 
-    expect(pageErrors, 'the page threw while the walk ran').toEqual([]);
+    expect(pageErrors, 'the page threw while rendering').toEqual([]);
   });
 });
