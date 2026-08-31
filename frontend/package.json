@@ -13,8 +13,8 @@
     "playwright": "playwright test"
   },
   "dependencies": {
-    "@brendanbank/atrium-host-bundle-utils": "^0.28.0",
-    "@brendanbank/atrium-host-types": "^0.28.0",
+    "@brendanbank/atrium-host-bundle-utils": "^0.29.0",
+    "@brendanbank/atrium-host-types": "^0.29.0",
     "@mantine/core": "^9.5.2",
     "@mantine/hooks": "^9.5.2",
     "@tabler/icons-react": "^3.41.1",
@@ -23,7 +23,7 @@
     "react-dom": "^19.2.5"
   },
   "devDependencies": {
-    "@brendanbank/atrium-test-utils": "^0.28.0",
+    "@brendanbank/atrium-test-utils": "^0.29.0",
     "@playwright/test": "^1.61.0",
     "@testing-library/jest-dom": "^7.0.1",
     "@testing-library/react": "^16.3.3",
