@@ -41,6 +41,70 @@ export function zoneHref(id: number): string {
   return `/atrium-ddns/zones/${id}`;
 }
 
+/** The names surface, filtered to one zone.
+ *
+ * A query parameter and not a path segment: the names page is a list
+ * with filters, and "the names in zone 7" is one of those filters rather
+ * than a different page. `ZONE_ROUTE_PATH` earns a segment because a
+ * zone is a thing you open; this is a view of another thing.
+ *
+ * The zone card used to render this list inline. It does not any more —
+ * that is a different interface, and a form is not where you browse.
+ */
+export function namesHrefForZone(zoneId: number): string {
+  return `/atrium-ddns/names?zone=${zoneId}`;
+}
+
+/** The zone list, which is also where a zone modal is drawn over. */
+export const ZONES_LIST_PATH = DOMAINS_PATH;
+
+/** The open zone, as a **query parameter on the list route**.
+ *
+ * Not a path segment, and the reason is a bug rather than a preference.
+ * `/atrium-ddns/zones/:id` was a separate registered route, so opening
+ * and closing the modal swapped atrium's route element — which unmounts
+ * the host's React root. The modal is portalled to `document.body`, so
+ * on close the root went away and **the portal was orphaned**: the zone
+ * was deleted, the list refreshed underneath, and the dialog stayed on
+ * screen with nothing behind it.
+ *
+ * A query parameter never changes the route. Same mount, same portal,
+ * only `search` moves — which is also the pattern the host SDK's own
+ * `useAtriumLocation` docs use for exactly this shape. Reload, Back and
+ * paste all still work, because the address still carries the state.
+ */
+export const ZONE_PARAM = 'zone';
+
+/** `?zone=new`. A literal the id parser rejects, so "create" and "zone
+ *  number N" cannot be confused for one another. */
+export const ZONE_NEW_VALUE = 'new';
+
+export function zoneHrefParam(id: number): string {
+  return `${DOMAINS_PATH}?${ZONE_PARAM}=${id}`;
+}
+
+export function zoneNewHref(): string {
+  return `${DOMAINS_PATH}?${ZONE_PARAM}=${ZONE_NEW_VALUE}`;
+}
+
+/** What `?zone=` means, in three states.
+ *
+ * `undefined` — no modal. `null` — the create form. A number — that
+ * zone. Three states and not two, because *closed* and *creating* are
+ * different and a single nullable id cannot hold both.
+ */
+export function zoneFromSearch(
+  search: string,
+): { open: false } | { open: true; id: number | null } {
+  const raw = new URLSearchParams(search).get(ZONE_PARAM);
+  if (raw === null) return { open: false };
+  if (raw === ZONE_NEW_VALUE) return { open: true, id: null };
+  // Same rule as `zoneIdFromPath`: only all-digits is an id. A junk
+  // value opens nothing rather than opening "zone NaN".
+  if (!/^\d+$/.test(raw)) return { open: false };
+  return { open: true, id: Number(raw) };
+}
+
 /** The id in `/atrium-ddns/zones/:id`, or `null` when the pathname is
  *  not that route.
  *

@@ -1297,6 +1297,26 @@ def credential_origin(password_hash: str | None) -> CredentialOrigin:
 # --------------------------------------------------------------------- #
 
 
+class SettingFieldOut(BaseModel):
+    """One non-secret provider setting, as the form needs it.
+
+    Mirrors :class:`~atrium_ddns.providers.base.SettingField`. Shipped
+    rather than hardcoded for the reason ``ProviderOut`` gives about
+    ``credential_keys``: a provider that gains a setting grows the field
+    the next time the page loads.
+    """
+
+    key: str
+    label: str
+    help: str = ""
+    #: Non-empty renders a select instead of a text box. An algorithm is
+    #: an enum the DNS library will accept or refuse, and a free-text box
+    #: for it turns a typo into a publish-time failure.
+    choices: list[str] = []
+    required: bool = False
+    default: str = ""
+
+
 class ProviderOut(BaseModel):
     """One DNS provider this build ships, and its field list.
 
@@ -1317,6 +1337,14 @@ class ProviderOut(BaseModel):
     #: present and non-empty before the adapter will talk to the
     #: provider at all. These go in the **encrypted** column.
     credential_keys: list[str]
+    #: ``key -> {label, help}`` for the credential boxes, where the
+    #: provider has bothered to name them. Missing keys fall back to
+    #: the key itself, which is what every provider did before.
+    credential_labels: dict[str, SettingFieldOut] = {}
+    #: ``BaseProvider.SETTING_FIELDS`` — the non-secret settings, with
+    #: enough shape for a form. These go in the **plaintext** ``config``
+    #: column, and were previously reachable only by typing raw JSON.
+    setting_fields: list[SettingFieldOut] = []
 
 
 class ProviderCatalogueOut(BaseModel):
@@ -1334,6 +1362,23 @@ def _credential_keys(backend_type: str) -> tuple[str, ...]:
     """
     cls = provider_class(backend_type)
     return () if cls is None else tuple(cls.REQUIRED_CREDENTIALS)
+
+
+def _credential_labels(backend_type: str) -> dict[str, tuple[str, str]]:
+    """``CREDENTIAL_LABELS`` for a stored ``backend_type``, or ``{}``."""
+    cls = provider_class(backend_type)
+    return {} if cls is None else dict(cls.CREDENTIAL_LABELS)
+
+
+def _setting_fields(backend_type: str):
+    """``SETTING_FIELDS`` for a stored ``backend_type``, or ``()``.
+
+    Same shape and same reasoning as :func:`_credential_keys`: a service
+    nobody claims has no opinion about its settings, and that is a real
+    state rather than an error.
+    """
+    cls = provider_class(backend_type)
+    return () if cls is None else tuple(cls.SETTING_FIELDS)
 
 
 def _all_secret_keys() -> frozenset[str]:
@@ -1431,7 +1476,23 @@ async def list_providers(
     return ProviderCatalogueOut(
         providers=[
             ProviderOut(
-                service=service, credential_keys=list(_credential_keys(service))
+                service=service,
+                credential_keys=list(_credential_keys(service)),
+                credential_labels={
+                    key: SettingFieldOut(key=key, label=label, help=help_)
+                    for key, (label, help_) in _credential_labels(service).items()
+                },
+                setting_fields=[
+                    SettingFieldOut(
+                        key=f.key,
+                        label=f.label,
+                        help=f.help,
+                        choices=list(f.choices),
+                        required=f.required,
+                        default=f.default,
+                    )
+                    for f in _setting_fields(service)
+                ],
             )
             for service in known_services()
         ]

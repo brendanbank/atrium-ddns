@@ -847,3 +847,52 @@
   white-space: nowrap;
   border: 0;
 }
+
+/* --------------------------------------------------------------------
+   The zone table.
+
+   A grid rather than a row of flex children, so every row shares one
+   column template and the provider and name-count line up down the page.
+   With flex, each row sized its own columns from the length of its zone
+   name, which is why the list read as a pile rather than a table.
+
+   `subgrid` is deliberately not used: it is well supported now, but the
+   rows are direct children here, so the plain three-column grid on the
+   container already gives every row the same tracks.
+   -------------------------------------------------------------------- */
+[data-ddns-root] .ddns-zones {
+  display: grid;
+  /* zone | provider | names | mark. The zone column takes the slack —
+     it is the one with unbounded content — and the other three are
+     sized to their contents so they do not drift apart on a short list. */
+  grid-template-columns: minmax(12rem, 1fr) max-content max-content max-content;
+  column-gap: var(--mantine-spacing-lg);
+  row-gap: 0;
+  align-items: baseline;
+}
+
+[data-ddns-root] .ddns-zones__head,
+[data-ddns-root] .ddns-zones__row {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  align-items: baseline;
+  padding-block: 0.35rem;
+}
+
+[data-ddns-root] .ddns-zones__head {
+  border-bottom: 1px solid var(--ddns-rule);
+  padding-bottom: 0.25rem;
+}
+
+[data-ddns-root] .ddns-zones__row + .ddns-zones__row {
+  border-top: 1px solid var(--ddns-edge);
+}
+
+/* The 911 sentence, when a zone has no provider. Spans the whole row
+   under it rather than squeezing into a column: it is a sentence, not a
+   field, and §2.2's boundary rule puts prose in the body face. */
+[data-ddns-root] .ddns-zones__note {
+  grid-column: 1 / -1;
+  padding-bottom: 0.35rem;
+}

@@ -41,14 +41,12 @@ import { HELP_PATH, HelpPage } from './HelpPage';
 import { NAMES_PATH, HostnamesPage } from './HostnamesPage';
 import { LOG_PATH, LogSearchPage } from './LogSearchPage';
 import { SettingsPage } from './SettingsPage';
-import { ZoneDetailPage } from './ZoneDetailPage';
 import { CONFIG_PERMISSION } from './api/config';
 import {
   BOARD_PATH,
   DEVICES_PATH,
   DEVICE_DETAIL_PATH,
   DOMAINS_PATH,
-  ZONE_ROUTE_PATH,
 } from './paths';
 import {
   SETTINGS_GROUP_KEY,
@@ -68,7 +66,7 @@ export { BOARD_PATH, DEVICES_PATH, DOMAINS_PATH };
  *  and #89's `/atrium-ddns/devices/:id`. Re-exported for the same reason
  *  as their three neighbours above: this file stays the one place a
  *  reader looks for "what paths does this bundle own". */
-export { ZONE_ROUTE_PATH, DEVICE_DETAIL_PATH };
+export { DEVICE_DETAIL_PATH };
 
 /** #46's log search. Defined in `LogSearchPage` because `logHref` needs
  *  it too, and re-exported here for the same reason. */
@@ -152,12 +150,7 @@ if (!reg || !AtriumReact) {
   // The host subtree cannot read it back through `useParams` — a second
   // React root, no shared context — so the page parses the pathname via
   // `useAtriumLocation`.
-  reg.registerRoute({
-    key: 'atrium-ddns-zone-detail',
-    path: ZONE_ROUTE_PATH,
-    render: () => makeWrapperElement(<ZoneDetailPage />),
-  });
-  reg.registerRoute({
+      reg.registerRoute({
     key: 'atrium-ddns-devices',
     path: DEVICES_PATH,
     render: () => makeWrapperElement(<DevicesPage />),
