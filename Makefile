@@ -3,7 +3,35 @@
 # Convenience wrappers around the docker-compose stack. Most of these
 # assume you ran `make dev-bootstrap` first to bring everything up.
 
-COMPOSE := docker compose
+# Compose's project name decides the container names, the network, the
+# volume, AND the tag of the image it builds. Left to compose, it is derived
+# from the directory you invoked make *from* — the logical path, symlink and
+# all.
+#
+# That is not hypothetical here. This worktree is reachable both as its real
+# path and through a Conductor symlink pointing at it, so the *same
+# directory* became two projects: two sets of containers, two volumes, and
+# both binding API_HOST_PORT/MYSQL_HOST_PORT out of the same `.env`. The
+# second stack to start dies with "port is already allocated", and — worse,
+# because it is quiet — `make dev-down` from one path leaves the stack
+# created from the other path running with its data intact.
+#
+# So the name is pinned, and derived from the **resolved** directory: a
+# symlink and its target agree, while two genuinely separate worktrees still
+# get separate stacks. Lowercased and punctuation-folded because compose
+# rejects a project name that is not [a-z0-9_-].
+#
+# Override it (COMPOSE_PROJECT=other) to run a second stack from one
+# worktree — but give it its own ports in `.env` first, or it collides for
+# exactly the reason above.
+COMPOSE_PROJECT ?= $(shell basename "$(realpath $(dir $(firstword $(MAKEFILE_LIST))))" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g')
+COMPOSE := docker compose -p $(COMPOSE_PROJECT)
+
+# The scripts shell out to `docker compose` themselves and would otherwise
+# re-derive the name from *their* cwd, which is the bug this file just
+# fixed. Exported rather than passed per-call so a script added later
+# inherits it without having to know.
+export COMPOSE_PROJECT
 
 # Where the Dockerfile's `dev` stage puts the repo-root `tests/` tree. Mirrors
 # the repo layout, so `/opt/compat_tests/compat/...` is `tests/compat/...`.
@@ -93,7 +121,7 @@ define CHECK_FRESH
 	echo "$(1): container matches worktree ($$hd)"
 endef
 
-.PHONY: help dev-bootstrap up down build logs ps migrate \
+.PHONY: help dev-bootstrap dev-up dev-down up down build logs ps migrate \
 	seed-admin seed-bundle seed-compat-fixture verify-compat-rehash \
 	test test-frontend test-backend test-compat \
 	check-fresh check-compat-fresh check-backend-fresh check-host-pkg-fresh \
@@ -139,6 +167,113 @@ seed-admin:  ## seed a super_admin (EMAIL=... PASSWORD=... [FULL_NAME=...])
 
 seed-bundle:  ## point system.host_bundle_url at /host/main.js
 	$(COMPOSE) exec -T api python -m atrium_ddns.scripts.seed_host_bundle /host/main.js
+
+# --- A dev stack you sign in to yourself ------------------------------------
+#
+# `make dev-bootstrap` raises a stack, and `make seed-admin EMAIL=… PASSWORD=…`
+# gives it an admin — but one typed on the command line, with no TOTP. So it
+# is not the account you actually log in as, and the password ends up in
+# your shell history and in make's own echo of the recipe.
+#
+# `make dev-up` is the same stack seeded from a 1Password login item:
+# username, password *and* the one-time password secret, so your
+# authenticator's codes work against it. scripts/dev-admin.sh holds the
+# reasoning, including why the item is named in a gitignored file rather
+# than here.
+#
+# The port is read from `.env` the way scripts/smoke.sh reads it, so a
+# worktree that moved off the default is followed rather than guessed.
+DEV_API_HOST_PORT := $(shell sed -n 's/^API_HOST_PORT=//p' .env 2>/dev/null | tail -n1)
+DEV_MYSQL_HOST_PORT := $(shell sed -n 's/^MYSQL_HOST_PORT=//p' .env 2>/dev/null | tail -n1)
+DEV_BASE_URL ?= http://localhost:$(or $(DEV_API_HOST_PORT),8053)
+
+dev-up:  ## raise the stack + seed YOUR admin from 1Password (see scripts/dev-admin.sh)
+	@if [ ! -f .env ]; then echo "creating .env from .env.example"; cp .env.example .env; fi
+	@# Refuse before building anything. A five-minute image build that ends
+	@# in "the 1Password CLI is not signed in" is a worse way to learn it.
+	./scripts/dev-admin.sh --check
+	@# Ports, before the build. Compose reports a clash as "Bind for
+	@# :::13353 failed: port is already allocated" from the daemon, after
+	@# it has built an image and created half the stack — and it names
+	@# neither what is holding the port nor that `.env` is where you
+	@# change it. Checked against this project's own containers too, so
+	@# "my own stack is already up" reads differently from "something
+	@# else has that port".
+	@for pair in "API_HOST_PORT $(or $(DEV_API_HOST_PORT),8053)" "MYSQL_HOST_PORT $(or $(DEV_MYSQL_HOST_PORT),13353)"; do \
+		set -- $$pair; key=$$1; port=$$2; \
+		holder=$$(docker ps --format '{{.Label "com.docker.compose.project"}}\t{{.Names}}\t{{.Ports}}' \
+			| awk -v p=":$$port->" '$$0 ~ p {print $$1"/"$$2; exit}'); \
+		if [ -n "$$holder" ]; then \
+			case "$$holder" in \
+				$(COMPOSE_PROJECT)/*) echo "note: $$holder already publishes $$port — it will be recreated" ;; \
+				*) echo "port $$port ($$key) is taken by container $$holder"; \
+				   echo "  stop it, or give this stack its own ports in .env"; \
+				   exit 1 ;; \
+			esac; \
+		elif lsof -nP -iTCP:$$port -sTCP:LISTEN >/dev/null 2>&1; then \
+			echo "port $$port ($$key) is in use by a process outside docker"; \
+			echo "  lsof -nP -iTCP:$$port -sTCP:LISTEN   names it"; \
+			echo "  or give this stack its own ports in .env"; \
+			exit 1; \
+		fi; \
+	done
+	$(COMPOSE) up -d --build
+	@# Not belt-and-braces, and the same reason e2e-up does it: a plain
+	@# `up -d --build` can build an image carrying a new host bundle, tag
+	@# it, and leave the containers running the previous one. Measured in
+	@# this repo on 2026-08-16.
+	$(COMPOSE) up -d --force-recreate --no-deps api worker
+	@ready=0; for i in $$(seq 1 40); do \
+		if curl -fsS $(DEV_BASE_URL)/api/readyz >/dev/null 2>&1; then ready=1; break; fi; \
+		sleep 3; \
+	done; \
+	if [ "$$ready" != "1" ]; then \
+		echo "the api at $(DEV_BASE_URL) did not become ready in 120s"; \
+		$(COMPOSE) logs --tail 50 api; \
+		exit 1; \
+	fi
+	$(MAKE) --no-print-directory migrate
+	@./scripts/dev-admin.sh
+	$(MAKE) --no-print-directory seed-bundle
+	$(MAKE) --no-print-directory check-bundle-fresh
+	@echo "dev stack ready at $(DEV_BASE_URL) — sign in with that 1Password item"
+	@echo "  make down       stops it and keeps the database"
+	@echo "  make dev-down   shreds it, database and all"
+	@echo "  make ui-live / make ui   for UI edits without an image rebuild"
+
+# The counterpart to dev-up, and deliberately not a synonym for `down`.
+#
+# `down` stops the containers and leaves the volume, so `make up` comes
+# back to the same database. This removes the volume — which is the whole
+# point of having a second target, and the reason it asks first.
+#
+# What goes with the volume is not just rows. It holds every zone, device
+# and name you created by hand, and the **encrypted** provider
+# credentials: `SECRET_ENCRYPTION_KEY` lives in `.env` and survives this,
+# but the ciphertext it decrypts does not, so a Route 53 key entered
+# through the UI is gone and has to be pasted in again.
+#
+# The image is left alone. It is build output rather than state, and
+# keeping it is what makes the next `make dev-up` fast.
+#
+# FORCE=1 skips the prompt, for a script that already knows. Without a
+# TTY the `read` gets nothing and the default answer is no, which is the
+# right way round for a target that deletes a database.
+dev-down:  ## shred the dev stack — containers, network AND the database volume
+	@if [ "$(FORCE)" != "1" ]; then \
+		echo "This removes the containers, the network, and this volume:"; \
+		$(COMPOSE) config --volumes 2>/dev/null | sed 's/^/  - /'; \
+		echo "Every zone, device, name and stored provider credential goes with it."; \
+		echo "(\`make down\` stops the stack and keeps all of it.)"; \
+		printf 'Shred it? [y/N] '; \
+		read -r reply || reply=; \
+		case "$$reply" in \
+			[yY]|[yY][eE][sS]) ;; \
+			*) echo "nothing was removed"; exit 1 ;; \
+		esac; \
+	fi
+	$(COMPOSE) down -v --remove-orphans
+	@echo "shredded — 'make dev-up' builds it again from scratch"
 
 # The other promotion step. `0001_init` seeds `app_settings['brand']` so a
 # *fresh* database comes up named correctly, but an alembic revision runs
@@ -338,8 +473,20 @@ E2E_BASE_URL ?= http://localhost:$(or $(E2E_API_HOST_PORT),8053)
 # The tag compose.yaml gives this project's image, resolved the same way
 # compose resolves it. Needed by check-bundle-fresh, which has to read the
 # image *as built* and not the container's copy of it.
-E2E_PROJECT := $(shell sed -n 's/^COMPOSE_PROJECT_NAME=//p' .env 2>/dev/null | tail -n1)
-E2E_IMAGE := $(or $(E2E_PROJECT),atrium-ddns):latest
+# Ask compose which image it will actually run, rather than guessing the
+# name from `.env`.
+#
+# `COMPOSE_PROJECT_NAME` is usually ABSENT from `.env` — compose defaults
+# it to the directory name — so the old derivation fell through to a
+# hardcoded `atrium-ddns:latest`. In a worktree called anything else that
+# is a different image, often a stale one, and `check-bundle-fresh` then
+# compared the served bundle against an artefact nobody had built today.
+# It reported "the containers are running an older image" about an image
+# the containers had never run.
+#
+# The guard is only worth having if it names its target the way the thing
+# under test does. This asks compose.
+E2E_IMAGE := $(shell $(COMPOSE) config --images 2>/dev/null | grep -v '^mysql' | head -n1)
 
 # ATRIUM_DDNS_COMPAT_STUB=1 is not optional here and its absence is quiet:
 # without it `stub1` resolves to no adapter, every update answers 911, and
@@ -389,6 +536,26 @@ e2e-up:  ## raise + migrate + seed the stack the e2e specs run against
 # Deliberately NOT a comparison against a locally built `frontend/dist`:
 # that would require a host-side `pnpm build` on every gate run, and it
 # would be asserting about a tree the deployed stack never reads.
+ui-live:  ## start the stack with frontend/dist bind-mounted (no image rebuild per UI change)
+	cd frontend && pnpm build
+	$(COMPOSE) -f compose.yaml -f compose.dev.yaml up -d api
+	@echo
+	@echo "  live UI mount is on. Loop:  edit -> make ui -> hard-reload the browser"
+	@echo "  turn it off with:           make ui-static"
+
+ui:  ## rebuild ONLY the host bundle (~1s). Needs `make ui-live` first.
+	@cd frontend && pnpm build
+	@if ! docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' $$($(COMPOSE) ps -q api) 2>/dev/null | grep -q /opt/atrium/static/host; then \
+		echo "  the live mount is NOT active — this build will not reach the container."; \
+		echo "  run: make ui-live"; \
+		exit 1; \
+	fi
+	@echo "  bundle rebuilt and served. Hard-reload the browser (cmd-shift-R)."
+
+ui-static:  ## drop the bind mount and go back to the image's own bundle
+	$(COMPOSE) up -d --force-recreate api
+	@echo "  live mount off; serving the bundle baked into the image."
+
 check-bundle-fresh:  ## fail if the SERVED host bundle is not the one in this project's image
 	@img=$$(docker run --rm --entrypoint /opt/venv/bin/python $(E2E_IMAGE) -c \
 		"import hashlib,pathlib;p=pathlib.Path('/opt/atrium/static/host/main.js');b=p.read_bytes();print(hashlib.sha256(b).hexdigest(), len(b))"); \

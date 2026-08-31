@@ -1,0 +1,28 @@
+# Live UI editing — no image rebuild per change.
+#
+# The Dockerfile bakes the built bundle in:
+#
+#     COPY --from=frontend-builder /app/dist /opt/atrium/static/host
+#
+# so every CSS tweak otherwise costs a full `docker compose build` (tens of
+# seconds) to move a file that takes ~1s to produce. This overlay mounts the
+# host's `frontend/dist` over that directory instead, so the loop is:
+#
+#     make ui-live      # once, to start the stack with the mount
+#     …edit…
+#     make ui           # ~1s, then hard-reload the browser
+#
+# Read-only on purpose: the container has no business writing into a source
+# tree, and a bind mount that can be written to is a source tree that can be
+# changed by something you are not watching.
+#
+# NOT auto-loaded. Named `compose.dev.yaml` rather than `compose.override.yaml`
+# precisely so it does not apply by accident: with the mount in place the
+# served bundle is whatever is on disk, which is exactly what
+# `make check-bundle-fresh` exists to catch. That guard compares the served
+# bundle against the one baked into the image, and under this overlay they are
+# legitimately different — so a gate run must not silently inherit it.
+services:
+  api:
+    volumes:
+      - ./frontend/dist:/opt/atrium/static/host:ro

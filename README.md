@@ -23,6 +23,47 @@ the home page, with a sidebar link to `/atrium-ddns`, an admin tab,
 and a profile-page card. Bump the counter to exercise the RBAC + audit
 path end to end.
 
+### A dev stack you sign in to as yourself
+
+`make seed-admin` above takes the password on the command line, which puts
+it in your shell history and in make's echo of the recipe — and it cannot
+pre-enrol TOTP, so the account it makes is not the one you actually sign in
+as. If you keep the login in 1Password, `make dev-up` raises the stack and
+seeds from there instead:
+
+```bash
+# once — which item holds the login. The file is gitignored.
+echo 'DDNS_OP_ITEM=<item uuid>' > .devstack.local.conf
+
+make dev-up      # up + migrate + seed admin (with TOTP) + seed bundle
+```
+
+It reads `username`, `password` and the item's one-time password field, so
+your authenticator's codes work against the stack. It refuses before
+building anything if the CLI is locked or the item does not resolve.
+
+Both targets pin the compose project name to the **resolved** directory, so
+invoking make through a symlink to this worktree addresses the same stack as
+invoking it through the real path. Compose's own default uses the path you
+typed, which turned one directory into two projects — two sets of
+containers, two volumes, both binding the ports out of one `.env`, and a
+`dev-down` from one path that left the other stack running. Set
+`COMPOSE_PROJECT=other` to run a second stack from one worktree, and give it
+its own ports in `.env` first.
+
+`make dev-down` is the counterpart, and is not a synonym for `make down`:
+`down` stops the containers and keeps the database, `dev-down` removes the
+volume too. That takes every zone, device, name and stored provider
+credential with it — `SECRET_ENCRYPTION_KEY` in `.env` survives, the
+ciphertext it decrypts does not — so it asks first. `FORCE=1` skips the
+prompt; without a terminal the answer defaults to no.
+
+Prefer the item's UUID over its title — `op item list --format json` has
+them. The title is often a hostname, and this repository keeps real
+hostnames out of tracked files (the same reason `.env.example` ships
+`TRAEFIK_HOSTNAME=ddns.example.invalid`). `scripts/dev-admin.sh` has the
+rest of the reasoning.
+
 ## Layout
 
 ```
@@ -30,7 +71,7 @@ atrium-ddns/
   Dockerfile           # frontend-builder + FROM atrium runtime
   compose.yaml         # api + worker + mysql
   .env.example         # secrets template (copy to .env)
-  Makefile             # dev-bootstrap / migrate / seed-* / test
+  Makefile             # dev-bootstrap / dev-up / migrate / seed-* / test
   backend/             # host Python package (atrium_ddns)
     pyproject.toml
     alembic.ini

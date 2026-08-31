@@ -16,7 +16,16 @@
 # prints what it got, not just that it failed.
 set -uo pipefail
 
-cd "$(dirname "$0")/.." || exit 1
+cd -P "$(dirname "$0")/.." || exit 1
+
+# The compose project this repo's Makefile pins. Left to compose, the name
+# comes from the directory you invoked *from* — so a run through a symlink
+# to this worktree addresses a different project than the one the stack was
+# created under, finds no containers, and reports that as a failure of the
+# stack rather than of the lookup. `cd -P` above resolves the symlink; this
+# honours an explicit COMPOSE_PROJECT when make exports one.
+COMPOSE_PROJECT="${COMPOSE_PROJECT:-$(basename "$PWD" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g')}"
+compose() { docker compose -p "$COMPOSE_PROJECT" "$@"; }
 
 # Deliberately NOT `. ./.env`. Compose tolerates unquoted values containing
 # spaces (WEBAUTHN_RP_NAME=Atrium DDNS); the shell does not, and sourcing it
@@ -168,9 +177,9 @@ fi
 if [ "$BASE_EXPLICIT" = "1" ]; then
   info "migration checks skipped — --base was given, so this may not be the local stack"
   info "on the target: docker compose exec -T api alembic current"
-elif command -v docker >/dev/null 2>&1 && docker compose ps -q api >/dev/null 2>&1; then
+elif command -v docker >/dev/null 2>&1 && compose ps -q api >/dev/null 2>&1; then
   for chain in alembic_version alembic_version_app; do
-    rev="$(docker compose exec -T api /opt/venv/bin/python -c "
+    rev="$(compose exec -T api /opt/venv/bin/python -c "
 import asyncio, sqlalchemy as sa
 from app.db import get_session_factory
 async def main():
