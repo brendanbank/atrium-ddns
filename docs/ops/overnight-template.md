@@ -47,10 +47,19 @@ agent **measures its own baseline** — do not inherit these numbers.
 ```bash
 cd frontend && pnpm install --frozen-lockfile
 pnpm typecheck                     # tsc --noEmit — 0 errors
-pnpm test                          # vitest — 200 passed (17 files)
+pnpm test                          # vitest
 cd .. && make up && make migrate    # both alembic chains to head
-make test-backend                  # host tests 833 passed + compat 31 passed, 3 skipped
+make test-backend                  # host tests + compat guards
 ```
+
+**No counts here, deliberately.** They were `2` and `532` for a fortnight
+against a real 200 and 833; re-measured on 2026-08-31 they were stale again
+within hours — `4d10e37`, the re-measure commit itself, ran 835 and the tip ran
+841 the same evening, because every issue in this milestone adds tests. This
+file's own rule applies to this file: *prefer deleting a derived number to
+maintaining one — an uncounted list cannot be miscounted.* Every agent measures
+its own baseline and reports it in the PR, which is the reading that matters,
+taken on the tree it actually ran against.
 
 Better: **`make gate`**, which reads the diff and runs exactly the above subset
 that the change can reach, printing what it skipped and why. One command, no
