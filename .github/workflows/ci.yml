@@ -14,6 +14,15 @@ name: CI
 # So: nothing fires for a PR into a milestone branch, or for a push to one.
 # CI is the gate on the way into `master`, where it is the last check before
 # a release, and there it is worth the wall-clock.
+#
+# ## Before you widen these triggers
+#
+# `docs/ops/dev-releases.md` and `scripts/dev-release.sh` both depend on
+# this being an allowlist of exactly `master`, and on there being no `tags:`
+# trigger. The release script READS THIS FILE and refuses to cut a dev
+# release if either stops being true — so widening the triggers will not
+# silently start billing CI for every staging iteration, it will stop dev
+# releases with a message pointing here. Update that doc in the same change.
 on:
   pull_request:
     branches: [master]
