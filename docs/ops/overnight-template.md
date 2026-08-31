@@ -210,13 +210,20 @@ same typecheck, same vitest suite, same backend tests, same Playwright specs
 (CI's `e2e` job, added by #91), plus a smoke test against a stack it stood up
 itself, which CI's `smoke` job also does but only after a full image build.
 
-Two consequences an agent must not get wrong:
+Three consequences an agent must not get wrong:
 
 - **Running the gate is not optional and not delegable to CI.** There is no
   green tick coming later to catch what you skipped. An issue whose PR was
   opened without a full local gate run has been merged unverified.
 - **Report the gate's real numbers in the PR body**, measured in your own
   worktree. They are the only record that it ran.
+- **The gate is about your branch. The tip you merge into is a separate
+  question, and it has been red before** — `4ff2da4` was red on arrival and
+  stayed so across two merges, with every instrument above reporting green.
+  Answering it does not mean reversing the decision in this paragraph; it
+  means running the same backend commands against the merge tree, which
+  `scripts/merge-tip-check.sh` does in about 40 seconds. See *After the
+  merge*.
 
 **The gate as scaffolded was not green.** `pnpm test` failed to collect every
 suite — `@brendanbank/atrium-host-bundle-utils@0.27.0` ships extensionless
@@ -661,7 +668,11 @@ hurriedly is the wrong way to do it; that decision belongs in a fresh session.
 8. **Merge, then hold.** Deploys are serial and belong to the orchestrator, so
    the deployed half of the evidence runs after the orchestrator deploys the
    wave and **verifies the deploy contains this merge**.
-9. **Close** with a comment summarising what was done, the deployed evidence,
+9. **Check the tip you just made.** `scripts/merge-tip-check.sh` — see *After
+   the merge* below. **Do not move the board item to Done on a red tip.** The
+   gate you ran at step 5 was about your branch; this is about the tree that
+   now exists, which nobody has gated.
+10. **Close** with a comment summarising what was done, the deployed evidence,
    and anything measured that contradicts the issue body — and move the board
    item to Done in the same step.
 
@@ -865,6 +876,77 @@ spent drifting to fourteen minutes — `conftest.py` did still own the only
 container *of the kind it knew about*. Eleven fixtures had grown up outside it.
 **A warning phrased as "the thing I know about is still fine" cannot see the
 thing it does not know about; a count can.**
+
+### After the merge — the tip is a tree nobody gated
+
+**Two green branches can merge into a red one.** `v1m4-migration-cutover`
+merged `v1m3-host-ui` at `4ff2da4`: #65's harness guard came from one side,
+#50's rehearsal fixture from the other, and `git cat-file -e` on each parent
+shows neither parent held both files. Both PRs were correct against the tree
+they were reviewed on; the merge commit was the first tree in which the guard
+could see the fixture, and it was red the moment it existed. It stayed red
+across two further merges and was found by an unrelated issue's gate run,
+whose PR touched zero files under `backend/` or `tests/`.
+
+Every instrument in the contract says green about that state, and each for a
+good reason. CI does not run on milestone branches (deliberate; see the gate
+card). The gate is per-issue — it answers *is my branch green*, never *is the
+branch I merged into green*. And a merge with no textual conflict emits no
+signal at all: nothing conflicted here, the semantics did.
+
+So **step 9 of the per-issue workflow runs the gate against the merge tree**:
+
+```bash
+scripts/merge-tip-check.sh            # the milestone branch tip, fetched first
+scripts/merge-tip-check.sh --commit <sha>
+```
+
+Same commands, different tree. Not a second quality bar — it is the first bar,
+applied to the one tree nothing else looks at. It materialises the commit with
+`git archive` into its own directory, raises its own stack on ports it asks the
+kernel for, and tears both down; it cannot disturb your worktree, your branch
+or another agent's stack.
+
+**A red run is not a verdict, and the script does not report one.** This
+repository has a measured background rate, all of it on byte-identical trees:
+PR #111 recorded five full e2e runs at 18/20, 19/20, 20/20, 20/20, 20/20; PR
+#110 one more spec; PR #112 one non-reproducing backend failure. A check that
+called any of those a regression would be ignored inside a week. Three things
+follow:
+
+- **It runs the instrument with the low rate.** Backend only. e2e is not
+  reinstated here — its rate is far too high for an unattended accusation.
+- **It confirms before it accuses**, re-running the *full* suite rather than
+  the failing node ids, because re-running a subset changes the parallel
+  contention that produced the failure and would file a real xdist bug as a
+  flake. Only failures in the intersection of every run count.
+- **Its positive verdict is comparative, not repetitive** — and this is the
+  part that matters, because *"an intermittent failure is diagnosed by
+  sweeping, not by re-running"* is the rule two paragraphs up. The verdict is
+  *reproducibly red here **and** not red on either parent*. A flake would have
+  to hit the same node on every run of the merge tree and on no run of either
+  parent. Where a failing file simply does not exist on a parent, `git
+  cat-file -e` settles that parent in milliseconds and no stack is raised for
+  it.
+
+**The report names the merge, not the last PR.** That is the diagnosis half,
+and it is the half #78 actually cost: the natural reading of a red tip is "the
+last PR broke it", and there the last PR had not touched the files. Every
+verdict prints the commit and all of its parents.
+
+| exit | verdict | what it means |
+|---|---|---|
+| 0 | `GREEN` | clean, or the only failure did not reproduce — which is **reported, not swallowed** |
+| 3 | `MERGE-INDUCED` / `INTRODUCED HERE` | reproducibly red here, no parent is. Open the issue against **this commit**, naming both parents and which file came from which side |
+| 4 | `INHERITED` | red here *and* on a parent. It arrived broken; go to that parent's history |
+| 5 | `UNRESOLVED` | reproducibly red, parent evidence inconclusive. Reported rather than rounded to either verdict |
+| 6 | `INFRASTRUCTURE` | docker, build, migrate or the freshness guard failed. **Not** a red tip |
+
+Measured on this box, 2026-08-31: **40s** for the green path on the V1M7 tip
+(materialise, build, up, migrate, one full suite), **71s** for `4ff2da4` with
+two confirming runs and one parent replayed, **98s** for the worst case of
+three stacks. Against a merge that costs an agent a whole issue's work, that
+is the cheapest instrument in this file.
 
 ---
 
