@@ -705,6 +705,39 @@ built to refuse.
 The dry run reports target counts as `n/a — NOT MEASURED, because nothing was
 committed`, explicitly not as `0`.
 
+#### The two lines to read before anything else — the pre-cutover check (#83)
+
+Since #83 the plan block prints two counts unconditionally, and on the
+population this runbook was written against **both are zero**:
+
+```
+  per-name TTL              -> 0 of 11 ddns_hostname.ttl written (0 zone(s) disagreed)
+  per-name backend choice   -> 0 ddns_hostname_backend row(s) for 0 name(s), from 11 legacy binding(s)
+```
+
+**Anything other than `0` on either line means this import is doing something
+no rehearsal has ever done.** That is not a reason to stop — the importer now
+migrates both states, where before #83 it refused them outright — but it is a
+reason to read the NOTE that comes with the count and to re-check the affected
+names after step 5.6, because no run against real data has ever taken those
+branches.
+
+The zeroes are measured, and by two differently-shaped instruments:
+
+| | reading | instrument |
+|---|---|---|
+| hostnames whose zone disagrees about TTL | **0** | `refactor-plan.md` §3.3.1, "ttl \| uniformly 60" — #49, direct query against the WAL-safe copy, 2026-08-15 |
+| hostnames selecting a strict subset of their zone's backends | **0** | same table, "hostname_backends \| 11 rows … degenerate (each hostname lists exactly its domain's backends)" |
+| both, together | **0** | #50's four-run rehearsal completed against that same copy while the importer still *refused* both states. A run that reached either one could not have finished, so its completion is an independent reading of the same two counts |
+
+**Both numbers are inherited, not re-taken.** They date from 2026-08-15. V1M7
+does not touch the deploy host, so #83 had no legacy database to re-measure and
+did not invent one; the widened branches are exercised against a synthetic
+source built for them (`backend/tests/test_import_legacy.py` §7), end to end
+through `apply`, `verify` and `/nic/update`. **A re-import is a re-measurement**
+— the two lines above are where it reports, which is the whole reason they
+print even when they are zero.
+
 *Rollback:* the importer **refuses to run twice** rather than merging —
 
 ```
@@ -1262,5 +1295,5 @@ estimated.
 * `infra/traefik/dynamic-acme.yml` — the router after the hand-over, and the fallback's side effect
 * `scripts/test-acme-handover.sh` — the gate test behind § 2.2.4 (`make test-acme-handover`)
 * `scripts/verify-acme-handover.sh` — step 5.4(e) (`make acme-verify`)
-* `backend/src/atrium_ddns/scripts/import_legacy.py` — the importer and its ten refusals
+* `backend/src/atrium_ddns/scripts/import_legacy.py` — the importer and the states it refuses (eleven mutations of a good world, one per rule; #83 retired two of them and added one)
 * `backend/src/atrium_ddns/scripts/rehearse_migration.py` — the rehearsal harness (#50)

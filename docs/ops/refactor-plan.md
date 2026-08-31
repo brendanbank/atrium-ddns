@@ -963,8 +963,8 @@ copy. Small enough that the whole migration is a single transaction:
 | domains | 1 |
 | domain_backends | 1 (`aws`) |
 | backend_configs | 2 (`aws_access_key_id`, `aws_secret_access_key`, Fernet) |
-| hostname_backends | **11 rows**, not empty as first recorded — but degenerate (each hostname lists exactly its domain's backends), so the meaning is unchanged. #49 measured it on the live copy; the original reading came from the stale snapshot. A strict subset would be a different model and the importer refuses one. |
-| ttl | uniformly 60 |
+| hostname_backends | **11 rows**, not empty as first recorded — but degenerate (each hostname lists exactly its domain's backends), so the meaning is unchanged. #49 measured it on the live copy; the original reading came from the stale snapshot. ~~A strict subset would be a different model and the importer refuses one.~~ Since #83 a strict subset migrates as `ddns_hostname_backend` rows; **0 of the 11 are one.** |
+| ttl | uniformly 60 — so **0** zones disagree, and the per-name `ddns_hostname.ttl` #83 writes for a disagreeing zone is written 0 times here |
 | orphan hostnames | 0 |
 
 **⚠ `~/dyndns.db` is a stale snapshot and must not be the migration source.**

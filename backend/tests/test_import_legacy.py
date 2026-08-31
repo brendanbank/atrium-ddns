@@ -67,7 +67,13 @@ from httpx import ASGITransport
 
 from atrium_ddns import compat_stub, router_nic
 from atrium_ddns.compat_stub import CALLS
-from atrium_ddns.models import Device, Domain, DomainBackend, Hostname
+from atrium_ddns.models import (
+    Device,
+    Domain,
+    DomainBackend,
+    Hostname,
+    HostnameBackend,
+)
 from atrium_ddns.scripts import import_legacy as il
 
 W = os.environ.get("PYTEST_XDIST_WORKER", "serial")
@@ -102,11 +108,25 @@ SPREAD = {
 ADMIN_PASSWORD = "the-one-real-account"
 TTL = 60
 
+#: The TTL the widened world gives its one dissenting hostname. Chosen
+#: to be neither :data:`TTL` nor ``providers.DEFAULT_TTL`` (both 60), so
+#: a per-name TTL that was silently dropped cannot resolve to the right
+#: answer by falling through to either fallback.
+ODD_TTL = 300
+
 #: The scripted slot the migrated backend resolves to. A real
 #: ``route53`` row would contact AWS; this one contacts nothing and
 #: still runs every check above ``createrecords`` — the zone check, the
 #: credential check and the factory lookup.
 STUB_SERVICE = "stub1"
+
+#: The second slot the widened world adds beside :data:`STUB_SERVICE`.
+#: A *strict subset* is not expressible on a zone with one backend —
+#: "all of them" and "the only one" are the same set — so without a
+#: second backend there is nothing for #83's second widening to be
+#: about, and a fixture that forgot it would pass while asserting the
+#: degenerate case twice.
+SECOND_SLOT = "stub2"
 
 # At import, not inside a fixture. `_resolve_backend_type` goes through
 # the provider registry — that is the whole point of it — so a plan
@@ -328,6 +348,67 @@ def build_legacy_db(
     conn.execute(
         "INSERT INTO rate_limit_configs (id, user_id, requests_per_minute, "
         "requests_per_hour, is_global) VALUES (1, NULL, 30, 500, 1)"
+    )
+    conn.commit()
+    conn.close()
+
+
+#: The legacy hostname id the widened world singles out. ``1`` is
+#: ``router-a-0``, owned by the production-cost device, so the pinned
+#: TTL and the narrowed selection are exercised on the same row the
+#: wire tests already drive.
+WIDENED_HOSTNAME_ID = 1
+
+
+def widen(path: Path, *, fernet_key: str) -> None:
+    """Turn a built world into the two states #83 stopped refusing.
+
+    **Both at once, in one zone**, because they interact and a fixture
+    that exercised them separately would never ask the question that
+    matters: a pinned ``ddns_hostname.ttl`` has to win over the
+    ``config['ttl']`` of a binding the name did *not* select, and it
+    has to keep winning for the names that selected nothing.
+
+    Three mutations, each undoing one of the reasons the base fixture
+    cannot express a subset:
+
+    * a **second backend** on the only zone, with its own Fernet
+      credentials — without it "all of this zone's backends" and "the
+      one backend" are the same set;
+    * every hostname **except** :data:`WIDENED_HOSTNAME_ID` gains a
+      binding to that second backend, so it stays degenerate. Leaving
+      them alone would make all eleven names a strict subset and the
+      test would no longer be about one;
+    * :data:`WIDENED_HOSTNAME_ID` moves to :data:`ODD_TTL`, so the zone
+      disagrees.
+
+    The result: one name pinned to one backend at 300, ten names
+    inheriting both backends at 60, and a zone whose binding says 60.
+    """
+    fernet = Fernet(fernet_key.encode())
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO domain_backends (id, domain_id, backend_type) "
+        "VALUES (2, 1, ?)",
+        (SECOND_SLOT,),
+    )
+    for key, value in (
+        ("aws_access_key_id", "AKIAFIXTURENOTREAL02"),
+        ("aws_secret_access_key", "fixture-secret-not-real-9876543210"),
+    ):
+        conn.execute(
+            "INSERT INTO backend_configs (domain_backend_id, config_key, "
+            "config_value) VALUES (2, ?, ?)",
+            (key, fernet.encrypt(value.encode()).decode()),
+        )
+    conn.execute(
+        "INSERT INTO hostname_backends (hostname_id, domain_backend_id) "
+        "SELECT id, 2 FROM hostnames WHERE id <> ?",
+        (WIDENED_HOSTNAME_ID,),
+    )
+    conn.execute(
+        "UPDATE hostnames SET ttl = ? WHERE id = ?",
+        (ODD_TTL, WIDENED_HOSTNAME_ID),
     )
     conn.commit()
     conn.close()
@@ -668,34 +749,109 @@ def test_the_hashes_are_the_ones_auth_device_can_verify(
 def test_the_legacy_ttl_lands_on_the_backend_not_the_hostname(
     legacy_db: Path, fernet_key: str
 ) -> None:
-    """A correction to the issue body, made explicit.
+    """A correction to #50's issue body, and the half of it #83 undid.
 
-    The issue asks for ``ttl`` to be "preserved" on ``ddns_hostname``.
-    That column does not exist: TTL is per **backend** in this schema
+    #50 asked for ``ttl`` to be "preserved" on ``ddns_hostname``. At
+    the time that column did not exist — TTL was per **backend**
     (``ddns_domain_backend.config['ttl']``, read by
-    ``router_nic._backend_plan``), because a zone is written with one
-    TTL by one provider. The value is carried; where it lands is
-    different from where the issue expected it.
+    ``router_nic._backend_plan``) — so the value was carried, but not
+    where the issue expected it.
+
+    ``0004_hostname_backends_and_ttl`` has since added the column, and
+    #83 writes it. What did **not** change is where an *agreeing*
+    zone's TTL lands: still the binding, with every ``ddns_hostname.
+    ttl`` NULL, because NULL is what lets a name keep following its
+    zone. So both halves are asserted here — the column exists and it
+    is deliberately empty for this world.
     """
     plan = plan_for(legacy_db, fernet_key)
-    assert not hasattr(plan.hostnames[0], "ttl")
+    assert hasattr(plan.hostnames[0], "ttl")
+    assert plan.hostnames[0].ttl is None
     assert plan.backends[0].config["ttl"] == TTL
 
 
-def test_disagreeing_ttls_in_one_zone_are_refused(
+def test_a_zone_that_agrees_about_ttl_still_pins_no_hostname(
+    legacy_db: Path, fernet_key: str
+) -> None:
+    """#83 must not change the path #50 rehearsed. The regression half.
+
+    The measured population is uniformly 60 (``refactor-plan.md``
+    §3.3.1), so *this* is the branch a real re-import takes, and the
+    only evidence that widening the other one cost nothing is that
+    every ``ddns_hostname.ttl`` here is still NULL. A widening that
+    also started pinning agreeing zones would detach every migrated
+    name from its binding on the day it ran — silently, because
+    resolution answers 60 either way until somebody edits the zone.
+    """
+    plan = plan_for(legacy_db, fernet_key)
+    assert [h.ttl for h in plan.hostnames] == [None] * 11
+    assert plan.backends[0].config["ttl"] == TTL
+    assert not any("DISAGREE" in note for note in plan.notes)
+
+
+def test_a_zone_whose_hostnames_disagree_about_ttl_is_carried_not_refused(
     tmp_path, fernet_key: str
 ) -> None:
+    """The first of #83's two widenings, at the plan level.
+
+    Refused before ``0004``, and correctly: there was no column to put
+    a per-name TTL in, so the choice was between refusing and quietly
+    republishing somebody's 300-second name at 60. ``0004`` added
+    ``ddns_hostname.ttl``, so the choice is gone.
+
+    Every name in the zone is pinned, not just the dissenting one —
+    see ``_selected_bindings``' sibling argument in ``build_plan``: a
+    zone whose names disagree has no zone TTL, and letting the majority
+    inherit one would invent an answer that a later edit to the binding
+    would apply to a subset of the names an operator thinks of as
+    identical.
+    """
     path = tmp_path / "ttl-clash.db"
     build_legacy_db(path, fernet_key=fernet_key)
     conn = sqlite3.connect(path)
-    conn.execute("UPDATE hostnames SET ttl = 300 WHERE id = 1")
+    conn.execute(f"UPDATE hostnames SET ttl = {ODD_TTL} WHERE id = 1")
     conn.commit()
     conn.close()
-    with pytest.raises(il.MigrationRefused) as excinfo:
-        plan_for(path, fernet_key)
-    message = str(excinfo.value)
-    assert "per hostname" in message
-    assert "300" in message
+
+    plan = plan_for(path, fernet_key)
+    by_legacy_id = {h.legacy_id: h for h in plan.hostnames}
+    assert by_legacy_id[1].ttl == ODD_TTL
+    assert {h.ttl for h in plan.hostnames if h.legacy_id != 1} == {TTL}
+    # The zone's value is the mode, so what gets created *next* in this
+    # zone inherits the commonest answer rather than the loudest one.
+    assert plan.backends[0].config["ttl"] == TTL
+    assert any("DISAGREE" in note for note in plan.notes)
+
+
+def test_the_zone_ttl_is_the_mode_and_ties_break_low(
+    tmp_path, fernet_key: str
+) -> None:
+    """Two names at 300 against one at 60 puts 300 in the binding.
+
+    Without this the mode is indistinguishable from "whatever the first
+    row said", which is what the set-based version of this code did and
+    which made the same source database import to two different configs
+    depending on iteration order.
+    """
+    path = tmp_path / "ttl-mode.db"
+    build_legacy_db(path, fernet_key=fernet_key)
+    conn = sqlite3.connect(path)
+    conn.execute(f"UPDATE hostnames SET ttl = {ODD_TTL}")
+    conn.execute("UPDATE hostnames SET ttl = 60 WHERE id = 1")
+    conn.commit()
+    conn.close()
+    assert plan_for(path, fernet_key).backends[0].config["ttl"] == ODD_TTL
+
+    # A dead heat: 60 and 300 with nothing between them. Lowest wins,
+    # and the point is that it is *fixed*, not that it is 60.
+    conn = sqlite3.connect(path)
+    conn.execute("UPDATE hostnames SET ttl = 60 WHERE id <= 5")
+    conn.execute(f"UPDATE hostnames SET ttl = {ODD_TTL} WHERE id > 5")
+    conn.execute("DELETE FROM hostnames WHERE id = 11")
+    conn.execute("DELETE FROM hostname_backends WHERE hostname_id = 11")
+    conn.commit()
+    conn.close()
+    assert plan_for(path, fernet_key).backends[0].config["ttl"] == TTL
 
 
 @pytest.mark.parametrize(
@@ -747,23 +903,31 @@ def test_disagreeing_ttls_in_one_zone_are_refused(
             "does not exist",
             id="orphan-hostname",
         ),
-        # A second backend on the zone that no hostname is bound to.
-        # Deleting a binding would NOT do it: the legacy model reads an
-        # empty association as "all of this domain's backends", so an
-        # absent row and a complete one mean the same thing. Only a
-        # strict subset is unrepresentable here.
+        # The one `hostname_backends` shape #83 did NOT widen, and the
+        # reason it did not: `resolve_backends` filters a selection
+        # against the zone's own bindings, so a row naming a backend
+        # that is not on this hostname's zone resolves to the empty
+        # set — "publish nowhere", which `0004` made unspellable on
+        # purpose. A strict subset, by contrast, is now migrated; that
+        # is `test_a_selective_binding_is_carried_across`.
         pytest.param(
-            "INSERT INTO domain_backends (id, domain_id, backend_type) "
-            "VALUES (2, 1, 'hetzner')",
-            "SUBSET",
-            id="selective-backend-binding",
+            "INSERT INTO hostname_backends (hostname_id, domain_backend_id) "
+            "VALUES (1, 99)",
+            "not on that hostname's own domain",
+            id="binding-names-a-backend-off-the-zone",
+        ),
+        pytest.param(
+            "INSERT INTO hostname_backends (hostname_id, domain_backend_id) "
+            "VALUES (99, 1)",
+            "not on that hostname's own domain",
+            id="binding-names-a-hostname-that-does-not-exist",
         ),
     ],
 )
 def test_a_world_the_mapping_cannot_represent_is_refused(
     tmp_path, fernet_key: str, sql: str, expected: str
 ) -> None:
-    """Ten mutations of a good world, each refused, each named.
+    """Eleven mutations of a good world, each refused, each named.
 
     Every one of these is a state the mapping *could* have guessed at,
     and every guess changes behaviour without saying so — a disabled
@@ -799,22 +963,81 @@ def test_the_mutation_harness_is_not_vacuous(
     assert len(plan.devices) == 6 and len(plan.hostnames) == 11
 
 
-def test_a_selective_binding_is_only_refused_when_it_is_selective(
+def test_a_degenerate_binding_writes_no_selection_row(
     tmp_path, fernet_key: str
 ) -> None:
-    """Eleven rows binding every hostname to the only backend is *not* it.
+    """Eleven rows binding every hostname to the only backend is *not* a subset.
 
     The legacy model's ``get_backends()`` returns the domain's backends
     when the association is empty, so "all of them" and "none listed"
-    mean the same thing — and this schema expresses both. Plan §3.3.1
-    recorded the table empty on 2026-08-15 and it holds eleven rows;
-    the note in the output says so, and the target is unaffected.
+    mean the same thing — and ``models.resolve_backends`` spells it the
+    same way, which is why this maps to **no** ``ddns_hostname_backend``
+    row rather than to eleven. Plan §3.3.1 recorded the table empty on
+    2026-08-15 and it holds eleven rows; this is the entire measured
+    population, so it is also the branch a real re-import takes.
     """
     path = tmp_path / "fully-bound.db"
     build_legacy_db(path, fernet_key=fernet_key)
     plan = plan_for(path, fernet_key)
     assert len(plan.snapshot.hostname_backends) == 11
+    assert [h.selected_legacy_backend_ids for h in plan.hostnames] == [()] * 11
     assert any("degenerate" in note for note in plan.notes)
+
+
+def test_a_selective_binding_is_carried_across(
+    tmp_path, fernet_key: str
+) -> None:
+    """The second of #83's two widenings, at the plan level.
+
+    A strict subset was a refusal until ``0004`` added
+    ``ddns_hostname_backend`` — before it, this schema hung backends
+    off the zone and migrating a per-name choice would have widened
+    those names to every backend of their zone without saying so. The
+    refusal was right and it is now unnecessary.
+
+    Note what the assertion is on: the *other ten* names keep an empty
+    selection. A widening that wrote a row per legacy binding would
+    also pass "the subset survived" while quietly freezing ten names
+    that ``0004`` deliberately left tracking their zone.
+    """
+    path = tmp_path / "selective.db"
+    build_legacy_db(path, fernet_key=fernet_key)
+    widen(path, fernet_key=fernet_key)
+    plan = plan_for(path, fernet_key)
+
+    by_legacy_id = {h.legacy_id: h for h in plan.hostnames}
+    assert by_legacy_id[WIDENED_HOSTNAME_ID].selected_legacy_backend_ids == (1,)
+    assert all(
+        h.selected_legacy_backend_ids == ()
+        for h in plan.hostnames
+        if h.legacy_id != WIDENED_HOSTNAME_ID
+    )
+    assert [b.backend_type for b in plan.backends] == [STUB_SERVICE, SECOND_SLOT]
+    assert any("strict SUBSET" in note for note in plan.notes)
+
+
+def test_the_publication_the_plan_predicts_is_the_legacy_one(
+    tmp_path, fernet_key: str
+) -> None:
+    """``Plan.publication`` — the source half of #83's assertion.
+
+    Derived from ``hostnames.ttl`` and ``hostname_backends`` through
+    the legacy service's own two rules, and asserted here on its own
+    before anything is written, so a later disagreement with the target
+    is attributable to one side rather than to both moving together.
+    """
+    path = tmp_path / "publication.db"
+    build_legacy_db(path, fernet_key=fernet_key)
+    widen(path, fernet_key=fernet_key)
+    plan = plan_for(path, fernet_key)
+
+    pinned = next(
+        h.name for h in plan.hostnames if h.legacy_id == WIDENED_HOSTNAME_ID
+    )
+    publication = plan.publication
+    assert publication[pinned] == ((STUB_SERVICE, ODD_TTL),)
+    others = {v for k, v in publication.items() if k != pinned}
+    assert others == {((STUB_SERVICE, TTL), (SECOND_SLOT, TTL))}
 
 
 def test_names_are_normalised_and_a_collision_is_refused(
@@ -1428,3 +1651,331 @@ async def test_a_successful_call_upgrades_the_stored_hash(imported) -> None:
     assert all(value.startswith("$argon2") for value in shapes.values()), {
         k: v[:7] for k, v in shapes.items()
     }
+
+
+# ===================================================================== #
+# 7. #83 — the two states the importer stopped refusing, end to end
+# ===================================================================== #
+#
+# Everything above this line is the world the cutover rehearsal used:
+# one backend, every binding degenerate, TTL uniformly 60. On that
+# population both of #83's new branches are dead code — measured, not
+# assumed: `refactor-plan.md` §3.3.1 reads "ttl | uniformly 60" and
+# "hostname_backends | 11 rows … degenerate", taken by #49 from a
+# WAL-safe copy on 2026-08-15, so the two counts this issue was opened
+# to discover are **zero and zero**.
+#
+# That is exactly why this section exists. An importer whose new
+# branches have never seen a row is an artefact with no writer: the
+# code is there, the refusal is gone, and nothing anywhere has proved
+# that what replaced the refusal writes a row a router would
+# recognise. There is no legacy database in this run to point it at —
+# the deploy host is not touched — so the fixture is built instead, and
+# driven all the way to `/nic/update`.
+
+
+WIDE_EMAIL = f"legacy-owner-wide-{W}@example.invalid"
+WIDE_LOCK_OWNER = "test_import_legacy.imported_wide"
+
+
+async def _make_named_owner(email: str) -> int:
+    async with fixture_writes(WIDE_LOCK_OWNER) as session:
+        user = User(
+            email=email,
+            hashed_password=unusable_password_hash(),
+            is_active=True,
+            is_verified=True,
+            full_name="Legacy owner (widened)",
+            preferred_language="en",
+        )
+        session.add(user)
+        await session.flush()
+        return user.id
+
+
+@pytest_asyncio.fixture(scope="module")
+async def imported_wide(tmp_path_factory, fernet_key: str) -> Any:
+    """Import a world that exercises **both** widened branches.
+
+    Its own owner, its own zone and its own device usernames: the
+    importer refuses to run twice against colliding rows, correctly, so
+    sharing :func:`imported`'s world would measure that refusal instead
+    of this.
+
+    Both migrated backends are scripted ``result: good`` afterwards and
+    outside the import, for the reason :func:`imported` gives — the
+    legacy schema has no column for a scripted result, every legacy
+    config row is an encrypted credential, and teaching the importer
+    about a fixture would be teaching it to write a row production
+    never has. The ``ttl`` the import wrote is left exactly as it is;
+    it is what the wire test below reads back.
+    """
+    compat_stub.register_stub_providers(force=True)
+    await purge_tenants([WIDE_EMAIL], owner=WIDE_LOCK_OWNER)
+    owner_id = await _make_named_owner(WIDE_EMAIL)
+
+    path = tmp_path_factory.mktemp("legacy-wide") / "dyndns.db"
+    build_legacy_db(path, fernet_key=fernet_key, tag="-wide")
+    widen(path, fernet_key=fernet_key)
+    plan = plan_for(path, fernet_key)
+
+    factory = get_session_factory()
+    async with fixture_writes(WIDE_LOCK_OWNER) as session:
+        written = await il.apply(
+            session, plan, owner_email=WIDE_EMAIL, create_owner=False
+        )
+    async with factory() as session:
+        reading = await il.verify(session, written.owner_id)
+
+    async with factory() as session:
+        rows = (
+            (
+                await session.execute(
+                    sa.select(DomainBackend).where(
+                        DomainBackend.user_id == owner_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for row in rows:
+            row.config = {**(row.config or {}), "result": "good"}
+        await session.commit()
+
+    yield {
+        "owner_id": owner_id,
+        "plan": plan,
+        "written": written,
+        "reading": reading,
+        "source": path,
+    }
+
+    await purge_tenants([WIDE_EMAIL], owner=WIDE_LOCK_OWNER)
+
+
+def test_the_widened_world_writes_the_rows_it_claims_to(imported_wide) -> None:
+    """One pinned TTL per name, one selection row, and both instruments agree.
+
+    ``ttl_overrides == 11`` rather than ``1`` is the deliberate part: a
+    zone whose names disagree has no zone TTL, so every name in it is
+    pinned rather than only the dissenter. See ``build_plan``.
+    """
+    plan, written, reading = (
+        imported_wide["plan"],
+        imported_wide["written"],
+        imported_wide["reading"],
+    )
+    assert il.compare(plan, written, reading) == []
+    assert (written.ttl_overrides, written.selections) == (11, 1)
+    assert (written.hostnames, reading.hostnames) == (11, 11)
+    assert (written.backends, reading.backends) == (2, 2)
+
+
+async def test_the_columns_0004_added_actually_hold_the_migrated_values(
+    imported_wide,
+) -> None:
+    """Read straight out of MySQL, not through :class:`il.Reading`.
+
+    A third instrument, and a deliberately dumb one: two ``SELECT``s
+    over the two things ``0004`` created, compared against the SQLite
+    source. :func:`il.verify` resolves; this counts.
+    """
+    conn = sqlite3.connect(imported_wide["source"])
+    source_ttl = dict(conn.execute("SELECT name, ttl FROM hostnames"))
+    conn.close()
+
+    factory = get_session_factory()
+    async with factory() as session:
+        stored = dict(
+            (
+                await session.execute(
+                    sa.select(Hostname.name, Hostname.ttl)
+                    .join(Domain, Domain.id == Hostname.domain_id)
+                    .where(Domain.user_id == imported_wide["owner_id"])
+                )
+            ).all()
+        )
+        selections = (
+            await session.execute(
+                sa.select(Hostname.name, DomainBackend.backend_type)
+                .join(HostnameBackend, HostnameBackend.hostname_id == Hostname.id)
+                .join(
+                    DomainBackend,
+                    DomainBackend.id == HostnameBackend.backend_id,
+                )
+                .join(Domain, Domain.id == Hostname.domain_id)
+                .where(Domain.user_id == imported_wide["owner_id"])
+            )
+        ).all()
+
+    assert stored == source_ttl
+    assert sorted(stored.values()) == [TTL] * 10 + [ODD_TTL]
+    pinned = f"{PRODUCTION_COST_DEVICE}-0.{zone_for('-wide')}"
+    assert [tuple(row) for row in selections] == [(pinned, STUB_SERVICE)]
+
+
+def test_the_publication_comparison_is_not_vacuous(imported_wide) -> None:
+    """Break each half of #83's assertion and watch it bite.
+
+    :func:`il.compare` returning ``[]`` above is only evidence if it can
+    return something else about *these* two properties.
+
+    Four mutations: the TTL alone, the backend set alone, a name the
+    target does not hold, and a name it holds that the plan does not.
+    """
+    plan, written, reading = (
+        imported_wide["plan"],
+        imported_wide["written"],
+        imported_wide["reading"],
+    )
+    pinned = f"{PRODUCTION_COST_DEVICE}-0.{zone_for('-wide')}"
+    published = dict(reading.hostname_publication)
+    assert published[pinned] == ((STUB_SERVICE, ODD_TTL),)
+
+    wrong_ttl = {**published, pinned: ((STUB_SERVICE, TTL),)}
+    problems = il.compare(
+        plan, written, replace(reading, hostname_publication=wrong_ttl)
+    )
+    assert problems and any(f"{STUB_SERVICE}@{TTL}" in p for p in problems)
+
+    widened = {
+        **published,
+        pinned: ((STUB_SERVICE, ODD_TTL), (SECOND_SLOT, ODD_TTL)),
+    }
+    assert il.compare(
+        plan, written, replace(reading, hostname_publication=widened)
+    )
+
+    missing = {k: v for k, v in published.items() if k != pinned}
+    problems = il.compare(
+        plan, written, replace(reading, hostname_publication=missing)
+    )
+    assert problems and any("NOTHING" in p for p in problems)
+
+    extra = {**published, "stray." + zone_for("-wide"): ()}
+    problems = il.compare(
+        plan, written, replace(reading, hostname_publication=extra)
+    )
+    assert problems and any("not in the plan" in p for p in problems)
+
+
+async def test_a_pre_83_write_of_the_same_plan_is_caught(
+    tmp_path, fernet_key: str
+) -> None:
+    """Mutate the implementation, and show the assertion fails.
+
+    The mutation is the *old* importer. #83's write-side diff is
+    exactly "put ``ddns_hostname.ttl`` and ``ddns_hostname_backend``
+    rows in", so stripping both from the plan makes :func:`il.apply`
+    write precisely the rows the pre-#83 code would have written had it
+    not refused outright. Everything else — counts, hostname → device,
+    hashes, credentials — is unchanged and still agrees, which is the
+    point: those are the instruments that were already here, and
+    **none of them notices**.
+
+    The comparison is then made against the *true* plan, so what is
+    asserted is that the new check, and only the new check, sees a
+    world in which one name publishes to two providers at 60 where it
+    used to publish to one at 300.
+    """
+    email = f"pre83-{W}@example.invalid"
+    path = tmp_path / "pre83.db"
+    build_legacy_db(path, fernet_key=fernet_key, tag="-pre83")
+    widen(path, fernet_key=fernet_key)
+    truth = plan_for(path, fernet_key)
+    mutated = replace(
+        truth,
+        hostnames=tuple(
+            replace(h, ttl=None, selected_legacy_backend_ids=())
+            for h in truth.hostnames
+        ),
+    )
+
+    await purge_tenants([email], owner=WIDE_LOCK_OWNER)
+    owner_id = await _make_named_owner(email)
+    factory = get_session_factory()
+    try:
+        async with fixture_writes(WIDE_LOCK_OWNER) as session:
+            written = await il.apply(
+                session, mutated, owner_email=email, create_owner=False
+            )
+        async with factory() as session:
+            reading = await il.verify(session, owner_id)
+
+        assert (written.ttl_overrides, written.selections) == (0, 0)
+
+        problems = il.compare(truth, written, reading)
+        assert problems, "the publication check did not bite"
+        # **Only** the new check bites. Every problem reported is a
+        # publication problem, so counts, hostname -> device, password
+        # hashes, credential digests and last_ip_* — the whole
+        # pre-#83 instrument set — are silent about a name that has
+        # just been moved from one provider at 300 to two at 60.
+        assert all("would publish through" in p for p in problems)
+        assert any(f"{SECOND_SLOT}@{TTL}" in p for p in problems)
+        assert any(f"{STUB_SERVICE}@{ODD_TTL}" in p for p in problems)
+
+        # Said the other way round, without circularity: satisfy the
+        # new check by construction and the rest of `compare` reports a
+        # clean migration of this same defective world.
+        assert (
+            il.compare(
+                truth,
+                written,
+                replace(reading, hostname_publication=truth.publication),
+            )
+            == []
+        )
+    finally:
+        await purge_tenants([email], owner=WIDE_LOCK_OWNER)
+
+
+async def test_the_narrowed_name_publishes_to_one_provider_at_its_own_ttl(
+    client, imported_wide
+) -> None:
+    """The wire — the half a column read cannot satisfy.
+
+    ``il.verify`` resolves through ``models.resolve_backends`` and
+    ``models.resolve_ttl``, which is a strong reading but still this
+    module's own. This is ``/nic/update`` doing it: the migrated device
+    presenting its original password, and the provider call log saying
+    which backend was called and at what TTL.
+
+    Two names, because one proves nothing on its own. The pinned name
+    must reach ``stub1`` alone at 300; its neighbour in the same zone,
+    which selected nothing, must reach both at 60. A selection written
+    for every legacy binding rather than only for the strict subset
+    would pass the first assertion and fail the second.
+    """
+    zone = zone_for("-wide")
+    username = device_username(PRODUCTION_COST_DEVICE, "-wide")
+    password = PASSWORDS[PRODUCTION_COST_DEVICE]
+
+    response = await client.get(
+        "/nic/update",
+        params={
+            "hostname": f"{PRODUCTION_COST_DEVICE}-0.{zone}",
+            "myip": "198.51.100.31",
+        },
+        headers=basic(username, password),
+    )
+    assert response.text == "good 198.51.100.31"
+    assert [(c.service, c.ttl) for c in CALLS if c.op == "create"] == [
+        (STUB_SERVICE, ODD_TTL)
+    ]
+
+    CALLS.clear()
+    response = await client.get(
+        "/nic/update",
+        params={
+            "hostname": f"{PRODUCTION_COST_DEVICE}-1.{zone}",
+            "myip": "198.51.100.32",
+        },
+        headers=basic(username, password),
+    )
+    assert response.text == "good 198.51.100.32"
+    assert [(c.service, c.ttl) for c in CALLS if c.op == "create"] == [
+        (STUB_SERVICE, TTL),
+        (SECOND_SLOT, TTL),
+    ]
