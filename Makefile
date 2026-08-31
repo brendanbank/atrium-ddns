@@ -454,7 +454,16 @@ test-backend-file:  ## one file, verbose — the way to diagnose a hang (FILE=te
 #
 # BASE is what "changed" is measured against — the milestone branch during a
 # run, trunk otherwise.
-GATE_BASE ?= $(or $(OVERNIGHT_MILESTONE_BRANCH),$(OVERNIGHT_TRUNK),master)
+# Read from `.overnight.conf` the way every other target here reads `.env` —
+# one key, with sed, never sourced. The first version of this consulted only
+# `$(OVERNIGHT_MILESTONE_BRANCH)`, which make sees only if it is *exported*;
+# `.overnight.conf` is a file the shell scripts source, not something make
+# inherits. So it silently fell through to `master` during a run, diffed the
+# whole milestone branch against trunk, and reported every already-merged file
+# as changed. Over-inclusive rather than unsafe, and invisible: a gate that
+# runs too much still says PASS.
+GATE_CONF_BRANCH := $(shell sed -n 's/^OVERNIGHT_MILESTONE_BRANCH=//p' .overnight.conf 2>/dev/null | tail -n1)
+GATE_BASE ?= $(or $(OVERNIGHT_MILESTONE_BRANCH),$(GATE_CONF_BRANCH),$(OVERNIGHT_TRUNK),master)
 
 gate:  ## run exactly the checks this diff can reach (auto-scoped; GATE_BASE=...)
 	@set -e; \
