@@ -698,6 +698,27 @@ forever if the condition *errors* rather than turning true, and the run looks
 hung for no reason anyone can see. Bound every wait with a maximum number of
 attempts and fail loudly when they are exhausted.
 
+**Scope the gate to what the change can reach — and say who scoped it.**
+The gate is mandatory, not ceremonial, and those are different claims. A
+change confined to `.gitignore` and `docs/` cannot be reached by a Playwright
+suite, a docker stack, a backend pytest session or a smoke test: there is no
+code path between them. Running them anyway does not raise confidence, it
+manufactures a **probe that cannot fail** and puts it in the gate, which is the
+defect family this file is most insistent about.
+
+Measured, on #76 of V1M7: an agent told to "run the full gate" on a two-line
+ignore-pattern change invoked `make test-e2e` **36 times** — fighting an
+unrelated flake in a suite its diff could not touch — and had still pushed no
+branch and opened no PR when the orchestrator stopped it. The brief was wrong,
+not the agent; it did exactly as instructed.
+
+So: run the cheapest gate that could conceivably fail because of *this* diff,
+and put the reasoning in the PR body where a reader sees a decision on the
+record rather than a skipped step. For a change touching no code that is
+`git diff --stat` plus the direct proof of the behaviour changed. **The
+scoping is the orchestrator's call, not the agent's** — an agent that thinks
+the gate is disproportionate names the file and the mechanism and asks.
+
 **Measure your own baseline; never inherit one.** An orchestrator propagated a
 branch-local suite count as the milestone-branch count and two separate agents
 had to correct it. Every brief since says: measure your own.
