@@ -186,6 +186,41 @@ FIXTURE_LOCK_TIMEOUT = 30
 _HELD_BY: str | None = None
 
 
+#: The attribute name that carries membership of the harness-guard
+#: population for things pytest will not let you mark. Same string as the
+#: registered marker in ``backend/pyproject.toml``, deliberately: one
+#: registry, one name.
+GUARD_ATTRIBUTE = "harness_guard"
+
+
+def harness_guard(obj: object) -> object:
+    """Tag a non-test callable as a guard on the harness itself — #108.
+
+    ``@pytest.mark.harness_guard`` is the carrier for everything pytest
+    collects. It is not available here: pytest refuses marks on fixtures
+    outright ("Marks applied to fixtures have no effect"), so a guard
+    that lives in a fixture cannot join the population the way a test
+    does.
+
+    That is not a hypothetical. :func:`_sweep_unattributed_events` is
+    what turned #87's mutation M4 into an error instead of a silent
+    pass — a guard by behaviour, in a fixture by necessity, and
+    invisible to every enumeration this repo had. #108 exists because a
+    population that silently excludes it is short, and a short
+    population is a clause counting its own denominator.
+
+    So the tag is an attribute rather than a mark, applied **above** the
+    fixture decorator so it lands on whatever object ends up bound to
+    the module name (pytest 8+ binds a ``FixtureFunctionDefinition``,
+    not the function). ``test_harness_guards.harness_guards()`` reads
+    both carriers and returns one population;
+    ``test_every_autouse_session_fixture_in_conftest_is_tagged`` is what
+    stops the next one being added without it.
+    """
+    setattr(obj, GUARD_ATTRIBUTE, True)
+    return obj
+
+
 @functools.cache
 def unusable_password_hash() -> str:
     """The placeholder hash every tenant fixture used to compute itself.
@@ -472,6 +507,7 @@ async def purge_unattributed_events(
         )
 
 
+@harness_guard
 @pytest_asyncio.fixture(scope="session", autouse=True)
 async def _sweep_unattributed_events() -> AsyncIterator[None]:
     """The one place #87's rows are cleaned up. Autouse, session-scoped.

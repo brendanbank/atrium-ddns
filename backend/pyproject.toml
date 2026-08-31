@@ -42,6 +42,31 @@ packages = ["src/atrium_ddns"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 
+# The one name the harness-guard population is derived from — #108.
+#
+# Clause 3 of V1M7 is about "every guard this suite relies on", and a guard
+# is not the same thing as a test: it is a check whose subject is the
+# suite's own instruments rather than the product's behaviour. Nothing in
+# the collected set distinguishes the two, so the distinction is declared,
+# once, here — and read back off pytest's own collection by
+# `test_harness_guards.harness_guards()`. A list of guard names typed into
+# a module would be the identical defect one release later, which is what
+# #78 corrected `EXPECTED_PARTICIPANTS` for.
+#
+# Registering it is not optional decoration. `--strict-markers` is in the
+# addopts below, so an unregistered `@pytest.mark.harness_guard` is a
+# collection error rather than a silent no-op — which is exactly why #85
+# left the marker to #108: adding one means editing this file.
+#
+# pytest refuses to attach a mark to a *fixture*, and one guard in this
+# suite is a fixture (`conftest._sweep_unattributed_events`). That half of
+# the population carries `conftest.harness_guard` as a plain attribute
+# instead. Same registry, same name, two carriers, because pytest forbids
+# the first one on fixtures — see `conftest.harness_guard`.
+markers = [
+    "harness_guard: a check whose subject is the test harness itself — it fails when the suite's own instruments have stopped being trustworthy, not when the product is wrong. The population clause 3 of V1M7 is swept over; see backend/tests/test_harness_guards.py.",
+]
+
 # Parallel by default, matching the recipe that gets atrium-pa to ~72
 # tests/sec (6197 tests in 86s). `-n auto` is one worker per CPU;
 # `--dist=loadfile` keeps every test in a file on the same worker, which is

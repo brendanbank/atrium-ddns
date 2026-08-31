@@ -12,6 +12,55 @@ module that fails to import still gets counted. Every guard carries a
 vacuity check, because the failure mode of a scan-the-source guard is
 scanning nothing and reporting clean — this repository's own most
 frequent defect, aimed at itself.
+
+The population, and what it deliberately is not — #108
+------------------------------------------------------
+Clause 3 of V1M7 reads *"every guard this suite relies on is shown
+failing when the thing it guards is broken"*, and it cannot be closed
+without saying what "every" ranges over. Three readings were available
+and the middle one is the one taken:
+
+* **This file's guards.** What ``harness_guards()`` returned before
+  #108: the module-level ``test_*`` in this module, read off its own
+  source. Rejected — it is short by construction. ``conftest``'s
+  session-scoped autouse sweep refuses at teardown when the teardown
+  did not remove what it recorded; it is a guard by behaviour and a
+  fixture by necessity, and no enumeration in this repo counted it. A
+  population that excludes a guard because of where it is written is
+  the clause measuring its own denominator.
+
+* **Every harness guard in the host suite, wherever it lives.** Taken.
+  A guard is a check whose subject is the suite's own instruments —
+  it fails when the harness has stopped being trustworthy, not when
+  the product is wrong. That is a property of intent, not of syntax,
+  so it is *declared* (``@pytest.mark.harness_guard``, registered in
+  ``backend/pyproject.toml``; ``conftest.harness_guard`` for the
+  fixture pytest will not let us mark) and *derived* from pytest's own
+  collection by :func:`harness_guards`. Declared once per guard, never
+  listed anywhere.
+
+* **Every test in the host suite** — two orders of magnitude larger.
+  Rejected. "Guard" is a narrower word than "test" and clause 3 means
+  the narrower one: a demonstration per product test is a mutation
+  campaign over the whole suite, not a clause that can be closed. It
+  would also dilute the term until the sweep meant nothing.
+
+Two neighbours are named rather than folded in, because naming them is
+the difference between a boundary and an oversight:
+
+* **The compat session's guards** (``tests/compat/test_runner_contract.py``
+  and the service-free half of ``test_protocol.py``). Guard-shaped, and
+  guards on a *different* harness — the wire runner's — collected by a
+  second pytest session with its own rootdir and no ini file at all, so
+  neither the marker registry nor ``--strict-markers`` reaches them.
+  Out of this population; a peer of it.
+
+* **Derived-oracle product tests**, such as
+  ``test_router_events.test_partially_attributed_codes_are_derived_from_the_writer_not_listed``.
+  They protect a test's expected value from being retyped, which is the
+  same virtue — but their subject is ``router_nic``'s source, and they
+  fail when the *product* drifts. Product tests with good oracles, not
+  harness guards.
 """
 from __future__ import annotations
 
@@ -21,6 +70,23 @@ import re
 from collections.abc import Iterable, Mapping
 
 import pytest
+
+#: The registry's one name: the registered ``pytest.mark`` for anything
+#: pytest collects, and the attribute :func:`conftest.harness_guard` sets
+#: for the fixture it will not let us mark. Imported rather than retyped
+#: — two spellings of one registry is two registries, and the pair would
+#: come apart silently because each half has its own carrier.
+from conftest import GUARD_ATTRIBUTE as GUARD_MARKER
+
+#: Every guard in this module is a harness guard, marked here rather
+#: than one decorator per function: a per-function mark is a list typed
+#: into a file wearing a decorator's clothes, and the sixteenth guard
+#: would be the one that got forgotten.
+#:
+#: ``test_the_guard_list_is_derived_and_matches_what_was_imported``
+#: fails if this line is removed or narrowed, so the marker is
+#: load-bearing rather than declarative.
+pytestmark = pytest.mark.harness_guard
 
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
 
@@ -559,44 +625,108 @@ def test_the_two_matchers_disagree_only_over_prose_and_orm() -> None:
     )
 
 
-def harness_guards() -> tuple[str, ...]:
-    """Every guard this module defines, read off its own source.
+def harness_guards(session: pytest.Session) -> tuple[str, ...]:
+    """The harness-guard population of the run this is called from — #108.
 
-    Here for #108, which owns the sweep of *all* the harness guards to a
-    negative result and needs a population it did not type. This covers
-    one module — the one the guards live in — and is derived from the
-    file on disk, so a guard deleted takes itself out of the list and a
-    guard added joins it without a second edit.
+    Replaces the module-scoped AST reading #85 added, rather than
+    sitting beside it: two enumerations of one population is the defect
+    this issue was opened about, one indirection along.
 
-    A ``pytest.mark`` would be the more general mechanism and is
-    deliberately not used: ``--strict-markers`` is on and no ``markers``
-    list is registered, so introducing one means editing
-    ``backend/pyproject.toml``, which is outside #85's declared scope.
+    Derived from **pytest's own collection**, in two halves because
+    pytest offers two carriers and refuses the first one on fixtures:
+
+    * every collected item carrying ``@pytest.mark.harness_guard``,
+      which for this module comes from its module-level ``pytestmark``;
+    * every object in a module this run loaded *from the suite's own
+      tree* carrying the ``harness_guard`` attribute
+      :func:`conftest.harness_guard` sets — the fixture half, and the
+      seam #87 named and left for this issue.
+
+    Returned as ``file.py::name`` so the two halves are commensurable
+    and a guard that moves module is visibly a different entry. The base
+    name rather than the path: the same tree is at ``backend/tests`` in
+    the worktree and ``/opt/host_app/tests`` in the api container, and a
+    population whose members are spelled differently depending on where
+    it is read is not one population.
+
+    **The reading is invocation-scoped, on purpose.** ``session.items``
+    is post-selection, so under ``-k`` or a single-file invocation this
+    returns the guards *that run*, not the guards that exist. Every
+    consumer here compares it against what was collected rather than
+    against a constant, so ``make test-backend-file`` still works — a
+    guard that fails under the diagnostic invocation is a guard standing
+    in front of the diagnosis. The number quoted for clause 3 is the one
+    from a full ``make test-backend``.
+    """
+    found: set[str] = set()
+
+    modules: dict[str, object] = {}
+    for item in session.items:
+        if item.get_closest_marker(GUARD_MARKER) is not None:
+            found.add(f"{item.path.name}::{item.originalname or item.name}")
+        module = getattr(item, "module", None)
+        source = getattr(module, "__file__", None)
+        if source and pathlib.Path(source).resolve().parent == TESTS_DIR:
+            modules[str(source)] = module
+
+    # conftest.py is registered as a plugin and collects no items, so it
+    # is reachable only this way. Anything else pytest loaded from this
+    # tree comes along with it, which is what makes the mechanism
+    # general rather than a special case for one file.
+    for plugin in session.config.pluginmanager.get_plugins():
+        source = getattr(plugin, "__file__", None)
+        if source and pathlib.Path(source).resolve().parent == TESTS_DIR:
+            modules[str(source)] = plugin
+
+    for source, module in modules.items():
+        base = pathlib.Path(source).name
+        for name, value in vars(module).items():
+            if getattr(value, GUARD_MARKER, False) is True:
+                found.add(f"{base}::{name}")
+
+    return tuple(sorted(found))
+
+
+def _module_level_test_functions() -> frozenset[str]:
+    """This module's ``test_*``, read off its own source on disk.
+
+    #85's static reading, kept as the second instrument for the
+    agreement guard below and no longer doubling as the population.
     """
     tree = ast.parse(
         pathlib.Path(__file__).read_text(encoding="utf-8"), filename=__file__
     )
-    return tuple(
-        sorted(
-            node.name
-            for node in tree.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name.startswith("test_")
-        )
+    return frozenset(
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("test_")
     )
 
 
-def test_the_guard_list_is_derived_and_matches_what_was_imported() -> None:
-    """Two readings of this module's own population, and they must agree.
+def test_the_guard_list_is_derived_and_matches_what_was_imported(
+    request: pytest.FixtureRequest,
+) -> None:
+    """Three readings of this module's guards, and they must agree.
 
-    The list on disk against the names the interpreter actually bound.
-    They come apart when a guard is defined inside a ``class``, under an
-    ``if``, or shadowed by a later definition — all of which are ways to
-    have a guard that :func:`harness_guards` reports and pytest does not
-    run, or the reverse. Either way #108's sweep would be counting
-    something other than what executes.
+    The list on disk against the names the interpreter actually bound —
+    #85's pair. They come apart when a guard is defined inside a
+    ``class``, under an ``if``, or shadowed by a later definition, all
+    of which are ways to have a guard the static read reports and pytest
+    does not run, or the reverse.
+
+    And, added by #108, against what pytest *collected and marked*. That
+    is the reading the population is built from, and it is the one that
+    goes wrong quietly: delete the module-level ``pytestmark`` and every
+    guard in this file leaves the population while every one of them
+    still passes. The marker is load-bearing only if something fails
+    when it is not there.
+
+    Compared against the collected set rather than against the on-disk
+    set, so a selective invocation shrinks both sides together instead
+    of failing.
     """
-    on_disk = set(harness_guards())
+    on_disk = set(_module_level_test_functions())
     imported = {
         name
         for name, value in globals().items()
@@ -609,6 +739,163 @@ def test_the_guard_list_is_derived_and_matches_what_was_imported() -> None:
         "the guards read off this file and the guards this module bound "
         f"disagree: only on disk {sorted(on_disk - imported)}, only imported "
         f"{sorted(imported - on_disk)}"
+    )
+
+    here = pathlib.Path(__file__).name
+    collected = {
+        item.originalname or item.name
+        for item in request.session.items
+        if item.path.name == here
+    }
+    marked = {
+        entry.split("::", 1)[1]
+        for entry in harness_guards(request.session)
+        if entry.startswith(f"{here}::")
+    }
+    assert collected, (
+        f"{here} contributed no collected items to this session — the "
+        "third reading is vacuous and would agree with anything"
+    )
+    assert collected == marked, (
+        "guards in this file that pytest collected but the harness_guard "
+        f"marker did not reach: {sorted(collected - marked)}; marked but not "
+        f"collected: {sorted(marked - collected)}. The usual cause is the "
+        "module-level `pytestmark` being removed or narrowed, which drops "
+        "this whole file out of #108's population while every guard in it "
+        "still passes"
+    )
+
+
+def test_the_population_counts_guards_that_are_not_tests(
+    request: pytest.FixtureRequest,
+) -> None:
+    """The seam #87 named: a guard that is not a ``test_*``.
+
+    ``conftest._sweep_unattributed_events`` refuses at session teardown
+    when the teardown did not remove what it recorded. It is what turned
+    #87's fourth mutation into an error rather than a silent pass, and
+    it is a fixture — so ``pytest.mark`` cannot reach it and no
+    enumeration in this repo counted it before #108.
+
+    The assertion is on the *shape*, not on the name: at least one
+    member of the population is something pytest did not collect as a
+    test. Naming the fixture here would put the population back into a
+    file, which is the whole thing #108 was opened to stop; the
+    structural rule that keeps it honest is
+    :func:`test_every_autouse_session_fixture_in_conftest_is_tagged`.
+
+    Its vacuity check is the other direction: a population with no
+    collected tests in it means the marker stopped reaching anything and
+    "at least one non-test" would be true of a population of one.
+    """
+    population = harness_guards(request.session)
+    collected = {
+        f"{item.path.name}::{item.originalname or item.name}"
+        for item in request.session.items
+    }
+    tests = [entry for entry in population if entry in collected]
+    others = [entry for entry in population if entry not in collected]
+
+    assert tests, (
+        "no collected test carries the harness_guard marker — the "
+        "population is not being derived from anything, so the split "
+        "below says nothing"
+    )
+    assert others, (
+        "every member of the harness-guard population is a collected "
+        "test, so nothing that lives in a fixture is being counted. That "
+        "is the exact shortfall #108 was opened for: "
+        "conftest._sweep_unattributed_events is a guard by behaviour and "
+        "a fixture by necessity. Population was: " + repr(population)
+    )
+
+
+def _autouse_session_fixtures_in_conftest() -> dict[str, bool]:
+    """``{fixture name: carries the harness_guard tag}`` for conftest.py.
+
+    Read off the source rather than from pytest's fixture registry: a
+    fixture that stopped being *collected* is precisely the failure
+    ``test_the_unattributed_sweep_is_installed_in_this_process`` exists
+    for, and a completeness rule that could not see an uncollected
+    fixture would go quiet at the same moment.
+
+    Decorators are matched by attribute name — ``pytest.fixture``,
+    ``pytest_asyncio.fixture`` and a bare ``fixture`` all read as
+    ``fixture`` — because which module the decorator came from is not
+    what makes it session-wide and autouse.
+    """
+    tree = ast.parse(CONFTEST.read_text(encoding="utf-8"), filename=CONFTEST.name)
+    found: dict[str, bool] = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        session_autouse = False
+        tagged = False
+        for decorator in node.decorator_list:
+            name = (
+                decorator.id
+                if isinstance(decorator, ast.Name)
+                else getattr(decorator, "attr", None)
+            )
+            if name == GUARD_MARKER:
+                tagged = True
+            if not isinstance(decorator, ast.Call):
+                continue
+            call = decorator.func
+            call_name = (
+                call.id if isinstance(call, ast.Name) else getattr(call, "attr", "")
+            )
+            if call_name != "fixture":
+                continue
+            kwargs = {kw.arg: kw.value for kw in decorator.keywords}
+            scope = kwargs.get("scope")
+            autouse = kwargs.get("autouse")
+            session_autouse = (
+                isinstance(scope, ast.Constant)
+                and scope.value == "session"
+                and isinstance(autouse, ast.Constant)
+                and autouse.value is True
+            )
+        if session_autouse:
+            found[node.name] = tagged
+    return found
+
+
+def test_every_autouse_session_fixture_in_conftest_is_tagged() -> None:
+    """The completeness rule for the half of the population pytest cannot mark.
+
+    A marker is opt-in, and opt-in is a list typed into a file
+    distributed across it — unless something fails when the next guard
+    is added without opting in. For tests there is no mechanical way to
+    recognise "this is a harness guard" from source; for the fixture
+    half there is, and this is it.
+
+    A **session-scoped autouse fixture in the suite's shared conftest**
+    is, by construction, an enforcement point that runs whatever anyone
+    does and that no test names. That is the shape
+    ``_sweep_unattributed_events`` has and the shape #87 could not get
+    counted. So the rule is: every one of them declares itself, or this
+    fails and names it.
+
+    The vacuity check matters more here than usual — the whole rule
+    evaporates if the decorator walk stops recognising a fixture, and it
+    would evaporate into a pass.
+    """
+    fixtures = _autouse_session_fixtures_in_conftest()
+    assert fixtures, (
+        f"no session-scoped autouse fixture found in {CONFTEST.name} — either "
+        "the shared sweep has been removed (in which case the suite is "
+        "leaking #87's rows again) or this decorator walk has stopped seeing "
+        "what it is looking for. Both are failures; a clean pass is not "
+        "available here"
+    )
+    untagged = sorted(name for name, tagged in fixtures.items() if not tagged)
+    assert not untagged, (
+        "these fixtures run for the whole session, autouse, and are not in "
+        f"#108's harness-guard population: {untagged}. A session-wide autouse "
+        "fixture in the shared conftest is an enforcement point by "
+        "construction — decorate it with `@harness_guard` (above the fixture "
+        "decorator), or make it not that shape"
     )
 
 
@@ -719,19 +1006,51 @@ def test_the_fixture_lock_is_not_a_no_op() -> None:
     would still be green almost always — the shape of guard this repo
     keeps finding in its own code — so the refusal is asserted here
     rather than assumed.
+
+    **Scoped to the function, and it was not — found by #108's sweep.**
+    Until then the count walked the whole of ``conftest.py``, and there
+    are three ``raise`` statements in that file: two in
+    ``fixture_writes`` and one in ``purge_unattributed_events``. So
+    deleting the ``GET_LOCK`` refusal — the exact line this docstring
+    says is asserted — left two behind and this guard stayed green.
+    Measured, not reasoned: the mutation ran and the file reported *15
+    passed*. That is the failure mode the whole issue is about, in the
+    guard that names it, which is why it is fixed here rather than
+    noted.
     """
-    source = (TESTS_DIR / "conftest.py").read_text(encoding="utf-8")
-    tree = ast.parse(source, filename="conftest.py")
-    guarded = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Raise)
-    ]
+    source = CONFTEST.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=CONFTEST.name)
+    subject = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "fixture_writes"
+        ),
+        None,
+    )
+    assert subject is not None, (
+        f"no module-level fixture_writes() in {CONFTEST.name} — every "
+        "assertion below would be about nothing. It has been renamed, moved "
+        "into a class, or removed"
+    )
+    body = ast.get_source_segment(source, subject) or ""
+    assert "GET_LOCK" in body, (
+        "fixture_writes() no longer calls GET_LOCK, so there is no lock to "
+        "refuse on and the exclusion every fixture write depends on is gone"
+    )
+    assert "RELEASE_LOCK" in body, (
+        "fixture_writes() takes the lock and never releases it — every other "
+        "worker would stall for FIXTURE_LOCK_TIMEOUT"
+    )
+    guarded = [node for node in ast.walk(subject) if isinstance(node, ast.Raise)]
     assert len(guarded) >= 2, (
         "conftest.fixture_writes must raise on a failed GET_LOCK and on "
-        f"re-entry; found {len(guarded)} raise statements"
+        f"re-entry; found {len(guarded)} raise statement(s) inside it. "
+        "Counting raises across the whole module instead of inside this "
+        "function is what let the GET_LOCK refusal be deleted while this "
+        "guard stayed green"
     )
-    assert "GET_LOCK" in source and "RELEASE_LOCK" in source
 
 
 @pytest.mark.asyncio
