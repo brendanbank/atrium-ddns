@@ -17,10 +17,20 @@ from __future__ import annotations
 
 import ast
 import pathlib
+import re
+from collections.abc import Iterable, Mapping
 
 import pytest
 
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
+
+#: The shared teardown, and the host's ORM models. Both read from disk
+#: rather than imported, for the reason the module docstring gives.
+#: ``MODELS`` resolves inside the api container too — the image does
+#: ``COPY backend /opt/host_app``, so ``tests/`` and ``src/`` keep the
+#: same relationship there as in the worktree.
+CONFTEST = TESTS_DIR / "conftest.py"
+MODELS = TESTS_DIR.parent / "src" / "atrium_ddns" / "models.py"
 
 #: Every module whose fixtures build rows in the shared database.
 #: Named rather than globbed so that a file *disappearing* is a failure
@@ -139,6 +149,207 @@ def _fixtures(tree: ast.AST) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
     return found
 
 
+#: ``DELETE FROM <table>`` in any casing, across a line break, with the
+#: whitespace SQL allows. Stricter than the ``"DELETE FROM USERS" in
+#: upper`` it replaces in one direction — ``\w+`` then compared against
+#: a known table, so ``DELETE FROM users_archive`` is not a hit for
+#: ``users`` — and looser in another, since a statement split over two
+#: source lines now matches.
+_DELETE = re.compile(r"DELETE\s+FROM\s+(\w+)", re.IGNORECASE)
+
+#: A floor on the derived set below, not a substitute for it. The
+#: failure this module exists to refuse is a scan that matches nothing
+#: and reports clean; a derivation that quietly returned the empty set
+#: would make :func:`test_no_fixture_deletes_rows_itself` vacuous, and
+#: it would still be green. These two are the tables #65 and #78 were
+#: about, so their absence is a broken derivation rather than a change
+#: of policy.
+TABLES_THE_GUARD_MUST_COVER = frozenset({"users", "ddns_event"})
+
+
+def _docstrings(node: ast.AST) -> set[int]:
+    """``id()`` of every docstring constant anywhere in a subtree.
+
+    By identity, not by value. Two functions may carry the same
+    docstring, and a fixture may hold a nested helper with one of its
+    own; excluding by *text* would also drop a genuine code string that
+    happened to read the same.
+    """
+    found: set[int] = set()
+    for child in ast.walk(node):
+        if not isinstance(
+            child, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            continue
+        body = child.body
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            found.add(id(body[0].value))
+    return found
+
+
+def _code_strings(node: ast.AST) -> list[str]:
+    """Every string literal in a subtree's *code*, docstrings excluded.
+
+    Comments are excluded for free — they are not in the tree at all.
+    f-strings are included for free, the other way: an ``ast.JoinedStr``
+    holds its literal chunks as ``ast.Constant``, so
+    ``f"DELETE FROM users WHERE email = {e}"`` yields its SQL here,
+    while a statement assembled from a *variable* still does not.
+    """
+    skip = _docstrings(node)
+    return [
+        child.value
+        for child in ast.walk(node)
+        if isinstance(child, ast.Constant)
+        and isinstance(child.value, str)
+        and id(child) not in skip
+    ]
+
+
+def _tables_deleted_in(strings: Iterable[str], tables: Iterable[str]) -> set[str]:
+    """Which of ``tables`` these strings issue a ``DELETE FROM`` against."""
+    watched = {t.lower() for t in tables}
+    return {t.lower() for text in strings for t in _DELETE.findall(text)} & watched
+
+
+def _tables_the_shared_teardown_owns() -> frozenset[str]:
+    """The tables ``conftest.purge_tenants`` deletes from, from its body.
+
+    Derived rather than typed, because the guard's whole claim is that
+    a fixture must not do centrally-owned teardown itself: the set it
+    forbids in a fixture is *by definition* the set the shared helper
+    issues. A table added to ``purge_tenants`` is covered here without
+    anyone remembering to add it, which is the failure mode
+    ``EXPECTED_PARTICIPANTS`` had before #78.
+
+    Read with the same docstring-excluding walk as the guard, so
+    ``purge_tenants``'s own prose about ``DELETE FROM users`` is not the
+    thing that puts ``users`` in the set.
+    """
+    tree = ast.parse(CONFTEST.read_text(encoding="utf-8"), filename="conftest.py")
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "purge_tenants"
+        ):
+            return frozenset(
+                t.lower() for s in _code_strings(node) for t in _DELETE.findall(s)
+            )
+    return frozenset()
+
+
+def _models_for(tables: Iterable[str]) -> dict[str, str]:
+    """``class name -> table``, for the guarded tables this repo declares.
+
+    ``users`` and ``user_secret_keys`` are atrium's tables, not this
+    host's, so no class in this tree maps to them and the ORM half
+    below **cannot reach them**. The string half does, and that split is
+    named here rather than left implicit: a guard that covers half of
+    what it looks like it covers is worse than one that says which half.
+    """
+    tree = ast.parse(MODELS.read_text(encoding="utf-8"), filename=MODELS.name)
+    watched = {t.lower() for t in tables}
+    found: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for stmt in node.body:
+            if isinstance(stmt, ast.Assign):
+                names = [t.id for t in stmt.targets if isinstance(t, ast.Name)]
+            elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                names = [stmt.target.id]
+            else:
+                continue
+            value = stmt.value
+            if (
+                "__tablename__" in names
+                and isinstance(value, ast.Constant)
+                and isinstance(value.value, str)
+                and value.value.lower() in watched
+            ):
+                found[node.name] = value.value.lower()
+    return found
+
+
+def _orm_deletes(node: ast.AST, models: Mapping[str, str]) -> set[str]:
+    """Guarded tables reached by ``sa.delete(Model)`` rather than by SQL.
+
+    Only the *construct* form, and only for a model one of the guarded
+    tables maps to. Counted rather than assumed: one fixture in this
+    suite calls ``delete`` at all — ``test_worker_jobs.py``'s
+    ``config()``, with ``sa.delete(AppSetting)``, restoring a config row
+    it moved and doing exactly the right thing. An unscoped rule would
+    flag it and be reverted within the week.
+
+    The per-instance form ``session.delete(obj)`` is deliberately **not**
+    matched: ``client.delete(url)`` is the identical shape, and there
+    are ten of those in this suite. All ten sit in test bodies today,
+    which this guard does not scan — but a fixture that drives the HTTP
+    client is an ordinary thing to write, and keying on the attribute
+    name alone would flag it. No fixture here uses the per-instance
+    form; if one ever does, this is the hole it goes through, and it is
+    a hole with a name rather than a silent pass.
+    """
+    hit: set[str] = set()
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call) or not child.args:
+            continue
+        func = child.func
+        called = (
+            func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        )
+        if called != "delete":
+            continue
+        first = child.args[0]
+        model = (
+            first.attr if isinstance(first, ast.Attribute) else getattr(first, "id", "")
+        )
+        if model in models:
+            hit.add(models[model])
+    return hit
+
+
+def _deletes_by_ast(
+    source: str,
+    node: ast.AST,
+    tables: Iterable[str],
+    models: Mapping[str, str],
+) -> set[str]:
+    """Instrument A: what the fixture's **code** deletes.
+
+    Strings the parser says are code, plus the ORM construct. Prose —
+    docstring or comment — is not code and is not seen.
+
+    ``source`` is unused here and ``models`` is unused in instrument B.
+    Both are in both signatures on purpose: the two are called in the
+    same loop, over the same population, and a caller that had to
+    remember which one takes what would eventually pass the wrong one.
+    """
+    return _tables_deleted_in(_code_strings(node), tables) | _orm_deletes(node, models)
+
+
+def _deletes_by_text(
+    source: str,
+    node: ast.AST,
+    tables: Iterable[str],
+    models: Mapping[str, str] | None = None,
+) -> set[str]:
+    """Instrument B: what the fixture's **source segment** says.
+
+    This is the matcher the guard used before #85, kept rather than
+    deleted, because the two disagree in exactly the cases that decide
+    whether the guard is worth having —
+    :func:`test_the_two_matchers_disagree_only_over_prose_and_orm` is
+    that comparison, run as a test rather than asserted in a comment.
+    """
+    return _tables_deleted_in([ast.get_source_segment(source, node) or ""], tables)
+
+
 def test_no_fixture_deletes_rows_itself() -> None:
     """Fixtures call the shared teardown; they do not write their own.
 
@@ -149,10 +360,42 @@ def test_no_fixture_deletes_rows_itself() -> None:
     would delete a real assertion to satisfy a guard. What #65 is about
     is teardown: eight modules each owning a copy of it.
 
-    Vacuity: the scan must find fixtures at all, in modules known to
-    have them. Otherwise a decorator spelling this walk does not
-    recognise turns the guard into a pass.
+    **Matched against the parsed body, not the source segment** — #85.
+    Until then this was the one guard in the file that grepped, over
+    ``ast.get_source_segment``, which returns the docstring with the
+    code. Both directions were wrong. A fixture whose docstring
+    explained the teardown it had *stopped* owning failed, textually
+    identically to not having done the work — #78 paid that tax, by
+    writing two fixtures' docstrings around the literal SQL. And a
+    teardown built out of an f-string went through untouched.
+
+    What it still does not catch, said plainly rather than implied:
+    a statement assembled from a variable (``"DELETE FROM " + table``),
+    and any ORM delete of ``users`` or ``user_secret_keys``, which are
+    atrium's tables and have no model class in this tree
+    (:func:`_models_for`). It is a copy-paste detector with an ORM
+    corner, not a teardown detector.
+
+    Vacuity, three ways, because a guard of this shape fails by
+    matching nothing: the scan must find fixtures at all; the statement
+    set it forbids must be non-empty and must still contain the two
+    tables the guard was opened about; and the ORM half must have
+    resolved at least one model.
     """
+    tables = _tables_the_shared_teardown_owns()
+    assert TABLES_THE_GUARD_MUST_COVER <= tables, (
+        "the forbidden statements are derived from conftest.purge_tenants "
+        f"and came back as {sorted(tables)}, which does not cover "
+        f"{sorted(TABLES_THE_GUARD_MUST_COVER)} — either the shared teardown "
+        "stopped deleting them or this derivation has stopped reading it, "
+        "and in the second case every assertion below is vacuous"
+    )
+    models = _models_for(tables)
+    assert models, (
+        f"no model in {MODELS.name} maps to any of {sorted(tables)}, so the "
+        "sa.delete(...) half of this guard matches nothing at all"
+    )
+
     offenders: list[str] = []
     seen_fixtures = 0
     for path in _test_modules():
@@ -160,14 +403,11 @@ def test_no_fixture_deletes_rows_itself() -> None:
         tree = ast.parse(source, filename=str(path))
         for node in _fixtures(tree):
             seen_fixtures += 1
-            body = ast.get_source_segment(source, node) or ""
-            upper = body.upper()
-            for statement in ("DELETE FROM USERS", "DELETE FROM DDNS_EVENT"):
-                if statement in upper:
-                    offenders.append(
-                        f"{path.name}:{node.lineno} fixture {node.name}() "
-                        f"contains {statement}"
-                    )
+            for table in sorted(_deletes_by_ast(source, node, tables, models)):
+                offenders.append(
+                    f"{path.name}:{node.lineno} fixture {node.name}() "
+                    f"contains DELETE FROM {table.upper()}"
+                )
     assert seen_fixtures >= len(EXPECTED_PARTICIPANTS), (
         f"only {seen_fixtures} fixtures found across {len(_test_modules())} "
         "modules — the decorator walk is not seeing them"
@@ -177,20 +417,211 @@ def test_no_fixture_deletes_rows_itself() -> None:
     )
 
 
+#: Fixture-shaped sources, and the verdict each instrument owes on
+#: them: ``(label, source, instrument A says, instrument B says)``.
+#:
+#: Written as a table rather than as six tests because the *pattern of
+#: disagreement* is the claim, not any single row. Rows 1 and 2 are the
+#: false positives #78 paid for; row 5 is the false negative #85 was
+#: opened about; row 6 is the gap neither closes, kept visible on
+#: purpose; row 7 is the case-table's own vacuity check — an instrument
+#: that flagged everything would pass every other row here.
+MATCHER_CASES: tuple[tuple[str, str, bool, bool], ...] = (
+    (
+        "a docstring naming the teardown it stopped owning",
+        '''
+@pytest.fixture
+def world():
+    """It used to hold its own DELETE FROM users; it now calls
+    conftest.purge_tenants, which issues that statement itself."""
+    yield 1
+''',
+        False,
+        True,
+    ),
+    (
+        "a comment naming the statement",
+        """
+@pytest.fixture
+def world():
+    # Teardown was a DELETE FROM ddns_event here until #65.
+    yield 1
+""",
+        False,
+        True,
+    ),
+    (
+        "the statement itself, the way #78 found it",
+        """
+@pytest.fixture
+async def imported():
+    yield 1
+    async with factory() as session:
+        await session.execute(
+            sa.text("DELETE FROM users WHERE email = :e"), {"e": EMAIL}
+        )
+""",
+        True,
+        True,
+    ),
+    (
+        "the statement in an f-string",
+        """
+@pytest.fixture
+async def world():
+    yield 1
+    await s.execute(sa.text(f"DELETE FROM ddns_event WHERE user_id = {uid}"))
+""",
+        True,
+        True,
+    ),
+    (
+        "the ORM construct, which is not text at all",
+        """
+@pytest.fixture
+async def world():
+    yield 1
+    await s.execute(sa.delete(DnsEvent).where(DnsEvent.user_id == uid))
+""",
+        True,
+        False,
+    ),
+    (
+        "assembled from a variable — the gap neither instrument closes",
+        """
+@pytest.fixture
+async def world():
+    yield 1
+    await s.execute(sa.text("DELETE FROM " + table + " WHERE id = 1"))
+""",
+        False,
+        False,
+    ),
+    (
+        "a fixture doing it properly",
+        """
+@pytest.fixture
+async def world():
+    await purge_tenants([EMAIL], owner=LOCK_OWNER)
+    yield 1
+    await purge_tenants([EMAIL], owner=LOCK_OWNER)
+""",
+        False,
+        False,
+    ),
+)
+
+
+def test_the_two_matchers_disagree_only_over_prose_and_orm() -> None:
+    """Two instruments over one population, and both readings reported.
+
+    ``_deletes_by_ast`` reads the parsed body; ``_deletes_by_text``
+    reads the source segment. They are not a check and a re-check —
+    they are differently shaped, and #85 exists because the difference
+    is where the guard was wrong in both directions at once.
+
+    Asserted per row, so a regression names the case that moved rather
+    than a count. The last two assertions are this table's own vacuity
+    check: it must contain at least one row where each instrument is
+    alone in flagging, or "they disagree" is being asserted against
+    nothing.
+    """
+    tables = _tables_the_shared_teardown_owns()
+    models = _models_for(tables)
+    ast_only: list[str] = []
+    text_only: list[str] = []
+    for label, source, want_ast, want_text in MATCHER_CASES:
+        tree = ast.parse(source)
+        fixtures = _fixtures(tree)
+        assert len(fixtures) == 1, f"{label}: the case source is not one fixture"
+        node = fixtures[0]
+        by_ast = bool(_deletes_by_ast(source, node, tables, models))
+        by_text = bool(_deletes_by_text(source, node, tables, models))
+        assert by_ast is want_ast, (
+            f"{label}: the parsed-body matcher said {by_ast}, expected "
+            f"{want_ast} (text matcher said {by_text})"
+        )
+        assert by_text is want_text, (
+            f"{label}: the source-segment matcher said {by_text}, expected "
+            f"{want_text} (parsed-body matcher said {by_ast})"
+        )
+        if by_ast and not by_text:
+            ast_only.append(label)
+        if by_text and not by_ast:
+            text_only.append(label)
+    assert ast_only, (
+        "no case where only the parsed-body matcher fires — the false "
+        "negative #85 was opened about is not being exercised"
+    )
+    assert text_only, (
+        "no case where only the source-segment matcher fires — the false "
+        "positive #78 paid for is not being exercised"
+    )
+
+
+def harness_guards() -> tuple[str, ...]:
+    """Every guard this module defines, read off its own source.
+
+    Here for #108, which owns the sweep of *all* the harness guards to a
+    negative result and needs a population it did not type. This covers
+    one module — the one the guards live in — and is derived from the
+    file on disk, so a guard deleted takes itself out of the list and a
+    guard added joins it without a second edit.
+
+    A ``pytest.mark`` would be the more general mechanism and is
+    deliberately not used: ``--strict-markers`` is on and no ``markers``
+    list is registered, so introducing one means editing
+    ``backend/pyproject.toml``, which is outside #85's declared scope.
+    """
+    tree = ast.parse(
+        pathlib.Path(__file__).read_text(encoding="utf-8"), filename=__file__
+    )
+    return tuple(
+        sorted(
+            node.name
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test_")
+        )
+    )
+
+
+def test_the_guard_list_is_derived_and_matches_what_was_imported() -> None:
+    """Two readings of this module's own population, and they must agree.
+
+    The list on disk against the names the interpreter actually bound.
+    They come apart when a guard is defined inside a ``class``, under an
+    ``if``, or shadowed by a later definition — all of which are ways to
+    have a guard that :func:`harness_guards` reports and pytest does not
+    run, or the reverse. Either way #108's sweep would be counting
+    something other than what executes.
+    """
+    on_disk = set(harness_guards())
+    imported = {
+        name
+        for name, value in globals().items()
+        if name.startswith("test_") and callable(value)
+    }
+    assert on_disk, (
+        "no guards found in this module's own source — the walk is vacuous"
+    )
+    assert on_disk == imported, (
+        "the guards read off this file and the guards this module bound "
+        f"disagree: only on disk {sorted(on_disk - imported)}, only imported "
+        f"{sorted(imported - on_disk)}"
+    )
+
+
 def _names_referenced(node: ast.AST) -> set[str]:
     """Every identifier a subtree *refers to*, string literals excluded.
 
-    By binding rather than by text, and the contrast with
-    :func:`test_no_fixture_deletes_rows_itself` above is deliberate.
-    That guard matches SQL as text over
-    ``ast.get_source_segment(...)``, so it cannot tell a statement from
-    a sentence describing one — a fixture whose docstring explains
-    which teardown it no longer owns fails it, and a ``DELETE`` a
-    fixture assembles from a variable passes. Both directions are
-    wrong; it is still the right guard for what it catches, because a
-    teardown written any other way is a much rarer thing than a
-    teardown written literally. Filed rather than changed here — see
-    the note in #78. Here the distinction costs nothing:
+    By binding rather than by text. #78 added this walk and recorded
+    the contrast with :func:`test_no_fixture_deletes_rows_itself`, which
+    at the time matched SQL as text over ``ast.get_source_segment(...)``
+    and so could not tell a statement from a sentence describing one.
+    **#85 closed that**: the guard above now reads the parsed body, and
+    keeps the text matcher only as the second instrument it is compared
+    against. Here the distinction costs nothing either way —
     ``ast.Name``/``ast.Attribute`` never look inside a string.
     """
     used: set[str] = set()
