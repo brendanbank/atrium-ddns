@@ -1377,3 +1377,200 @@ def test_the_unattributed_sweep_is_installed_in_this_process() -> None:
         "the listener is attached but no sink is open, so every id it "
         "records is discarded — a recorder that cannot fail to look clean"
     )
+
+
+# ===================================================================== #
+# #117 — the shared config row has exactly one writer
+# ===================================================================== #
+
+#: What a write to ``app_settings`` looks like, in the three shapes this
+#: suite can spell one. Not one matcher: ``put_namespace`` is the app's
+#: own writer, ``sa.delete(AppSetting)`` reaches the table around it,
+#: and ``client.put("/api/admin/app-config/…")`` reaches it around the
+#: process. A census built on any single one of them would report a
+#: negative result about a third of the surface.
+_APP_CONFIG_PATH = "app-config"
+_SQL_WRITE_CALLS = frozenset({"delete", "update", "insert"})
+_HTTP_WRITE_CALLS = frozenset({"put", "post", "patch", "delete"})
+
+
+def _app_settings_writes_in(source: str, filename: str) -> list[str]:
+    """Every write to ``app_settings`` in one source text, as ``line: why``.
+
+    Parsed, not grepped, so the paragraphs in ``conftest`` and
+    ``test_worker_jobs`` that *describe* ``put_namespace`` and
+    ``sa.delete(AppSetting)`` are not counted as calls to them — the
+    prose-versus-code distinction #85 was opened about, applied to a
+    different table.
+
+    Takes source rather than a path so the matcher can be pointed at a
+    synthetic snippet. That is how the third shape below is shown to
+    work: no file in this suite PUTs to the admin endpoint today, and a
+    matcher with no instance is a branch nobody has ever executed.
+    """
+    tree = ast.parse(source, filename=filename)
+    hits: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        called = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+
+        # 1. the app's own writer.
+        if called == "put_namespace":
+            hits.append(f"{node.lineno}: put_namespace(...)")
+            continue
+
+        # 2. the table, reached around it — construct form and the ORM
+        #    row itself.
+        if called == "AppSetting":
+            hits.append(f"{node.lineno}: AppSetting(...) constructed")
+            continue
+        if called in _SQL_WRITE_CALLS and node.args:
+            first = node.args[0]
+            model = (
+                first.attr
+                if isinstance(first, ast.Attribute)
+                else getattr(first, "id", "")
+            )
+            if model == "AppSetting":
+                hits.append(f"{node.lineno}: sa.{called}(AppSetting)")
+                continue
+
+        # 3. the table, reached around the *process* — atrium's admin
+        #    endpoint. A test that PUTs here changes the same row from
+        #    the api container, where no in-process lock can see it.
+        if called in _HTTP_WRITE_CALLS:
+            for arg in [*node.args, *(kw.value for kw in node.keywords)]:
+                if (
+                    isinstance(arg, ast.Constant)
+                    and isinstance(arg.value, str)
+                    and _APP_CONFIG_PATH in arg.value
+                ):
+                    hits.append(f"{node.lineno}: HTTP {called} {arg.value!r}")
+                    break
+    return hits
+
+
+def _app_settings_writes(path: pathlib.Path) -> list[str]:
+    return _app_settings_writes_in(path.read_text(encoding="utf-8"), str(path))
+
+
+def test_the_shared_config_row_has_exactly_one_writer() -> None:
+    """#117's negative result, kept rather than re-derived.
+
+    ``app_settings['atrium_ddns']`` is **one row per compose project**.
+    It is the only thing this suite touches that carries no
+    ``PYTEST_XDIST_WORKER`` suffix, and it cannot carry one: the key is
+    a production constant and two of its readers are the api and worker
+    *containers*, which no in-process patch reaches.
+
+    Measured on the tip before this guard existed, from the database
+    server's general log over one full run: **16 connections read the
+    row 277 times, and 2 — both on the one xdist worker running
+    ``test_worker_jobs.py`` — wrote it 62 times, unlocked.** The
+    readers are not the three files that spell ``load_config``: nine
+    endpoints call it and 98 test functions across 10 files drive one
+    of those endpoints without naming the config at all.
+
+    So the invariant is *one owner*, and the owner is ``conftest``. Any
+    other file writing this table is the state in which a value one
+    worker set is visible to another — which is the mechanism behind
+    ``test_router_events``'s ``assert 30 == 90``.
+
+    The vacuity check is the second assertion: this matcher has to find
+    ``conftest``'s own writes, or "nobody writes it" is what a broken
+    matcher also prints.
+    """
+    writers = {
+        path.name: hits
+        for path in [*_test_modules(), CONFTEST]
+        if (hits := _app_settings_writes(path))
+    }
+
+    # Vacuity, in three parts, because "nobody writes it" is also what a
+    # broken matcher prints.
+    own = writers.get("conftest.py", [])
+    assert own, (
+        "the matcher found no app_settings write in conftest.py, which owns "
+        "the row. The census below is vacuous, not clean"
+    )
+    assert any("put_namespace" in hit for hit in own), (
+        f"the put_namespace shape matched nothing in conftest.py: {own}"
+    )
+    assert any("AppSetting" in hit for hit in own), (
+        f"the AppSetting-construct shape matched nothing in conftest.py: {own}"
+    )
+    # The third shape has no instance in this suite — nothing here PUTs
+    # to atrium's admin endpoint — so it is exercised against a snippet
+    # rather than left as a branch that has never run. A matcher whose
+    # only evidence is that it found nothing is not a matcher.
+    synthetic = _app_settings_writes_in(
+        'async def f(client):\n'
+        '    await client.put("/api/admin/app-config/atrium_ddns", json={})\n',
+        "<synthetic>",
+    )
+    assert len(synthetic) == 1 and "HTTP put" in synthetic[0], (
+        "the admin-endpoint shape does not match the call it exists for; a "
+        f"test could PUT the row past this census. matcher said {synthetic}"
+    )
+
+    others = {name: hits for name, hits in writers.items() if name != "conftest.py"}
+    assert not others, (
+        "app_settings has exactly one owner — conftest — and these files "
+        "write it too:\n  "
+        + "\n  ".join(f"{name} {hits}" for name, hits in sorted(others.items()))
+        + "\nThe row is shared by every xdist worker AND by the api and worker "
+        "containers, so a write here is visible to tests that never mention "
+        "it. Take conftest's `ddns_config` fixture instead — see #117."
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_config_baseline_is_applied_in_this_process(ddns_config) -> None:
+    """The pin, asked of the database rather than of the code.
+
+    #117's item 3: *make it fail loudly if it stops holding*. The static
+    guard above says nothing else writes the row; this says the row is
+    actually there, with the sweep actually off, at the moment a test is
+    running. A pin that silently stopped being applied reads exactly
+    like a pin that is working — which is how the previous arrangement
+    survived, its teardown deleting the row while the suite stayed
+    green.
+
+    Reachable in the AST and unreachable in the process is the same
+    distinction ``test_the_unattributed_sweep_is_installed_in_this_process``
+    draws one section up, and this is that distinction pointed at a row
+    instead of at a listener.
+
+    It takes ``ddns_config`` and writes nothing through it. That is not
+    ceremony: without the lock this guard would run on one worker while
+    ``test_worker_jobs.py`` legitimately holds the row at
+    ``event_retention_days=90`` on another, and a guard that
+    false-alarms on correct behaviour is deleted rather than
+    investigated. Holding the lock is what makes "the row is the
+    baseline" a statement that can be true.
+    """
+    import conftest
+
+    row = await conftest.read_ddns_config_row()
+    assert row is not None, (
+        "the atrium_ddns app_settings row is ABSENT while a test is running. "
+        "Absent is not neutral: get_namespace falls back to DdnsConfig(), "
+        "where health_check_enabled is True, so the worker container is armed "
+        "to sweep cross-tenant over rows this suite is asserting on. "
+        "conftest._pin_ddns_config is meant to hold it present for the whole "
+        "session"
+    )
+    assert row.get("health_check_enabled") is False, (
+        "the shared config row is present but health_check_enabled is "
+        f"{row.get('health_check_enabled')!r}, so the worker container's 60 s "
+        "tick will sweep this suite's hostnames cross-tenant"
+    )
+    assert row == conftest.ddns_config_baseline().model_dump(mode="json"), (
+        "the shared config row is present but is not the baseline:\n"
+        f"  expected {conftest.ddns_config_baseline().model_dump(mode='json')!r}\n"
+        f"  found    {row!r}\n"
+        "Some test left it moved, and every reader since has been reading "
+        "that value"
+    )

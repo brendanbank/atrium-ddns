@@ -153,14 +153,18 @@ from __future__ import annotations
 
 import functools
 import os
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import asynccontextmanager, contextmanager
+from typing import Any
 
 import pytest_asyncio
 import sqlalchemy as sa
 from app.db import get_engine, get_session_factory
 from app.models.auth import User
+from app.models.ops import AppSetting
+from app.services.app_config import put_namespace
 from atrium_ddns.models import DnsEvent
+from atrium_ddns.worker_jobs import CONFIG_NAMESPACE, DdnsConfig
 from sqlalchemy.ext.asyncio import AsyncSession
 
 #: This worker's namespace. Ten workers share one MySQL, so anything a
@@ -177,6 +181,13 @@ FIXTURE_LOCK = "atrium_ddns_fixture_writes"
 #: loaded box does not trip it, short enough that a re-entrancy bug
 #: fails the run instead of looking like a hang.
 FIXTURE_LOCK_TIMEOUT = 30
+
+#: The advisory lock the shared ``atrium_ddns`` config row is owned
+#: under. Deliberately **not** :data:`FIXTURE_LOCK`: tenant setup and
+#: config ownership have different lifetimes (one statement versus one
+#: whole test), and sharing a lock between them would serialise the
+#: entire suite behind the config-taking tests.
+DDNS_CONFIG_LOCK = "atrium_ddns_config_row"
 
 #: Set while this process holds the lock. Taking it twice from one
 #: worker would wait on a lock the same worker holds — on a *different*
@@ -536,3 +547,278 @@ async def _sweep_unattributed_events() -> AsyncIterator[None]:
     with record_unattributed_events() as ids:
         yield
         await purge_unattributed_events(ids, owner=f"conftest.sweep[{WORKER}]")
+
+
+# ===================================================================== #
+# #117 — the one row nothing could namespace
+# ===================================================================== #
+#
+# Everything else this suite creates carries ``PYTEST_XDIST_WORKER``.
+# ``app_settings['atrium_ddns']`` cannot: it is **one row per compose
+# project**, the key is a production constant, and the readers include
+# two processes pytest does not own — the api container serving the
+# tests' own HTTP calls, and the worker container running the health
+# check and the retention prune on a 60 s / 3600 s tick.
+#
+# So it cannot be namespaced and it cannot be monkeypatched (an
+# in-process patch is invisible to the other two containers). What is
+# left is to give it exactly one owner, a state it is always in, and a
+# lock for the moments it is not.
+#
+# What was measured before this existed, on this box, over one full
+# ``make test-backend`` (853 tests, 10.6 s):
+#
+# * the row was **ABSENT for 91.8 % of the run** (458 of 499 samples,
+#   taken by the database server itself at 20 ms). Absent means
+#   ``get_namespace`` falls back to ``DdnsConfig()``, where
+#   ``health_check_enabled`` is **True** — so the worker container was
+#   armed to sweep cross-tenant for nine seconds in ten;
+# * 16 distinct MySQL connections **read** the row 277 times; 2 of them
+#   — both on the single xdist worker running ``test_worker_jobs.py`` —
+#   **wrote** it 62 times (36 upserts, 26 deletes). Counted from the
+#   server's own general log, not from the code;
+# * the readers are not the three files that spell ``load_config``.
+#   Nine HTTP endpoints call it (``/board``, ``/devices``, ``/events``,
+#   ``/hostnames/{id}/update``, ``/health-checks/run``, …) plus
+#   ``router_nic._admit``, and **98 test functions across 10 files**
+#   drive one of them without naming the config at all. A name-based
+#   sweep sees three files; the population is ten.
+#
+# The teardown that produced the 91.8 % was correct on its own terms:
+# it restored what it read on entry, and on a fresh database it read
+# nothing. **"Faithful to what was found" and "safe" are different
+# properties here, and #117 asks which one to pick.** Absence is the
+# faithful answer and it is the one state in which a second process
+# behaves differently from every in-process reader, so it is the wrong
+# thing to restore to. The baseline below is present, explicit, and
+# identical to ``DdnsConfig()`` except for the single field that arms
+# another container.
+#
+# What this does NOT claim. The armed sweep was measured writing into
+# the suite's own rows — with the worker tick amplified from 60 s to
+# 1 s, 51 substantive sweeps and 277 ``health_check.transition`` lines
+# across 15 full runs — and the suite stayed green 15/15, with
+# ``test_router_health_checks.py`` 25/25. So this closes a live race
+# and a real cross-container write; it is **not** an explanation of
+# ``test_worker_jobs.py``'s two non-reproducing failures, which remain
+# unexplained. See #117.
+
+#: Set while this process owns the shared config row, for the same
+#: reason :data:`_HELD_BY` exists: the lock is held on its own
+#: connection, so a second acquisition from the same worker would wait
+#: on a lock that worker already holds and read as a hang.
+_CONFIG_HELD_BY: str | None = None
+
+
+def ddns_config_baseline() -> DdnsConfig:
+    """The state the shared row is in whenever no test owns it.
+
+    ``DdnsConfig()``'s defaults with ``health_check_enabled=False`` and
+    nothing else moved — so every value an endpoint reads through
+    ``load_config`` is the model default a reader would expect, and the
+    one field that makes another *container* act is off for the whole
+    session rather than for 8 % of it.
+    """
+    return DdnsConfig(health_check_enabled=False)
+
+
+async def read_ddns_config_row() -> dict[str, Any] | None:
+    """The row as MySQL holds it, or ``None`` when it does not exist.
+
+    ``None`` and ``{}`` are different states and this returns the
+    difference: absent is what arms the worker container, and folding it
+    into an empty config would hide exactly the condition this section
+    exists to prevent.
+    """
+    factory = get_session_factory()
+    async with factory() as s:
+        return (
+            await s.execute(
+                sa.select(AppSetting.value).where(AppSetting.key == CONFIG_NAMESPACE)
+            )
+        ).scalar_one_or_none()
+
+
+async def write_ddns_config(cfg: DdnsConfig) -> None:
+    """Write the namespace through the path the app itself writes it.
+
+    ``put_namespace`` rather than a hand-built ``INSERT … ON DUPLICATE
+    KEY``: it validates against the registered model, so a test pinning
+    a field the model dropped fails here instead of storing a value
+    nothing will ever read back.
+    """
+    factory = get_session_factory()
+    async with factory() as s:
+        await put_namespace(s, CONFIG_NAMESPACE, cfg.model_dump(mode="json"))
+
+
+async def remove_ddns_config_row() -> None:
+    """Delete the row, for the one test whose subject is its absence.
+
+    ``test_get_namespace_answers_with_the_defaults_when_nothing_is_seeded``
+    has to see the row gone. Routed through here rather than spelled in
+    that module so the census in ``test_harness_guards`` can still say
+    *exactly one file writes this row*; the caller holds
+    :data:`DDNS_CONFIG_LOCK` for the duration and :func:`ddns_config`
+    puts the baseline back.
+    """
+    factory = get_session_factory()
+    async with factory() as s:
+        await s.execute(sa.delete(AppSetting).where(AppSetting.key == CONFIG_NAMESPACE))
+        await s.commit()
+
+
+@asynccontextmanager
+async def ddns_config_lock(owner: str = "?") -> AsyncIterator[None]:
+    """Exclusive ownership of the shared row, across every xdist worker.
+
+    Same mechanism as :func:`fixture_writes` and for a different reason:
+    that one prevents a deadlock between concurrent INSERTs, this one
+    prevents a *reader on another worker* seeing a value a writer is
+    about to take away. #108's agent measured that race —
+    ``test_worker_jobs.py`` writes ``event_retention_days=90``,
+    ``test_router_events.py`` reads it back through the API, and
+    ``--dist=loadfile`` puts them on different workers — as
+    ``assert 30 == 90``, one gate run in two.
+
+    **Lock order is config-then-fixture, never the reverse.** Nothing in
+    :func:`fixture_writes` or :func:`purge_tenants` touches this row, so
+    there is no cycle today; the second refusal below is what keeps it
+    that way, because a cycle between two 30-second named locks presents
+    as a hung suite with no failing test to name.
+    """
+    global _CONFIG_HELD_BY
+    if _CONFIG_HELD_BY is not None:
+        raise RuntimeError(
+            f"ddns_config_lock({owner!r}) nested inside "
+            f"ddns_config_lock({_CONFIG_HELD_BY!r}). The lock is held on a "
+            f"second connection, so this would block for "
+            f"{FIXTURE_LOCK_TIMEOUT}s and then fail."
+        )
+    if _HELD_BY is not None:
+        raise RuntimeError(
+            f"ddns_config_lock({owner!r}) taken inside "
+            f"fixture_writes({_HELD_BY!r}). Lock order is config-then-fixture; "
+            "the reverse order on any worker makes a deadlock between the two "
+            "named locks reachable, and it would present as a hang."
+        )
+
+    engine = get_engine()
+    async with engine.connect() as guard:
+        got = (
+            await guard.execute(
+                sa.text("SELECT GET_LOCK(:name, :timeout)"),
+                {"name": DDNS_CONFIG_LOCK, "timeout": FIXTURE_LOCK_TIMEOUT},
+            )
+        ).scalar()
+        if got != 1:
+            raise RuntimeError(
+                f"GET_LOCK({DDNS_CONFIG_LOCK!r}, {FIXTURE_LOCK_TIMEOUT}) returned "
+                f"{got!r} for {owner!r} — 0 is a timeout, NULL is an error. Not "
+                "proceeding unguarded: an unguarded write to this row is visible "
+                "to every other worker and to the api and worker containers."
+            )
+        _CONFIG_HELD_BY = owner
+        try:
+            yield
+        finally:
+            _CONFIG_HELD_BY = None
+            await guard.execute(
+                sa.text("SELECT RELEASE_LOCK(:name)"), {"name": DDNS_CONFIG_LOCK}
+            )
+
+
+@harness_guard
+@pytest_asyncio.fixture(scope="session", autouse=True)
+async def _pin_ddns_config() -> AsyncIterator[None]:
+    """Put the shared row on its baseline, and refuse a session that
+    ends with it anywhere else.
+
+    Autouse and session-scoped because the property is about the whole
+    run: between tests, during tests that never heard of the config, and
+    while a container three processes away is on its own clock, the row
+    must be present and the sweep must be off. Every worker seeds the
+    same value under the lock, so ten sessions starting at once is ten
+    idempotent writes rather than a lost update.
+
+    **The exit check is the part that fails loudly.** A pin that
+    silently stops being applied reads exactly like a pin that is
+    working, and that is how the previous arrangement survived: its
+    teardown deleted the row and the suite went on passing. This one
+    takes the lock — so no other worker can be mid-test — and compares
+    the row against the baseline, naming both sides. A fixture that
+    starts restoring to absence again fails here, on the worker that did
+    it, at the end of the session.
+    """
+    baseline = ddns_config_baseline()
+    expected = baseline.model_dump(mode="json")
+
+    async with ddns_config_lock(owner=f"conftest.baseline[{WORKER}]"):
+        await write_ddns_config(baseline)
+        seeded = await read_ddns_config_row()
+        if seeded != expected:
+            raise AssertionError(
+                f"the {CONFIG_NAMESPACE} baseline did not stick on {WORKER}. "
+                f"wrote {expected!r}, read back {seeded!r}. Absent means the "
+                "worker container falls back to health_check_enabled=True and "
+                "sweeps cross-tenant for the length of the run."
+            )
+
+    yield
+
+    async with ddns_config_lock(owner=f"conftest.baseline-exit[{WORKER}]"):
+        final = await read_ddns_config_row()
+    if final != expected:
+        raise AssertionError(
+            f"the shared {CONFIG_NAMESPACE} row was left off its baseline at "
+            f"the end of {WORKER}'s session.\n"
+            f"  expected {expected!r}\n"
+            f"  found    {final!r}\n"
+            "Something wrote this row without going through the ddns_config "
+            "fixture, or restored it to absence. Absence is the state that "
+            "arms the worker container's cross-tenant sweep — see #117."
+        )
+
+
+@pytest_asyncio.fixture
+async def ddns_config(
+    request: Any,
+) -> AsyncIterator[Callable[[DdnsConfig], Awaitable[None]]]:
+    """Own the shared ``atrium_ddns`` row for one test, then put it back.
+
+    Yields the writer, so a test that needs a particular value spells
+    it: ``await ddns_config(DdnsConfig(event_retention_days=7))``. A
+    test that only needs the row to hold still takes the fixture and
+    calls nothing.
+
+    Three properties, and the middle one is the fix:
+
+    * **entry is checked, not assumed.** The row must already be the
+      baseline. If it is not, an earlier test left it moved and every
+      reader since has been reading somebody else's value — the failure
+      this fixture exists to make impossible, so it is raised here
+      rather than absorbed;
+    * **the lock is held for the whole test**, not for the write. The
+      race is between a writer on one worker and a *reader* on another,
+      and a lock released at the write would still let the reader land
+      between the write and the restore;
+    * **teardown restores the baseline, not the entry state.** Restoring
+      "what was there" is what deleted the row for 92 % of every run.
+    """
+    baseline = ddns_config_baseline()
+    expected = baseline.model_dump(mode="json")
+    owner = f"ddns_config[{getattr(request.node, 'nodeid', '?')}]"
+
+    async with ddns_config_lock(owner=owner):
+        on_entry = await read_ddns_config_row()
+        if on_entry != expected:
+            raise AssertionError(
+                f"{CONFIG_NAMESPACE} was not on its baseline when {owner} took "
+                f"the lock.\n  expected {expected!r}\n  found    {on_entry!r}\n"
+                "The row has one owner (this fixture); a value here that is not "
+                "the baseline means something else wrote it."
+            )
+        try:
+            yield write_ddns_config
+        finally:
+            await write_ddns_config(baseline)

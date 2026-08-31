@@ -1372,19 +1372,46 @@ async def test_the_limit_ceiling_refuses_rather_than_clamps(
 @pytest.mark.asyncio
 async def test_the_retention_window_comes_from_the_config(
     tenants: dict[str, Any],
+    ddns_config: Any,
 ) -> None:
     """The UI's "the log holds the last N days" is read, never typed.
 
-    Compared against ``load_config`` rather than against the literal
-    30: an operator who changes ``event_retention_days`` must not be
-    able to make that sentence wrong, and a test asserting ``== 30``
-    would keep passing while the panel lied.
+    An operator who changes ``event_retention_days`` must not be able to
+    make that sentence wrong, and a test asserting ``== 30`` would keep
+    passing while the panel lied.
+
+    Two things this used to get wrong, both fixed by owning the row
+    rather than reading it twice (#117).
+
+    **It was flaky.** It read ``load_config`` and then the endpoint, and
+    compared the two. ``test_worker_jobs.py`` writes
+    ``event_retention_days=90`` into the same un-namespaced row and
+    ``--dist=loadfile`` puts that file on another worker, so a write
+    landing between the two reads produced ``assert 30 == 90`` — one
+    gate run in two, measured by #108's agent. ``ddns_config`` holds a
+    cross-worker lock for the length of this test, so there is no
+    "between".
+
+    **It was also vacuous.** With nothing seeded, ``load_config``
+    returns the model default and so does the endpoint — 30 == 30 — and
+    a handler that had hardcoded ``retention_days=30`` would have passed
+    every time except during the race that broke it. So the window is
+    pinned to a value that is *not* the default, and the vacuity guard
+    below says so rather than leaving it to be re-derived.
     """
     a = tenants["a"]
+
+    pinned = 47
+    assert pinned != wj.DdnsConfig().event_retention_days, (
+        "the pinned window has become the model default; this test would then "
+        "pass against a handler that ignores the config entirely"
+    )
+    await ddns_config(wj.DdnsConfig(health_check_enabled=False, event_retention_days=pinned))
+
     factory = get_session_factory()
     async with factory() as s:
-        expected = (await wj.load_config(s)).event_retention_days
-    assert (await _events(a["user"])).json()["retention_days"] == expected
+        assert (await wj.load_config(s)).event_retention_days == pinned
+    assert (await _events(a["user"])).json()["retention_days"] == pinned
 
 
 @pytest.mark.asyncio
