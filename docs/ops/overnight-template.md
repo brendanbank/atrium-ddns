@@ -51,8 +51,22 @@ pnpm test                          # vitest — 200 passed (17 files)
 cd .. && make up && make migrate    # both alembic chains to head
 make test-backend                  # host tests 833 passed + compat 31 passed, 3 skipped
 make smoke PASS=<pw> EMAIL=<addr>  # scripts/smoke.sh — 11 passed (11)
-make test-e2e                      # Playwright — 20 passed (7 spec files)
 ```
+
+**`make test-e2e` is NOT in the per-issue gate.** Operator decision, V1M7. It
+runs **once**, on the release PR from `<MILESTONE_BRANCH>` into `<TRUNK>` —
+where GitHub CI runs it anyway, because the workflow fires on PRs into
+`master` and carries an `e2e` job. Running it per issue is therefore not an
+extra opinion, it is the same opinion paid for N times.
+
+The cost is not the specs — 20 of them run in ~40s. It is that every
+invocation stands a stack up first: `e2e-up` builds the image,
+force-recreates api and worker, runs both alembic chains, seeds the admin and
+the bundle, and checks bundle freshness. Per issue, per agent, per re-run.
+
+If your change is one an e2e spec could plausibly catch — a route, a nav
+item, the host bundle contract, anything that renders — **say so in the PR
+body** so the milestone merge knows where to look. Do not run it yourself.
 
 **Re-measured 2026-08-31 on the V1M7 tip.** The figures above were the
 2026-08-15 scaffold's and had drifted badly — vitest read `2 passed` against a
@@ -751,8 +765,10 @@ so with the file and the mechanism rather than silently escalating.
 |---|---|---|
 | **1 — none** | only docs, `.gitignore`, CI yaml, `scripts/` not imported by the app | `git diff --stat` proving no code path, plus the direct proof of the behaviour changed. **No stack.** |
 | **2 — backend** | `backend/`, `tests/`, python under `scripts/` | `make test-backend` + `make smoke`. **No `pnpm`, no e2e.** |
-| **3 — frontend** | `frontend/src/` | `pnpm typecheck`, `pnpm test`, `make test-e2e` |
-| **4 — cross-cutting** | routes, migrations, the host bundle contract, anything in two of the above | everything |
+| **3 — frontend** | `frontend/src/` | `pnpm typecheck`, `pnpm test` |
+| **4 — cross-cutting** | routes, migrations, the host bundle contract, anything in two of the above | tiers 2 + 3 together |
+
+No tier includes e2e. It is a milestone-merge step, not a per-issue one.
 
 Tier 1 is not a skipped gate, and the PR body must not read like one. It is
 `git diff --stat` showing the change cannot reach a test, plus the proof that
@@ -1228,7 +1244,13 @@ When every issue in the milestone is closed:
 5. **Re-run at close-out rather than quoting the reading on file** — the estate
    moves. One re-run found a *third* gap that had not existed when the criterion
    was first demonstrated.
-6. Open a release PR from `<MILESTONE_BRANCH>` into `<TRUNK>`, merge, and close
+6. **Run the e2e suite once, here.** It is deliberately absent from the
+   per-issue gate, so the release PR is the first and only time the browser
+   sees the milestone's combined work. Opening the PR into `<TRUNK>` also
+   triggers CI's own `e2e` job, which is a second instrument on the same
+   question — report both, and treat a disagreement between them as the
+   finding rather than as noise.
+7. Open a release PR from `<MILESTONE_BRANCH>` into `<TRUNK>`, merge, and close
    the milestone.
 7. **Leave the milestone open if a clause is genuinely time-bound.** Closing an
    epic whose own AC says "exit criterion met" when it is not is the failure this
