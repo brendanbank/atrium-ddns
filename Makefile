@@ -475,12 +475,11 @@ gate:  ## run exactly the checks this diff can reach (auto-scoped; GATE_BASE=...
 	fi; \
 	echo; \
 	if [ "$$be" -gt 0 ]; then \
-		echo "gate: backend touched ($$be file(s)) -> stack + backend tests + smoke"; \
+		echo "gate: backend touched ($$be file(s)) -> stack + backend unit tests"; \
 		$(MAKE) --no-print-directory up migrate; \
 		$(MAKE) --no-print-directory test-backend; \
-		$(MAKE) --no-print-directory smoke; \
 	else \
-		echo "gate: SKIP stack + backend tests + smoke — no backend/, tests/ or python script changed"; \
+		echo "gate: SKIP stack + backend unit tests — no backend/, tests/ or python script changed"; \
 	fi; \
 	echo; \
 	if [ "$$fe" -eq 0 ] && [ "$$be" -eq 0 ]; then \

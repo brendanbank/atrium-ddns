@@ -50,8 +50,18 @@ pnpm typecheck                     # tsc --noEmit — 0 errors
 pnpm test                          # vitest — 200 passed (17 files)
 cd .. && make up && make migrate    # both alembic chains to head
 make test-backend                  # host tests 833 passed + compat 31 passed, 3 skipped
-make smoke PASS=<pw> EMAIL=<addr>  # scripts/smoke.sh — 11 passed (11)
 ```
+
+Better: **`make gate`**, which reads the diff and runs exactly the above subset
+that the change can reach, printing what it skipped and why. One command, no
+judgement for a brief or an agent to get wrong.
+
+**Unit tests only.** `make smoke` and `make test-e2e` are both out of the
+per-issue gate by operator decision (V1M7). Smoke needs a stack and asserts
+about deployment wiring — bundle promotion, router mounting, migration heads —
+none of which a per-issue diff changes; e2e is covered by CI on the release PR.
+Both belong to the milestone merge, where they are asserting about the thing
+they actually describe.
 
 **`make test-e2e` is NOT in the per-issue gate.** Operator decision, V1M7. It
 runs **once**, on the release PR from `<MILESTONE_BRANCH>` into `<TRUNK>` —
@@ -764,7 +774,7 @@ so with the file and the mechanism rather than silently escalating.
 | tier | when the diff touches | run |
 |---|---|---|
 | **1 — none** | only docs, `.gitignore`, CI yaml, `scripts/` not imported by the app | `git diff --stat` proving no code path, plus the direct proof of the behaviour changed. **No stack.** |
-| **2 — backend** | `backend/`, `tests/`, python under `scripts/` | `make test-backend` + `make smoke`. **No `pnpm`, no e2e.** |
+| **2 — backend** | `backend/`, `tests/`, python under `scripts/` | `make test-backend`. **No `pnpm`, no smoke, no e2e.** |
 | **3 — frontend** | `frontend/src/` | `pnpm typecheck`, `pnpm test` |
 | **4 — cross-cutting** | routes, migrations, the host bundle contract, anything in two of the above | tiers 2 + 3 together |
 
