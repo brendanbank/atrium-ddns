@@ -447,6 +447,50 @@ docker compose exec -T -u 0 api chmod 0644 /tmp/fernet.key   # readable by uid 1
 
 and delete it from the container when the import is done (§ 8).
 
+### 2.7 GATE: `git status` on the deploy host is clean, and `git add -A` is safe
+
+One command, in the checkout on the deploy host, before the window opens:
+
+```bash
+git status --porcelain --untracked-files=all      # expect: no output at all
+```
+
+**Why this is a gate and not housekeeping.** #76: that checkout held a
+`.admin-credential` file — mode 0600, correct, untracked, and matched by no
+pattern in `.gitignore`. So it showed as `??`, and § 5 is the one place in
+the whole runbook where an operator is typing git commands under time
+pressure. A hurried `git add -A` commits it, and the repository is public.
+It was mitigated at the time by appending the name to `.git/info/exclude`,
+which is local to that one checkout and travels to no other host — a
+perfectly good *stopgap*, and the way to tell a stopgap from a fix is that
+a stopgap is invisible to every other clone. The fix is the `#76` block in
+`.gitignore`.
+
+Three things worth knowing before you reach for that block:
+
+* **Nothing in this repository writes that file, and nothing needs to.**
+  `make seed-admin` passes the password to `app.scripts.seed_admin`, which
+  prints its result and performs no filesystem write; `scripts/dev-admin.sh`
+  reads the login out of 1Password and writes nothing either. The file was
+  made by hand — so the patterns cover *families* (`*credential*`, `*.key`,
+  `*.pem`, `*.db`, `*.sql`, `*.bundle`) rather than the one name, because
+  the next hand-made one will be spelled differently.
+* **`make seed-admin` puts the password in your shell history** (README says
+  so, and § 2.5 is where you will be doing it). Clear the history entry
+  afterwards. Do not solve it by writing the password to a file here.
+* **A non-empty `git status` is the finding, not the noise.** If something
+  appears that this block does not cover, it is a file family nobody
+  anticipated: add it to `.gitignore` so the next host inherits the answer
+  rather than the discovery.
+
+If you want the pattern-level reading rather than the behavioural one —
+which of the two spellings actually matched, and whether it would still
+match on this Linux host rather than only on a case-insensitive laptop:
+
+```bash
+git -c core.ignorecase=false check-ignore -v -- <path>
+```
+
 ---
 
 ## 3. ⛔ Copy, never open. Never `immutable`.
@@ -1097,6 +1141,21 @@ rm -rf /tmp/cutover                                # workstation
 
 The copies carry real bcrypt hashes and Fernet ciphertext. They are not the
 archive; § 8.2's are. Verified empty on both sides before the session ends.
+
+And the checkout itself, which § 2.7 gated going in:
+
+```bash
+git status --porcelain --untracked-files=all       # expect: nothing
+```
+
+`.gitignore` covers the loose key, database-copy and dump files this
+sequence produces (#76), so the expected output is empty. **Empty because
+the files are gone is not the same result as empty because they are
+ignored** — `ls` the directory as well, since § 8.2 says the legacy copy is
+kept indefinitely and only § 8.4's *working* copies are deleted. If
+something untracked does appear, it is a file family nobody anticipated:
+add it to `.gitignore` so the next host inherits the answer rather than the
+discovery.
 
 ---
 

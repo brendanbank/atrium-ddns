@@ -1172,3 +1172,41 @@ fussiness and gets dropped by the next person tidying the file — and the two
 warnings in the original version of this template that *were* kept, and *were*
 still walked into, are the reason each is now written as a story rather than an
 instruction.
+
+**A `.git/info/exclude` fix is a fix for exactly one checkout.** #76: a deploy
+directory held a `.admin-credential` file, mode 0600, untracked and matched by
+nothing in `.gitignore`, so `git status` listed it as `??` — during a cutover
+window, which is the one hour an operator is typing git commands under time
+pressure. It was mitigated on that host by appending the name to
+`.git/info/exclude`. That is machine-local: it protected that checkout and no
+other, and it is invisible to anyone reading the repository, so the next host
+inherits the foot-gun and not the answer. The same mistake had already been
+made once and corrected — `.context/` was excluded that way before it was moved
+into `.gitignore`.
+
+Three things the fix taught that a `.gitignore` line alone would not have:
+
+* **Nothing in the repo wrote the file.** `make seed-admin` takes the password
+  on argv and prints; atrium's `app.scripts.seed_admin` performs no filesystem
+  write at all; a repo-wide grep for the name returns zero hits. The issue
+  proposed "display it once instead of persisting it" as the better fix, and
+  there was no writer to change. **The premise was about an operator habit, not
+  about code** — which is precisely why the pattern has to cover a family
+  rather than a filename.
+* **A macOS reading cannot answer this question.** macOS checkouts default to
+  `core.ignorecase=true`, so `git check-ignore` on this workstation matched
+  `.admin-credential` against `/*Credential*` — a pattern that does **not**
+  match it on the Linux deploy host. A laptop reading would have reported the
+  host as covered on the strength of a line that is dead there.
+  `git -c core.ignorecase=false check-ignore -v` is the reading that answers
+  for the host, and it is what the PR body records.
+* **The real find came from a population nobody authored.** The synthetic
+  candidate list is written by the same person as the fix, so agreement
+  between them proves little. Sweeping the *actual* untracked files across
+  all 41 real checkouts of this repo on the workstation — 123 distinct paths
+  — turned up six that no synthetic list had suggested and that the old
+  `.gitignore` left stageable: a copy of the legacy SQLite database and its
+  `-wal` / `-shm` siblings, mode 0644, carrying `users.password_hash` and
+  `users.totp_secret`. **The defect the issue described on the deploy host was
+  also sitting on the workstation, in a different file family.** An accidental
+  find is not a sampling method; sweep a population you did not write.
