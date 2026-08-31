@@ -23,6 +23,27 @@ name: CI
 # release if either stops being true — so widening the triggers will not
 # silently start billing CI for every staging iteration, it will stop dev
 # releases with a message pointing here. Update that doc in the same change.
+#
+# ## "But then who notices a red milestone tip?"
+#
+# `scripts/merge-tip-check.sh` does, locally, after each merge — and the
+# question is not hypothetical. `v1m4-migration-cutover` went red at the merge
+# 4ff2da4 and stayed red across two further merges, because both parents were
+# green, no PR could have caught the combination, and nothing ran the gate on
+# the tip (#78, #84). The check runs the same backend commands this workflow
+# runs, against the merge tree instead of against a branch, in about 40s when
+# it is green; when it is red it replays the parents and says whether the
+# merge caused it or inherited it, because the natural misreading of a red tip
+# is "the last PR broke it" and in #78's case the last PR had not touched the
+# files. See `docs/ops/overnight-template.md` § "After the merge".
+#
+# It is deliberately NOT a job in this file. Answering #84 by adding a
+# milestone-branch trigger would cost minutes of runner time per merge to
+# reach a conclusion a local run reaches in seconds, would need the
+# Docker-dependent half of the gate in a runner, and would reinstate the
+# second quality bar the paragraphs above exist to prevent. Clause 6 of V1M7's
+# exit criterion asks that a red tip cannot go unnoticed, not that CI notices
+# it. The triggers below are therefore unchanged, byte for byte.
 on:
   pull_request:
     branches: [master]
