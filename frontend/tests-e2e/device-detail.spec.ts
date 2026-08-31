@@ -124,11 +124,15 @@ test.describe('the device detail route', () => {
     const detailHref = (await page
       .getByTestId(`open-${original}`)
       .getAttribute('href')) as string;
-    expect(detailHref).toMatch(new RegExp(`${DEVICES_PATH}/\\d+$`));
+    expect(detailHref).toMatch(new RegExp(`${DEVICES_PATH}\\?device=\\d+$`));
     await page.goto(detailHref);
-    await expect(page).toHaveURL(new RegExp(`${DEVICES_PATH}/\\d+$`));
-    await expect(page.getByTestId('device-name')).toHaveText(original);
-    await expect(page.getByTestId('detail-username')).toHaveText(
+    await expect(page).toHaveURL(new RegExp(`${DEVICES_PATH}\\?device=\\d+$`));
+    await expect(page.getByTestId('device-name-input')).toHaveValue(original);
+    // The cell carries a "Username:" prefix now — on a line that also
+    // says "seen" and "created", the bare `ddns-…` string was the one
+    // item that did not say what it was. Contains, not equals, so the
+    // label can be reworded without failing a test about the value.
+    await expect(page.getByTestId('detail-username')).toContainText(
       created.username,
     );
 
@@ -136,19 +140,22 @@ test.describe('the device detail route', () => {
     // overlay. §17 is about how the card is *reached*; it does not move
     // this field into a modal of its own, which would hide the string
     // being renamed while it is renamed.
-    await page.getByTestId('device-rename').click();
     await expect(page.getByTestId('device-name-input')).toBeVisible();
-    await expect(page.locator('[role="dialog"]')).toHaveCount(0);
+    // **One** dialog, not none. The card itself is a modal now —
+    // `?device=` opens it over the list — so "no overlay" is the
+    // wrong assertion. What still has to hold is that renaming does
+    // not open a *second* one over the name being renamed.
+    await expect(page.locator('[role="dialog"]')).toHaveCount(1);
 
     const renamed = `renamed-${suffix}`;
     await page.getByTestId('device-name-input').fill(renamed);
     await page.getByTestId('device-name-save').click();
-    await expect(page.getByTestId('device-name')).toHaveText(renamed);
+    await expect(page.getByTestId('device-name-input')).toHaveValue(renamed);
 
     // Linkable, and it survives a reload — the first of §12's three
     // things a drawer cannot do.
     await page.reload();
-    await expect(page.getByTestId('device-name')).toHaveText(renamed);
+    await expect(page.getByTestId('device-name-input')).toHaveValue(renamed);
 
     // Back works — the second.
     await page.goBack();
@@ -203,7 +210,6 @@ test.describe('the device detail route', () => {
 
     await page.goto(DEVICES_PATH);
     await page.getByTestId(`open-${mover}`).click();
-    await page.getByTestId('device-rename').click();
     await page.getByTestId('device-name-input').fill(taken);
     await page.getByTestId('device-name-save').click();
 
@@ -241,14 +247,13 @@ test.describe('the device detail route', () => {
 
     await secondPage.goto(DEVICES_PATH);
     await secondPage.getByTestId(`open-${mine}`).click();
-    await secondPage.getByTestId('device-rename').click();
     await secondPage.getByTestId('device-name-input').fill(shared);
     await secondPage.getByTestId('device-name-save').click();
 
     // Succeeds. A test that only checked "a duplicate is a 409" would
     // pass identically against an installation-wide constraint, which
     // would let one tenant's naming choices refuse another's.
-    await expect(secondPage.getByTestId('device-name')).toHaveText(shared);
+    await expect(secondPage.getByTestId('device-name-input')).toHaveValue(shared);
     await expect(secondPage.getByTestId('device-name-refusal')).toHaveCount(0);
 
     await first.close();
@@ -297,8 +302,8 @@ test.describe('the device detail route', () => {
     const { deviceId } = await attachName(page, deviceName, zone, suffix);
 
     await page.setViewportSize({ width: 1440, height: 1000 });
-    await page.goto(`${DEVICES_PATH}/${deviceId}`);
-    await expect(page.getByTestId('device-name')).toHaveText(deviceName);
+    await page.goto(`${DEVICES_PATH}?device=${deviceId}`);
+    await expect(page.getByTestId('device-name-input')).toHaveValue(deviceName);
 
     // The name block reaches the route. This zone has no provider, so
     // §10.1's state applies and the block says *nothing published yet —
@@ -384,8 +389,8 @@ test.describe('the device detail route', () => {
     expect((await published.text()).trim()).toMatch(/^(good|nochg)\b/);
 
     await page.setViewportSize({ width: 1440, height: 1000 });
-    await page.goto(`${DEVICES_PATH}/${deviceId}`);
-    await expect(page.getByTestId('device-name')).toHaveText(deviceName);
+    await page.goto(`${DEVICES_PATH}?device=${deviceId}`);
+    await expect(page.getByTestId('device-name-input')).toHaveValue(deviceName);
 
     // The signature element, on the detail route, for the first time in
     // this repository's history in a browser. Either shape counts — a

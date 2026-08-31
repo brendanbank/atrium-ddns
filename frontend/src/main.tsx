@@ -18,10 +18,8 @@ import {
   IconAdjustments,
   IconHandStop,
   IconHelp,
-  IconKey,
   IconListSearch,
   IconRouter,
-  IconTag,
   IconWorld,
 } from '@tabler/icons-react';
 import {
@@ -30,9 +28,7 @@ import {
 } from '@brendanbank/atrium-host-bundle-utils';
 
 import { AtriumDdnsAdminTab } from './AtriumDdnsAdminTab';
-import { AtriumDdnsPage } from './AtriumDdnsPage';
 import { AtriumDdnsProfileItem } from './AtriumDdnsProfileItem';
-import { AtriumDdnsWidget } from './AtriumDdnsWidget';
 import { DeviceBoardPage } from './DeviceBoardPage';
 import { DeviceDetailPage } from './DeviceDetailPage';
 import { DevicesPage } from './DevicesPage';
@@ -88,20 +84,41 @@ if (!reg || !AtriumReact) {
     '[atrium-ddns] window.__ATRIUM_REGISTRY__ or window.React missing — atrium SPA must mount before the host bundle loads',
   );
 } else {
+  // Atrium's `/` renders `HomePage`, which renders host home widgets
+  // and hides its own greeting once any host registers one. So this
+  // widget IS how a host replaces the landing page — there is no
+  // setting for it, and nothing a backend rebuild would change.
   reg.registerHomeWidget({
     key: 'atrium-ddns-widget',
-    render: () => makeWrapperElement(<AtriumDdnsWidget />),
+    render: () => makeWrapperElement(<DeviceBoardPage />),
+    // `full` so the board owns the width. Atrium wraps a widget in a
+    // 680px Container by default, and the table needs the shell's
+    // whole 1168px — see `ui-design.md` §3.
+    width: 'full',
   });
+  // The root **is** the board. It was a scaffold landing page, so
+  // the surface the product exists for was one click in, and the
+  // first thing a tenant saw was a page about the app rather than
+  // about their names.
   reg.registerRoute({
     key: 'atrium-ddns-page',
     path: '/atrium-ddns',
-    render: () => makeWrapperElement(<AtriumDdnsPage />),
+    render: () => makeWrapperElement(<DeviceBoardPage />),
   });
   reg.registerNavItem({
-    key: 'atrium-ddns-nav',
-    label: 'Atrium Ddns',
+    key: 'atrium-ddns-board-nav',
+    // Named for what it shows, not for the app: it is the board now,
+    // and "Atrium Ddns" inside Atrium Ddns told a reader nothing. One
+    // entry, not three — the separate Devices and Names items are gone,
+    // because the board is both of those lists joined.
+    // The bundle root, which renders the board. `BOARD_PATH` still
+    // resolves and renders the same page — it is simply not where the
+    // sidebar sends you, because the board is the landing surface and a
+    // sidebar entry pointing one level deeper than the home page makes
+    // two addresses for one place and highlights neither.
+    label: 'Devices and names',
     to: '/atrium-ddns',
-    icon: AtriumReact.createElement(IconHandStop, { size: 18 }),
+    icon: AtriumReact.createElement(IconRouter, { size: 18 }),
   });
   // The primary surface. Deliberately not permission-gated at the
   // registry level: `registerNavItem` has no `perm`, and the page's own
@@ -113,13 +130,7 @@ if (!reg || !AtriumReact) {
     path: BOARD_PATH,
     render: () => makeWrapperElement(<DeviceBoardPage />),
   });
-  reg.registerNavItem({
-    key: 'atrium-ddns-board-nav',
-    label: 'Devices and names',
-    to: BOARD_PATH,
-    icon: AtriumReact.createElement(IconRouter, { size: 18 }),
-  });
-  // #45's tenant CRUD, registered in the same shape and gated the same
+    // #45's tenant CRUD, registered in the same shape and gated the same
   // way: no `perm` on the nav item, because each page's own gate
   // renders a *refusal* rather than an empty list. Hiding the nav item
   // would turn "you may not manage these" into "these do not exist".
@@ -134,34 +145,23 @@ if (!reg || !AtriumReact) {
     to: DOMAINS_PATH,
     icon: AtriumReact.createElement(IconWorld, { size: 18 }),
   });
-  // #88's zone detail — design Part II §10.2, and §12 for why it is a
-  // route rather than a drawer: a resolution strip needs 592px, atrium's
-  // shell gives 1168px, a 360/800 split leaves ~790px and Mantine's `lg`
-  // drawer is 620px. The drawer is the one below the one-strip minimum,
-  // so the signature element would wrap inside its own detail view.
+  // #45's devices list. **No nav item**: the board is the list now, and
+  // a second sidebar entry to a second table of the same devices was one
+  // of the two the operator asked to remove. Still a route, because the
+  // device card links here and old bookmarks resolve.
   //
-  // **Route, no nav item.** The other five surfaces are destinations;
-  // this one is reached from a row. A sidebar entry pointing at
-  // `/atrium-ddns/zones/:id` would be a link to a literal colon, which
-  // is the "a writer nothing calls" shape wearing a nav item's clothing.
-  //
-  // The path carries react-router's `:id`, which works because atrium
-  // drops a registered path straight into `<Route path=…>` (App.tsx).
-  // The host subtree cannot read it back through `useParams` — a second
-  // React root, no shared context — so the page parses the pathname via
-  // `useAtriumLocation`.
-      reg.registerRoute({
+  // #88's zone detail route used to be registered here. It is gone: two
+  // registered routes made atrium swap the route element on open and
+  // close, which unmounts the host's React root — and the zone modal is
+  // portalled to `document.body`, so closing it orphaned the portal on
+  // screen. The modal is `?zone=` on the list route instead, which never
+  // changes the route. `DomainsPage.tsx` carries the full account.
+  reg.registerRoute({
     key: 'atrium-ddns-devices',
     path: DEVICES_PATH,
     render: () => makeWrapperElement(<DevicesPage />),
   });
-  reg.registerNavItem({
-    key: 'atrium-ddns-devices-nav',
-    label: 'Devices',
-    to: DEVICES_PATH,
-    icon: AtriumReact.createElement(IconKey, { size: 18 }),
-  });
-  // #89's device detail — ui-design.md §11.2. A **route** and not a
+    // #89's device detail — ui-design.md §11.2. A **route** and not a
   // drawer, decided on §12's measured width budget: one resolution
   // strip needs ≈592px, atrium's shell gives 1168px, and Mantine's `lg`
   // drawer at 620px is below the one-strip minimum, so the signature
@@ -193,12 +193,6 @@ if (!reg || !AtriumReact) {
     key: 'atrium-ddns-names',
     path: NAMES_PATH,
     render: () => makeWrapperElement(<HostnamesPage />),
-  });
-  reg.registerNavItem({
-    key: 'atrium-ddns-names-nav',
-    label: 'Names',
-    to: NAMES_PATH,
-    icon: AtriumReact.createElement(IconTag, { size: 18 }),
   });
   // #46's log search. Deliberately **not** permission-gated at the
   // registry level and deliberately carrying no `perm` — but for a

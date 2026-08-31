@@ -37,7 +37,7 @@ import {
   type Provider,
 } from '../api/domains';
 import { WIRE_CONSEQUENCE } from '../tenant/ZoneStatus';
-import { zoneHref } from '../paths';
+import { zoneHrefParam } from '../paths';
 import { queryClient } from '../queryClient';
 
 const OPERATOR: UserContext = {
@@ -64,8 +64,15 @@ const PROVIDERS: Provider[] = [
   {
     service: 'route53',
     credential_keys: ['aws_access_key_id', 'aws_secret_access_key'],
+    credential_labels: {},
+    setting_fields: [],
   },
-  { service: 'hetzner', credential_keys: ['hetzner_api_token'] },
+  {
+    service: 'hetzner',
+    credential_keys: ['hetzner_api_token'],
+    credential_labels: {},
+    setting_fields: [],
+  },
 ];
 
 function backend(overrides: Partial<DomainBackend> = {}): DomainBackend {
@@ -220,41 +227,65 @@ describe('a zone with no provider is the exceptional row', () => {
     expect(row.textContent).not.toMatch(/911/);
   });
 
-  test('the row links to the zone’s own route', async () => {
-    // §12's first argument for a route over a drawer: it is linkable.
+  test('the row links to the zone, and the link is the modal', async () => {
+    // Still linkable, which was §12's first argument — the address just
+    // carries the zone as a query parameter rather than a path segment,
+    // because a second route unmounts the host root under the portalled
+    // modal. Asserted twice on purpose: once against the constant every
+    // link is built from, once against the literal, so a change to
+    // `zoneHrefParam` cannot move every link and every assertion together.
     await mount(OPERATOR);
     const link = await screen.findByTestId('open-domain-example.invalid');
-    expect(link).toHaveAttribute('href', zoneHref(1));
-    expect(link).toHaveAttribute('href', '/atrium-ddns/zones/1');
+    expect(link).toHaveAttribute('href', zoneHrefParam(1));
+    expect(link).toHaveAttribute('href', '/atrium-ddns/domains?zone=1');
   });
 });
 
+async function choose(testid: string, label: string) {
+  fireEvent.click(screen.getByTestId(testid));
+  const options = () =>
+    Array.from(document.querySelectorAll('[data-combobox-option]'));
+  await waitFor(() => expect(options().length).toBeGreaterThan(0));
+  const option = options().find((node) => node.textContent === label);
+  expect(
+    option,
+    `no option labelled ${label}; saw ${options()
+      .map((node) => node.textContent)
+      .join(' | ')}`,
+  ).toBeDefined();
+  fireEvent.click(option!);
+}
+
 describe('creating a zone', () => {
-  async function openCreate() {
+  /** Open the modal and pick the provider. **Nothing is preselected**:
+   *  a zone publishes through exactly one provider and that is not a
+   *  choice to make on the operator's behalf, so `zone-provider` starts
+   *  empty and the credential fields do not exist until it is set. */
+  async function openCreate(service = 'route53') {
     await mount(OPERATOR);
     fireEvent.click(screen.getByTestId('add-domain'));
     await waitFor(() =>
       expect(screen.getByTestId('zone-name')).toBeInTheDocument(),
     );
+    await choose('zone-provider', service);
   }
 
   test('the provider is in the form, and it is not optional-looking', async () => {
     await openCreate();
     // The zone field and the provider select are in the same submission.
     expect(screen.getByTestId('zone-name')).toBeInTheDocument();
-    expect(screen.getByTestId('backend-service')).toBeInTheDocument();
+    expect(screen.getByTestId('zone-provider')).toBeInTheDocument();
     // …and the credential fields are `BackendForm`'s, derived from
     // `GET /providers`. A field list retyped into a create-only fork is
     // the identical defect one release later, and this is the assertion
     // that the fork does not exist.
-    fireEvent.click(screen.getByTestId('credential-mode-replace'));
     await waitFor(() =>
       expect(
-        screen.getByTestId('credential-aws_access_key_id'),
+        screen.getByTestId('zone-credential-field-aws_access_key_id'),
       ).toBeInTheDocument(),
     );
     expect(
-      screen.getByTestId('credential-aws_secret_access_key'),
+      screen.getByTestId('zone-credential-field-aws_secret_access_key'),
     ).toBeInTheDocument();
   });
 
@@ -263,19 +294,18 @@ describe('creating a zone', () => {
     fireEvent.change(screen.getByTestId('zone-name'), {
       target: { value: '  new.example.invalid  ' },
     });
-    fireEvent.click(screen.getByTestId('credential-mode-replace'));
     await waitFor(() =>
       expect(
-        screen.getByTestId('credential-aws_access_key_id'),
+        screen.getByTestId('zone-credential-field-aws_access_key_id'),
       ).toBeInTheDocument(),
     );
-    fireEvent.change(screen.getByTestId('credential-aws_access_key_id'), {
+    fireEvent.change(screen.getByTestId('zone-credential-field-aws_access_key_id'), {
       target: { value: 'AKIAEXAMPLE' },
     });
-    fireEvent.change(screen.getByTestId('credential-aws_secret_access_key'), {
+    fireEvent.change(screen.getByTestId('zone-credential-field-aws_secret_access_key'), {
       target: { value: 'sekrit' },
     });
-    fireEvent.click(screen.getByTestId('backend-submit'));
+    fireEvent.click(screen.getByTestId('zone-submit'));
 
     // **One** request. Two would be able to half-succeed — the zone
     // lands, the credential is refused — and leave behind exactly the
@@ -290,7 +320,7 @@ describe('creating a zone', () => {
       name: 'new.example.invalid',
       backend: {
         backend_type: 'route53',
-        config: {},
+        config: { ttl: 60 },
         credentials: {
           aws_access_key_id: 'AKIAEXAMPLE',
           aws_secret_access_key: 'sekrit',
@@ -301,12 +331,12 @@ describe('creating a zone', () => {
 
   test('the submit is unavailable until the zone has a name', async () => {
     await openCreate();
-    expect(screen.getByTestId('backend-submit')).toBeDisabled();
+    expect(screen.getByTestId('zone-submit')).toBeDisabled();
     fireEvent.change(screen.getByTestId('zone-name'), {
       target: { value: 'new.example.invalid' },
     });
     await waitFor(() =>
-      expect(screen.getByTestId('backend-submit')).not.toBeDisabled(),
+      expect(screen.getByTestId('zone-submit')).not.toBeDisabled(),
     );
   });
 
@@ -317,69 +347,55 @@ describe('creating a zone', () => {
     fireEvent.change(screen.getByTestId('zone-name'), {
       target: { value: 'new.example.invalid' },
     });
-    fireEvent.click(screen.getByTestId('credential-mode-replace'));
     await waitFor(() =>
       expect(
-        screen.getByTestId('credential-aws_access_key_id'),
+        screen.getByTestId('zone-credential-field-aws_access_key_id'),
       ).toBeInTheDocument(),
     );
-    fireEvent.change(screen.getByTestId('credential-aws_access_key_id'), {
+    fireEvent.change(screen.getByTestId('zone-credential-field-aws_access_key_id'), {
       target: { value: 'AKIAEXAMPLE' },
     });
-    fireEvent.click(screen.getByTestId('backend-submit'));
+    fireEvent.click(screen.getByTestId('zone-submit'));
 
     await waitFor(() =>
-      expect(screen.getByTestId('backend-form-problem')).toHaveTextContent(
+      expect(screen.getByTestId('zone-modal-error')).toHaveTextContent(
         'aws_secret_access_key',
       ),
     );
     expect(sent).toEqual([]);
     expect(
-      screen.getByTestId('backend-form-problem').textContent,
+      screen.getByTestId('zone-modal-error').textContent,
     ).not.toContain('AKIAEXAMPLE');
   });
 });
 
-describe('“add a provider later” — a link, not a checkbox, not the default', () => {
-  test('there is no checkbox, and nothing is pre-selected for the user', async () => {
+describe('a zone cannot be created without a provider', () => {
+  // The old create form offered "add a provider later" — a link that
+  // posted `backend: null` after stating the wire consequence. It is
+  // gone, and its absence is the assertion: a zone publishes through
+  // exactly one provider (split-horizon is two zones), so the escape
+  // hatch was an affordance for producing the one state the whole
+  // surface warns about.
+  //
+  // The zero-provider zone is still reachable by legacy import, and it
+  // is still marked — `a zone with no provider is the exceptional row`
+  // above covers that, so removing the way to *make* one did not remove
+  // the way to *see* one.
+  test('there is no escape hatch, and no checkbox standing in for one', async () => {
     await mount(OPERATOR);
     fireEvent.click(screen.getByTestId('add-domain'));
     await waitFor(() =>
-      expect(screen.getByTestId('zone-later-link')).toBeInTheDocument(),
+      expect(screen.getByTestId('zone-name')).toBeInTheDocument(),
     );
-    // A `button` rendered as a link, never an `input[type=checkbox]`:
-    // a checkbox sits in the form's reading order as one more option and
-    // can be left in either state by accident.
-    expect(screen.getByTestId('zone-later-link').tagName).toBe('BUTTON');
-    expect(
-      document.querySelectorAll('input[type="checkbox"]'),
-    ).toHaveLength(0);
-    // Not the default: the consequence and its confirm button are not
-    // even rendered until the link is taken.
-    expect(screen.queryByTestId('zone-later-warning')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('zone-later-link')).not.toBeInTheDocument();
     expect(screen.queryByTestId('zone-later-submit')).not.toBeInTheDocument();
+    // Not replaced by a checkbox either: a checkbox sits in the reading
+    // order as one more option and can be left in either state by
+    // accident, which is the argument the link was chosen over.
+    expect(document.querySelectorAll('input[type="checkbox"]')).toHaveLength(0);
   });
 
-  test('taking it states the wire consequence before it can be confirmed', async () => {
-    await mount(OPERATOR);
-    fireEvent.click(screen.getByTestId('add-domain'));
-    await waitFor(() =>
-      expect(screen.getByTestId('zone-later-link')).toBeInTheDocument(),
-    );
-    fireEvent.click(screen.getByTestId('zone-later-link'));
-    await waitFor(() =>
-      expect(screen.getByTestId('zone-later-warning')).toBeInTheDocument(),
-    );
-    expect(screen.getByTestId('zone-later-warning')).toHaveTextContent(
-      WIRE_CONSEQUENCE,
-    );
-    expect(screen.getByTestId('zone-later-warning')).toHaveTextContent(/911/);
-  });
-
-  test('confirming sends an explicit null backend, not an omitted key', async () => {
-    // `null` and "absent" would both create a zero-provider zone, and
-    // only one of them says on the wire that it was asked for. The audit
-    // row records which shape the call was.
+  test('the submit stays unavailable until a provider is chosen', async () => {
     await mount(OPERATOR);
     fireEvent.click(screen.getByTestId('add-domain'));
     await waitFor(() =>
@@ -388,19 +404,13 @@ describe('“add a provider later” — a link, not a checkbox, not the default
     fireEvent.change(screen.getByTestId('zone-name'), {
       target: { value: 'staged.example.invalid' },
     });
-    fireEvent.click(screen.getByTestId('zone-later-link'));
+    // A name alone is not enough. Nothing is preselected, so the button
+    // cannot be reached by filling in the one field that looks required.
+    expect(screen.getByTestId('zone-submit')).toBeDisabled();
+    await choose('zone-provider', 'route53');
     await waitFor(() =>
-      expect(screen.getByTestId('zone-later-submit')).toBeInTheDocument(),
+      expect(screen.getByTestId('zone-submit')).not.toBeDisabled(),
     );
-    fireEvent.click(screen.getByTestId('zone-later-submit'));
-
-    await waitFor(() => expect(sent.length).toBe(1));
-    expect(sent[0].body).toEqual({
-      name: 'staged.example.invalid',
-      backend: null,
-    });
-    expect(
-      Object.keys(sent[0].body as Record<string, unknown>),
-    ).toContain('backend');
+    expect(sent).toEqual([]);
   });
 });

@@ -30,14 +30,22 @@ import { Anchor, Text } from '@mantine/core';
 
 import { type Domain } from '../api/domains';
 import { opensInThisTab } from '../cards';
-import { namesHrefForZone, zoneHref } from '../paths';
+import { namesHrefForZone, zoneHrefParam } from '../paths';
 import { ZoneNowhereMark, ZoneWireConsequence } from './ZoneStatus';
 
 function ZoneRow({
   domain,
+  index,
   onOpen,
 }: {
   domain: Domain;
+  /** Row position, only so the row can state its own stripe parity.
+   *  CSS cannot count these reliably: the head is a sibling in the same
+   *  grid so `:nth-child(even)` is off by one, and `:nth-child(even of
+   *  .ddns-zones__row)` — which would be right — is rejected by
+   *  lightningcss at build time. Compensating with `odd` would work
+   *  until the head moved, and then fail silently. */
+  index: number;
   onOpen: (id: number) => void;
 }) {
   const nowhere = domain.backends.length === 0;
@@ -45,6 +53,7 @@ function ZoneRow({
   return (
     <div
       className="ddns-zones__row"
+      data-stripe={index % 2 === 1 ? 'on' : 'off'}
       data-diverged={nowhere ? 'true' : 'false'}
       data-testid={`domain-${domain.name}`}
     >
@@ -54,7 +63,7 @@ function ZoneRow({
             behave exactly as the anchor promises — and the address it
             copies opens the modal, because the modal is the URL. */}
         <Anchor
-          href={zoneHref(domain.id)}
+          href={zoneHrefParam(domain.id)}
           className="ddns-data"
           onClick={(event) => {
             if (!opensInThisTab(event.nativeEvent)) return;
@@ -65,7 +74,7 @@ function ZoneRow({
         >
           {domain.name}
         </Anchor>
-        <span className="ddns-label" data-testid={`provider-${domain.name}`}>
+        <span className="ddns-cell" data-testid={`provider-${domain.name}`}>
           {provider ?? '—'}
         </span>
         <Anchor
@@ -125,13 +134,18 @@ export function DomainList({
           down the page instead of each row deciding its own widths from
           the length of its zone name. */}
       <div className="ddns-zones__head">
-        <span className="ddns-label">; zone</span>
-        <span className="ddns-label">; provider</span>
-        <span className="ddns-label">; names</span>
-        <span className="ddns-label" />
+        <span className="ddns-th">Zone</span>
+        <span className="ddns-th">Provider</span>
+        <span className="ddns-th">Names</span>
+        <span className="ddns-th" />
       </div>
-      {domains.map((domain) => (
-        <ZoneRow key={domain.id} domain={domain} onOpen={onOpen} />
+      {domains.map((domain, index) => (
+        <ZoneRow
+          key={domain.id}
+          domain={domain}
+          index={index}
+          onOpen={onOpen}
+        />
       ))}
     </div>
   );

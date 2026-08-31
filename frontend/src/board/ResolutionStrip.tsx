@@ -107,10 +107,27 @@ function Quiet({ children }: { children: ReactNode }) {
 
 export interface ResolutionStripProps {
   hostname: string;
+  /** Where the name points, if anywhere. Optional so the strip stays
+   *  usable without one — it renders a plain span then, exactly as
+   *  before. The strip takes a *name*, not a row, so the href is passed
+   *  rather than derived: giving this component an id would make it know
+   *  about routing, which is the caller's business. */
+  hostnameHref?: string;
   strip: Strip;
 }
 
-export function ResolutionStrip({ hostname, strip }: ResolutionStripProps) {
+export function ResolutionStrip({
+  hostname,
+  hostnameHref,
+  strip,
+}: ResolutionStripProps) {
+  const name = hostnameHref ? (
+    <a className="ddns-data" href={hostnameHref}>
+      {hostname}
+    </a>
+  ) : (
+    <span className="ddns-data">{hostname}</span>
+  );
   // §3.4: a strip whose every applicable joint is `agreed` collapses to
   // one line. A strip with any other verdict is expanded and is **not
   // collapsed by any default** — which is why the initial state is
@@ -134,7 +151,7 @@ export function ResolutionStrip({ hostname, strip }: ResolutionStripProps) {
         data-testid={`strip-collapsed-${hostname}-${strip.family}`}
         aria-expanded="false"
       >
-        <span className="ddns-data">{hostname}</span>
+        {name}
         <span className="ddns-data ddns-strip__family">{strip.family}</span>
         <span className="ddns-label">{agreementSummary(strip)}</span>
         <AddressText value={strip.published.address} />
@@ -156,7 +173,7 @@ export function ResolutionStrip({ hostname, strip }: ResolutionStripProps) {
       data-testid={`strip-${hostname}-${strip.family}`}
     >
       <header className="ddns-strip__head">
-        <span className="ddns-data">{hostname}</span>
+        {name}
         <span className="ddns-data ddns-strip__family">{strip.family}</span>
       </header>
       <div className="ddns-strip__body">

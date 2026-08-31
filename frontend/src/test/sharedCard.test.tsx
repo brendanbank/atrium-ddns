@@ -49,6 +49,7 @@ import {
 } from '@brendanbank/atrium-test-utils';
 
 import { queryClient } from '../queryClient';
+import { zoneHrefParam, zoneNewHref } from '../paths';
 import { board, device as boardDevice } from './fixtures';
 
 /** The substitutes. Each renders a string that exists nowhere else in
@@ -213,7 +214,7 @@ describe('DeviceCard has one definition and three call sites', () => {
 
   test('the board opens it from the device name', async () => {
     renderWithAtrium(<DeviceBoardPage />);
-    await screen.findByTestId('board');
+    await screen.findByTestId('board-table');
     fireEvent.click(screen.getByTestId(`board-open-${DEVICE_ROW.name}`));
     const found = await screen.findByTestId('device-card-substitute');
     expect(found).toHaveTextContent(`${DEVICE_SENTINEL} ${DEVICE_ROW.id}`);
@@ -226,14 +227,14 @@ describe('ZoneModal has one definition, and the URL decides what it shows', () =
     // — as a reload, a pasted link or a Back — and the modal is already
     // open on the right zone. A test that clicked first would pass
     // against the old `useState` version too.
-    window.history.pushState({}, '', `/atrium-ddns/zones/${ZONE_ROW.id}`);
+    window.history.pushState({}, '', zoneHrefParam(ZONE_ROW.id));
     renderWithAtrium(<DomainsPage />);
     const found = await screen.findByTestId('zone-card-substitute');
     expect(found).toHaveTextContent(`${ZONE_SENTINEL} ${ZONE_ROW.id}`);
   });
 
   test('the create address opens the same modal with no zone', async () => {
-    window.history.pushState({}, '', '/atrium-ddns/zones/new');
+    window.history.pushState({}, '', zoneNewHref());
     renderWithAtrium(<DomainsPage />);
     const found = await screen.findByTestId('zone-card-substitute');
     expect(found).toHaveTextContent(`${ZONE_SENTINEL} new`);

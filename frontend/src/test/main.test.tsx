@@ -40,7 +40,13 @@ test('the board is registered as a route and a nav item at one path', async () =
   // One constant, two consumers. A nav item pointing at a path no route
   // serves is a dead link that no component test can see.
   expect(route!.path).toBe(main.BOARD_PATH);
-  expect(nav!.to).toBe(main.BOARD_PATH);
+  // The nav points at the bundle root, not at `BOARD_PATH`: the board is
+  // the landing surface, so `/atrium-ddns` renders it and the sidebar
+  // sends you there. `BOARD_PATH` stays registered and renders the same
+  // page, so old links and bookmarks resolve.
+  expect(nav!.to).toBe('/atrium-ddns');
+  const root = handles.routes.find((entry) => entry.path === '/atrium-ddns');
+  expect(root, 'the nav item points at a path no route serves').toBeDefined();
 });
 
 test('every registered surface still mounts through the wrapper element', async () => {
@@ -90,7 +96,16 @@ test('every registered surface still mounts through the wrapper element', async 
     ...handles.adminTabs,
     ...handles.profileItems,
   ];
-  expect(rendered.length).toBe(15);
+  //
+  // **Fourteen, not fifteen.** The zone-detail route was removed, not
+  // forgotten: `/atrium-ddns/zones/:id` was a second registered route,
+  // and opening or closing it swapped atrium's route element — which
+  // unmounts the host's React root while the zone modal is portalled to
+  // `document.body`, leaving the dialog on screen over a list that had
+  // already refreshed. `?zone=` on the list route never changes the
+  // route. Subtracting a surface is exactly the edit this count is here
+  // to make someone justify, so the justification is here.
+  expect(rendered.length).toBe(14);
   // Keys are the registry's primary key: two registrations sharing one
   // silently replace each other, so the count above would still read 15
   // while one surface never mounts. Added by #46 because three issues
@@ -106,7 +121,6 @@ test('every registered surface still mounts through the wrapper element', async 
     'atrium-ddns-settings-rate-limits',
     'atrium-ddns-settings-health-checks',
     'atrium-ddns-settings-retention',
-    'atrium-ddns-zone-detail',
     'atrium-ddns-device-detail',
   ]) {
     expect(
@@ -131,27 +145,21 @@ test('every registered surface still mounts through the wrapper element', async 
   }
 });
 
-test('the zone detail route is registered with a parameter, and no nav item', async () => {
-  const main = await import('../main');
+test('the zone modal is a query parameter, and not a second route', async () => {
+  await import('../main');
 
-  const route = handles.routes.find(
-    (entry) => entry.key === 'atrium-ddns-zone-detail',
-  );
-  expect(route, 'the zone detail route was never registered').toBeDefined();
-  // Compared against the module's own constant, not a literal typed
-  // twice — and the constant is what `zoneHref` is built from, so the
-  // registered path and the links pointing at it cannot drift.
-  expect(route!.path).toBe(main.ZONE_ROUTE_PATH);
-  // The parameter is the point. Atrium drops a registered `path`
-  // straight into react-router's `<Route path=…>`, so `:id` is matched
-  // there; a route registered as a literal `/atrium-ddns/zones/:id`
-  // would serve exactly one URL, and it would be the one with a colon
-  // in it.
-  expect(route!.path).toContain('/:id');
-
-  // Deliberately no nav item. Every other surface has one; this is
-  // reached from a row, and a sidebar entry would be a link to a literal
-  // colon.
+  // `/atrium-ddns/zones/:id` was registered here and is deliberately
+  // gone. Two routes meant atrium swapped the route element on open and
+  // close, unmounting the host's React root — and the modal is portalled
+  // to `document.body`, so closing it left an orphaned dialog over a
+  // list that had already refreshed. A query parameter never changes the
+  // route, so the mount and its portal survive.
+  //
+  // Asserted as an absence rather than deleted, so that re-registering
+  // the route has to come past this test and read why it was removed.
+  expect(
+    handles.routes.filter((entry) => entry.path?.includes('/zones')),
+  ).toEqual([]);
   expect(
     handles.navItems.filter((entry) => entry.to?.startsWith('/atrium-ddns/zones')),
   ).toEqual([]);

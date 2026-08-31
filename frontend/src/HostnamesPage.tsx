@@ -36,6 +36,10 @@
  */
 import { Alert, Stack, Text, Title } from '@mantine/core';
 import { useQuery } from '@tanstack/react-query';
+import {
+  useAtriumLocation,
+  useAtriumNavigate,
+} from '@brendanbank/atrium-host-bundle-utils/react';
 import { usePerm } from '@brendanbank/atrium-host-bundle-utils/react';
 
 import { devicesQuery } from './api/devices';
@@ -43,6 +47,9 @@ import { domainsQuery } from './api/domains';
 import { HOSTNAME_PERMISSION, hostnamesQuery } from './api/hostnames';
 import { DdnsRoot } from './host/DdnsRoot';
 import { HostnameList } from './tenant/HostnameList';
+import { NAME_ID_PARAM, NAME_ZONE_PARAM, NEW_VALUE } from './paths';
+import { NameModal } from './tenant/NameModal';
+import { NEW_NAME } from './tenant/HostnameList';
 
 /** This page's path.
  *
@@ -60,6 +67,24 @@ export function HostnamesInner() {
   const hostnames = useQuery(hostnamesQuery({ enabled: canManage }));
   const domains = useQuery(domainsQuery({ enabled: canManage }));
   const devices = useQuery(devicesQuery({ enabled: canManage }));
+  /** The filters other surfaces link in with. The zone list sends
+   *  `?zone=`, the device card sends `?name=`.
+   *
+   *  Until now this page read neither, so both links landed on the whole
+   *  list and looked like they had worked — the worst kind of broken,
+   *  because nothing is missing on screen to tell you. */
+  const { search } = useAtriumLocation();
+  const navigate = useAtriumNavigate();
+  const params = new URLSearchParams(search);
+  const zoneFilter = Number(params.get(NAME_ZONE_PARAM)) || null;
+  /* `?name=` opens the modal rather than filtering to one row: opening
+     the name IS the useful version of "show me just that one", and two
+     meanings for one parameter is how the zone page went wrong. `?zone=`
+     stays a filter. */
+  const rawName = params.get(NAME_ID_PARAM);
+  const nameOpen = rawName !== null;
+  const nameId =
+    rawName === null || rawName === NEW_VALUE ? null : Number(rawName) || null;
 
   const loading =
     hostnames.isLoading || domains.isLoading || devices.isLoading;
@@ -99,11 +124,25 @@ export function HostnamesInner() {
         </Alert>
       ) : hostnames.data && domains.data && devices.data ? (
         <HostnameList
+          onOpen={(id) =>
+            navigate(
+              `${NAMES_PATH}?${NAME_ID_PARAM}=${
+                id === NEW_NAME ? NEW_VALUE : id
+              }`,
+            )
+          }
           hostnames={hostnames.data}
+          zoneFilter={zoneFilter}
           domains={domains.data}
           devices={devices.data}
         />
       ) : null}
+
+      <NameModal
+        nameId={nameId}
+        opened={nameOpen}
+        onClose={() => navigate(NAMES_PATH, { replace: true })}
+      />
     </Stack>
   );
 }

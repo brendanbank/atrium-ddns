@@ -27,7 +27,11 @@ import { HostnamesPage } from '../HostnamesPage';
 import { composeHostname } from '../tenant/HostnameList';
 import { DEVICE_PERMISSION, type Device } from '../api/devices';
 import { DOMAIN_PERMISSION, type Domain } from '../api/domains';
-import { HOSTNAME_PERMISSION, type Hostname } from '../api/hostnames';
+import {
+  HOSTNAME_PERMISSION,
+  type Hostname,
+  type HostnamePublishing,
+} from '../api/hostnames';
 import { queryClient } from '../queryClient';
 
 const OPERATOR: UserContext = {
@@ -150,6 +154,12 @@ function stubFetch() {
       if (url.endsWith('/atrium_ddns/devices') && method === 'GET') {
         return json(devicesPayload);
       }
+      // `NameModal` reads a name's publishing configuration before it can
+      // seed the TTL. Unserved, the modal never leaves "Loading…" — and
+      // that reads in a failure as "the modal never opened".
+      if (/\/atrium_ddns\/hostnames\/\d+\/backends$/.test(url) && method === 'GET') {
+        return json(publishingPayload);
+      }
       return json({});
     }),
   );
@@ -170,6 +180,26 @@ afterEach(() => {
   currentMe = null;
 });
 
+/** What `GET /hostnames/:id/backends` answers. An empty provider list
+ *  means *this name follows its zone* — the state a name is created in
+ *  and the one most rows are in. */
+let publishingPayload: HostnamePublishing = {
+  hostname_id: 100,
+  name: `home.${ZONE}`,
+  domain_id: 1,
+  domain_name: ZONE,
+  device_id: 7,
+  // Inheriting: nothing is pinned, so the name follows its zone. The
+  // state a name is created in and the one most rows are in.
+  inherits_backends: true,
+  ttl: null,
+  default_ttl: 60,
+  ttl_min: 30,
+  ttl_max: 86400,
+  backends: [],
+  publishes_to: [],
+};
+
 async function mount(user: UserContext | null) {
   currentMe = user;
   handles = mockAtriumRegistry({ me: user });
@@ -182,6 +212,16 @@ async function mount(user: UserContext | null) {
     : 'hostnames-refused';
   await waitFor(() =>
     expect(screen.getByTestId(expected)).toBeInTheDocument(),
+  );
+}
+
+/** Open an existing name's modal. The row's name is the control: the
+ *  gear and the row dropdown are gone, and one modal holds every setting
+ *  the name has. */
+async function openTheName(name: string) {
+  fireEvent.click(screen.getByTestId(`hostname-${name}-link`));
+  await waitFor(() =>
+    expect(screen.getByTestId('name-modal-body')).toBeInTheDocument(),
   );
 }
 
@@ -279,19 +319,30 @@ describe('the device column has three states, not two', () => {
       hostname({ id: 101, name: `spare.${ZONE}`, device_id: null, device_name: null }),
     ];
     await mount(OPERATOR);
-    const select = screen.getByTestId(`assign-spare.${ZONE}`);
-    // `Not assigned yet` — the model's own state, rendered as a value.
-    // A blank cell would read as missing data.
-    expect((select as HTMLInputElement).value).toBe('Not assigned yet');
+    // The model's own state, rendered as a value. A blank cell would
+    // read as missing data. It is a cell rather than a dropdown now —
+    // the row shows, the modal edits.
+    expect(screen.getByTestId(`assigned-spare.${ZONE}`)).toHaveTextContent(
+      'Not assigned',
+    );
+    expect(
+      screen.queryByTestId(`assign-spare.${ZONE}`),
+      'the row still carries a control that mutates data',
+    ).not.toBeInTheDocument();
   });
 
   test('reassigning sends the new device id', async () => {
     devicesPayload = [device(), device({ id: 8, name: 'shed-router' })];
     await mount(OPERATOR);
-    await choose(`assign-home.${ZONE}`, 'shed-router');
-    await waitFor(() => expect(sent.length).toBe(1));
+    await openTheName(`home.${ZONE}`);
+    await choose('hostname-device', 'shed-router');
+    fireEvent.click(screen.getByTestId('name-submit'));
+    await waitFor(() => expect(sent.length).toBeGreaterThan(0));
     expect(sent[0].method).toBe('PATCH');
     expect(sent[0].url).toContain('/atrium_ddns/hostnames/100');
+    // Only the key that changed. The modal holds the name, the zone, the
+    // device and the TTL, and sending all four on every save would make
+    // a device change able to rename the row it was opened from.
     expect(sent[0].body).toEqual({ device_id: 8 });
   });
 
@@ -299,8 +350,10 @@ describe('the device column has three states, not two', () => {
     // `null` and *absent* are different requests, and the endpoint reads
     // them differently. A body of `{}` would leave the device attached.
     await mount(OPERATOR);
-    await choose(`assign-home.${ZONE}`, 'Not assigned yet');
-    await waitFor(() => expect(sent.length).toBe(1));
+    await openTheName(`home.${ZONE}`);
+    await choose('hostname-device', 'Not assigned');
+    fireEvent.click(screen.getByTestId('name-submit'));
+    await waitFor(() => expect(sent.length).toBeGreaterThan(0));
     expect(sent[0].body).toEqual({ device_id: null });
     expect('device_id' in sent[0].body).toBe(true);
   });
@@ -317,7 +370,7 @@ describe('creating a name', () => {
     fireEvent.change(screen.getByTestId('hostname-name'), {
       target: { value: '  attic  ' },
     });
-    fireEvent.click(screen.getByTestId('hostname-submit'));
+    fireEvent.click(screen.getByTestId('name-submit'));
 
     await waitFor(() => expect(sent.length).toBe(1));
     expect(sent[0].method).toBe('POST');
@@ -342,7 +395,7 @@ describe('creating a name', () => {
       target: { value: '  attic ' },
     });
     await waitFor(() =>
-      expect(screen.getByTestId('hostname-preview')).toBeInTheDocument(),
+      expect(screen.getByTestId('hostname-will-send')).toBeInTheDocument(),
     );
     expect(willSend()).toBe(`attic.${ZONE}`);
   });
@@ -356,7 +409,7 @@ describe('creating a name', () => {
       target: { value: `attic.${ZONE}` },
     });
     await choose('hostname-device', 'attic-router');
-    fireEvent.click(screen.getByTestId('hostname-submit'));
+    fireEvent.click(screen.getByTestId('name-submit'));
     await waitFor(() => expect(sent.length).toBe(1));
     expect(sent[0].body.device_id).toBe(7);
   });
@@ -447,19 +500,25 @@ describe('the zone is a suffix, not a retype', () => {
     expect(unchanged.length).toBeGreaterThan(1);
   });
 
-  test('the field renders the zone as a fixed suffix, and follows the select', async () => {
+  test('the composed name follows the zone select', async () => {
     domainsPayload = [domain(), domain({ id: 2, name: 'example.org' })];
     await mount(OPERATOR);
     await openTheForm();
-    // Nothing chosen yet: there is no suffix to promise.
+    fireEvent.change(screen.getByTestId('hostname-name'), {
+      target: { value: 'attic' },
+    });
+    // The suffix used to be rendered inside the field, as fixed text. It
+    // was a restatement of the select directly beside it, and the
+    // operator asked for it gone. What promises the zone now is the
+    // `will send:` line — the composed string, which is the one that
+    // actually leaves the browser.
     expect(screen.queryByTestId('hostname-suffix')).not.toBeInTheDocument();
     await choose('hostname-zone', ZONE);
-    expect(screen.getByTestId('hostname-suffix').textContent).toBe(`.${ZONE}`);
-    // The suffix is a restatement of the row above, so it moves with it.
+    await waitFor(() => expect(willSend()).toBe(`attic.${ZONE}`));
+    // …and it moves with the select, which is the property the fixed
+    // suffix existed to provide.
     await choose('hostname-zone', 'example.org');
-    expect(screen.getByTestId('hostname-suffix').textContent).toBe(
-      '.example.org',
-    );
+    await waitFor(() => expect(willSend()).toBe('attic.example.org'));
   });
 
   test('what is previewed is what is posted, byte for byte', async () => {
@@ -475,7 +534,7 @@ describe('the zone is a suffix, not a retype', () => {
     });
     const previewed = willSend();
     expect(previewed).toBe(`attic.${ZONE.toUpperCase()}`);
-    fireEvent.click(screen.getByTestId('hostname-submit'));
+    fireEvent.click(screen.getByTestId('name-submit'));
     await waitFor(() => expect(sent.length).toBe(1));
     expect(sent[0].body.name).toBe(previewed);
   });
@@ -503,8 +562,8 @@ describe('the bundle does not second-guess the server about validity', () => {
     });
     // Composition ran — and did not gate. The submit button is live.
     expect(willSend()).toBe(`bad_label.${ZONE}`);
-    expect(screen.getByTestId('hostname-submit')).not.toBeDisabled();
-    fireEvent.click(screen.getByTestId('hostname-submit'));
+    expect(screen.getByTestId('name-submit')).not.toBeDisabled();
+    fireEvent.click(screen.getByTestId('name-submit'));
 
     // It was sent — the browser did not decide.
     await waitFor(() => expect(sent.length).toBe(1));
@@ -513,9 +572,9 @@ describe('the bundle does not second-guess the server about validity', () => {
     // …and the server's own words are what the user reads, including the
     // wire status. Diagnostics in full.
     await waitFor(() =>
-      expect(screen.getByTestId('hostname-error')).toBeInTheDocument(),
+      expect(screen.getByTestId('name-error')).toBeInTheDocument(),
     );
-    expect(screen.getByTestId('hostname-error').textContent).toContain(
+    expect(screen.getByTestId('name-error').textContent).toContain(
       'notfqdn',
     );
   });
@@ -535,11 +594,11 @@ describe('the bundle does not second-guess the server about validity', () => {
     fireEvent.change(screen.getByTestId('hostname-name'), {
       target: { value: '-bad' },
     });
-    fireEvent.click(screen.getByTestId('hostname-submit'));
+    fireEvent.click(screen.getByTestId('name-submit'));
     await waitFor(() => expect(sent.length).toBe(1));
     expect(sent[0].body.name).toBe(`-bad.${ZONE}`);
     await waitFor(() =>
-      expect(screen.getByTestId('hostname-error')).toBeInTheDocument(),
+      expect(screen.getByTestId('name-error')).toBeInTheDocument(),
     );
   });
 
@@ -554,11 +613,11 @@ describe('the bundle does not second-guess the server about validity', () => {
     fireEvent.change(screen.getByTestId('hostname-name'), {
       target: { value: 'home' },
     });
-    fireEvent.click(screen.getByTestId('hostname-submit'));
+    fireEvent.click(screen.getByTestId('name-submit'));
     await waitFor(() =>
-      expect(screen.getByTestId('hostname-error')).toBeInTheDocument(),
+      expect(screen.getByTestId('name-error')).toBeInTheDocument(),
     );
-    const text = screen.getByTestId('hostname-error').textContent ?? '';
+    const text = screen.getByTestId('name-error').textContent ?? '';
     expect(text).toContain('409');
     expect(text).toContain('already registered');
   });

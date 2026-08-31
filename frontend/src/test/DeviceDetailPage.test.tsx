@@ -179,7 +179,7 @@ describe('arriving on the route', () => {
   test('a linked URL renders the device it names', async () => {
     await mount(OPERATOR);
     await waitFor(() =>
-      expect(screen.getByTestId('device-name')).toHaveTextContent(
+      expect(screen.getByTestId('device-name-input')).toHaveValue(
         'home-router',
       ),
     );
@@ -244,14 +244,9 @@ describe('arriving on the route', () => {
 describe('the name is editable, in place', () => {
   test('renaming PATCHes name plus the stored limit, and nothing else', async () => {
     await mount(OPERATOR);
-    await waitFor(() =>
-      expect(screen.getByTestId('device-rename')).toBeInTheDocument(),
-    );
-    fireEvent.click(screen.getByTestId('device-rename'));
-
-    // In place, at the top of the route — not in a modal. Mantine's
-    // `Modal` renders into a portal with `role="dialog"`; the absence of
-    // one is the assertion.
+    // In place, at the top of the card — not in a nested modal. Mantine's
+    // `Modal` renders into a portal with `role="dialog"`; on this route
+    // the card is not in one, and the absence is the assertion.
     await waitFor(() =>
       expect(screen.getByTestId('device-name-input')).toBeInTheDocument(),
     );
@@ -277,7 +272,7 @@ describe('the name is editable, in place', () => {
     expect(patches[0].body.rate_limit_per_minute).toBeNull();
 
     await waitFor(() =>
-      expect(screen.getByTestId('device-name')).toHaveTextContent(
+      expect(screen.getByTestId('device-name-input')).toHaveValue(
         'garage-router',
       ),
     );
@@ -285,10 +280,6 @@ describe('the name is editable, in place', () => {
 
   test('the name is trimmed and a blank one cannot be submitted', async () => {
     await mount(OPERATOR);
-    await waitFor(() =>
-      expect(screen.getByTestId('device-rename')).toBeInTheDocument(),
-    );
-    fireEvent.click(screen.getByTestId('device-rename'));
     await waitFor(() =>
       expect(screen.getByTestId('device-name-input')).toBeInTheDocument(),
     );
@@ -307,22 +298,22 @@ describe('the name is editable, in place', () => {
     expect(patches[0].body.name).toBe('spaced-router');
   });
 
-  test('Cancel restores the stored name and sends nothing', async () => {
+  test('Escape restores the stored name and sends nothing', async () => {
     await mount(OPERATOR);
-    await waitFor(() =>
-      expect(screen.getByTestId('device-rename')).toBeInTheDocument(),
-    );
-    fireEvent.click(screen.getByTestId('device-rename'));
     await waitFor(() =>
       expect(screen.getByTestId('device-name-input')).toBeInTheDocument(),
     );
     fireEvent.change(screen.getByTestId('device-name-input'), {
       target: { value: 'never-saved' },
     });
-    fireEvent.click(screen.getByTestId('device-name-cancel'));
+    // Escape rather than a Cancel button: the field is always live, so
+    // there is no edit mode to leave — only a draft to abandon.
+    fireEvent.keyDown(screen.getByTestId('device-name-input'), {
+      key: 'Escape',
+    });
 
     await waitFor(() =>
-      expect(screen.getByTestId('device-name')).toHaveTextContent(
+      expect(screen.getByTestId('device-name-input')).toHaveValue(
         'home-router',
       ),
     );
@@ -335,16 +326,12 @@ describe('the conflict is surfaced, not avoided', () => {
   test("a 409 renders the server's own sentence and the name does not move", async () => {
     await mount(OPERATOR);
     await waitFor(() =>
-      expect(screen.getByTestId('device-rename')).toBeInTheDocument(),
+      expect(screen.getByTestId('device-name-input')).toBeInTheDocument(),
     );
     patchRefusal = {
       status: 409,
       body: { detail: "you already have a device called 'garage-router'" },
     };
-    fireEvent.click(screen.getByTestId('device-rename'));
-    await waitFor(() =>
-      expect(screen.getByTestId('device-name-input')).toBeInTheDocument(),
-    );
     fireEvent.change(screen.getByTestId('device-name-input'), {
       target: { value: 'garage-router' },
     });
@@ -364,8 +351,8 @@ describe('the conflict is surfaced, not avoided', () => {
     expect(
       patches.filter((patch) => String(patch.body.name).includes('(2)')),
     ).toEqual([]);
-    // The editor stays open on the refused draft, so the operator can
-    // correct it rather than retype it.
+    // The draft survives the refusal, so the operator can correct it
+    // rather than retype it.
     expect(
       (screen.getByTestId('device-name-input') as HTMLInputElement).value,
     ).toBe('garage-router');
@@ -383,12 +370,13 @@ describe('the rate limit keeps its third state', () => {
     expect(screen.getByTestId('detail-limit-current')).toHaveTextContent(
       '30/min, inherited',
     );
-    expect(document.body.textContent).toContain(
-      'inherit the installation default (30)',
-    );
+    // Prefilled with the limit in force, so the box never reads as
+    // "no limit" on a device that has one.
+    expect(
+      (screen.getByTestId('detail-limit-input') as HTMLInputElement).value,
+    ).toBe('30');
 
-    // Choosing a per-device value sends the number.
-    fireEvent.click(screen.getByTestId('detail-limit-own'));
+    // Typing a per-device value sends the number.
     fireEvent.change(screen.getByTestId('detail-limit-input'), {
       target: { value: '4' },
     });
@@ -404,16 +392,16 @@ describe('the rate limit keeps its third state', () => {
         '4/min, set on this device',
       ),
     );
-    // …and now the default is *not* knowable, so no number is invented.
-    expect(document.body.textContent).toContain(
-      'inherit the installation default',
-    );
-    expect(document.body.textContent).not.toContain(
-      'inherit the installation default (30)',
+    // …and the summary now says which of the three states it is, which
+    // is the whole reason the resolved number is not shown alone: `30`
+    // on an inheriting device and `30` on a pinned one are different
+    // facts about what happens when the installation default changes.
+    expect(screen.getByTestId('detail-limit-current')).not.toHaveTextContent(
+      'inherited',
     );
   });
 
-  test('choosing inherit sends null, and it is a choice rather than an empty box', async () => {
+  test('clearing the box sends null, which is inherit and not zero', async () => {
     payload = device({
       rate_limit_per_minute: 9,
       effective_rate_limit_per_minute: 9,
@@ -426,7 +414,12 @@ describe('the rate limit keeps its third state', () => {
     expect(
       (screen.getByTestId('detail-limit-input') as HTMLInputElement).value,
     ).toBe('9');
-    fireEvent.click(screen.getByTestId('detail-limit-inherit'));
+    // Clearing the box is the inherit choice. It travels as `null`, not
+    // as `0` and not as an omitted key — #73's rule that `null` is a
+    // value on this column.
+    fireEvent.change(screen.getByTestId('detail-limit-input'), {
+      target: { value: '' },
+    });
     fireEvent.click(screen.getByTestId('detail-limit-save'));
 
     await waitFor(() => expect(patches.length).toBe(1));
@@ -442,12 +435,10 @@ describe('rotation is its own operation', () => {
     await waitFor(() =>
       expect(screen.getByTestId('detail-rotate')).toBeInTheDocument(),
     );
-    // The consequence is stated on the page, beside the control, before
-    // anything is clicked.
-    expect(screen.getByTestId('detail-rotate-consequence')).toHaveTextContent(
-      /stops working until it is reconfigured/i,
-    );
-
+    // The consequence is stated before the operation commits. It moved
+    // from a standing line beside the control to the confirm step when
+    // the card was condensed — which is the step that cannot be skipped,
+    // where a line above the button can be read past.
     fireEvent.click(screen.getByTestId('detail-rotate'));
     await waitFor(() =>
       expect(screen.getByTestId('detail-rotate-warning')).toHaveTextContent(
@@ -476,10 +467,6 @@ describe('rotation is its own operation', () => {
 
   test('no rename request ever carries a secret-shaped key', async () => {
     await mount(OPERATOR);
-    await waitFor(() =>
-      expect(screen.getByTestId('device-rename')).toBeInTheDocument(),
-    );
-    fireEvent.click(screen.getByTestId('device-rename'));
     await waitFor(() =>
       expect(screen.getByTestId('device-name-input')).toBeInTheDocument(),
     );

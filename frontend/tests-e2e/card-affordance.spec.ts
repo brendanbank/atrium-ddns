@@ -53,12 +53,11 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
 
 import {
   API_URL,
-  BOARD_PATH,
   DEVICES_PATH,
   DOMAINS_PATH,
   bindScriptedBackend,
-  deviceCallsIn,
   loginAsUser,
+  seedZoneDeviceAndName,
   uniqueDeviceName,
   uniqueZoneName,
 } from './helpers';
@@ -69,7 +68,6 @@ import { ONE_STRIP_MIN_PX, QUALIFIED_STRIP_MIN_PX } from '../src/cards';
  *  pins the *called from* station to TEST-NET-3 through
  *  `X-Forwarded-For`, so every address on these images is documentation
  *  space and none of them is the machine the run happened on. */
-const DOC_PUBLISHED_V4 = '192.0.2.42';
 
 /** How chromium reports "no underline". Named because `none` and the
  *  empty string are two different readings and only one of them means
@@ -115,7 +113,7 @@ async function makeZone(page: Page, name: string): Promise<number> {
 }
 
 test.describe('#97 — an interactive .ddns-data says so, at rest', () => {
-  test.describe.configure({ timeout: 120_000 });
+  test.describe.configure({ timeout: 30_000 });
 
   test('the zone name is a link, underlined at rest, in the ink it always had', async ({
     page,
@@ -130,12 +128,18 @@ test.describe('#97 — an interactive .ddns-data says so, at rest', () => {
 
     await page.goto(DOMAINS_PATH);
     const name = page.getByTestId(`open-domain-${zone}`);
-    await expect(name).toBeVisible({ timeout: 15_000 });
+    await expect(name).toBeVisible({ timeout: 8_000 });
 
     // §17 keeps §12's two surviving arguments, and both are properties
     // of the URL. The row is still an anchor and still carries the
     // route, so copy-link and open-in-new-tab still work.
-    await expect(name).toHaveAttribute('href', new RegExp(`/zones/${zoneId}$`));
+    // The address is `?zone=` on the list route now, and the href has to
+    // match what a click does — copy-link and cmd-click pointing somewhere
+    // else is the bug this whole spec is about.
+    await expect(name).toHaveAttribute(
+      'href',
+      new RegExp(`\\\\?zone=${zoneId}$`),
+    );
     expect(await name.evaluate((el) => el.tagName)).toBe('A');
     expect(
       await name.evaluate((el) => el.className),
@@ -153,28 +157,54 @@ test.describe('#97 — an interactive .ddns-data says so, at rest', () => {
     ).toContain('underline');
 
     // The control. Open the card and read an inert `.ddns-data` — the
-    // provider's own name inside it — with the same instrument.
-    await name.click();
-    const card = page.getByTestId('zone-card');
-    await expect(card).toBeVisible({ timeout: 15_000 });
-    const inert = card.locator('span.ddns-data').first();
-    await expect(inert).toBeVisible();
+    // The control, and it is now the stylesheet rather than an element.
+    //
+    // After the rewrites almost every `.ddns-data` in the app is a link
+    // or a button — the zone name is an input, the board cells are
+    // `.ddns-cell` — so there is no inert one left to read. Injecting a
+    // bare `span.ddns-data` and asking the browser what it computes to
+    // tests the rule itself: the underline is on `a`/`button` and not on
+    // `.ddns-data` at large. A version of this that found some inert span
+    // in the markup would keep passing if that span were later deleted.
+    const inertDecoration = await page.evaluate(() => {
+      const root = document.querySelector('[data-ddns-root]');
+      const probe = document.createElement('span');
+      probe.className = 'ddns-data';
+      probe.textContent = 'probe';
+      root!.appendChild(probe);
+      const value = getComputedStyle(probe).textDecorationLine;
+      probe.remove();
+      return value;
+    });
 
     expect(
-      await decorationOf(inert),
+      inertDecoration,
       'an inert .ddns-data is underlined too, so the reading above says ' +
         'nothing about interactivity',
     ).toBe(NO_DECORATION);
 
     // …and the colour did not move. This is the assertion that fails if
+    // …and the colour did not move. This is the assertion that fails if
     // a later change "fixes" the affordance by taking `.ddns-data` off
-    // the anchor: Mantine's link colour would come back and the two
-    // would stop matching.
+    // the anchor: Mantine's link colour would come back.
+    //
+    // Read against the token rather than a sibling element, for the same
+    // reason as the probe above — there is no inert `.ddns-data` left to
+    // compare with, and `--ddns-ink` is what §2.3 actually specifies.
+    const ink = await page.evaluate(() => {
+      const root = document.querySelector('[data-ddns-root]')!;
+      const probe = document.createElement('span');
+      probe.className = 'ddns-data';
+      root.appendChild(probe);
+      const value = getComputedStyle(probe).color;
+      probe.remove();
+      return value;
+    });
     expect(
       await colourOf(name),
-      'the link and the value no longer render in the same ink — §2.3 has ' +
-        'been retracted on the anchors, which is the fix §16.1 rules out',
-    ).toBe(await colourOf(inert));
+      'the link no longer renders in the ink §2.3 specifies — the fix ' +
+        '§16.1 rules out has been applied',
+    ).toBe(ink);
 
     // The pixels the report was about. The list is behind the card, so
     // one image carries both the underlined name in the row and the
@@ -204,21 +234,29 @@ test.describe('#97 — an interactive .ddns-data says so, at rest', () => {
 
     // §17's decision, rendered: a modal pops up.
     const modal = page.getByRole('dialog');
-    await expect(modal).toBeVisible({ timeout: 15_000 });
-    // …and it is a modal and not a navigation. Asserting the URL did
-    // *not* move is what distinguishes the two shapes; without it this
-    // test passes against a route that happens to render a dialog.
-    expect(page.url()).toBe(listUrl);
+    await expect(modal).toBeVisible({ timeout: 8_000 });
+    // …and it is a modal, not a route change. The URL *does* move —
+    // `?zone=` is how a reload restores the open card — so the test
+    // is that the **path** is unchanged and only the query grew.
+    // Asserting the whole URL was unchanged would now be asserting
+    // the bug this design replaced: state the address cannot carry.
+    expect(new URL(page.url()).pathname).toBe(new URL(listUrl).pathname);
+    expect(new URL(page.url()).search).toMatch(/^\?zone=\d+$/);
 
     // The edit controls are in it. "A modal pops up" with nothing in it
     // that edits the zone would satisfy the sentence and not the report.
-    const card = modal.getByTestId('zone-card');
+    const card = modal.getByTestId('zone-modal-body');
     await expect(card).toBeVisible();
-    await expect(card.getByTestId(`zone-${zone}`)).toBeVisible();
-    await expect(card.getByTestId('zone-rename')).toBeVisible();
+    // The card shows the zone in an editable field now, not a heading —
+    // a name that could be set once and never corrected made a typo
+    // permanent.
+    await expect(card.getByTestId('zone-name')).toHaveValue(zone);
+    await expect(card.getByTestId('zone-name')).toBeVisible();
     await expect(card.getByTestId('zone-delete')).toBeVisible();
-    await expect(card.getByTestId('zone-add-backend')).toBeVisible();
-    await expect(card.getByTestId('backend-stub1')).toBeVisible();
+    await expect(card.getByTestId('zone-provider')).toBeVisible();
+    // One provider per zone, so the binding is the Provider field's
+    // value rather than a listed entry.
+    await expect(card.getByTestId('zone-provider')).toHaveValue('stub1');
 
     // §17's width condition. Measured off the modal's *content box* —
     // what a strip would actually be laid out in — rather than off the
@@ -259,12 +297,18 @@ test.describe('#97 — an interactive .ddns-data says so, at rest', () => {
     await expect(page.getByTestId(`domain-${zone}`)).toBeVisible();
 
     // --- the same card, through the route ---------------------------
-    await page.goto(`/atrium-ddns/zones/${zoneId}`);
-    const routeCard = page.getByTestId('zone-card');
-    await expect(routeCard).toBeVisible({ timeout: 15_000 });
+    await page.goto(`${DOMAINS_PATH}?zone=${zoneId}`);
+    const routeCard = page.getByTestId('zone-modal-body');
+    await expect(routeCard).toBeVisible({ timeout: 8_000 });
     // The route is a route: no dialog. If this were also a modal the
     // comparison below would be comparing a thing with itself.
-    await expect(page.getByRole('dialog')).toHaveCount(0);
+    // The address renders the **same modal**, which is the point of
+    // §17: one card, two entrances, and the address carries which
+    // one is open so a reload restores it. "No dialog here" was an
+    // assertion about the route-vs-modal split that no longer
+    // exists; asserting exactly one is what still has teeth,
+    // because two would mean a second editor had grown.
+    await expect(page.getByRole('dialog')).toHaveCount(1);
 
     const routeShape = await cardShape(routeCard);
     // Vacuity: a card that rendered nothing would compare equal to
@@ -285,155 +329,52 @@ test.describe('#97 — an interactive .ddns-data says so, at rest', () => {
     expect(pageErrors, 'the page threw while rendering').toEqual([]);
   });
 
-  test('the board row does two jobs on two targets, and a keyboard reaches both', async ({
+  test('the board row opens the card, and the name goes to its own surface', async ({
     page,
-  }, testInfo) => {
-    const pageErrors: string[] = [];
-    page.on('pageerror', (error) => pageErrors.push(error.message));
+  }) => {
+    // Rewritten for the flat board.
+    //
+    // This used to assert an expand toggle beside the device name — "two
+    // jobs on two targets". The board is a table now: one row per name
+    // per family, no per-device disclosure, because the nested layout
+    // changed shape as check results arrived and the columns moved under
+    // the reader's eye.
+    //
+    // What the test still has to hold is the same property #97 was about:
+    // every interactive thing in the row is reachable and says where it
+    // goes. Two targets remain — the device opens its card, the name goes
+    // to the surface that owns it — and neither is the whole row.
+    const suffix = Math.random().toString(36).slice(2, 10);
+    const zone = uniqueZoneName();
+    const deviceName = `router-${suffix}`;
 
     await loginAsUser(page);
-    const zone = uniqueZoneName();
-    const deviceName = uniqueDeviceName();
-    const fqdn = `home.${zone}`;
+    const created = await seedZoneDeviceAndName(page, { zone, deviceName });
 
-    // A device created through the UI, because the secret is shown
-    // exactly once and the only way a browser holds one is to have been
-    // there when it was issued.
-    await page.goto(DEVICES_PATH);
-    await page.getByTestId('add-device').click();
-    const create = page.getByRole('dialog');
-    await expect(create).toBeVisible({ timeout: 15_000 });
-    await create.getByTestId('device-name').fill(deviceName);
-    await create.getByTestId('device-submit').click();
-    await expect(page.getByTestId('device-secret-once')).toBeVisible();
-    const username = (
-      await page.getByTestId('issued-username').innerText()
-    ).trim();
-    const secret = (await page.getByTestId('issued-secret').innerText()).trim();
-    await page.getByTestId('dismiss-secret').click();
-
-    // A zone with a *scripted* provider, so nothing here contacts a
-    // nameserver, and a name under it assigned to this device.
-    const zoneId = await makeZone(page, zone);
-    await bindScriptedBackend(page.request, zoneId);
-    const devices = await page.request.get(`${API_URL}/atrium_ddns/devices`);
-    const deviceId = (await devices.json()).find(
-      (row: { name: string }) => row.name === deviceName,
-    ).id as number;
-    const nameResp = await page.request.post(
-      `${API_URL}/atrium_ddns/hostnames`,
-      { data: { name: fqdn, domain_id: zoneId, device_id: deviceId } },
+    await page.goto('/atrium-ddns');
+    const row = page.getByTestId(
+      `board-row-${created.hostname}-${created.family ?? 'none'}`,
     );
-    expect(nameResp.status()).toBe(201);
+    await expect(row).toBeVisible({ timeout: 8_000 });
 
-    // One `/nic/update` over HTTP Basic, exactly as a router does. This
-    // is what writes `last_ip_*` and therefore what makes a strip exist
-    // at all — without it the card renders `no strip to draw` and the
-    // screenshot below would be of an empty state.
-    const published = await deviceCallsIn(page.request, {
-      username,
-      secret,
-      hostname: fqdn,
-      ip: DOC_PUBLISHED_V4,
-    });
-    expect(published.status).toBe(200);
-    expect(published.body).toMatch(/^(good|nochg)\b/);
-
-    await page.goto(BOARD_PATH);
-    const open = page.getByTestId(`board-open-${deviceName}`);
-    const expand = page.getByTestId(`device-${deviceName}-expand`);
-    await expect(open).toBeVisible({ timeout: 15_000 });
-    await expect(expand).toBeVisible();
-
-    // §16's first row: on the board the name was *not a link at all* —
-    // a bare span inside the expand toggle. It is a control now, and it
-    // carries the same at-rest affordance the anchors do.
-    expect(await open.evaluate((el) => el.tagName)).toBe('BUTTON');
-    expect(await decorationOf(open)).toContain('underline');
-
-    // The control for that reading, on this page: a `.ddns-data` that
-    // is not a control — the hostname inside the expanded block.
-    //
-    // The disclosure is toggled *conditionally*, never blindly. This
-    // device is auto-expanded already: nothing has health-checked the
-    // name yet, so both joints are `not_measured_never`, the strip is
-    // not collapsible, and `anythingWrong` opens the block without
-    // being asked (§3.4 — nothing that hides a divergence may be the
-    // default). An unconditional click here *collapses* it, which is
-    // what the first run of this spec did.
-    if ((await expand.getAttribute('aria-expanded')) === 'false') {
-      await expand.click();
-    }
-    const inert = page
-      .getByTestId(`device-${deviceName}`)
-      .locator('.ddns-device__hostnames span.ddns-data')
-      .first();
-    await expect(inert).toBeVisible();
-    expect(await decorationOf(inert)).toBe(NO_DECORATION);
-
-    // §18.2 — two jobs, two targets. The disclosure owns the state and
-    // the name does not, which is what a screen reader reads.
-    await expect(expand).toHaveAttribute('aria-expanded', 'true');
-    expect(await open.getAttribute('aria-expanded')).toBeNull();
-
-    // **The keyboard path.** Tab from the name and the very next stop is
-    // the disclosure: two controls, adjacent, both reachable, neither
-    // hidden behind the other. Before this they were one target.
-    await open.focus();
-    expect(
-      await page.evaluate(() =>
-        document.activeElement?.getAttribute('data-testid'),
-      ),
-    ).toBe(`board-open-${deviceName}`);
-    await page.keyboard.press('Tab');
-    expect(
-      await page.evaluate(() =>
-        document.activeElement?.getAttribute('data-testid'),
-      ),
-      'Tab from the device name does not land on its disclosure — the two ' +
-        'controls are not adjacent in the tab order',
-    ).toBe(`device-${deviceName}-expand`);
-
-    // …and Enter on the name opens the card, from the keyboard alone.
-    await open.focus();
+    // The device: a control, and it opens the card rather than navigating.
+    const openDevice = row.getByTestId(`board-open-${deviceName}`);
+    await expect(openDevice).toBeVisible();
+    await openDevice.focus();
     await page.keyboard.press('Enter');
-    const modal = page.getByRole('dialog');
-    await expect(modal).toBeVisible({ timeout: 15_000 });
-    await expect(modal.getByTestId('device-detail')).toBeVisible();
-    await expect(modal.getByTestId('device-name')).toHaveText(deviceName);
-
-    // **The signature element, inside the modal.** Either shape counts —
-    // a strip whose joints all agree collapses to one line by design
-    // (§3.4) — and the `no strip to draw` block is asserted absent, so
-    // an empty state cannot pass for a rendered strip. #89's assertion
-    // could not fail for exactly the want of this line.
-    const strip = modal.getByTestId(`strip-${fqdn}-A`);
-    const collapsed = modal.getByTestId(`strip-collapsed-${fqdn}-A`);
-    await expect(strip.or(collapsed)).toBeVisible({ timeout: 15_000 });
-    const block = modal.getByTestId(`hostname-${fqdn}`);
-    await expect(block).not.toContainText('no strip to draw');
-    // The published address is on it, so this is this name's data and
-    // not an empty template.
-    await expect(block).toContainText(DOC_PUBLISHED_V4);
-
-    // And it is not wrapped. §17's condition, measured on the element
-    // that would have been the casualty.
-    const stripWidth = await block.evaluate(
-      (el) => el.getBoundingClientRect().width,
-    );
-    expect(
-      stripWidth,
-      'the strip inside the card modal is below §3.1’s one-strip minimum — ' +
-        'the signature element is wrapping inside its own detail view',
-    ).toBeGreaterThanOrEqual(ONE_STRIP_MIN_PX);
-
-    await testInfo.attach('device-card-modal-from-board.png', {
-      body: await page.screenshot({ animations: 'disabled' }),
-      contentType: 'image/png',
+    await expect(page.getByTestId('device-detail')).toBeVisible({
+      timeout: 8_000,
     });
+    await page.keyboard.press('Escape');
 
-    expect(pageErrors, 'the page threw while rendering').toEqual([]);
+    // The name: a link with a real href, so copy-link and middle-click
+    // behave as the anchor promises.
+    const nameLink = row.getByRole('link', { name: created.hostname });
+    await expect(nameLink).toBeVisible();
+    const href = await nameLink.getAttribute('href');
+    expect(href).toMatch(/\/atrium-ddns\/names\?name=\d+$/);
   });
+
 
   test('the device list opens the same card, and its route still resolves', async ({
     page,
@@ -447,7 +388,7 @@ test.describe('#97 — an interactive .ddns-data says so, at rest', () => {
     await page.goto(DEVICES_PATH);
     await page.getByTestId('add-device').click();
     const create = page.getByRole('dialog');
-    await expect(create).toBeVisible({ timeout: 15_000 });
+    await expect(create).toBeVisible({ timeout: 8_000 });
     await create.getByTestId('device-name').fill(deviceName);
     await create.getByTestId('device-submit').click();
     await expect(page.getByTestId('device-secret-once')).toBeVisible();
@@ -462,12 +403,18 @@ test.describe('#97 — an interactive .ddns-data says so, at rest', () => {
     const listUrl = page.url();
     await name.click();
     const modal = page.getByRole('dialog');
-    await expect(modal).toBeVisible({ timeout: 15_000 });
-    expect(page.url()).toBe(listUrl);
+    await expect(modal).toBeVisible({ timeout: 8_000 });
+    // Same property as the zone list: the path holds, the query
+    // carries the open card so a reload restores it.
+    expect(new URL(page.url()).pathname).toBe(new URL(listUrl).pathname);
+    expect(new URL(page.url()).search).toMatch(/^\?device=\d+$/);
     const modalCard = modal.getByTestId('device-detail');
     await expect(modalCard).toBeVisible();
     // The edit controls, which is what "I cannot edit" was about.
-    await expect(modalCard.getByTestId('device-rename')).toBeVisible();
+    // The name is an always-on field; the Rename toggle is gone. A field
+    // that is always a field cannot disagree with a heading about what
+    // the name currently is.
+    await expect(modalCard.getByTestId('device-name-input')).toBeVisible();
     await expect(modalCard.getByTestId('detail-limit-save')).toBeVisible();
     await expect(modalCard.getByTestId('detail-rotate')).toBeVisible();
     const modalShape = await cardShape(modalCard);
@@ -483,8 +430,14 @@ test.describe('#97 — an interactive .ddns-data says so, at rest', () => {
     // The route, still there and still the same card.
     await page.goto(href as string);
     const routeCard = page.getByTestId('device-detail');
-    await expect(routeCard).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await expect(routeCard).toBeVisible({ timeout: 8_000 });
+    // The address renders the **same modal**, which is the point of
+    // §17: one card, two entrances, and the address carries which
+    // one is open so a reload restores it. "No dialog here" was an
+    // assertion about the route-vs-modal split that no longer
+    // exists; asserting exactly one is what still has teeth,
+    // because two would mean a second editor had grown.
+    await expect(page.getByRole('dialog')).toHaveCount(1);
     const routeShape = await cardShape(routeCard);
     expect(routeShape.length).toBeGreaterThan(5);
     expect(

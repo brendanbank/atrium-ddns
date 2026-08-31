@@ -48,7 +48,7 @@ import { DeviceBoardPage } from '../DeviceBoardPage';
 import { DevicesPage } from '../DevicesPage';
 import { DomainsPage } from '../DomainsPage';
 import { DDNS_ROOT_ATTRIBUTE } from '../host/DdnsRoot';
-import { deviceHref, zoneHref } from '../paths';
+import { deviceHrefParam, zoneHrefParam } from '../paths';
 import { queryClient } from '../queryClient';
 import { board, device as boardDevice } from './fixtures';
 
@@ -138,7 +138,7 @@ describe('the zones list — §16, row 2', () => {
     // surviving arguments, and both are properties of the URL. A modal
     // that replaced the anchor would take copy-link and Back with it.
     expect(name.tagName).toBe('A');
-    expect(name).toHaveAttribute('href', zoneHref(ZONE_ROW.id));
+    expect(name).toHaveAttribute('href', zoneHrefParam(ZONE_ROW.id));
 
     // …and it is still `.ddns-data`. This is the fix that was
     // explicitly ruled out — dropping the class to get Mantine's link
@@ -165,7 +165,7 @@ describe('the card modal keeps the host’s CSS scope', () => {
     // refactor would drop.
     renderWithAtrium(<DomainsPage />);
     fireEvent.click(await screen.findByTestId(`open-domain-${ZONE_ROW.name}`));
-    const card = await screen.findByTestId('zone-card');
+    const card = await screen.findByTestId('zone-modal-body');
     expect(
       card.closest(`[${DDNS_ROOT_ATTRIBUTE}]`),
       'the card modal is outside the host bundle’s CSS scope — nothing in ' +
@@ -179,7 +179,7 @@ describe('the devices list — §16, row 3', () => {
     renderWithAtrium(<DevicesPage />);
     const name = await screen.findByTestId(`open-${DEVICE_ROW.name}`);
     expect(name.tagName).toBe('A');
-    expect(name).toHaveAttribute('href', deviceHref(DEVICE_ROW.id));
+    expect(name).toHaveAttribute('href', deviceHrefParam(DEVICE_ROW.id));
     expect(name.className.split(/\s+/)).toContain('ddns-data');
   });
 });
@@ -187,7 +187,7 @@ describe('the devices list — §16, row 3', () => {
 describe('the board — §16, row 1: it was not a link at all', () => {
   test('the device name is a control, not a span', async () => {
     renderWithAtrium(<DeviceBoardPage />);
-    await screen.findByTestId('board');
+    await screen.findByTestId('board-table');
     const name = screen.getByTestId(`board-open-${DEVICE_ROW.name}`);
 
     // The one cause of the three that no stylesheet could have fixed.
@@ -197,37 +197,28 @@ describe('the board — §16, row 1: it was not a link at all', () => {
     expect(name.className.split(/\s+/)).toContain('ddns-data');
   });
 
-  test('expanding and opening are two controls, not two jobs on one target', async () => {
-    // §18.2. Before this, the whole row was one `<button>` whose job
-    // was expand, with the name inert inside it — so there was exactly
-    // one tab stop and it did the wrong one of the two things.
+  test('the row has one control, and it is the name', async () => {
+    // §18.2. Before this, the whole row was one `<button>` whose job was
+    // expand, with the name inert inside it — one tab stop, doing the
+    // wrong one of the two things.
+    //
+    // The disclosure is gone entirely: the board is a flat table with a
+    // row per name, so there is nothing left to expand and the name is
+    // the row's only control. That is the strongest form of §18.2's
+    // finding — the two jobs cannot be confused for one when there is
+    // one job.
     renderWithAtrium(<DeviceBoardPage />);
-    await screen.findByTestId('board');
+    await screen.findByTestId('board-table');
     const open = screen.getByTestId(`board-open-${DEVICE_ROW.name}`);
-    const expand = screen.getByTestId(`device-${DEVICE_ROW.name}-expand`);
 
-    expect(open).not.toBe(expand);
-    // Two focusable controls: both are `<button>`, so both are in the
-    // tab order without either needing a `tabindex` this file would
-    // then have to police.
     expect(open.tagName).toBe('BUTTON');
-    expect(expand.tagName).toBe('BUTTON');
-
-    // The disclosure state is on the disclosure. It used to be on the
-    // row, which is what made the name announce as "collapsed" to a
-    // screen reader user who was trying to open it.
-    expect(expand).toHaveAttribute('aria-expanded');
+    // No disclosure state anywhere on the row: a control announcing
+    // "collapsed" to a screen reader user trying to open a device is the
+    // defect this test was written for.
     expect(open).not.toHaveAttribute('aria-expanded');
-
-    // Neither control is nested inside the other. A `<button>` inside a
-    // `<button>` is invalid HTML and browsers resolve it by dropping
-    // one of them — silently, and differently between engines.
-    expect(open.contains(expand)).toBe(false);
-    expect(expand.contains(open)).toBe(false);
-
-    // The disclosure has an accessible name that says which device it
-    // belongs to. A row of bare `▸` glyphs is a list of controls a
-    // screen reader cannot tell apart.
-    expect(expand.textContent).toContain(DEVICE_ROW.name);
+    expect(
+      screen.queryByTestId(`device-${DEVICE_ROW.name}-expand`),
+    ).not.toBeInTheDocument();
+    expect(document.querySelectorAll('[aria-expanded]')).toHaveLength(0);
   });
 });

@@ -31,12 +31,10 @@
  * paint half the board and destroy the marker. Idle is normal, and it
  * renders as a measured `0` — a statement, not a silence.
  */
-import { useState } from 'react';
-
-import type { Board, BoardDevice, BoardHostname } from '../api/board';
+import type { BoardHostname } from '../api/board';
 import { LogLink } from '../LogSearchPage';
+import { namesHrefForName } from '../paths';
 import { ResolutionStrip, StripSkeleton } from './ResolutionStrip';
-import { absoluteTitle, formatAge, rateLimitSummary } from './format';
 
 /* The board answers *which* device stopped talking. The next question is
    always *when, and what did it say* — and that is the log, filtered to
@@ -66,11 +64,19 @@ export function HostnameBlock({ hostname }: { hostname: BoardHostname }) {
   if (hostname.strips.length === 0) {
     return (
       <div className="ddns-hostname__strips" data-testid={`hostname-${hostname.name}`}>
-        <span className="ddns-data">{hostname.name}</span>
+        <a
+            className="ddns-data"
+            href={namesHrefForName(hostname.id)}
+            data-testid={`hostname-${hostname.name}-link`}
+          >
+            {hostname.name}
+          </a>
         {/* A real state, not an empty one: #17 counts this slice as
             `hostnames_never_written` rather than dropping it. Two empty
             rails would be the lie. */}
-        <span className="ddns-label">nothing published yet — no strip to draw</span>
+        <span className="ddns-note">
+            Nothing published yet — no strip to draw.
+          </span>
         {logLink}
       </div>
     );
@@ -81,6 +87,7 @@ export function HostnameBlock({ hostname }: { hostname: BoardHostname }) {
         <ResolutionStrip
           key={`${hostname.id}-${strip.family}`}
           hostname={hostname.name}
+          hostnameHref={namesHrefForName(hostname.id)}
           strip={strip}
         />
       ))}
@@ -89,226 +96,20 @@ export function HostnameBlock({ hostname }: { hostname: BoardHostname }) {
   );
 }
 
-/** One device row.
+/** `DeviceBlock` and `DeviceBoard` lived here and are gone.
  *
- * ## Two jobs were on one target, and it did neither visibly
+ * The board is a flat table now — `BoardTable`, one row per (device,
+ * name, family) — so the per-device block, its disclosure and the
+ * separate section for unassigned names all went with it. What
+ * survives in this file is what the *device card* still draws:
+ * `HostnameBlock` (the strips for one name) and `BoardSkeleton`.
  *
- * Until Part III the whole line was a single `<button>` whose job was
- * *expand*, and the device name inside it was a bare
- * `<span class="ddns-data">` — §16's third cause, and the only one of
- * the three where the name was **not a link at all**. §18.2:
- *
- * > The board's device name becomes a way in. It is currently an expand
- * > toggle and a name; those are two jobs on one target and it does
- * > neither visibly.
- *
- * So the line is now a grid holding **two** controls, and they are two
- * tab stops because they are two operations:
- *
- * 1. the **name**, a `button.ddns-data` that opens this device's card —
- *    the same `DeviceCard` the route and the device list render, reached
- *    here through `DeviceBoardPage`'s modal. It carries §2a's underline
- *    at rest, so it says it is a way in without spending colour, which
- *    §1.2 Rule 2 has already spent.
- * 2. the **disclosure** at the end of the line, which expands the names
- *    under the device and nothing else. `aria-expanded` and
- *    `aria-controls` are on *it* now rather than on the row, which is
- *    what makes the two reachable and distinguishable from a keyboard.
- *
- * A `button` and not an `<a>` for the name: this row has no URL of its
- * own to offer — the board is one page — and `DeviceList`'s row is the
- * surface that carries the pasteable address.
+ * The legend those blocks carried — the updates window and the
+ * "nothing has been checked yet" line — moved into `BoardTable`
+ * rather than being dropped: both numbers are read from the payload,
+ * and an operator who changes `health_check_interval_minutes` must
+ * not be able to make the sentence wrong.
  */
-function DeviceBlock({
-  device,
-  windowDays,
-  onOpen,
-}: {
-  device: BoardDevice;
-  windowDays: number;
-  onOpen: (id: number) => void;
-}) {
-  // A device collapses only when everything under it agrees. Same rule
-  // as §3.4's strips, applied one level up: nothing that hides a
-  // divergence may be the default, and "page height is an instrument"
-  // only holds if a healthy device is short.
-  const anythingWrong =
-    device.marked ||
-    device.hostnames.some(
-      (hostname) =>
-        hostname.strips.length === 0 ||
-        hostname.strips.some((strip) => !strip.collapsible),
-    );
-  const [expanded, setExpanded] = useState(anythingWrong);
-  const namesId = `ddns-device-${device.id}-names`;
-
-  return (
-    <section data-testid={`device-${device.name}`} data-liveness={device.liveness}>
-      <div className="ddns-device__line">
-        <span className="ddns-device__marker" aria-hidden="true">
-          {device.marked ? '!' : ''}
-        </span>
-        <button
-          type="button"
-          className="ddns-data"
-          onClick={() => onOpen(device.id)}
-          data-testid={`board-open-${device.name}`}
-        >
-          {device.name}
-          {device.marked ? (
-            <span className="ddns-sr"> — needs attention</span>
-          ) : null}
-        </button>
-        <span
-          className="ddns-station__time"
-          title={absoluteTitle(device.last_seen_at)}
-          data-testid={`device-${device.name}-last-seen`}
-        >
-          {formatAge(device.last_seen_at)}
-        </span>
-        <span
-          className="ddns-station__time"
-          data-testid={`device-${device.name}-updates`}
-        >
-          {device.updates_display}
-        </span>
-        <button
-          type="button"
-          className="ddns-device__expand"
-          onClick={() => setExpanded((value) => !value)}
-          aria-expanded={expanded}
-          aria-controls={namesId}
-          data-testid={`device-${device.name}-expand`}
-        >
-          {/* The glyph is decoration; the sentence beside it is the
-              accessible name. "▸" alone would announce as a character
-              nobody can act on, and two of these in a list would be
-              indistinguishable by name. */}
-          <span aria-hidden="true">{expanded ? '▾' : '▸'}</span>
-          <span className="ddns-sr">
-            {expanded ? 'Hide' : 'Show'} the names {device.name} updates
-          </span>
-        </button>
-      </div>
-      {expanded ? (
-        <div id={namesId} className="ddns-device__hostnames">
-          <LogLink
-            params={{ device_id: device.id }}
-            data-testid={`device-${device.name}-log`}
-          >
-            log for this device
-          </LogLink>
-          {/* #73's AC 4 — the stored limit is displayed wherever a
-              device is shown. In the *detail*, not in the line: the
-              board's four columns are a status grid and §4 spends its
-              boldness on the strip. This is configuration sitting
-              quietly beside the log link, which is where a reader who
-              has already asked "what is wrong with this device" looks
-              next. */}
-          <span
-            className="ddns-label"
-            data-testid={`device-${device.name}-limit`}
-          >
-            rate limit {rateLimitSummary(device)}
-          </span>
-          {device.hostnames.length === 0 ? (
-            <span className="ddns-label">
-              this device has no hostnames. Assign one to start tracking it.
-            </span>
-          ) : (
-            device.hostnames.map((hostname) => (
-              <HostnameBlock key={hostname.id} hostname={hostname} />
-            ))
-          )}
-        </div>
-      ) : null}
-      <span className="ddns-sr">
-        {device.updates_display} updates in the last {windowDays} days
-      </span>
-    </section>
-  );
-}
-
-export interface DeviceBoardProps {
-  board: Board;
-  /** Raised when a device name is clicked.
-   *
-   * The board does not own the modal, and that is not fussiness: the
-   * card imports `HostnameBlock` from *this* module, so a `DeviceCard`
-   * import here would close a cycle. `DeviceBoardPage` holds it
-   * instead, which also keeps this component a pure rendering of a
-   * `Board` payload. */
-  onOpenDevice: (id: number) => void;
-}
-
-export function DeviceBoard({ board, onOpenDevice }: DeviceBoardProps) {
-  if (board.devices.length === 0 && board.unassigned_hostnames.length === 0) {
-    return (
-      <p data-testid="board-empty">
-        You have no devices yet. Add one to get a DDNS username and password.
-      </p>
-    );
-  }
-
-  // §4.5's fourth empty state. The interval is read from the payload,
-  // never typed into the sentence — an operator who changes
-  // `health_check_interval_minutes` must not be able to make this string
-  // wrong.
-  const nothingChecked =
-    board.devices.every((device) =>
-      device.hostnames.every((hostname) =>
-        hostname.strips.every(
-          (strip) => strip.answered.status === 'never_checked',
-        ),
-      ),
-    ) &&
-    board.devices.some((device) =>
-      device.hostnames.some((hostname) => hostname.strips.length > 0),
-    );
-
-  return (
-    <div className="ddns-board" data-testid="board">
-      <div className="ddns-board__head">
-        <span aria-hidden="true" />
-        <span className="ddns-label">device</span>
-        <span className="ddns-label">last seen</span>
-        <span className="ddns-label" data-testid="board-updates-head">
-          updates / {board.window_days} d
-        </span>
-        {/* The disclosure's column. Unlabelled on purpose — §2.4's rule
-            is that a `;` comment marks the head of a column of
-            machine-generated data, and a control is not that. */}
-        <span aria-hidden="true" />
-      </div>
-      {nothingChecked ? (
-        <p data-testid="board-never-checked">
-          Nothing has been checked yet. The health check runs every{' '}
-          {board.health_check_interval_minutes} minutes.
-        </p>
-      ) : null}
-      {board.devices.map((device) => (
-        <DeviceBlock
-          key={device.id}
-          device={device}
-          windowDays={board.window_days}
-          onOpen={onOpenDevice}
-        />
-      ))}
-      {board.unassigned_hostnames.length > 0 ? (
-        <section data-testid="board-unassigned">
-          <span className="ddns-label">
-            hostnames with no device — nothing can update these
-          </span>
-          <div className="ddns-device__hostnames">
-            {board.unassigned_hostnames.map((hostname) => (
-              <HostnameBlock key={hostname.id} hostname={hostname} />
-            ))}
-          </div>
-        </section>
-      ) : null}
-    </div>
-  );
-}
 
 /** §4.5's loading state, at board scale. Static grey blocks, no
  *  shimmer, and critically **no rail** — a loading strip that carried

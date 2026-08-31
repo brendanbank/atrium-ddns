@@ -862,11 +862,20 @@
    -------------------------------------------------------------------- */
 [data-ddns-root] .ddns-zones {
   display: grid;
-  /* zone | provider | names | mark. The zone column takes the slack —
-     it is the one with unbounded content — and the other three are
-     sized to their contents so they do not drift apart on a short list. */
-  grid-template-columns: minmax(12rem, 1fr) max-content max-content max-content;
-  column-gap: var(--mantine-spacing-lg);
+  /* zone | provider | names | slack.
+     The zone column is capped at ~50 characters rather than given the
+     `1fr`. With the slack on the zone, provider and names were shoved
+     to the far edge of a 1168px shell and the eye had to travel the
+     whole width to read one row. The slack now sits in a trailing
+     column that carries only the diverged mark, so the three fields
+     that matter stay together on the left.
+
+     `ch` is the width of "0" in the current font, so in the body face
+     this is approximate — which is right for a cap whose job is "stop
+     before it gets silly", not a measured alignment. */
+  grid-template-columns:
+    minmax(12rem, 50ch) max-content max-content minmax(0, 1fr);
+  column-gap: var(--mantine-spacing-md);
   row-gap: 0;
   align-items: baseline;
 }
@@ -895,4 +904,536 @@
 [data-ddns-root] .ddns-zones__note {
   grid-column: 1 / -1;
   padding-bottom: 0.35rem;
+}
+
+
+/* ====================================================================
+   The zone table, restyled at the operator's request.
+
+   §2.3 set the data face to mono and made values outrank their labels,
+   and that argument still holds where a value is a *measurement* you
+   compare down a column: an IPv6 address is 39 characters, never
+   compressed, and tabular figures are what make two of them
+   comparable at a glance.
+
+   A zone name is not that. It is a name — read, not aligned — and the
+   provider beside it is a word. So this table takes the body face and
+   sentence-case headings, matching the reference the operator supplied.
+   The strip and the board keep the data face; the rule is now "mono
+   where the value is measured", not "mono everywhere".
+   ==================================================================== */
+
+/* Headings: sentence case, weighted rather than shouted. The `;` prefix
+   was a zone-file borrowing that reads as noise on a heading row a
+   newcomer meets first. It stays on the strip's station labels, where
+   the borrowing is doing real work. */
+/* Column headings. Their own class rather than `.ddns-label`, because
+   that class carries `::before { content: '; ' }` — the zone-file
+   borrowing — and a heading that also typed the semicolon rendered it
+   twice. Restyling `.ddns-label` here instead would have suppressed the
+   marker on the strip's station labels, where it is doing real work. */
+[data-ddns-root] .ddns-th {
+  font-family: var(--ddns-font-body);
+  font-size: var(--mantine-font-size-md);
+  font-weight: 600;
+  color: var(--ddns-ink);
+}
+
+/* A value in a column. Not a label — it names nothing — so it takes no
+   `; ` marker. */
+[data-ddns-root] .ddns-cell {
+  font-family: var(--ddns-font-body);
+  font-size: var(--mantine-font-size-md);
+  color: var(--ddns-quiet);
+}
+
+/* The zone name: body face, and still the most important string in the
+   row — so it keeps the size advantage §2.3 gave it rather than the
+   typeface. */
+[data-ddns-root] .ddns-zones__row .ddns-data,
+[data-ddns-root] .ddns-devices__row .ddns-data {
+  font-family: var(--ddns-font-body);
+  font-size: var(--mantine-font-size-md);
+  font-variant-numeric: normal;
+  /* The cap is on the column; this keeps a long zone name from
+     forcing the track wider than the cap by refusing to wrap. */
+  overflow-wrap: anywhere;
+}
+
+/* The names link. Mantine's `size` prop sets this, so it is overridden
+   here rather than left at `sm` — one declaration for the whole row
+   beats a size prop per element that the next person has to find. */
+[data-ddns-root] .ddns-zones__row a,
+[data-ddns-root] .ddns-devices__row a {
+  font-size: var(--mantine-font-size-md);
+}
+
+/* Zebra striping, from an attribute rather than from sibling counting.
+
+   `:nth-child(even)` is wrong here — the head is a sibling in the same
+   grid, so it shifts the parity — and `:nth-child(even of .row)`, which
+   would be correct, is not supported by lightningcss (the build fails
+   outright: `Unexpected token Ident("of")`). Counting `:nth-child(odd)`
+   to compensate for the head would work today and break silently the
+   day the head is removed or a second element joins the grid.
+
+   So the row states its own parity and CSS expresses the rule, which is
+   the same division `data-diverged` already uses on these rows.
+
+   The tint is `--ddns-edge` at partial alpha rather than a new value:
+   §1's six-value palette is not being extended for a stripe, and an
+   alpha of the existing edge colour lands correctly in both schemes
+   without a second dark-mode declaration. */
+[data-ddns-root] .ddns-zones__row[data-stripe='on'] {
+  background: color-mix(in srgb, var(--ddns-edge) 45%, transparent);
+}
+
+/* The rules between rows are redundant once the stripes carry the
+   separation, and two devices doing one job is the thing §7 says to
+   cut. The head keeps its rule — that boundary is a different kind. */
+[data-ddns-root] .ddns-zones__row + .ddns-zones__row {
+  border-top: none;
+}
+
+/* Stripes need the row to be a band, not four floating cells. */
+[data-ddns-root] .ddns-zones__head,
+[data-ddns-root] .ddns-zones__row {
+  padding-inline: 0.5rem;
+  padding-block: 0.45rem;
+  border-radius: 2px;
+}
+
+[data-ddns-root] .ddns-zones__row:hover {
+  background: color-mix(in srgb, var(--ddns-edge) 75%, transparent);
+}
+
+
+/* ====================================================================
+   The devices table. Same type, same stripes, same rules as the zone
+   table — sharing `.ddns-th` / `.ddns-cell` rather than copying their
+   declarations, because "the same as the zones screen" is a statement
+   about one thing, not two that currently match.
+
+   Its own grid, though: the columns are different, and
+   `.ddns-device__line` is shared with the board and the hostname list,
+   so it is deliberately not reused here.
+   ==================================================================== */
+[data-ddns-root] .ddns-devices {
+  display: grid;
+  /* name | last seen | username | names | limit | actions | slack.
+     Everything but the name is content-sized and the slack sits at the
+     end, so the fields stay together on the left instead of being
+     spread across a 1168px shell. */
+  /* Every column hugs its content and the slack sits at the end.
+     `minmax(9rem, 36ch)` on the name looked equivalent and was not: a
+     definite max lets the track take space the content does not need, so
+     a two-character device name still opened a gap the width of the cap
+     before `Last seen`. `max-content` with a cap enforced on the item
+     (below) keeps the column honest and still bounds a long name. */
+  grid-template-columns:
+    minmax(9rem, max-content) max-content max-content max-content
+    max-content max-content minmax(0, 1fr);
+  column-gap: var(--mantine-spacing-xl);
+  align-items: center;
+}
+
+[data-ddns-root] .ddns-devices__head,
+[data-ddns-root] .ddns-devices__row {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  align-items: center;
+  padding-inline: 0.5rem;
+  padding-block: 0.35rem;
+  border-radius: 2px;
+}
+
+[data-ddns-root] .ddns-devices__head {
+  border-bottom: 1px solid var(--ddns-rule);
+  align-items: baseline;
+}
+
+[data-ddns-root] .ddns-devices__row[data-stripe='on'] {
+  background: color-mix(in srgb, var(--ddns-edge) 45%, transparent);
+}
+
+[data-ddns-root] .ddns-devices__row:hover {
+  background: color-mix(in srgb, var(--ddns-edge) 75%, transparent);
+}
+
+/* The action icons. Kept on one line with the data rather than below it:
+   three labelled buttons under every row turned a five-device list into
+   a page you scroll. */
+[data-ddns-root] .ddns-devices__actions {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+/* A notice that belongs to a row spans it, rather than squeezing into
+   whichever column it happened to be declared in. */
+[data-ddns-root] .ddns-devices__note {
+  grid-column: 1 / -1;
+  padding-bottom: 0.35rem;
+}
+
+
+/* The cap on a device name, applied to the cell rather than the track —
+   see the note on `.ddns-devices`'s template. */
+[data-ddns-root] .ddns-devices__row .ddns-data {
+  max-width: 36ch;
+  overflow-wrap: anywhere;
+}
+
+/* The secret dialog's field labels. `.ddns-th` gives them the table's
+   face; this puts them on their own line-height so a two-column grid of
+   label/value lines up without the label's descenders shifting it. */
+[data-ddns-root] .ddns-secret__label {
+  align-self: center;
+}
+
+
+/* Prose inside a data area. §2.2's boundary rule: if you would say it
+   out loud it is the body face — so an empty-state sentence is not a
+   `.ddns-label`, which would give it both the data face and the `; `
+   marker meant for the strip's station names. */
+[data-ddns-root] .ddns-note {
+  font-family: var(--ddns-font-body);
+  font-size: var(--mantine-font-size-sm);
+  color: var(--ddns-quiet);
+}
+
+/* ====================================================================
+   The names table. Third of three, and the classes are shared rather
+   than copied: `.ddns-th` and `.ddns-cell` are the same ones the zone
+   and device tables use, so "the same font as the other screens" is a
+   statement about one rule instead of three that happen to agree today.
+   ==================================================================== */
+[data-ddns-root] .ddns-names {
+  display: grid;
+  /* name | zone | device | last published | actions | slack.
+     The device column is a `Select` with a fixed width, so it is sized
+     to content like the rest and the slack sits at the end — the fields
+     stay together on the left rather than spreading across the shell. */
+  grid-template-columns:
+    minmax(9rem, max-content) max-content max-content max-content
+    max-content minmax(0, 1fr);
+  column-gap: var(--mantine-spacing-xl);
+  align-items: center;
+}
+
+[data-ddns-root] .ddns-names__head,
+[data-ddns-root] .ddns-names__row {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  align-items: center;
+  padding-inline: 0.5rem;
+  padding-block: 0.35rem;
+  border-radius: 2px;
+}
+
+[data-ddns-root] .ddns-names__head {
+  border-bottom: 1px solid var(--ddns-rule);
+  align-items: baseline;
+}
+
+[data-ddns-root] .ddns-names__row[data-stripe='on'] {
+  background: color-mix(in srgb, var(--ddns-edge) 45%, transparent);
+}
+
+[data-ddns-root] .ddns-names__row:hover {
+  background: color-mix(in srgb, var(--ddns-edge) 75%, transparent);
+}
+
+[data-ddns-root] .ddns-names__actions {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+/* The name itself: body face like the other two tables, capped so a
+   long FQDN cannot widen the track past the rest of the row. */
+[data-ddns-root] .ddns-names__row .ddns-data {
+  font-family: var(--ddns-font-body);
+  font-size: var(--mantine-font-size-md);
+  font-variant-numeric: normal;
+  max-width: 40ch;
+  overflow-wrap: anywhere;
+}
+
+[data-ddns-root] .ddns-names__row a {
+  font-size: var(--mantine-font-size-md);
+}
+
+/* ====================================================================
+   The log ledger. Fourth table, same shared classes.
+
+   It was one entry per two-or-three lines: a head row, an address line
+   under it, and a message line under that. The address line made every
+   row in a 200-row page pay for a detail that matters on the few you
+   stop at, and it lined up with nothing — `called from` looked like a
+   column while sitting under one.
+
+   Now one line per event, and a click opens `LogDetail` with the rest.
+   ==================================================================== */
+[data-ddns-root] .ddns-logs {
+  display: grid;
+  /* when | device | name | event | result | via | from | user
+     `event` gets a floor because `manual_update` is 13 characters and a
+     content-sized track let it run into `result` — visible in the
+     operator's screenshot as overlapping text. */
+  grid-template-columns:
+    max-content minmax(7rem, max-content) minmax(9rem, max-content)
+    minmax(8.5rem, max-content) minmax(6rem, max-content) max-content
+    max-content minmax(0, 1fr);
+  column-gap: var(--mantine-spacing-lg);
+  align-items: center;
+}
+
+[data-ddns-root] .ddns-logs__head,
+[data-ddns-root] .ddns-logs__row {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  align-items: center;
+  padding-inline: 0.5rem;
+  padding-block: 0.4rem;
+  border-radius: 2px;
+  text-align: left;
+}
+
+[data-ddns-root] .ddns-logs__head {
+  border-bottom: 1px solid var(--ddns-rule);
+  align-items: baseline;
+}
+
+[data-ddns-root] .ddns-logs__row[data-stripe='on'] {
+  background: color-mix(in srgb, var(--ddns-edge) 45%, transparent);
+}
+
+[data-ddns-root] .ddns-logs__row:hover {
+  background: color-mix(in srgb, var(--ddns-edge) 75%, transparent);
+  cursor: pointer;
+}
+
+/* Keyboard reachability. The row is a `role="button"`, so it needs a
+   focus ring — an interactive row that only responds to a mouse is the
+   affordance problem of §16 in a different costume. */
+[data-ddns-root] .ddns-logs__row:focus-visible {
+  outline: 2px solid var(--mantine-color-blue-6);
+  outline-offset: -2px;
+}
+
+/* The `≠` beside "called from" when the declared address differs. A
+   glyph rather than a second address: §3.4's rule is that a value which
+   always repeats another has stopped carrying anything, and the full
+   pair is one click away in the detail. */
+[data-ddns-root] .ddns-log__declared {
+  color: var(--ddns-diverge);
+  font-weight: 600;
+}
+
+/* The detail dialog: label/value pairs on one grid so the values align
+   down the column instead of each row setting its own indent. */
+[data-ddns-root] .ddns-logdetail {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  column-gap: var(--mantine-spacing-lg);
+  row-gap: 0.3rem;
+  align-items: baseline;
+}
+
+[data-ddns-root] .ddns-logdetail__row {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  align-items: baseline;
+}
+
+/* Cells do not wrap. One long value — `alice@compat.invalid` in the user
+   column — was wrapping to two lines and taking the whole row with it,
+   so a table whose job is scanning had rows of two different heights
+   depending on the length of a value nobody is reading closely.
+
+   Truncated with the full text in `title`, which is the same bargain the
+   time column already makes: the scannable form on screen, the exact one
+   on hover. */
+[data-ddns-root] .ddns-logs__row > * {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The user column is the one that overflows, and it is last before the
+   slack — so give it somewhere to go rather than a hard cap. */
+[data-ddns-root] .ddns-logs {
+  grid-template-columns:
+    max-content minmax(7rem, max-content) minmax(9rem, max-content)
+    minmax(8.5rem, max-content) minmax(6rem, max-content) max-content
+    max-content minmax(6rem, 1fr);
+}
+
+/* The device's own facts, on one line under its row. Two short values —
+   a link and a limit — each taking a full row was three lines of chrome
+   above the strips, which are the thing the page exists for. */
+[data-ddns-root] .ddns-device__meta {
+  display: flex;
+  align-items: baseline;
+  gap: var(--mantine-spacing-lg);
+  flex-wrap: wrap;
+}
+
+/* ====================================================================
+   Board density.
+
+   The spacing was set against a handful of devices. At fifteen or twenty
+   the page stops being scannable: every device costs a `lg` gap, an
+   expanded block costs a meta line, and every strip is a bordered card
+   with `md` padding on all four sides. Twenty devices with one name each
+   was several screens of mostly border.
+
+   Nothing here changes what is *said* — the stations, the rail, the
+   five-state table and the accent rule are untouched. It changes how
+   much vertical space saying it costs.
+   ==================================================================== */
+[data-ddns-root] .ddns-board {
+  gap: var(--mantine-spacing-xs);
+}
+
+/* The device row is the thing you scan. Tight, with a rule between rows
+   so twenty of them read as a list rather than as a wall. */
+[data-ddns-root] .ddns-board .ddns-device__line {
+  padding-block: 0.25rem;
+}
+
+[data-ddns-root] .ddns-board > section + section {
+  border-top: 1px solid var(--ddns-edge);
+  padding-top: 0.25rem;
+}
+
+/* The strip was a bordered card. At this density the border is the noise
+   and the rail already delimits it — so the border goes and the padding
+   drops to the left inset the rail needs. A *diverged* strip keeps its
+   wash and gains a left edge, which is stronger contrast against a plain
+   neighbour than it had against a bordered one. */
+[data-ddns-root] .ddns-board .ddns-strip {
+  border: none;
+  padding: 0.15rem 0 0.15rem var(--mantine-spacing-xs);
+}
+
+[data-ddns-root] .ddns-board .ddns-strip[data-diverged='true'] {
+  border-left: 2px solid var(--ddns-diverge);
+}
+
+[data-ddns-root] .ddns-board .ddns-hostname__strips,
+[data-ddns-root] .ddns-board .ddns-device__hostnames {
+  gap: 0.15rem;
+}
+
+[data-ddns-root] .ddns-device__meta {
+  gap: var(--mantine-spacing-md);
+  padding-bottom: 0.1rem;
+}
+
+/* Station rows: the three lines inside a strip. `sm` line-height on a
+   14px face is ~1.55; at three stations per family, per name, per
+   device, that leading is the single biggest consumer of the page. */
+[data-ddns-root] .ddns-board .ddns-station,
+[data-ddns-root] .ddns-board .ddns-strip__head {
+  line-height: 1.3;
+}
+
+/* Station rows, at board density. The label column had a 110px floor and
+   the value column took the slack, so a short value like `n/a` sat alone
+   with a hand's width of empty before the timestamp. Label and value now
+   sit together and the slack goes to the gap before the time, which is
+   the one column that genuinely wants to be right-aligned. */
+[data-ddns-root] .ddns-board .ddns-strip__stations {
+  grid-template-columns: max-content max-content minmax(0, 1fr);
+  column-gap: var(--mantine-spacing-md);
+  row-gap: 0;
+}
+
+[data-ddns-root] .ddns-board .ddns-strip__stations .ddns-station__time {
+  justify-self: end;
+}
+
+/* The name above the stations, and the family beside it. */
+[data-ddns-root] .ddns-board .ddns-strip__head {
+  padding-bottom: 0.1rem;
+}
+
+/* ====================================================================
+   The board, as a table.
+
+   One row per name per family, whether or not a check has run. The
+   nested layout changed shape as results arrived — a device with a
+   result and one without were laid out differently — so the columns
+   moved under the reader's eye. A table has one shape.
+   ==================================================================== */
+[data-ddns-root] .ddns-boardtable {
+  display: grid;
+  /* mark | device | name | family | answered | published | called from |
+     checked | log. The name takes the slack; everything else is sized
+     to what it holds. */
+  grid-template-columns:
+    1.25rem max-content minmax(12rem, 1fr) max-content max-content
+    max-content max-content max-content max-content max-content max-content;
+  column-gap: var(--mantine-spacing-md);
+  align-items: center;
+}
+
+[data-ddns-root] .ddns-boardtable__head,
+[data-ddns-root] .ddns-boardtable__row {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  align-items: center;
+  padding-inline: 0.35rem;
+  padding-block: 0.3rem;
+  border-radius: 2px;
+}
+
+[data-ddns-root] .ddns-boardtable__head {
+  border-bottom: 1px solid var(--ddns-rule);
+  align-items: baseline;
+}
+
+[data-ddns-root] .ddns-boardtable__row > * {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+[data-ddns-root] .ddns-boardtable__row[data-stripe='on'] {
+  background: color-mix(in srgb, var(--ddns-edge) 45%, transparent);
+}
+
+[data-ddns-root] .ddns-boardtable__row:hover {
+  background: color-mix(in srgb, var(--ddns-edge) 75%, transparent);
+}
+
+/* §1.2 Rule 1, carried over intact: agreement has no colour, and only a
+   measured divergence is accented. The wash wins over the stripe because
+   it is the one thing on this page the reader must not scroll past. */
+[data-ddns-root] .ddns-boardtable__row[data-tone='diverged'] {
+  background: var(--ddns-diverge-wash);
+  box-shadow: inset 2px 0 0 var(--ddns-diverge);
+}
+
+[data-ddns-root] .ddns-boardtable__mark {
+  color: var(--ddns-diverge);
+  font-weight: 700;
+}
+
+/* The device name is a button that has to sit in a text row. */
+[data-ddns-root] .ddns-boardtable__device {
+  background: none;
+  border: none;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
 }

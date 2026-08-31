@@ -19,6 +19,8 @@
  */
 import { useState } from 'react';
 import {
+  Tooltip,
+  ActionIcon,
   Alert,
   Anchor,
   Button,
@@ -42,12 +44,19 @@ import {
 } from '../api/devices';
 import { absoluteTitle, formatAge, rateLimitSummary } from '../board/format';
 import { opensInThisTab } from '../cards';
-import { deviceHref } from '../paths';
-import { DeviceCardModal } from './DeviceCard';
+import { deviceHrefParam } from '../paths';
+import {
+  IconGauge,
+  IconRefresh,
+  IconTrash,
+} from '@tabler/icons-react';
+
+import { DdnsPortalScope } from '../host/DdnsRoot';
 import { MigratedNotice, SecretOnce } from './SecretOnce';
 
 function DeviceLine({
   device,
+  index,
   onOpen,
   onRotate,
   onDelete,
@@ -55,6 +64,10 @@ function DeviceLine({
   busy,
 }: {
   device: Device;
+  /** Stripe parity, stated rather than counted — the head is a sibling
+   *  in the same grid, so `:nth-child(even)` is off by one, and the
+   *  selector that would be correct is rejected by lightningcss. */
+  index: number;
   onOpen: (id: number) => void;
   onRotate: (device: Device) => void;
   onDelete: (device: Device) => void;
@@ -62,93 +75,110 @@ function DeviceLine({
   busy: boolean;
 }) {
   return (
-    <Stack gap="xs" data-testid={`device-${device.name}`}>
-      <div className="ddns-device__line">
-        <span />
-        {/* #89 made the name the way in to `/atrium-ddns/devices/:id`.
-            #97 is about the fact that nothing on screen said so:
-            `.ddns-data` sets `color: var(--ddns-ink)`, which cancels
-            Mantine's link colour and underline, so on this very row
-            `log for this device` rendered blue and the device name did
-            not. §16.1's fix is in `ddns.css` §2a — an underline on the
-            data face, carried **at rest** — and the class stays,
-            because §2.3 is not being retracted on the most important
-            string on the page.
+    <div
+      className="ddns-devices__row"
+      data-stripe={index % 2 === 1 ? 'on' : 'off'}
+      data-testid={`device-${device.name}`}
+    >
+      {/* #89 made the name the way in to `/atrium-ddns/devices/:id`, and
+          #97 gave it an affordance that is not colour — `.ddns-data`
+          sets `--ddns-ink`, which cancels Mantine's link colour, so the
+          underline in `ddns.css` §2a is what says it is clickable.
 
-            Still an anchor with a real `href`: §17 keeps the route for
-            linkability and Back, so copy-link, middle-click and
-            cmd/ctrl-click all still navigate. Only the plain left click
-            is intercepted, and it opens the card in a modal — the shape
-            the operator asked for twice. */}
-        <Anchor
-          href={deviceHref(device.id)}
-          className="ddns-data"
-          onClick={(event) => {
-            if (!opensInThisTab(event.nativeEvent)) return;
-            event.preventDefault();
-            onOpen(device.id);
-          }}
-          data-testid={`open-${device.name}`}
-        >
-          {device.name}
-        </Anchor>
-        <span
-          className="ddns-station__time"
-          title={absoluteTitle(device.last_seen_at)}
-        >
-          {formatAge(device.last_seen_at)}
-        </span>
-        <span className="ddns-station__time">{device.username}</span>
-      </div>
+          Still an anchor with a real `href`: copy-link, middle-click and
+          cmd/ctrl-click navigate. Only the plain left click is
+          intercepted, and it opens the card. */}
+      <Anchor
+        /* The `?device=` form, not `/devices/:id`. A plain click is
+           intercepted and opens the modal; the href is what a
+           cmd-click or "copy link address" hands you, and those two
+           pointing at different addresses is how you end up with a link
+           that behaves differently from the thing you clicked. The
+           path route still resolves for old links — it renders the same
+           card as a full page. */
+        href={deviceHrefParam(device.id)}
+        className="ddns-data"
+        onClick={(event) => {
+          if (!opensInThisTab(event.nativeEvent)) return;
+          event.preventDefault();
+          onOpen(device.id);
+        }}
+        data-testid={`open-${device.name}`}
+      >
+        {device.name}
+      </Anchor>
+      <span className="ddns-cell" title={absoluteTitle(device.last_seen_at)}>
+        {formatAge(device.last_seen_at)}
+      </span>
+      <span className="ddns-cell">{device.username}</span>
+      <span className="ddns-cell" data-testid={`names-${device.name}`}>
+        {device.hostname_count} name{device.hostname_count === 1 ? '' : 's'}
+      </span>
+      {/* #73's AC 4: the stored limit is *displayed*, not merely accepted
+          at creation. Unconditionally — a limit shown only when it is
+          unusual is a limit nobody can check. */}
+      <span className="ddns-cell" data-testid={`limit-summary-${device.name}`}>
+        {rateLimitSummary(device)}
+      </span>
+      {/* Icons, not three labelled buttons on a line of their own. Each
+          keeps a `Tooltip` and an `aria-label`: an icon-only control
+          without a name is a control only the person who built it can
+          use, and the two destructive ones here are exactly where that
+          matters. */}
+      <span className="ddns-devices__actions">
+        <Tooltip label="Rotate secret" withArrow>
+          <ActionIcon
+            variant="subtle"
+            color="gray"
+            disabled={busy}
+            aria-label={`Rotate the secret for ${device.name}`}
+            onClick={() => onRotate(device)}
+            data-testid={`rotate-${device.name}`}
+          >
+            <IconRefresh size={16} />
+          </ActionIcon>
+        </Tooltip>
+        <Tooltip label="Rate limit" withArrow>
+          <ActionIcon
+            variant="subtle"
+            color="gray"
+            disabled={busy}
+            aria-label={`Change the rate limit for ${device.name}`}
+            onClick={() => onEditLimit(device)}
+            data-testid={`limit-${device.name}`}
+          >
+            <IconGauge size={16} />
+          </ActionIcon>
+        </Tooltip>
+        <Tooltip label="Delete" withArrow>
+          <ActionIcon
+            variant="subtle"
+            color="red"
+            disabled={busy}
+            aria-label={`Delete ${device.name}`}
+            onClick={() => onDelete(device)}
+            data-testid={`delete-${device.name}`}
+          >
+            <IconTrash size={16} />
+          </ActionIcon>
+        </Tooltip>
+      </span>
       <MigratedNotice origin={device.credential_origin} />
-      <Group gap="xs">
-        <Button
-          size="xs"
-          variant="default"
-          disabled={busy}
-          onClick={() => onRotate(device)}
-          data-testid={`rotate-${device.name}`}
-        >
-          Rotate secret
-        </Button>
-        <Button
-          size="xs"
-          variant="default"
-          disabled={busy}
-          onClick={() => onEditLimit(device)}
-          data-testid={`limit-${device.name}`}
-        >
-          Rate limit
-        </Button>
-        <Button
-          size="xs"
-          variant="default"
-          disabled={busy}
-          onClick={() => onDelete(device)}
-          data-testid={`delete-${device.name}`}
-        >
-          Delete
-        </Button>
-        <Text size="xs" c="dimmed" data-testid={`names-${device.name}`}>
-          {device.hostname_count} hostname
-          {device.hostname_count === 1 ? '' : 's'}
-        </Text>
-        {/* #73's AC 4: the stored value is *displayed*, not merely
-            accepted at creation. Unconditionally — a limit shown only
-            when it is unusual is a limit nobody can check. */}
-        <Text
-          size="xs"
-          c="dimmed"
-          data-testid={`limit-summary-${device.name}`}
-        >
-          {rateLimitSummary(device)}
-        </Text>
-      </Group>
-    </Stack>
+    </div>
   );
 }
 
-export function DeviceList({ devices }: { devices: Device[] }) {
+export function DeviceList({
+  devices,
+  onOpen,
+}: {
+  devices: Device[];
+  /** Navigates. The list does not know that opening a device is a URL
+   *  change — `DevicesPage` owns that, so there is one place that
+   *  decides what a device address is, and the modal survives a reload
+   *  because the address carries it. */
+  onOpen: (id: number) => void;
+}) {
   const client = useQueryClient();
   // The secret lives here and nowhere else. Not in the query cache, not
   // in storage, not in a ref that survives a remount.
@@ -157,12 +187,17 @@ export function DeviceList({ devices }: { devices: Device[] }) {
   const [name, setName] = useState('');
   const [limit, setLimit] = useState<number | ''>('');
   const [confirmRotate, setConfirmRotate] = useState<Device | null>(null);
+  /** Delete used to fire straight from the row — `onDelete={(target) =>
+   *  remove.mutate(target.id)}`, no dialog, no undo. One misplaced click
+   *  destroyed a device and every hostname assignment pointing at it,
+   *  and the icon that now triggers it is a 16px target beside two
+   *  others. Rotate already asked; delete does the same. */
+  const [confirmDelete, setConfirmDelete] = useState<Device | null>(null);
   const [editingLimit, setEditingLimit] = useState<Device | null>(null);
   const [nextLimit, setNextLimit] = useState<number | ''>('');
   const [error, setError] = useState<string | null>(null);
   /** Which device's card is open, if any. `null` is *closed*, never
    *  *device zero*. */
-  const [openDevice, setOpenDevice] = useState<number | null>(null);
 
   const invalidate = () =>
     client.invalidateQueries({ queryKey: DEVICES_QUERY_KEY });
@@ -170,15 +205,33 @@ export function DeviceList({ devices }: { devices: Device[] }) {
   const create = useMutation({
     mutationFn: createDevice,
     onSuccess: (result) => {
+      // **The create modal stays open.** The secret opens over it, and
+      // dismissing the secret closes both — see `dismissSecret`.
+      //
+      // Closing the form the instant the secret appeared put the one
+      // string that can never be recovered on a page that had just
+      // moved under the pointer. A modal over a modal is the shape that
+      // says "you are not finished yet", and the form behind it is the
+      // context for what you are being handed.
       setIssued(result);
-      setCreating(false);
-      setName('');
-      setLimit('');
       setError(null);
       void invalidate();
     },
     onError: (err: Error) => setError(err.message),
   });
+
+  /** One exit for the secret, whichever mutation produced it.
+   *
+   *  Creation leaves the form open behind; rotation has no form behind,
+   *  and `setCreating(false)` is a no-op there. Writing it once rather
+   *  than per call site is what keeps the two paths from drifting into
+   *  "rotate leaves the create modal open". */
+  const dismissSecret = () => {
+    setIssued(null);
+    setCreating(false);
+    setName('');
+    setLimit('');
+  };
 
   const rotate = useMutation({
     mutationFn: rotateDeviceSecret,
@@ -195,6 +248,7 @@ export function DeviceList({ devices }: { devices: Device[] }) {
     mutationFn: deleteDevice,
     onSuccess: () => {
       setError(null);
+      setConfirmDelete(null);
       void invalidate();
     },
     onError: (err: Error) => setError(err.message),
@@ -244,45 +298,85 @@ export function DeviceList({ devices }: { devices: Device[] }) {
         </Alert>
       ) : null}
 
-      {issued ? (
-        <SecretOnce issued={issued} onDismiss={() => setIssued(null)} />
-      ) : null}
-
-      <Group justify="space-between">
-        <div className="ddns-board__head">
-          <span />
-          <span className="ddns-label">device</span>
-          <span className="ddns-label">last seen</span>
-          <span className="ddns-label">username</span>
-        </div>
-      </Group>
-
       {devices.length === 0 ? (
         <Text size="sm" data-testid="devices-empty">
           {/* §4.5's voice: the next action, in the body face. */}
           You have no devices yet. Add one to get a DDNS username and password.
         </Text>
       ) : (
-        devices.map((device) => (
-          <DeviceLine
-            key={device.id}
-            device={device}
-            busy={busy}
-            onOpen={setOpenDevice}
-            onRotate={setConfirmRotate}
-            onEditLimit={openLimit}
-            onDelete={(target) => remove.mutate(target.id)}
-          />
-        ))
-      )}
+        <div className="ddns-devices" data-testid="devices-table">
+          {/* Sentence-case headings on the shared `.ddns-th`, and no `; `
+              marker: `.ddns-label` injects one via `::before`, and that
+              borrowing belongs to the strip's station labels rather than
+              to a column heading a newcomer meets first. */}
+          <div className="ddns-devices__head">
+            <span className="ddns-th">Device</span>
+            <span className="ddns-th">Last seen</span>
+            <span className="ddns-th">Username</span>
+            <span className="ddns-th">Names</span>
+            <span className="ddns-th">Rate limit</span>
+            <span className="ddns-th" />
+            <span className="ddns-th" />
+          </div>
+          {devices.map((device, index) => (
+            <DeviceLine
+              key={device.id}
+              device={device}
+              index={index}
+              busy={busy}
+                onOpen={onOpen}
+                onRotate={setConfirmRotate}
+                onEditLimit={openLimit}
+                onDelete={setConfirmDelete}
+              />
+            ))}
+          </div>
+        )}
 
-      {/* §17's normal entrance. The same `DeviceCard` the route renders
-          and the board opens — one definition, three call sites,
-          asserted by module identity in `src/test/sharedCard.test.tsx`. */}
-      <DeviceCardModal
-        deviceId={openDevice}
-        onClose={() => setOpenDevice(null)}
-      />
+      <Modal
+        opened={confirmDelete !== null}
+        onClose={() => setConfirmDelete(null)}
+        title="Delete this device?"
+        data-testid="device-delete-modal"
+      >
+        <DdnsPortalScope>
+          {confirmDelete ? (
+            <Stack gap="sm">
+              <Text size="sm" data-testid="device-delete-warning">
+                This deletes{' '}
+                <span className="ddns-data">{confirmDelete.name}</span> and its
+                credential. The {confirmDelete.hostname_count} name
+                {confirmDelete.hostname_count === 1 ? '' : 's'} it updates{' '}
+                <strong>survive</strong> — they are unassigned, not removed, and
+                stop being updated until another device takes them over. The
+                records already published stay in the zone with nothing
+                maintaining them.
+              </Text>
+              <Group justify="flex-end">
+                <Button
+                  size="xs"
+                  variant="default"
+                  disabled={busy}
+                  onClick={() => setConfirmDelete(null)}
+                  data-testid="device-delete-cancel"
+                >
+                  Keep it
+                </Button>
+                <Button
+                  size="xs"
+                  color="red"
+                  disabled={busy}
+                  onClick={() => remove.mutate(confirmDelete.id)}
+                  data-testid="device-delete-confirmed"
+                >
+                  Delete {confirmDelete.name}
+                </Button>
+              </Group>
+            </Stack>
+          ) : null}
+        </DdnsPortalScope>
+      </Modal>
+
 
       <Group>
         <Button
@@ -294,6 +388,29 @@ export function DeviceList({ devices }: { devices: Device[] }) {
         </Button>
       </Group>
 
+      {/* Over the create modal, not instead of it. `zIndex` is explicit
+          because Mantine gives every modal the same one by default, and
+          two at the same level stack by mount order — which is the sort
+          of thing that works until a re-render changes the order and the
+          secret ends up behind the form that produced it. */}
+      <Modal
+        opened={issued !== null}
+        onClose={dismissSecret}
+        title="Device created"
+        zIndex={400}
+        data-testid="device-secret-modal"
+      >
+        {/* Portalled to `document.body`, outside `[data-ddns-root]`, so
+            without this the secret renders with none of `ddns.css` — and
+            `.ddns-data` is what makes the secret selectable as one
+            monospaced run rather than reflowing prose. */}
+        <DdnsPortalScope>
+          {issued ? (
+            <SecretOnce issued={issued} onDismiss={dismissSecret} />
+          ) : null}
+        </DdnsPortalScope>
+      </Modal>
+
       <Modal
         opened={creating}
         onClose={() => setCreating(false)}
@@ -302,14 +419,12 @@ export function DeviceList({ devices }: { devices: Device[] }) {
         <Stack gap="sm">
           <TextInput
             label="Name"
-            description="What you call it. The username is generated for you."
             value={name}
             onChange={(event) => setName(event.currentTarget.value)}
             data-testid="device-name"
           />
           <NumberInput
             label="Rate limit (per minute)"
-            description="Leave empty to inherit the installation default. Zero means this device may never call — which is not the same thing."
             value={limit}
             min={0}
             onChange={(value) =>
@@ -357,7 +472,6 @@ export function DeviceList({ devices }: { devices: Device[] }) {
           </Text>
           <NumberInput
             label="Rate limit (per minute)"
-            description="Leave empty to inherit the installation default. Zero means this device may never call — which is not the same thing."
             value={nextLimit}
             min={0}
             disabled={busy}

@@ -71,7 +71,7 @@ import {
   type CredentialMode,
 } from '../api/credentials';
 import { DdnsPortalScope } from '../host/DdnsRoot';
-import { CARD_MODAL_PADDING_PX, CARD_MODAL_WIDTH_PX } from '../cards';
+import { CARD_MODAL_PADDING_PX, CARD_MODAL_WIDTH_PX, CARD_MODAL_PROPS, CARD_MODAL_STYLES } from '../cards';
 
 /** The three credential options, each stating its consequence rather
  *  than its verb. Lifted verbatim from the form this replaces — the
@@ -183,6 +183,8 @@ export function ZoneModal({ zoneId, opened, onClose }: ZoneModalProps) {
       title={zoneId === null ? 'Add a zone' : 'Zone'}
       size={CARD_MODAL_WIDTH_PX}
       padding={CARD_MODAL_PADDING_PX}
+      {...CARD_MODAL_PROPS}
+      styles={CARD_MODAL_STYLES}
       data-testid="zone-modal"
     >
       {/* Portalled to `document.body`, outside `[data-ddns-root]`, so
@@ -222,28 +224,33 @@ function ZoneModalBody({
   const extras = domain ? domain.backends.length - 1 : 0;
 
   const initial = splitTtl(binding?.config);
-  /** Seeded once, from the row. Fields the provider describes are lifted
-   *  out of the JSON box below so a value never appears in two editable
-   *  places — the bug the TTL field would otherwise reintroduce. */
-  const [seeded, setSeeded] = useState(false);
-  const [name, setName] = useState(domain?.name ?? '');
-  const [service, setService] = useState(binding?.backend_type ?? '');
-  const [ttl, setTtl] = useState<number | null>(
-    binding ? initial.ttl : DEFAULT_TTL_SECONDS,
+  /** **Nothing here may be seeded by a `useState` initialiser.**
+   *
+   *  On a reload of `?zone=3091` the queries have not resolved on the
+   *  first render, so `domain` is `undefined` — and a `useState`
+   *  initialiser runs exactly once. Every field seeded that way stayed
+   *  empty for the life of the modal, no matter what arrived a moment
+   *  later. The zone name box came up blank on a zone that plainly had
+   *  a name.
+   *
+   *  So the fields start empty and are filled by the render-phase seed
+   *  below, once the data is actually there. `seededFrom` records which
+   *  zone they were filled from, so reopening on a different zone
+   *  re-seeds and reopening on the same one does not stamp on edits in
+   *  progress. */
+  const [seededFrom, setSeededFrom] = useState<number | null | undefined>(
+    undefined,
   );
-  const [settingsText, setSettingsText] = useState(
-    Object.keys(initial.rest).length === 0
-      ? ''
-      : JSON.stringify(initial.rest, null, 2),
-  );
+  const [name, setName] = useState('');
+  const [service, setService] = useState('');
+  const [ttl, setTtl] = useState<number | null>(null);
+  const [settingsText, setSettingsText] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(false);
   /** Values for the fields the provider describes. Seeded from the
    *  stored config; a field with a `default` prefills it on a new
    *  binding. */
   const [fieldValues, setFieldValues] = useState<Record<string, string>>({});
-  const [mode, setMode] = useState<CredentialMode>(
-    defaultCredentialMode(binding?.credentials_set ?? false),
-  );
+  const [mode, setMode] = useState<CredentialMode>('replace');
   const [secrets, setSecrets] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -297,6 +304,49 @@ function ZoneModalBody({
    *  compat backends from `/providers` on purpose, and without this a
    *  fixture zone's Provider box rendered **blank** — which reads as
    *  "there are no providers" when there are three. */
+  /* The seed. A render-phase update — React re-runs this render with the
+     new state before touching the DOM, which is the documented way to
+     derive state from data that arrives late.
+
+     Keyed on the zone identity rather than a boolean: `undefined` means
+     "not seeded yet", and a zone id (or `null` for create) means "seeded
+     from that one". A boolean could not tell reopening-on-another-zone
+     from a re-render. */
+  const ready = !domains.isLoading && !providers.isLoading;
+  const identity = domain ? domain.id : creating ? null : undefined;
+  if (ready && seededFrom !== identity && identity !== undefined) {
+    setSeededFrom(identity);
+    const svc = binding?.backend_type ?? '';
+    const fields =
+      (providers.data ?? []).find((p) => p.service === svc)?.setting_fields ??
+      [];
+    const known = new Set(fields.map((f) => f.key));
+    setName(domain?.name ?? '');
+    setService(svc);
+    setTtl(binding ? initial.ttl : DEFAULT_TTL_SECONDS);
+    setMode(defaultCredentialMode(binding?.credentials_set ?? false));
+    setFieldValues(
+      Object.fromEntries(
+        fields.map((f) => {
+          const stored = initial.rest[f.key];
+          return [
+            f.key,
+            typeof stored === 'string' ? stored : binding ? '' : f.default,
+          ];
+        }),
+      ),
+    );
+    // Whatever the provider does not describe stays in the JSON box.
+    const leftovers = Object.fromEntries(
+      Object.entries(initial.rest).filter(([k]) => !known.has(k)),
+    );
+    setSettingsText(
+      Object.keys(leftovers).length === 0
+        ? ''
+        : JSON.stringify(leftovers, null, 2),
+    );
+  }
+
   const options =
     service && !offered.includes(service) ? [service, ...offered] : offered;
   const chosen = (providers.data ?? []).find((p) => p.service === service);
@@ -305,25 +355,25 @@ function ZoneModalBody({
    *  Anything the provider does not describe stays in the JSON box, so
    *  a setting nobody has modelled is still reachable. */
   const settingFields = chosen?.setting_fields ?? [];
-  const described = new Set(settingFields.map((f) => f.key));
 
-  if (!seeded && chosen) {
-    setSeeded(true);
-    const seed: Record<string, string> = {};
-    for (const f of settingFields) {
-      const stored = initial.rest[f.key];
-      seed[f.key] =
-        typeof stored === 'string' ? stored : binding ? '' : f.default;
-    }
-    setFieldValues(seed);
-    // Whatever the provider does not describe stays in the JSON box.
-    const leftovers = Object.fromEntries(
-      Object.entries(initial.rest).filter(([k]) => !described.has(k)),
-    );
-    setSettingsText(
-      Object.keys(leftovers).length === 0
-        ? ''
-        : JSON.stringify(leftovers, null, 2),
+  /* When the operator picks a different provider, its described fields
+     change and their defaults have to be re-seeded. Keyed on the service
+     so switching back and forth does not wipe what was typed for the one
+     already selected. */
+  const [fieldsFor, setFieldsFor] = useState<string | null>(null);
+  if (chosen && fieldsFor !== service) {
+    setFieldsFor(service);
+    setFieldValues((current) =>
+      Object.fromEntries(
+        settingFields.map((f) => {
+          const stored = initial.rest[f.key];
+          return [
+            f.key,
+            current[f.key] ??
+              (typeof stored === 'string' ? stored : binding ? '' : f.default),
+          ];
+        }),
+      ),
     );
   }
 
@@ -442,7 +492,6 @@ function ZoneModalBody({
 
       <Select
         label="Provider"
-        description="One provider per zone. For split-horizon, add a second zone with the same name is not possible — use separate zones with their own providers."
         data={options}
         value={service || null}
         // A binding's provider cannot change: the row is
@@ -465,7 +514,6 @@ function ZoneModalBody({
           <Select
             key={f.key}
             label={f.label}
-            description={f.help}
             data={f.choices}
             value={fieldValues[f.key] || null}
             withAsterisk={f.required}
@@ -478,7 +526,6 @@ function ZoneModalBody({
           <TextInput
             key={f.key}
             label={f.label}
-            description={f.help}
             value={fieldValues[f.key] ?? ''}
             withAsterisk={f.required}
             onChange={(event) =>
@@ -491,7 +538,6 @@ function ZoneModalBody({
 
       <NumberInput
         label="TTL (seconds)"
-        description="How long resolvers may cache this zone's records. Blank inherits the installation default."
         value={ttl ?? ''}
         min={1}
         allowDecimal={false}

@@ -52,7 +52,6 @@
  * fact.
  */
 import type { EventPage, EventRow, LogQuery } from '../api/events';
-import { AddressText } from '../board/AddressText';
 import { absoluteTitle, formatStationTime } from '../board/format';
 import {
   backendCell,
@@ -65,6 +64,7 @@ import {
 export interface LogLedgerProps {
   page: EventPage;
   onFilter: (key: keyof LogQuery, value: string) => void;
+  onOpen: (row: EventRow) => void;
 }
 
 /** A denormalised name, rendered — and made a filter only when there is
@@ -81,10 +81,14 @@ function NameCell({
   id,
   filterKey,
   onFilter,
+  title,
   testid,
 }: {
   name: string | null;
   id: number | null;
+  /** The full value, for when the cell is truncated. Truncation without
+   *  it loses information; with it, it defers information. */
+  title?: string;
   filterKey: keyof LogQuery;
   onFilter: (key: keyof LogQuery, value: string) => void;
   testid: string;
@@ -92,7 +96,12 @@ function NameCell({
   const cell = nameCell(name, id);
   if (!cell.filterable) {
     return (
-      <span className="ddns-data" data-tone={cell.tone} data-testid={testid}>
+      <span
+        className="ddns-data"
+        data-tone={cell.tone}
+        title={title}
+        data-testid={testid}
+      >
         {cell.text}
         {cell.deleted ? (
           <span className="ddns-log__gone" data-testid={`${testid}-deleted`}>
@@ -118,12 +127,20 @@ function NameCell({
 
 function LogEntry({
   row,
+  index,
   page,
   onFilter,
+  onOpen,
 }: {
   row: EventRow;
+  /** Stripe parity, stated rather than counted — the head is a sibling
+   *  in the same grid. */
+  index: number;
   page: EventPage;
   onFilter: (key: keyof LogQuery, value: string) => void;
+  /** Opens the full detail. The ledger does not own the modal; the page
+   *  does, so one place decides what "open an event" means. */
+  onOpen: (row: EventRow) => void;
 }) {
   const tone = responseTone(
     row.response_code,
@@ -139,123 +156,120 @@ function LogEntry({
 
   return (
     <div
-      className="ddns-log__entry"
+      className="ddns-logs__row"
+      data-stripe={index % 2 === 1 ? 'on' : 'off'}
       data-testid={`log-row-${row.id}`}
       data-tone={tone}
+      role="button"
+      tabIndex={0}
+      onClick={() => onOpen(row)}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onOpen(row);
+        }
+      }}
     >
-      <div className="ddns-log__head">
-        <span
-          className="ddns-station__time"
-          title={absoluteTitle(row.created_at)}
-          data-testid={`log-row-${row.id}-when`}
-        >
-          {formatStationTime(row.created_at)}
-        </span>
-        <NameCell
-          name={row.device_name}
-          id={row.device_id}
-          filterKey="device_id"
-          onFilter={onFilter}
-          testid={`log-row-${row.id}-device`}
-        />
-        <NameCell
-          name={row.hostname}
-          id={row.hostname_id}
-          filterKey="hostname_id"
-          onFilter={onFilter}
-          testid={`log-row-${row.id}-hostname`}
-        />
-        <span className="ddns-data" data-testid={`log-row-${row.id}-event`}>
-          {row.event_type}
-        </span>
-        <span
-          className="ddns-data ddns-log__result"
-          data-tone={tone}
-          data-testid={`log-row-${row.id}-result`}
-        >
-          {glyph ? (
-            <span className="ddns-log__glyph" aria-hidden="true">
-              {glyph}{' '}
-            </span>
-          ) : null}
-          {row.response_code ?? 'no answer'}
-          <span className="ddns-sr"> — {responseWord(tone)}</span>
-        </span>
-        <span
-          className="ddns-data"
-          data-tone={backend.tone}
-          title={backend.title}
-          data-testid={`log-row-${row.id}-backend`}
-        >
-          {backend.text}
-        </span>
-        {page.cross_tenant ? (
-          <NameCell
-            name={row.user_email}
-            id={row.user_id}
-            filterKey="user_id"
-            onFilter={onFilter}
-            testid={`log-row-${row.id}-user`}
-          />
-        ) : null}
-      </div>
-
-      <div className="ddns-log__addresses">
-        <span className="ddns-label">called from</span>
-        {row.client_ip === null ? (
-          <span className="ddns-data" data-tone="quiet">
-            not recorded
+      <span
+        className="ddns-cell"
+        title={absoluteTitle(row.created_at)}
+        data-testid={`log-row-${row.id}-when`}
+      >
+        {formatStationTime(row.created_at)}
+      </span>
+      <NameCell
+        name={row.device_name}
+        id={row.device_id}
+        filterKey="device_id"
+        onFilter={onFilter}
+        testid={`log-row-${row.id}-device`}
+      />
+      <NameCell
+        name={row.hostname}
+        id={row.hostname_id}
+        filterKey="hostname_id"
+        onFilter={onFilter}
+        testid={`log-row-${row.id}-hostname`}
+      />
+      <span className="ddns-cell" data-testid={`log-row-${row.id}-event`}>
+        {row.event_type}
+      </span>
+      <span
+        className="ddns-cell ddns-log__result"
+        data-tone={tone}
+        data-testid={`log-row-${row.id}-result`}
+      >
+        {glyph ? (
+          <span className="ddns-log__glyph" aria-hidden="true">
+            {glyph}{' '}
           </span>
-        ) : (
-          <AddressText
-            value={row.client_ip}
-            data-testid={`log-row-${row.id}-client-ip`}
-          />
-        )}
-        {declared !== null ? (
-          <>
-            {/* The interesting part of a NAT'd update, said in words.
-                `client_ip` and `ip` are different facts and a reader
-                who sees two addresses with no label assumes one is a
-                typo. */}
-            <span className="ddns-label">declared myip</span>
-            <AddressText
-              value={declared}
-              data-testid={`log-row-${row.id}-ip`}
-            />
-          </>
         ) : null}
-      </div>
-
-      {row.message !== null ? (
-        /* Diagnostics in full. `message` is set on exactly one kind of
-           row — the rate-limit refusal — and reducing it would turn a
-           one-line diagnosis into a support ticket. */
-        <div className="ddns-log__message" data-testid={`log-row-${row.id}-message`}>
-          {row.message}
-        </div>
+        {row.response_code ?? 'no answer'}
+        <span className="ddns-sr"> — {responseWord(tone)}</span>
+      </span>
+      <span
+        className="ddns-cell"
+        data-tone={backend.tone}
+        title={backend.title}
+        data-testid={`log-row-${row.id}-backend`}
+      >
+        {backend.text}
+      </span>
+      {/* `called from` was a second line under every row. It is a
+          short value and it belongs in the table; the rest of the
+          detail — declared myip, the message, the ids — moved into the
+          modal a click opens, because it mattered on the few rows you
+          stop at and every row was paying for it. */}
+      <span className="ddns-cell" data-testid={`log-row-${row.id}-client-ip`}>
+        {row.client_ip ?? 'not recorded'}
+        {declared !== null ? (
+          <span className="ddns-log__declared" title={`declared myip ${declared}`}>
+            {' '}≠
+          </span>
+        ) : null}
+      </span>
+      {page.cross_tenant ? (
+        <NameCell
+          name={row.user_email}
+          id={row.user_id}
+          filterKey="user_id"
+          onFilter={onFilter}
+          testid={`log-row-${row.id}-user`}
+        />
       ) : null}
     </div>
   );
 }
 
-export function LogLedger({ page, onFilter }: LogLedgerProps) {
+export function LogLedger({ page, onFilter, onOpen }: LogLedgerProps) {
   return (
-    <div className="ddns-log" data-testid="log-ledger">
+    <div className="ddns-logs" data-testid="log-ledger">
       {/* §2.4's borrowed convention, on machine-data column heads —
           the same kind of object as the device board's heads, and the
           same rendering. Not on the filter bar's form labels. */}
-      <div className="ddns-log__head ddns-log__columns" data-testid="log-head">
-        <span className="ddns-label">when</span>
-        <span className="ddns-label">device</span>
-        <span className="ddns-label">name</span>
-        <span className="ddns-label">event</span>
-        <span className="ddns-label">result</span>
-        <span className="ddns-label">via</span>
-        {page.cross_tenant ? <span className="ddns-label">user</span> : null}
+      {/* Sentence-case headings on the shared `.ddns-th`, matching the
+          zone, device and name tables. `.ddns-label` gave these the data
+          face and a `; ` marker; that borrowing belongs to the strip's
+          station labels, not to a column head. */}
+      <div className="ddns-logs__head" data-testid="log-head">
+        <span className="ddns-th">When</span>
+        <span className="ddns-th">Device</span>
+        <span className="ddns-th">Name</span>
+        <span className="ddns-th">Event</span>
+        <span className="ddns-th">Result</span>
+        <span className="ddns-th">Via</span>
+        <span className="ddns-th">Called from</span>
+        {page.cross_tenant ? <span className="ddns-th">User</span> : null}
       </div>
-      {page.rows.map((row) => (
-        <LogEntry key={row.id} row={row} page={page} onFilter={onFilter} />
+      {page.rows.map((row, index) => (
+        <LogEntry
+          key={row.id}
+          row={row}
+          index={index}
+          page={page}
+          onFilter={onFilter}
+          onOpen={onOpen}
+        />
       ))}
     </div>
   );
