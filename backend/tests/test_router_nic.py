@@ -159,6 +159,18 @@ OUT_OF_ZONE_DOMAIN = f"elsewhere.{SUFFIX}"
 #: anticipates still gets distinct values.
 BADAUTH_IP = "203.0.113.%d" % (100 + (zlib.crc32(W.encode()) % 100))
 
+#: The same handle for #64's other two refusals, in ranges that cannot
+#: collide with :data:`BADAUTH_IP`'s 100–199.
+#:
+#: Three addresses rather than one because the three rows have to be
+#: told apart *and* ``clear_events`` cannot reach all of them: it
+#: deletes by ``user_id``, so the attributed rows go and the
+#: unattributed one stays. Counting before and after per address is what
+#: makes each assertion about this test's own row rather than about the
+#: table.
+UNKNOWN_USERNAME_IP = "203.0.113.%d" % (200 + (zlib.crc32(W.encode()) % 50))
+INACTIVE_OWNER_IP = "192.0.2.%d" % (100 + (zlib.crc32(W.encode()) % 100))
+
 
 @pytest_asyncio.fixture(scope="module")
 async def world() -> Any:
@@ -1721,73 +1733,232 @@ async def test_a_refusal_decided_before_any_backend_still_writes_a_row(
     assert [row.response_code for row in rows] == ["911", "notfqdn", "911"]
 
 
-async def test_badauth_is_recorded(client, world) -> None:
-    """``event-badauth-writes-no-row``, disposition ``change`` — a seam.
+async def _badauth_rows(ip: str) -> list[Any]:
+    """Every ``auth`` row this worker's address produced, newest first."""
+    factory = get_session_factory()
+    async with factory() as s:
+        return list(
+            (
+                await s.execute(
+                    sa.select(DnsEvent)
+                    .where(DnsEvent.event_type == "auth")
+                    .where(DnsEvent.client_ip == ip)
+                    .order_by(DnsEvent.id.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
 
-    Its own note: "a device secret being brute-forced currently leaves
-    no trace in either store". It leaves one now, under ``event_type
-    'auth'``, with no user or device attached because there is nothing
-    to attach — the credential did not resolve.
+
+async def test_badauth_is_recorded_and_attributed_to_the_username_it_tried(
+    client, world
+) -> None:
+    """``event-badauth-writes-no-row``, disposition ``change`` — and #64.
+
+    The seam's own note: "a device secret being brute-forced currently
+    leaves no trace in either store". It leaves one now, under
+    ``event_type 'auth'``.
+
+    **What #64 changed is whose row it is.** The row used to carry
+    ``user_id NULL`` for every refusal, including this one — a wrong
+    password against a device that exists. A tenant filtering their log
+    for ``badauth`` therefore got zero however many times their router
+    had failed, and zero is also what a healthy account looks like.
+    ``authenticate_device`` had already resolved this username to a
+    device before rejecting the password; it now returns that
+    resolution and the row carries the owner.
+
+    Asserted as a **pair with the next test**, because "the row has a
+    user_id" on its own is satisfiable by attributing every refusal to
+    somebody, which would be far worse than the defect. The unknown
+    username must stay NULL.
 
     **Counted by this worker's own address, not globally.** The first
     version of this test read ``SELECT COUNT(*) FROM ddns_event WHERE
     event_type='auth'`` before and after, and asserted the difference
     was one. That count spans ten workers sharing one table, and
     ``test_router_events.py`` writes and then deletes a row of exactly
-    this shape — ``event_type='auth'``, ``response_code='badauth'``,
-    ``client_ip='203.0.113.10'``, every field this test could have
-    matched on. Observed once in 65 full-suite runs as
+    this shape. Observed once in 65 full-suite runs as
     ``assert 909 == 909 + 1``: the sibling module's teardown removed one
     row inside the window while this request added one, and the two
     cancelled.
-
-    The badauth row carries no ``user_id`` and no ``user_email`` — that
-    is the state under test — so the only thing left to namespace it by
-    is the address it came from, which ``X-Forwarded-For`` decides and
-    ``ix_ddns_event_client_ip`` indexes.
     """
     await clear_events()
-    factory = get_session_factory()
-    async with factory() as s:
-        before = (
-            await s.execute(
-                sa.text(
-                    "SELECT COUNT(*) FROM ddns_event "
-                    "WHERE event_type='auth' AND client_ip = :ip"
-                ),
-                {"ip": BADAUTH_IP},
-            )
-        ).scalar_one()
+    before = len(await _badauth_rows(BADAUTH_IP))
 
-    await get(
+    response = await get(
         client, "/nic/update",
         headers={**basic(world.device_usernames["alice"], "wrong"), **xff(BADAUTH_IP)},
         hostname=world.name("ok"), myip="203.0.113.10",
     )
+    # The wire is unchanged, and that is half the point: attribution
+    # must not become a way to tell a valid username from an invalid one
+    # by reading the response.
+    assert response.text == "badauth"
+
+    rows = await _badauth_rows(BADAUTH_IP)
+    assert len(rows) == before + 1
+    row = rows[0]
+    assert row.response_code == "badauth"
+    assert row.client_ip == BADAUTH_IP
+    # The tenant, by reference and by value. Both halves, because the
+    # id is what the filter indexes and the name is what survives the
+    # device being deleted — which is exactly when this log is read.
+    assert row.user_id == world.alice_id
+    assert row.device_id == world.alice_device
+    assert row.user_email is not None
+    assert row.device_name is not None
+    # `backend_type` stays NULL: decided before any provider was
+    # reached. `event-backend-type-is-null-for-outcomes-decided-before-
+    # any-backend` is `preserve` and attribution does not touch it.
+    assert row.backend_type is None
+
+
+async def test_a_badauth_for_a_username_nobody_holds_stays_unattributed(
+    client, world
+) -> None:
+    """The other half of the pair, and the one that stops #64 overreaching.
+
+    A username no device holds resolves to nothing, so there is no owner
+    to attribute the attempt to. ``user_id`` stays NULL and that NULL is
+    a *meaning* — *no account this could belong to* — not a value the
+    writer failed to supply.
+
+    Without this test the previous one is satisfiable by attributing
+    every refusal to an arbitrary account, which would be a far worse
+    defect than the zero it replaced: a tenant would see failures that
+    were never about them, and the count on their own screen would be
+    noise. It is also what keeps the enumeration surface exactly where
+    it was — an attacker submitting a guessed username still produces a
+    row nobody can read.
+    """
+    await clear_events()
+    before = len(await _badauth_rows(UNKNOWN_USERNAME_IP))
+
+    response = await get(
+        client, "/nic/update",
+        headers={
+            **basic(f"no-such-device-{W}", "irrelevant"),
+            **xff(UNKNOWN_USERNAME_IP),
+        },
+        hostname=world.name("ok"), myip="203.0.113.10",
+    )
+    assert response.text == "badauth"
+
+    rows = await _badauth_rows(UNKNOWN_USERNAME_IP)
+    assert len(rows) == before + 1
+    row = rows[0]
+    assert row.response_code == "badauth"
+    assert row.user_id is None, "an attempt on a username nobody holds was attributed"
+    assert row.device_id is None
+    assert row.user_email is None
+    assert row.device_name is None
+
+
+async def test_an_inactive_owners_badauth_is_attributed_to_that_owner(
+    client, world
+) -> None:
+    """The fourth refusal, and the one an operator will actually chase.
+
+    ``dave`` is an inactive user holding *correct* device credentials —
+    ``update-badauth-inactive-user`` is the frozen case. His router
+    answers ``badauth`` forever and, before #64, wrote a row nobody
+    could see. The row is his: the username resolved, the password
+    verified, and only the account gate refused.
+    """
+    await clear_events()
+    before = len(await _badauth_rows(INACTIVE_OWNER_IP))
+
+    response = await get(
+        client, "/nic/update",
+        headers={
+            **basic(world.device_usernames["dave"], DAVE_PASSWORD),
+            **xff(INACTIVE_OWNER_IP),
+        },
+        hostname=world.name("ok"), myip="203.0.113.10",
+    )
+    assert response.text == "badauth"
+
+    rows = await _badauth_rows(INACTIVE_OWNER_IP)
+    assert len(rows) == before + 1, rows
+    assert rows[0].user_id == world.dave_id
+    # Dave's device id is not on the fixture, so the assertion is that
+    # a device was named at all — the verified-password path resolved
+    # one, and only the account gate refused.
+    assert rows[0].device_id is not None
+    assert rows[0].device_name is not None
+
+
+async def test_a_failed_sign_in_turns_the_owners_device_red_on_the_board(
+    client, world
+) -> None:
+    """The consequence of #64 that nothing asked for, stated rather than left.
+
+    ``worker_jobs.device_statuses`` classifies a device by *its most
+    recent event carrying a ``device_id``*. Before #64 a ``badauth`` row
+    carried none, so a router whose password had been changed kept
+    whatever colour its last successful call had left behind — ``ACTIVE``
+    if it had updated inside the window, ``IDLE`` if it had not. The
+    board built to answer *which of my devices stopped working* showed a
+    broken router green.
+
+    Attribution changes that as a side effect, and the side effect is
+    the point rather than an accident: the row now carries the device,
+    so the device now reads ``LAST_CALL_FAILED``.
+
+    Driven through the real endpoint deliberately. ``test_worker_jobs``
+    already asserts this classification, but it does so over a
+    hand-written ``badauth`` row carrying a ``device_id`` — a shape
+    **nothing in this codebase wrote** until now. That test was
+    exercising a branch with no writer; this one supplies the writer.
+    """
+    from atrium_ddns.scope import DdnsScope
+    from atrium_ddns.worker_jobs import Liveness, device_statuses
+
+    await clear_events()
+    factory = get_session_factory()
+
+    # A device that worked a moment ago, established through the real
+    # endpoint: `_touch_device` stamps `last_seen_at` and the update
+    # writes a `good` row, so the classification below is over data the
+    # service produced rather than over a fixture's idea of it.
+    ok = await get(
+        client, "/nic/update",
+        headers={**basic(world.device_usernames["alice"], ALICE_PASSWORD),
+        **xff(BADAUTH_IP)},
+        hostname=world.name("ok"), myip="203.0.113.10",
+    )
+    assert ok.text.startswith("good"), ok.text
 
     async with factory() as s:
-        after = (
-            await s.execute(
-                sa.text(
-                    "SELECT COUNT(*) FROM ddns_event "
-                    "WHERE event_type='auth' AND client_ip = :ip"
-                ),
-                {"ip": BADAUTH_IP},
+        before = {
+            st.device_id: st.liveness
+            for st in await device_statuses(
+                s, scope=DdnsScope.for_user_id(world.alice_id), window_days=7
             )
-        ).scalar_one()
-        row = (
-            await s.execute(
-                sa.select(DnsEvent)
-                .where(DnsEvent.event_type == "auth")
-                .where(DnsEvent.client_ip == BADAUTH_IP)
-                .order_by(DnsEvent.id.desc())
-                .limit(1)
+        }
+    assert before[world.alice_device] is Liveness.ACTIVE, before
+
+    # Now the router's password is wrong — one real request, no fixture.
+    response = await get(
+        client, "/nic/update",
+        headers={**basic(world.device_usernames["alice"], "wrong"), **xff(BADAUTH_IP)},
+        hostname=world.name("ok"), myip="203.0.113.10",
+    )
+    assert response.text == "badauth"
+
+    async with factory() as s:
+        after = {
+            st.device_id: st.liveness
+            for st in await device_statuses(
+                s, scope=DdnsScope.for_user_id(world.alice_id), window_days=7
             )
-        ).scalar_one()
-    assert after == before + 1
-    assert row.response_code == "badauth"
-    assert row.user_id is None and row.device_id is None
-    assert row.client_ip == BADAUTH_IP
+        }
+    assert after[world.alice_device] is Liveness.LAST_CALL_FAILED, after
+    # And the two readings differ, which is the whole assertion: the
+    # same device, the same window, one failed sign-in in between.
+    assert before[world.alice_device] is not after[world.alice_device]
 
 
 async def test_a_rate_limited_delete_is_logged_as_a_delete(client, world) -> None:

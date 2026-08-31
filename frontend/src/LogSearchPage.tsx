@@ -40,6 +40,7 @@ import { LogFilters } from './logs/LogFilters';
 import type { EventRow } from './api/events';
 import { LogDetail } from './logs/LogDetail';
 import { LogLedger, LogSkeleton } from './logs/LogLedger';
+import { LogUnattributable } from './logs/LogUnattributable';
 import { useLogQuery } from './logs/useLogQuery';
 
 export function LogSearchInner() {
@@ -100,16 +101,33 @@ export function LogSearchInner() {
         </Alert>
       ) : data ? (
         data.rows.length === 0 ? (
-          <LogEmpty
-            page={data}
-            activeFilters={active}
-            onClear={() => {
-              setCursor(null);
-              clear();
-            }}
-          />
+          <>
+            <LogEmpty
+              page={data}
+              activeFilters={active}
+              onClear={() => {
+                setCursor(null);
+                clear();
+              }}
+            />
+            {/* #64. It renders on *both* branches, and that is the
+                point rather than a duplication: a tenant with two
+                attributed failures needs to know there are forty they
+                cannot see just as much as a tenant with none does. On
+                the empty branch it is what stops the zero reading as
+                "my credentials are fine"; on the ledger branch it is
+                what stops a short list reading as the whole story. */}
+            <LogUnattributable
+              tally={data.unattributable}
+              crossTenant={data.cross_tenant}
+            />
+          </>
         ) : (
           <>
+            <LogUnattributable
+              tally={data.unattributable}
+              crossTenant={data.cross_tenant}
+            />
             <LogLedger page={data} onOpen={setDetail}
           onFilter={onFilter} />
             <Group gap="sm" align="center">

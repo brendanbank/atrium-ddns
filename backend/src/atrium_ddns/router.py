@@ -56,7 +56,7 @@ from __future__ import annotations
 
 import functools
 import secrets as secrets_module
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Annotated, Any, Literal
 
@@ -4157,35 +4157,44 @@ RESPONSE_CODES: tuple[str, ...] = tuple(
     )
 )
 
-#: Response codes on rows that carry **no tenant at all**, and are
-#: therefore invisible to every tenant-scoped query.
+#: Response codes whose rows are **sometimes** attributable and
+#: sometimes not — the third state between "always yours" and "never
+#: anyone's".
 #:
-#: Found by running real traffic through ``/nic/update`` and reading the
-#: result, not by reading the code. ``_admit`` writes the ``badauth``
-#: row *before* a device is resolved — it has to, because there is no
-#: device — so ``user_id``, ``device_id`` and every denormalised name on
-#: that row are ``NULL``. ``scope.py`` then documents the consequence in
-#: as many words: ``user_id == uid`` is never true for ``NULL``, so an
-#: orphan row "is invisible to every tenant", and widening that "looks
-#: like a kindness" and hands every tenant the deleted tenant's history.
+#: One member, ``badauth``, and the history is the point. Until #64 this
+#: constant was ``UNATTRIBUTED_RESPONSE_CODES`` and it was right:
+#: ``_admit`` wrote the ``badauth`` row with no ``user_id`` at all, so
+#: ``response_code=badauth`` returned an ordinary tenant zero rows
+#: *however many times their router had failed* — and zero is also what
+#: a healthy account looks like, so the single most common support
+#: question got a confidently wrong answer from the surface built to
+#: answer it.
 #:
-#: Both halves of that are right. The consequence for **this** surface
-#: is not: ``response_code=badauth`` is offered in the filter vocabulary,
-#: and for an ordinary tenant it returns zero rows *however many times
-#: their router failed to authenticate*. Zero rows is exactly what "my
-#: credentials are fine" looks like, so the single most common support
-#: question — *why is my router not updating* — gets a confidently wrong
-#: answer from the surface built to answer it.
+#: #64 changed the writer rather than the reader.
+#: ``auth_device.authenticate_device`` already resolved the submitted
+#: username to a ``Device``/``User`` pair before verifying anything, and
+#: discarded it; it now returns it as a
+#: :class:`~atrium_ddns.auth_device.FailedAuth`, and ``_admit`` passes
+#: it as ``failed_auth=``. A wrong password against a real device, or a
+#: correct password on a deactivated account, is therefore attributed to
+#: that device's owner and **appears in their log**.
 #:
-#: Naming it is what this constant is for. The query still runs; the
-#: response carries an :class:`UnmatchableFilter` saying the rows exist
-#: and are not attributable, which is a different sentence from "there
-#: were none". Fixing it properly means attributing the row to the
-#: username that was tried, and that is a decision about confirming
-#: which usernames exist — ``authenticate_device`` deliberately does not
-#: distinguish "no such user" from "wrong password". That belongs to
-#: #16's writer and to the milestone owner, not to a reader.
-UNATTRIBUTED_RESPONSE_CODES: frozenset[str] = frozenset({STATUS_BADAUTH})
+#: What is left is the half that genuinely has no owner: an attempt
+#: whose username matches no device at all. That row keeps
+#: ``user_id IS NULL``, is invisible to every tenant-scoped query, and
+#: is also **exactly the shape a router configured with a typo'd
+#: username produces** — so a tenant's zero on this filter still does
+#: not mean the same thing as "no failures". It means *no failures
+#: against a username that belongs to you*. :class:`UnattributableTally`
+#: is what separates those two, by publishing the denominator instead of
+#: leaving the reader to assume one.
+#:
+#: Derived from the writer's own call sites by
+#: ``test_router_events.py``, not listed: a future refusal that starts
+#: passing ``failed_auth=`` joins this set on the commit that adds the
+#: call, and one that passes neither actor kwarg fails that test
+#: outright rather than silently serving a false zero.
+PARTIALLY_ATTRIBUTED_RESPONSE_CODES: frozenset[str] = frozenset({STATUS_BADAUTH})
 
 #: Page size. The default is a screenful and a half; the ceiling stops
 #: a hand-written query string turning a keyset scan into a full read of
@@ -4303,6 +4312,55 @@ class UnmatchableFilter(BaseModel):
     reason: str
 
 
+class UnattributableTally(BaseModel):
+    """How many rows carrying this response code belong to no account.
+
+    A count with its population named beside it, because the number is
+    useless without one: *41 unattributable* means nothing until you
+    know it was counted over the same response code, the same time
+    window, and which of the caller's other filters it could and could
+    not honour.
+
+    **Why the caller's filters cannot all be honoured, and why that is
+    said out loud.** An unattributable row carries no ``user_id``, no
+    ``device_id``, no ``domain_id`` and no ``hostname_id`` — those NULLs
+    are what *makes* it unattributable. So a tally narrowed by
+    ``device_id`` would be ``0`` by construction, every time, for every
+    installation: a probe that cannot fail, which this repository has a
+    whole section about. Rather than silently dropping those filters or
+    silently returning a structural zero, the ones that were dropped are
+    **named**, and a reader can see the population the count is really
+    over.
+
+    **What it discloses, in the operator's terms.** A tenant learns how
+    many times, in their retention window, somebody presented a username
+    this service has never issued. It names no username, no address, no
+    device and no other tenant — it is the installation's background
+    level of failed sign-ins. The alternative is that every tenant's
+    zero on this filter stays uninterpretable, which is the defect being
+    fixed. The trade is stated in #64 rather than buried here.
+    """
+
+    #: The code counted. Echoed rather than assumed, so a tally cannot
+    #: be read against the wrong filter.
+    response_code: str
+    #: The count. ``0`` here is a measurement — the object's existence
+    #: is what says the question was asked.
+    rows: int
+    #: The oldest row that could have been counted: the caller's
+    #: ``since`` when they gave one, otherwise the retention floor.
+    #: Printed so the divisor is not left to be assumed.
+    since: datetime
+    #: The newest, when the caller bounded it. ``None`` means *up to
+    #: now*.
+    until: datetime | None
+    #: Filters the caller applied that this count **could not** honour,
+    #: because a row with no owner cannot carry them. Empty is the
+    #: normal case and means the count is over exactly the caller's
+    #: query.
+    ignored_filters: list[str] = Field(default_factory=list)
+
+
 class EventPage(BaseModel):
     """One page of the log, and everything needed to read a zero."""
 
@@ -4337,12 +4395,32 @@ class EventPage(BaseModel):
     any_rows_in_scope: bool | None
     #: Filters that cannot match a row **for this caller**, each with
     #: the reason. A typo'd ``backend_type`` otherwise returns zero rows
-    #: and reads exactly like "no traffic for that provider"; a
-    #: tenant-scoped ``badauth`` filter returns zero rows and reads
-    #: exactly like "my credentials are fine". Both are false negatives
-    #: carrying the authority of a measurement, and they are two
-    #: different sentences. Empty for the normal case.
+    #: and reads exactly like "no traffic for that provider" — a false
+    #: negative carrying the authority of a measurement. Empty for the
+    #: normal case.
+    #:
+    #: ``response_code=badauth`` used to be listed here too, because it
+    #: could not match for any tenant. Since #64 it can, so it is not:
+    #: a filter that *does* match must never be reported as one that
+    #: structurally cannot. What is left of that problem is measured
+    #: rather than asserted — see :attr:`unattributable`.
     unmatchable_filters: list[UnmatchableFilter] = Field(default_factory=list)
+    #: The denominator that makes a zero on this filter a measurement.
+    #:
+    #: **Three states, and ``0`` is not the absent one.** ``None`` means
+    #: *not asked* — the filter is not on a partially-attributed code,
+    #: so no such population exists to count. An object with ``rows=0``
+    #: means *asked, and there were none*. An object with ``rows=41``
+    #: means *asked, and forty-one authentication failures in this
+    #: window belong to no account at all*.
+    #:
+    #: That is the whole point. After #64 a tenant filtering ``badauth``
+    #: sees their own failures, but an attempt whose username matches no
+    #: device still belongs to nobody — and that is precisely the shape
+    #: a router configured with a mistyped username produces. Without
+    #: this field, "no failures" and "failures that cannot be yours"
+    #: render identically, which is the defect one layer along.
+    unattributable: UnattributableTally | None = None
 
 
 def _parse_instant(raw: str | None, *, field: str) -> datetime | None:
@@ -4511,8 +4589,6 @@ def _vocabulary() -> EventVocabulary:
 def unmatchable(
     filters: EventFilters,
     vocabulary: EventVocabulary,
-    *,
-    cross_tenant: bool,
 ) -> list[UnmatchableFilter]:
     """Filters that ran and structurally cannot have matched.
 
@@ -4527,17 +4603,25 @@ def unmatchable(
     imports the legacy service's history, and a row carrying a service
     name this build does not ship must stay findable.
 
-    **The rows exist and are not yours.** ``response_code=badauth`` in a
-    tenant-scoped query returns zero rows *however many times that
-    tenant's router failed to authenticate*, because the writer has no
-    device to attribute the row to and ``user_id IS NULL`` is invisible
-    to every tenant. See :data:`UNATTRIBUTED_RESPONSE_CODES`. This is
-    the one that matters, because zero is also what a healthy account
-    looks like.
+    **There used to be a second way.** ``response_code=badauth`` in a
+    tenant-scoped query returned zero rows *however many times that
+    tenant's router failed to authenticate*, because the writer had no
+    device to attribute the row to. #64 fixed that in the writer, so
+    ``badauth`` is no longer reported here — a filter that can match
+    must never be described as one that structurally cannot, and
+    describing it that way after the fix would be an assertion on the
+    report rather than on the thing reported. The residue — attempts
+    whose username matched no device — is *counted* in
+    :class:`UnattributableTally` instead of being asserted here.
 
-    ``cross_tenant`` is a keyword and required: the second reason is a
-    property of *this caller*, not of the installation, and a signature
-    that let it default would answer the wrong question by omission.
+    **The ``cross_tenant`` argument is gone**, and the deletion is the
+    honest half of the change. It existed for exactly one branch — the
+    ``badauth`` one — and once that branch went, keeping a required
+    keyword nothing reads would have left a caller-dependent-looking
+    signature over a caller-independent function. Every reason left
+    here is a property of the *installation*: a provider it does not
+    ship, an event type nothing writes, a response code it never
+    answers with. None of them change with who is asking.
     """
     out: list[UnmatchableFilter] = []
     if (
@@ -4553,29 +4637,16 @@ def unmatchable(
                 ),
             )
         )
-    if filters.response_code is not None:
-        if filters.response_code not in vocabulary.response_codes:
-            out.append(
-                UnmatchableFilter(
-                    filter=f"response_code={filters.response_code}",
-                    reason="that is not a response code this service answers with",
-                )
+    if (
+        filters.response_code is not None
+        and filters.response_code not in vocabulary.response_codes
+    ):
+        out.append(
+            UnmatchableFilter(
+                filter=f"response_code={filters.response_code}",
+                reason="that is not a response code this service answers with",
             )
-        elif (
-            not cross_tenant
-            and filters.response_code in UNATTRIBUTED_RESPONSE_CODES
-        ):
-            out.append(
-                UnmatchableFilter(
-                    filter=f"response_code={filters.response_code}",
-                    reason=(
-                        "these lines are written before any device is "
-                        "identified, so they belong to no account and cannot "
-                        "appear in your log. A zero here is not evidence that "
-                        "your credentials are working."
-                    ),
-                )
-            )
+        )
     if (
         filters.backend_type is not None
         and filters.backend_type != vocabulary.backend_type_none
@@ -4591,6 +4662,115 @@ def unmatchable(
             )
         )
     return out
+
+
+#: The filters an unattributable row structurally cannot carry.
+#:
+#: Every one of these columns is ``NULL`` on a row with no owner — that
+#: is what having no owner *means* on this table. A tally narrowed by
+#: any of them would be ``0`` for every installation, forever, which is
+#: a probe that cannot fail wearing a count's clothing. They are dropped
+#: from the tally and **named** in its ``ignored_filters`` instead.
+#:
+#: Derived from the model rather than typed twice: each name is checked
+#: against ``DnsEvent`` at import, so a column renamed in ``models.py``
+#: breaks here rather than quietly leaving a filter honoured that cannot
+#: be.
+_UNATTRIBUTABLE_NULL_COLUMNS: tuple[str, ...] = tuple(
+    name
+    for name in ("user_id", "device_id", "domain_id", "hostname_id")
+    if hasattr(DnsEvent, name)
+)
+
+
+async def _unattributable_tally(
+    session: AsyncSession,
+    filters: EventFilters,
+    *,
+    retention_days: int,
+    now: datetime,
+) -> UnattributableTally | None:
+    """Count the rows for this response code that belong to nobody.
+
+    ``None`` when the question does not arise — the caller did not
+    filter on a code in :data:`PARTIALLY_ATTRIBUTED_RESPONSE_CODES`, so
+    there is no half-attributed population to describe. **Not ``0``**:
+    *not asked* and *asked, and there were none* are two states, and
+    rendering them in one type is the defect this whole surface exists
+    to avoid.
+
+    Deliberately **unscoped**, and this is the one place on the events
+    surface where that is not a bug. The rows counted are defined by
+    ``user_id IS NULL`` — there is no tenant they could be scoped to,
+    and ``DdnsScope`` applied to them matches nothing by construction,
+    which would return a structural zero and call it a measurement. The
+    exemption is registered in ``test_tenant_isolation.py``'s
+    ``READ_PATHS_NOT_SCOPED`` with that reason, so it is a claim in
+    writing rather than an omission.
+
+    It returns a **count and nothing else**. No row, no username, no
+    address, no device, no other tenant's data — the query selects
+    ``COUNT(*)`` and no column.
+    """
+    code = filters.response_code
+    if code is None or code not in PARTIALLY_ATTRIBUTED_RESPONSE_CODES:
+        return None
+
+    since = _parse_instant(filters.since, field="since")
+    until = _parse_instant(filters.until, field="until")
+    # The retention floor is the honest default divisor: it is the whole
+    # population the log can hold, and the least flattering choice —
+    # a narrower default window would report a smaller number for the
+    # same installation and read as reassurance.
+    floor = now - timedelta(days=retention_days)
+    since = max(since, floor) if since is not None else floor
+
+    # `count(DnsEvent.id)` and not `count()` + `select_from(DnsEvent)`.
+    # The two compile to the same SQL; only the first names the model
+    # *inside* the `sa.select(...)` call node, which is where
+    # `test_tenant_isolation.py`'s read-path census looks. Written the
+    # other way this query is invisible to that census — it is neither
+    # scoped nor UNSCOPED, it is simply not in the population, and the
+    # exemption registered for it then reads as stale. Measured: the
+    # census reported `router.py:_unattributable_tally` as an excused
+    # call site that no longer exists. See the close comment on #64;
+    # the blind spot itself belongs to clause 3's guard work.
+    stmt = sa.select(sa.func.count(DnsEvent.id)).where(
+        DnsEvent.response_code == code,
+        DnsEvent.user_id.is_(None),
+        DnsEvent.created_at >= since,
+    )
+    if until is not None:
+        stmt = stmt.where(DnsEvent.created_at <= until)
+    # `event_type` and `client_ip` are columns an ownerless row *does*
+    # carry, so honouring them keeps the tally over the caller's own
+    # question rather than over a wider one they did not ask.
+    if filters.event_type is not None:
+        stmt = stmt.where(DnsEvent.event_type == filters.event_type)
+    if filters.client_ip is not None:
+        stmt = stmt.where(DnsEvent.client_ip == filters.client_ip)
+
+    ignored = [
+        f"{name}={getattr(filters, name)}"
+        for name in _UNATTRIBUTABLE_NULL_COLUMNS
+        if getattr(filters, name, None) is not None
+    ]
+    if filters.backend_type is not None:
+        # `backend_type` is NULL on every row decided before a provider
+        # was reached, which is every badauth row. Naming a provider is
+        # therefore a filter this population cannot carry; asking for
+        # the null sentinel is one it always satisfies, so neither
+        # narrows anything and only the first is worth naming.
+        if filters.backend_type != BACKEND_TYPE_NONE:
+            ignored.append(f"backend_type={filters.backend_type}")
+
+    return UnattributableTally(
+        response_code=code,
+        rows=(await session.execute(stmt)).scalar_one(),
+        since=since,
+        until=until,
+        ignored_filters=ignored,
+    )
 
 
 @router.get("/events", response_model=EventPage)
@@ -4717,8 +4897,12 @@ async def get_events(
         retention_days=config.event_retention_days,
         cross_tenant=cross_tenant,
         any_rows_in_scope=any_rows_in_scope,
-        unmatchable_filters=unmatchable(
-            filters, vocabulary, cross_tenant=cross_tenant
+        unmatchable_filters=unmatchable(filters, vocabulary),
+        unattributable=await _unattributable_tally(
+            session,
+            filters,
+            retention_days=config.event_retention_days,
+            now=datetime.now(UTC).replace(tzinfo=None),
         ),
     )
 
