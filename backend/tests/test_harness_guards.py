@@ -774,3 +774,287 @@ async def test_the_lock_actually_excludes() -> None:
         ).scalar()
         assert answer == 1, f"the lock was not released (GET_LOCK returned {answer!r})"
         await rival.execute(sa.text("SELECT RELEASE_LOCK(:n)"), {"n": FIXTURE_LOCK})
+
+
+# ===================================================================== #
+# #87 — the teardown that could not name what it deleted
+# ===================================================================== #
+#
+# Clause 3 of V1M7 asks that every guard the suite relies on is shown
+# failing when the thing it guards is broken. The four below are about
+# `conftest`'s unattributed-event sweep, and they are deliberately
+# *runtime* guards rather than source scans: the sweep's failure mode is
+# that its listener stops being reached, which an AST walk cannot see.
+# `test_the_recorder_sees_the_routers_own_write` drives the production
+# writer, and `test_the_sweep_refuses_a_delete_that_matched_nothing`
+# breaks the teardown on purpose and requires the noise.
+
+
+def _guard_ip() -> str:
+    """A TEST-NET-2 address unique to this xdist worker.
+
+    An unattributed row carries no user and no email — that is the state
+    under test — so the address is the only handle, exactly as
+    ``test_router_nic.BADAUTH_IP`` records. **TEST-NET-2 rather than
+    TEST-NET-3**, so that nothing here can be confused with the
+    ``203.0.113.0/24`` addresses ``test_router_nic.py`` counts on: two
+    guards sharing an address space is how the sibling-module
+    cancellation in that file's docstring happened.
+    """
+    import zlib
+
+    from conftest import WORKER
+
+    return "198.51.100.%d" % (1 + zlib.crc32(WORKER.encode()) % 250)
+
+
+async def _write_unattributed_row(client_ip: str) -> int:
+    """One ``badauth``-shaped row with no tenant on it. Returns its id.
+
+    Written through ``router_nic.record_event`` with ``auth=None`` —
+    the production writer, called the way the production caller calls
+    it — rather than by constructing a ``DnsEvent`` here. A guard that
+    builds its own subject asserts about a row shaped like the one that
+    leaks; this asserts about the row that leaks.
+    """
+    from app.db import get_session_factory
+    from atrium_ddns import router_nic
+    from atrium_ddns.models import DnsEvent
+
+    factory = get_session_factory()
+    async with factory() as session:
+        router_nic.record_event(
+            session,
+            event_type=router_nic.EVENT_AUTH,
+            response_code=router_nic.STATUS_BADAUTH,
+            auth=None,
+            client_ip=client_ip,
+        )
+        # Taken from ``session.new`` *before* the flush, which is the
+        # only moment the pending object is reachable by identity. The
+        # writer returns nothing, and re-finding the row afterwards by
+        # ``client_ip`` would be a scan asserting on a shape rather than
+        # on the row this call produced.
+        pending = [obj for obj in session.new if isinstance(obj, DnsEvent)]
+        assert len(pending) == 1, (
+            f"router_nic.record_event queued {len(pending)} DnsEvent rows, "
+            "expected exactly 1 — this helper can no longer name what it wrote"
+        )
+        row = pending[0]
+        assert row.user_id is None and row.user_email is None, (
+            "record_event(auth=None) produced an attributed row "
+            f"(user_id={row.user_id!r}, user_email={row.user_email!r}) — the "
+            "state #87 is about is no longer reachable through this writer"
+        )
+        await session.flush()
+        row_id = row.id
+        await session.commit()
+    assert row_id is not None, (
+        "the writer produced no primary key — every assertion below would be "
+        "about the id None"
+    )
+    return int(row_id)
+
+
+async def _event_exists(row_id: int) -> bool:
+    """Read the row back by primary key, on its own connection."""
+    import sqlalchemy as sa
+    from app.db import get_session_factory
+
+    factory = get_session_factory()
+    async with factory() as session:
+        found = (
+            await session.execute(
+                sa.text("SELECT COUNT(*) FROM ddns_event WHERE id = :i"), {"i": row_id}
+            )
+        ).scalar_one()
+    return bool(found)
+
+
+@pytest.mark.asyncio
+async def test_an_unattributed_row_survives_every_email_shaped_teardown() -> None:
+    """#87's mechanism, demonstrated rather than described.
+
+    ``purge_tenants`` names tenants two ways and both are email-shaped:
+    ``emails`` resolves to ``users.id`` and deletes by ``user_id``, and
+    ``unattributed_emails`` matches ``user_email`` directly. The row
+    ``router_nic`` writes when a credential does not resolve has **both
+    columns NULL**, and ``IN (…)`` never matches NULL — so the teardown
+    runs, reports nothing wrong, and leaves the row behind.
+
+    Both halves are asserted, because only the pair is a measurement:
+    the row is confirmed *present* before the teardown (otherwise
+    "still present after" is vacuous) and confirmed *still present*
+    after. A version of this guard that only checked the second half
+    would pass against a table that never got the row at all.
+
+    The email handed in is this worker's own and belongs to nobody, so
+    the call is a real teardown with a real, non-empty predicate. That
+    is the point: it is not failing to delete because it was given
+    nothing to do.
+    """
+    from conftest import WORKER, purge_tenants
+
+    nobody = f"harness-guard-{WORKER}@nobody.invalid"
+    row_id = await _write_unattributed_row(_guard_ip())
+    try:
+        assert await _event_exists(row_id), (
+            f"the unattributed row {row_id} was not written — the assertion "
+            "that it survives teardown would be vacuous"
+        )
+        await purge_tenants(
+            [nobody],
+            unattributed_emails=[nobody],
+            owner="test_harness_guards.email-shaped",
+        )
+        assert await _event_exists(row_id), (
+            f"row {row_id} was removed by an email-shaped teardown. That is "
+            "not the behaviour #87 is about, and the sweep in conftest is "
+            "now solving a problem that no longer exists — check whether "
+            "router_nic has started attributing badauth rows"
+        )
+    finally:
+        await purge_tenants(
+            (), event_ids=[row_id], owner="test_harness_guards.cleanup"
+        )
+    assert not await _event_exists(row_id), (
+        f"row {row_id} survived purge_tenants(event_ids=…) as well, so the "
+        "id-shaped teardown does not work either and #87 has no fix"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_recorder_sees_the_routers_own_write() -> None:
+    """The listener is on the *production* path, not on a stand-in.
+
+    ``conftest.record_unattributed_events`` hangs a mapper-level
+    ``after_insert`` on ``DnsEvent``. That mechanism is invisible to a
+    Core ``insert()``, so the day ``router_nic.record_event`` stops
+    going through ``session.add`` the sink stays empty, the sweep
+    deletes nothing, reports nothing, and #87 comes back silently. This
+    is the guard that goes red on that day, and it is the reason the
+    helper above calls the router rather than constructing a row.
+
+    ``len(ids) == 1`` rather than ``ids`` — an equality, because "the
+    sink is non-empty" is also true of a listener that fires twice per
+    insert, and a double-recorded id would make the sweep's re-count
+    lie about its denominator.
+    """
+    from conftest import purge_unattributed_events, record_unattributed_events
+
+    with record_unattributed_events() as ids:
+        row_id = await _write_unattributed_row(_guard_ip())
+
+    assert ids == [row_id], (
+        f"the recorder captured {ids!r} for a row written at id {row_id}. An "
+        "empty list means the mapper listener is not reached by "
+        "router_nic.record_event any more — which is exactly the state in "
+        "which the sweep reports a clean nothing while rows accumulate"
+    )
+    assert await _event_exists(row_id), (
+        f"row {row_id} is not in the table, so the delete below cannot "
+        "distinguish working from matching nothing"
+    )
+
+    await purge_unattributed_events(ids, owner="test_harness_guards.recorder")
+
+    assert not await _event_exists(row_id), (
+        f"purge_unattributed_events returned without raising and row {row_id} "
+        "is still there — the helper's own re-count is not looking at what it "
+        "deleted"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_refuses_a_delete_that_matched_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deleted-zero-because-none and deleted-zero-because-unmatched, apart.
+
+    The whole of #87 is a teardown that ran, matched no rows, and
+    reported success. ``purge_unattributed_events`` is supposed to be
+    unable to do that — so here the teardown under it is replaced with
+    one that does nothing at all, which is the strongest form of "the
+    predicate could not match", and the helper is required to notice.
+
+    Three states, asserted as three, because rendering them in one type
+    is the defect this repo keeps finding:
+
+    * **nothing recorded** — ``[]`` returns quietly and touches no
+      connection;
+    * **recorded and removed** — the previous guard;
+    * **recorded and still there** — raises, and the message says which
+      ids survived.
+
+    The mutation is reverted by ``monkeypatch`` at the end of the test,
+    and the row is removed with the real teardown in ``finally`` — a
+    guard that leaves its own subject behind would be adding to the
+    accumulation it exists to stop.
+    """
+    import conftest
+
+    # State 1: nothing recorded. Must not raise, and must not pretend to
+    # have done work.
+    await conftest.purge_unattributed_events([], owner="test_harness_guards.empty")
+
+    row_id = await _write_unattributed_row(_guard_ip())
+    try:
+        async def _no_op_teardown(*args: object, **kwargs: object) -> None:
+            return None
+
+        monkeypatch.setattr(conftest, "purge_tenants", _no_op_teardown)
+
+        # State 3: recorded, and the teardown beneath cannot match it.
+        with pytest.raises(AssertionError) as caught:
+            await conftest.purge_unattributed_events(
+                [row_id], owner="test_harness_guards.broken"
+            )
+        message = str(caught.value)
+        assert str(row_id) in message, (
+            "the failure does not name the surviving id, and a guard that "
+            f"fails uninformatively gets deleted rather than fixed: {message}"
+        )
+        assert "did not match" in message, (
+            "the failure does not say which of the two zeroes this is: "
+            f"{message}"
+        )
+    finally:
+        monkeypatch.undo()
+        await conftest.purge_tenants(
+            (), event_ids=[row_id], owner="test_harness_guards.cleanup"
+        )
+    assert not await _event_exists(row_id)
+
+
+def test_the_unattributed_sweep_is_installed_in_this_process() -> None:
+    """The autouse fixture ran — not merely that it is written down.
+
+    ``conftest._sweep_unattributed_events`` is session-scoped and
+    autouse, and the failure that costs nothing to make is for it to
+    stop being collected — a rename, a move, a ``conftest.py`` that
+    pytest stops treating as one. Every other guard in this section
+    opens its own recorder and would keep passing through that; the
+    suite would go back to leaking 17 rows a run with a green board.
+
+    So this asks the *process*: is the listener attached to the mapper
+    right now, and is there an open sink for it to write into. Reachable
+    in the AST and unreachable in the process is a distinction this repo
+    has a name for.
+    """
+    import sqlalchemy as sa
+    from atrium_ddns.models import DnsEvent
+
+    import conftest
+
+    assert sa.event.contains(
+        DnsEvent, "after_insert", conftest._collect_unattributed
+    ), (
+        "the after_insert listener is not attached to DnsEvent in this "
+        "process, so nothing is recording the rows no email can name. The "
+        "usual cause is that the session-scoped autouse fixture "
+        "_sweep_unattributed_events is no longer being collected"
+    )
+    assert conftest._UNATTRIBUTED_SINKS, (
+        "the listener is attached but no sink is open, so every id it "
+        "records is discarded — a recorder that cannot fail to look clean"
+    )
