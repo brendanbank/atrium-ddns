@@ -562,12 +562,24 @@ The three sub-features and where each now lives:
   mechanism (atrium's `audit_log`) for a different reason — that one is not
   per-device.
 
-**The one thing this closes that is not a route.** `scripts/import_legacy.py`
+**The one thing this closes that is not a route.** ~~`scripts/import_legacy.py`
 refuses two legacy states it can now represent — a zone whose hostnames disagree
 about TTL, and a *selective* `hostname_backends` binding. Both refusals still
 refuse rather than corrupt, and both are now unnecessary. Not changed by #74 (it
 is #50's file and outside that issue's acceptance criteria); recorded so the
-next migration-cutover issue finds it.
+next migration-cutover issue finds it.~~
+
+**Closed by #83.** The file is
+`backend/src/atrium_ddns/scripts/import_legacy.py`, not `scripts/` — the path
+above was wrong from the day it was written. Both states are now migrated: a
+disagreeing zone pins every one of its names on `ddns_hostname.ttl`, and a
+strict-subset binding becomes `ddns_hostname_backend` rows. One
+`hostname_backends` shape still refuses, and correctly — a binding naming a
+backend that is not on the hostname's own zone, which `resolve_backends` would
+filter down to the empty set, leaving the name publishing nowhere. Neither state
+is present in the measured population (both counts zero, `cutover.md` § 5.3), so
+the widening is exercised against a synthetic source rather than against real
+rows, and the importer now prints both counts on every run.
 
 <details>
 <summary>the original blocking finding, for the record (#47, 2026-08-16)</summary>
