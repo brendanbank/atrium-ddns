@@ -97,11 +97,22 @@ matches NULL. ``router_nic`` writes one ``ddns_event`` row with
 resolve — the pre-auth ``badauth`` — so those rows survived every
 teardown the suite had and accumulated, monotonically, for ever.
 
-Measured on a fresh database on the V1M7 tip: **17 rows per full suite
-run**, from exactly three modules — ``test_router_nic.py`` (14),
-``test_import_legacy.py`` (2) and ``test_router_tenant.py`` (1). Against
-303 event rows written and 286 removed in the same run, so the tenant
-teardowns were working and these were the residue.
+**The population moved twice while this was being fixed, so the figure
+is written with its date and its tip rather than as a fact.** #87's
+headline is *~27 rows per suite run*. Measured on a fresh database at
+``4d10e37`` it was **17**, from three modules — ``test_router_nic.py``
+(14), ``test_import_legacy.py`` (2), ``test_router_tenant.py`` (1). #64
+then merged, and ``record_event`` learned to attribute a ``badauth``
+whose username *resolved to a device*; re-measured at ``9744071`` the
+same sweep reads **10**, from two — ``test_router_nic.py`` (9) and
+``test_import_legacy.py`` (1). ``test_router_tenant.py`` drove its
+refusal with a real username and a wrong secret, so #64 attributed it
+out of the population entirely.
+
+What survives all three readings is the shape: a refusal that resolved
+**nothing** has no tenant to name, by construction, and 10 of them are
+still written and still leaked per run. Against 322 event rows written
+in the same run, so the tenant teardowns work and these are the residue.
 
 The fix is deliberately **not** wired per module.
 :func:`record_unattributed_events` registers a mapper-level
@@ -111,12 +122,15 @@ records the id of every unattributed row *this process* writes, and
 that list to ``purge_tenants(event_ids=…)`` at the end of the worker's
 session. Two properties follow, and both are the reason for the shape:
 
-* **It cannot miss a module.** #87's own per-module table named two of
-  the three modules that leak. A fix hand-wired from that table would
-  have left ``test_router_tenant.py`` leaking and looked complete. The
-  listener is on the *writer*, so a module added tomorrow is covered
-  without anybody editing a list — the lesson #78 taught
-  ``EXPECTED_PARTICIPANTS``.
+* **It cannot miss a module, and it cannot go stale.** #87's own
+  per-module table named two of the three modules that were leaking when
+  it was written, and a fix hand-wired from it would have left
+  ``test_router_tenant.py`` leaking and looked complete. A week later
+  that same table would have been wrong in the *other* direction —
+  ``test_router_tenant.py`` stopped leaking without anybody touching it,
+  because #64 changed the writer. The listener is on the writer, so both
+  moves are absorbed: no list to be short, none to be stale. It is the
+  lesson #78 taught ``EXPECTED_PARTICIPANTS``, one level down.
 * **It cannot report success having matched nothing.** The sweep
   re-counts the ids it handed over and raises when any survive. Deleting
   zero *because there were none* and deleting zero *because the
@@ -392,8 +406,9 @@ def record_unattributed_events() -> Iterator[list[int]]:
 
     Registered against the **mapper**, not against a session, so it sees
     every write in the process — including the ones the app under test
-    makes through its own ``get_session`` dependency, which is where all
-    17 of #87's rows come from and which no fixture holds a handle to.
+    makes through its own ``get_session`` dependency, which is where
+    every one of #87's rows comes from and which no fixture holds a
+    handle to.
 
     The listener is attached once for the outermost sink and removed
     with it, so a run that opens no recorder pays nothing.
