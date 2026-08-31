@@ -88,17 +88,65 @@ autoincrement id, which no naming convention can namespace.
 code and it would make the suite green, but it leaves the contention in
 place: the server would still log a deadlock on every run, and #65 asks
 for zero rather than for zero-that-were-retried.
+
+The rows no teardown could name — #87
+-------------------------------------
+``purge_tenants`` names a tenant by email or by id, and ``IN (…)`` never
+matches NULL. ``router_nic`` writes one ``ddns_event`` row with
+``user_id`` *and* ``user_email`` NULL every time a credential fails to
+resolve — the pre-auth ``badauth`` — so those rows survived every
+teardown the suite had and accumulated, monotonically, for ever.
+
+Measured on a fresh database on the V1M7 tip: **17 rows per full suite
+run**, from exactly three modules — ``test_router_nic.py`` (14),
+``test_import_legacy.py`` (2) and ``test_router_tenant.py`` (1). Against
+303 event rows written and 286 removed in the same run, so the tenant
+teardowns were working and these were the residue.
+
+The fix is deliberately **not** wired per module.
+:func:`record_unattributed_events` registers a mapper-level
+``after_insert`` listener on :class:`~atrium_ddns.models.DnsEvent` that
+records the id of every unattributed row *this process* writes, and
+:func:`_sweep_unattributed_events` — session-scoped and autouse — hands
+that list to ``purge_tenants(event_ids=…)`` at the end of the worker's
+session. Two properties follow, and both are the reason for the shape:
+
+* **It cannot miss a module.** #87's own per-module table named two of
+  the three modules that leak. A fix hand-wired from that table would
+  have left ``test_router_tenant.py`` leaking and looked complete. The
+  listener is on the *writer*, so a module added tomorrow is covered
+  without anybody editing a list — the lesson #78 taught
+  ``EXPECTED_PARTICIPANTS``.
+* **It cannot report success having matched nothing.** The sweep
+  re-counts the ids it handed over and raises when any survive. Deleting
+  zero *because there were none* and deleting zero *because the
+  predicate could not match* are different states, and rendering them
+  identically is how this survived in the first place.
+
+The mechanism's own failure mode is that ``record_event`` stops going
+through the ORM — a Core ``insert()`` fires no mapper event, the sink
+stays empty, and the sweep reports a clean nothing. That is checked
+against the real writer in
+``test_harness_guards.test_the_recorder_sees_the_routers_own_write``,
+not asserted here.
+
+``unattributed_emails`` stays on ``purge_tenants`` and keeps its one
+caller (``test_tenant_isolation.py``), which is about a row written
+*with* an email whose user is then deleted — a different state from the
+one above, and the only one an email-shaped scan can reach.
 """
 from __future__ import annotations
 
 import functools
 import os
-from collections.abc import AsyncIterator, Sequence
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Iterator, Sequence
+from contextlib import asynccontextmanager, contextmanager
 
+import pytest_asyncio
 import sqlalchemy as sa
 from app.db import get_engine, get_session_factory
 from app.models.auth import User
+from atrium_ddns.models import DnsEvent
 from sqlalchemy.ext.asyncio import AsyncSession
 
 #: This worker's namespace. Ten workers share one MySQL, so anything a
@@ -258,10 +306,22 @@ async def purge_tenants(
                 ).bindparams(sa.bindparam("e", expanding=True)),
                 {"e": list(unattributed_emails)},
             )
-        user_ids = list(
-            (
-                await s.execute(sa.select(User.id).where(User.email.in_(list(emails))))
-            ).scalars()
+        # An empty ``emails`` is a legitimate call, not a mistake:
+        # :func:`purge_unattributed_events` has ids and no tenant. The
+        # guard is here rather than at the call site because
+        # ``Column.in_([])`` renders an always-false expression *and* a
+        # SQLAlchemy warning, and a warning nobody reads on a statement
+        # that cannot match is two bad things rather than one.
+        user_ids = (
+            list(
+                (
+                    await s.execute(
+                        sa.select(User.id).where(User.email.in_(list(emails)))
+                    )
+                ).scalars()
+            )
+            if emails
+            else []
         )
         if user_ids:
             await s.execute(
@@ -282,3 +342,146 @@ async def purge_tenants(
                 ),
                 {"ids": user_ids},
             )
+
+
+# ===================================================================== #
+# #87 — the rows no email can name
+# ===================================================================== #
+
+#: Every open sink, innermost last. A list of lists rather than one
+#: list, so :func:`record_unattributed_events` nests: the session-wide
+#: sweep is always open, and a guard that wants to watch one statement
+#: opens a second one inside it and gets its own ids without stealing
+#: them from the sweep.
+_UNATTRIBUTED_SINKS: list[list[int]] = []
+
+
+def _collect_unattributed(mapper: object, connection: object, target: DnsEvent) -> None:
+    """``after_insert`` on :class:`DnsEvent`. Records the unnameable ones.
+
+    A module-level function rather than a closure so that
+    ``sa.event.contains(DnsEvent, "after_insert", _collect_unattributed)``
+    is answerable — which is how a guard tells *the listener is
+    installed in this process* from *the listener is defined in this
+    file*. The AST-vs-process distinction is one this repo has already
+    paid for.
+
+    ``target.id`` is populated by the time this fires: the ORM has
+    executed the INSERT and fetched the generated key. Verified rather
+    than assumed — a listener that recorded ``None`` would produce a
+    sweep whose ``IN (…)`` matched nothing while looking busy, which is
+    the same defect one level up.
+
+    The condition mirrors ``router_nic.record_event``'s ``auth`` being
+    ``None``: it sets ``user_id`` and ``user_email`` from the same
+    object, so a row is either fully attributed or fully anonymous.
+    Testing both columns rather than trusting that pairing is cheap and
+    keeps this correct if the writer ever sets one without the other.
+    """
+    if target.user_id is None and target.user_email is None and target.id is not None:
+        for sink in _UNATTRIBUTED_SINKS:
+            sink.append(target.id)
+
+
+@contextmanager
+def record_unattributed_events() -> Iterator[list[int]]:
+    """Collect the ids of unattributed ``ddns_event`` rows written in here.
+
+    Yields the list itself, which fills as rows are written, so the
+    caller hands it to ``purge_tenants(event_ids=…)`` on the way out.
+
+    Registered against the **mapper**, not against a session, so it sees
+    every write in the process — including the ones the app under test
+    makes through its own ``get_session`` dependency, which is where all
+    17 of #87's rows come from and which no fixture holds a handle to.
+
+    The listener is attached once for the outermost sink and removed
+    with it, so a run that opens no recorder pays nothing.
+    """
+    sink: list[int] = []
+    if not _UNATTRIBUTED_SINKS:
+        sa.event.listen(DnsEvent, "after_insert", _collect_unattributed)
+    _UNATTRIBUTED_SINKS.append(sink)
+    try:
+        yield sink
+    finally:
+        _UNATTRIBUTED_SINKS.remove(sink)
+        if not _UNATTRIBUTED_SINKS:
+            sa.event.remove(DnsEvent, "after_insert", _collect_unattributed)
+
+
+async def purge_unattributed_events(
+    event_ids: Sequence[int], *, owner: str = "purge-unattributed"
+) -> None:
+    """Hand recorded ids to :func:`purge_tenants`, then prove they went.
+
+    The re-count is the whole point and is not ceremony. ``IN (…)``
+    never matching NULL is #87's entire mechanism, and a teardown that
+    issues the statement, gets ``rowcount`` 0 and returns happily is
+    indistinguishable from one that had nothing to do. The two states
+    are separated here by asking the *table* rather than the delete:
+
+    * nothing recorded — return without opening a connection, which is
+      what a worker that ran only ``test_providers.py`` does;
+    * recorded and gone — the normal path;
+    * recorded and **still there** — raise, naming both counts and the
+      surviving ids.
+
+    Asserted on the rows, not on the delete's report of itself.
+    ``rowcount`` is the statement describing its own work, and this repo
+    has been wrong more than once about an instrument's own account.
+    """
+    ids = sorted(set(event_ids))
+    if not ids:
+        return
+    await purge_tenants((), event_ids=ids, owner=owner)
+    factory = get_session_factory()
+    async with factory() as s:
+        survivors = list(
+            (
+                await s.execute(
+                    sa.text("SELECT id FROM ddns_event WHERE id IN :ids").bindparams(
+                        sa.bindparam("ids", expanding=True)
+                    ),
+                    {"ids": ids},
+                )
+            ).scalars()
+        )
+    if survivors:
+        raise AssertionError(
+            f"{len(survivors)} of {len(ids)} recorded unattributed ddns_event "
+            f"rows survived purge_tenants(event_ids=…) [{owner}]. The ids were "
+            "recorded at insert time, so this is NOT 'there was nothing to "
+            "delete' — it is 'the delete did not match'. Surviving ids: "
+            f"{survivors[:20]}{'…' if len(survivors) > 20 else ''}"
+        )
+
+
+@pytest_asyncio.fixture(scope="session", autouse=True)
+async def _sweep_unattributed_events() -> AsyncIterator[None]:
+    """The one place #87's rows are cleaned up. Autouse, session-scoped.
+
+    Autouse because the alternative is a list of participating modules,
+    and #78 already established what a hand-kept list of test modules is
+    worth: #87's own per-module table named two of the three modules
+    that leak, and a fix wired from it would have shipped looking
+    complete.
+
+    Session-scoped because the loop is
+    (``asyncio_default_*_loop_scope = "session"``) and because there is
+    nothing to gain from cleaning between modules — the rows are inert
+    while the run is in progress, and the defect is that they outlive
+    it.
+
+    ``--dist=loadfile`` gives each xdist worker its own session and its
+    own sink, and the sink only ever holds ids this process wrote. That
+    matters: ``test_router_nic.test_badauth_is_recorded`` counts rows by
+    address around a single request, and it was already observed flaking
+    once in 65 runs because a *sibling module* deleted a same-shaped row
+    inside its window. A sweep that scanned for unattributed rows
+    instead of naming its own would reintroduce that across all ten
+    workers.
+    """
+    with record_unattributed_events() as ids:
+        yield
+        await purge_unattributed_events(ids, owner=f"conftest.sweep[{WORKER}]")
