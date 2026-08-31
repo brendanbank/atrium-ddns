@@ -125,7 +125,7 @@ The strip screenshot the walk writes on every run is
 ## Pinning atrium
 
 `compose.yaml` reads `ATRIUM_IMAGE` from `.env`, and the pinned default is
-`ghcr.io/brendanbank/atrium:0.28.0`. Override it to try another release
+`ghcr.io/brendanbank/atrium:0.29.0`. Override it to try another release
 without editing anything:
 
 ```bash
