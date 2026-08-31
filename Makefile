@@ -98,7 +98,8 @@ endef
 	test test-frontend test-backend test-compat \
 	check-fresh check-compat-fresh check-backend-fresh check-host-pkg-fresh \
 	test-backend-serial test-backend-file typecheck smoke \
-	e2e-up e2e-deps e2e-down test-e2e check-bundle-fresh
+	e2e-up e2e-deps e2e-down test-e2e check-bundle-fresh \
+	atrium-bump
 
 help:  ## show this help
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-21s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -481,3 +482,21 @@ acme-verify:  ## which certificate is on the wire (HOST=<name> required)
 
 test-acme-handover:  ## gate-test the hand-over on a throwaway stack (LIVE=1 adds LE staging)
 	./scripts/test-acme-handover.sh $(if $(LIVE),--live-staging,)
+
+# --- Atrium version bump ---------------------------------------------------
+# The pinned atrium version lives in five files plus three npm packages, and
+# they are not independently upgradable. Rather than keep a second copy of
+# the editing rules here, this target dispatches the same workflow the daily
+# poll runs, so the laptop path and the unattended path are one
+# implementation. Reach for it to adopt a release ahead of the poll, or to
+# re-run a bump the watcher skipped.
+#
+# It opens a PR; it does not merge one. .github/workflows/auto-merge.yml
+# does that, and only once every check on the PR is green.
+#
+# `gh workflow run` dispatches the copy of the workflow on the default
+# branch — GitHub offers no dispatch for a workflow that is not on master
+# yet, so this target only works once atrium-watch.yml has been merged.
+atrium-bump:  ## open the atrium bump PR now (version=X.Y.Z, blank = latest release)
+	gh workflow run atrium-watch.yml $(if $(version),-f version=$(version),)
+	@echo "Dispatched. Watch it with: gh run watch \$$(gh run list --workflow atrium-watch.yml -L1 --json databaseId --jq '.[0].databaseId')"

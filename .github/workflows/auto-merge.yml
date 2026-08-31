@@ -1,0 +1,172 @@
+# Squash-merge an automated PR once every check on its head commit is
+# green. Two kinds qualify, and nothing else does:
+#
+#   atrium-bump/X.Y.Z   the lockstep atrium bump opened by atrium-watch.yml
+#   dependabot/...      a grouped minor/patch or security bump
+#
+# Why a workflow_run gate rather than `gh pr merge --auto`: native
+# auto-merge only waits when the base branch has *required* status checks
+# to wait for, and this repository is private on a plan where branch
+# protection is not available at all — the API answers 403, not "none
+# configured". Armed on an unprotected branch, `--auto` merges immediately,
+# before CI has started: the opposite of the intent. So the wait is
+# implemented here, by reading the checks on the exact commit CI ran on.
+#
+# This gates the automation, not the branch. A red PR stays open rather
+# than being blocked, and anyone can still merge it by hand.
+#
+# It does not deploy. Merging moves the pin in the source tree; the running
+# stack keeps its old image until it is rebuilt.
+
+name: Auto-merge
+
+on:
+  workflow_run:
+    # Every workflow that reports checks on a PR here. CI is currently the
+    # only one; when a security or codeql workflow is added, add it to this
+    # list too, or the gate can merge before it has reported. Whichever
+    # finishes last is the run that actually merges — the earlier ones find
+    # checks still pending and bail cheaply.
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-merge-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    name: Auto-merge the green PR
+    if: >
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      (startsWith(github.event.workflow_run.head_branch, 'atrium-bump/') ||
+       startsWith(github.event.workflow_run.head_branch, 'dependabot/'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      # `gh pr checks` reads statusCheckRollup, and that one call needs
+      # three separate scopes: the check runs themselves (checks), the
+      # commit statuses alongside them (statuses), and — because the query
+      # resolves every check back to the workflow run that produced it via
+      # checkSuite.workflowRun — the Actions API (actions). Miss any one and
+      # the whole query 403s with "Resource not accessible by integration",
+      # naming only the first field it could not reach, so they surface one
+      # at a time. Job-level permissions replace the workflow-level block
+      # outright, so everything needed must be listed here.
+      checks: read
+      statuses: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+      CI_SHA: ${{ github.event.workflow_run.head_sha }}
+      # The account ATRIUM_BUMP_TOKEN belongs to — the only author whose
+      # atrium-bump/* PRs may merge themselves. master is unprotected, so
+      # nothing else stops a hand-pushed branch from using that name; this
+      # is what makes the branch prefix mean something. Update it if the
+      # token ever changes hands.
+      BUMP_AUTHOR: brendanbank
+      # This workflow's own job name. A workflow_run run reports its check
+      # against the same head commit, so without excluding it the gate would
+      # see itself pending and never merge anything.
+      SELF_CHECK_NAME: "Auto-merge the green PR"
+    steps:
+      - name: Merge if every check on the head commit passed
+        run: |
+          set -euo pipefail
+
+          # Branch names reach us from an event payload; pin the shape
+          # before using one in a query, and decide from the shape alone who
+          # is allowed to have authored it.
+          #
+          # The Dependabot pattern is an allow-list of the group names in
+          # .github/dependabot.yml that carry minor, patch and security
+          # bumps. The `*-major-updates` groups are deliberately not on it:
+          # a major that typechecks and builds can still be wrong in ways no
+          # green tick catches, so those wait for a human. A branch that
+          # matches nothing here is not an error — the PR simply stays open.
+          if printf '%s' "$HEAD_BRANCH" | grep -qE '^atrium-bump/[0-9]+\.[0-9]+\.[0-9]+$'; then
+            EXPECTED_AUTHOR="$BUMP_AUTHOR"
+          elif printf '%s' "$HEAD_BRANCH" | grep -qE '^dependabot/[^/]+(/[^/]+)*/(pip|npm|actions|docker)-(version|security)-updates(-[0-9a-zA-Z.]+)?$'; then
+            EXPECTED_AUTHOR='dependabot[bot]'
+          else
+            echo "::notice::$HEAD_BRANCH is not an auto-merge branch — leaving it alone"
+            exit 0
+          fi
+
+          NUMBER="$(gh pr list --repo "$REPO" --head "$HEAD_BRANCH" --state open \
+            --json number --jq '.[0].number // empty')"
+          if [ -z "$NUMBER" ]; then
+            echo "::notice::no open PR for $HEAD_BRANCH — nothing to merge"
+            exit 0
+          fi
+
+          # The REST representation, not `gh pr list --json author`: the
+          # login there is rendered for humans and has been spelled
+          # "dependabot", "dependabot[bot]" and "app/dependabot" across gh
+          # versions. `.user.login` is the API's own value and is stable.
+          if ! PR_JSON="$(gh api "repos/$REPO/pulls/$NUMBER")"; then
+            echo "::error::could not read PR #$NUMBER — refusing to merge"
+            exit 1
+          fi
+          AUTHOR="$(jq -r '.user.login // ""' <<<"$PR_JSON")"
+          HEAD_OID="$(jq -r '.head.sha' <<<"$PR_JSON")"
+
+          if [ "$AUTHOR" != "$EXPECTED_AUTHOR" ]; then
+            echo "::warning::PR #$NUMBER is authored by '$AUTHOR', not '$EXPECTED_AUTHOR' — refusing to auto-merge"
+            exit 0
+          fi
+
+          # Merge only the exact commit the checks ran against. Without
+          # this, a push landing after a green run would inherit that run's
+          # success and merge unchecked code.
+          if [ "$HEAD_OID" != "$CI_SHA" ]; then
+            echo "::notice::PR #$NUMBER head ($HEAD_OID) moved past the checked commit ($CI_SHA) — waiting for its checks"
+            exit 0
+          fi
+
+          # All checks on the commit, not just the workflow that triggered
+          # this run.
+          #
+          # Judged on whether the JSON parses, not on the exit status: `gh
+          # pr checks` exits non-zero when anything is pending or failing,
+          # and this gate's own check run is pending by construction (it is
+          # the thing running). Treating that as an error would fail the run
+          # on the normal path.
+          set +e
+          CHECKS="$(gh pr checks "$NUMBER" --repo "$REPO" --json name,bucket 2>/dev/null)"
+          set -e
+          if ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$CHECKS"; then
+            echo "::error::could not read checks for PR #$NUMBER — refusing to merge"
+            exit 1
+          fi
+
+          UNRESOLVED="$(jq -r --arg self "$SELF_CHECK_NAME" '
+            [ .[]
+              | select(.name != $self)
+              | select(.bucket != "pass" and .bucket != "skipping")
+              | "\(.bucket)\t\(.name)"
+            ] | join("\n")' <<<"$CHECKS")"
+
+          TOTAL="$(jq -r --arg self "$SELF_CHECK_NAME" \
+            '[ .[] | select(.name != $self) ] | length' <<<"$CHECKS")"
+          if [ "$TOTAL" = "0" ]; then
+            echo "::warning::PR #$NUMBER reports no checks — refusing to merge on no evidence"
+            exit 0
+          fi
+
+          if [ -n "$UNRESOLVED" ]; then
+            echo "::notice::PR #$NUMBER still has checks that are not green:"
+            printf '%s\n' "$UNRESOLVED"
+            echo "Leaving it open."
+            exit 0
+          fi
+
+          echo "All $TOTAL checks green on $CI_SHA — squash-merging PR #$NUMBER."
+          gh pr merge "$NUMBER" --repo "$REPO" --squash --delete-branch

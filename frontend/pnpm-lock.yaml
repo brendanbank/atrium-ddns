@@ -9,10 +9,10 @@ importers:
   .:
     dependencies:
       '@brendanbank/atrium-host-bundle-utils':
-        specifier: ^0.28
+        specifier: ^0.28.0
         version: 0.28.0(@tanstack/react-query@5.101.4(react@19.2.8))(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(vite-plugin-css-injected-by-js@5.0.2(vite@8.2.1(@types/node@26.2.0)))(vite@8.2.1(@types/node@26.2.0))
       '@brendanbank/atrium-host-types':
-        specifier: ^0.28
+        specifier: ^0.28.0
         version: 0.28.0(react@19.2.8)
       '@mantine/core':
         specifier: ^9.1.0
@@ -34,7 +34,7 @@ importers:
         version: 19.2.8(react@19.2.8)
     devDependencies:
       '@brendanbank/atrium-test-utils':
-        specifier: ^0.28
+        specifier: ^0.28.0
         version: 0.28.0(@tanstack/react-query@5.101.4(react@19.2.8))(@testing-library/react@16.3.2(@testing-library/dom@10.4.1)(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(vite-plugin-css-injected-by-js@5.0.2(vite@8.2.1(@types/node@26.2.0)))(vite@8.2.1(@types/node@26.2.0))(vitest@4.1.10(@types/node@26.2.0)(jsdom@30.0.1(@noble/hashes@2.3.0))(vite@8.2.1(@types/node@26.2.0)))
       '@playwright/test':
         specifier: ^1.61.0
