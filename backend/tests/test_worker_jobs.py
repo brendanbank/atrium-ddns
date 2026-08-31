@@ -88,6 +88,7 @@ from atrium_ddns.worker_jobs import (
     DdnsConfig,
     DeviceStatus,
     DnsCheckStatus,
+    HealthCheckSummary,
     Liveness,
     classify_record,
     device_statuses,
@@ -1090,6 +1091,13 @@ async def test_the_health_check_batch_ceiling_reports_itself(config, tenants):
     assert summary.hostnames_checked == 2
     assert summary.truncated is True
     assert summary.hostnames_considered == 3
+    # `truncated` says *that* work was left; `hostnames_deferred` says
+    # how much (#107). A boolean cannot tell one skipped name from a
+    # thousand, and the operator reading the log line is being asked to
+    # decide whether the ceiling needs raising.
+    assert (summary.hostnames_due, summary.hostnames_deferred) == (3, 1)
+    assert summary.hostnames_moved == 0
+    summary.assert_consistent()
 
 
 async def test_the_never_written_slice_is_excluded_by_the_query_not_just_the_loop(
@@ -1131,11 +1139,443 @@ async def test_the_never_written_slice_is_excluded_by_the_query_not_just_the_loo
     ]
     assert len(due) == 1, f"expected one due-set SELECT, got {len(due)}"
     flat = due[0].replace("\n", " ")
-    assert "last_ip_v4 IS NOT NULL" in flat, (
+    # Spelled `coalesce(last_ip_v4, '') != ''` rather than
+    # `last_ip_v4 IS NOT NULL` since #107: `''` is not NULL in SQL and
+    # is falsy in Python, so the `IS NOT NULL` version let a row that
+    # `_check` would silently drop occupy a batch slot. The property
+    # asserted is unchanged — the query, not just the loop, excludes
+    # hostnames with nothing to compare against.
+    assert "coalesce(ddns_hostname.last_ip_v4" in flat.lower(), (
         f"the due-set query does not exclude hostnames with nothing to compare "
         f"against; they will occupy batch slots: {flat}"
     )
     assert "dns_checked_at IS NULL" in flat, flat
+
+
+# --------------------------------------------------------------------- #
+# 4a. #107 — the slice a sweep skips has to have a name
+# --------------------------------------------------------------------- #
+#
+# #107 recorded one non-reproducing failure of
+# `test_the_health_check_classifies_ok_mismatch_missing_and_error`:
+#
+#     hostnames_considered=5 hostnames_never_written=1 hostnames_checked=2
+#
+# Ten full-suite runs, six `make test-backend` runs and a cold-database
+# run did not reproduce it here either, and this file's 43 cases pass in
+# isolation. What these four tests do instead is remove the reason it
+# was worth chasing: at the time, that reading was *unfalsifiable*.
+# `assert_consistent()` sat two lines below the failing assertion and
+# did not fire, because `considered - never_written == checked` was not
+# one of its invariants — correctly, since staleness and batching are
+# allowed to leave rows unchecked. So the same numbers in production
+# read exactly like a healthy sweep with nothing due, and the symptom
+# would have been hostnames silently skipped by a health check.
+#
+# The four buckets below (`not_due`, `checked`, `deferred`, `moved`) now
+# partition the due set, so an unexplained gap is an AssertionError
+# rather than a log line that reads like a pass.
+
+
+async def test_the_reason_a_due_hostname_was_skipped_is_named_not_implied(
+    config, tenants
+):
+    """#107's exact recorded signature, produced on purpose.
+
+    Five hostnames, four with a ``last_ip``, and two of those four
+    stamped ``dns_checked_at = now`` before the run — the one state the
+    issue narrowed to, since the staleness clause is the only filter
+    that can drop a ``last_ip`` row from ``due``. The summary reads
+    ``considered=5 never_written=1 checked=2``: **character for
+    character the reading #107 filed**, and previously the whole of what
+    the job could say about it.
+
+    It now also says ``not_due=2``, which is the difference between a
+    diagnosis and a shrug.
+    """
+    a = tenants["a"]
+    zone = f"a-jobs-{W}.example.invalid"
+    fresh = [f"fresh{i}.{zone}" for i in range(2)]
+    stale = [f"stale{i}.{zone}" for i in range(2)]
+    never = f"nowrite107.{zone}"
+
+    for name in fresh + stale:
+        await _add_hostname(a["domain_id"], name, last_ip_v4="192.0.2.60")
+    await _add_hostname(a["domain_id"], never)
+
+    factory = get_session_factory()
+    async with factory() as s:
+        await s.execute(
+            sa.text(
+                "UPDATE ddns_hostname SET dns_checked_at = :t WHERE name IN :n"
+            ).bindparams(sa.bindparam("n", expanding=True)),
+            {"t": _now(), "n": fresh},
+        )
+        await s.commit()
+
+    resolver = FakeResolver({(n, "A"): ["192.0.2.60"] for n in fresh + stale})
+    summary = await run_health_checks(
+        resolve=resolver,
+        scope=DdnsScope.for_user_id(a["user_id"]),
+        config=DdnsConfig(health_check_enabled=True, health_check_interval_minutes=15),
+    )
+
+    # The three numbers #107 has, unchanged.
+    assert summary.hostnames_considered == 5
+    assert summary.hostnames_never_written == 1
+    assert summary.hostnames_checked == 2
+
+    # The two it did not have.
+    assert summary.hostnames_not_due == 2
+    assert summary.hostnames_due == 2
+    assert (summary.hostnames_deferred, summary.hostnames_moved) == (0, 0)
+    summary.assert_consistent()
+
+    # And the log line an operator would read carries them, so this is
+    # distinguishable from a healthy sweep *in production*, not only in
+    # a test that can reach the object.
+    fields = summary.as_log_fields()
+    assert fields["hostnames_not_due"] == 2
+    assert fields["hostnames_due"] == 2
+    assert fields["hostnames_deferred"] == 0
+    assert fields["hostnames_moved"] == 0
+
+    # The two fresh rows were genuinely not resolved — not resolved and
+    # discarded. A second instrument on the same claim: the resolver's
+    # own call log rather than the summary's arithmetic.
+    assert sorted(n for n, _ in resolver.calls) == sorted(stale)
+
+
+def test_the_due_accounting_refuses_a_run_that_skipped_rows_without_saying_so():
+    """The guard, shown biting — and shown *not* biting when it should not.
+
+    ``assert_consistent`` is believed, so it has to be demonstrated
+    rather than read. The first summary below is #107's numbers with the
+    gap unattributed; it must raise. The three after it are the same gap
+    with each of the three legitimate explanations attached; every one
+    must pass, because a guard that also refuses correct runs gets
+    disabled rather than investigated.
+    """
+    unattributed = HealthCheckSummary(
+        hostnames_considered=5,
+        hostnames_never_written=1,
+        hostnames_due=4,
+        hostnames_checked=2,
+    )
+    with pytest.raises(AssertionError) as raised:
+        unattributed.assert_consistent()
+    message = str(raised.value)
+    # Names both readings, per the rule that a guard failing
+    # uninformatively gets deleted rather than investigated.
+    assert "checked=2" in message and "due=4" in message
+
+    # Not due — the staleness clause did its job.
+    HealthCheckSummary(
+        hostnames_considered=5,
+        hostnames_never_written=1,
+        hostnames_not_due=2,
+        hostnames_due=2,
+        hostnames_checked=2,
+    ).assert_consistent()
+
+    # Deferred — the batch ceiling did its job.
+    HealthCheckSummary(
+        hostnames_considered=5,
+        hostnames_never_written=1,
+        hostnames_due=4,
+        hostnames_checked=2,
+        hostnames_deferred=2,
+        truncated=True,
+    ).assert_consistent()
+
+    # Moved — a concurrent writer stamped them between the count and
+    # the fetch. Benign, and the point is that it is *stated*.
+    HealthCheckSummary(
+        hostnames_considered=5,
+        hostnames_never_written=1,
+        hostnames_due=4,
+        hostnames_checked=2,
+        hostnames_moved=2,
+    ).assert_consistent()
+
+    # And the population half, which catches a due/not-due predicate
+    # that stops partitioning rather than a lost row.
+    with pytest.raises(AssertionError, match="does not partition"):
+        HealthCheckSummary(
+            hostnames_considered=5,
+            hostnames_never_written=1,
+            hostnames_not_due=1,
+            hostnames_due=1,
+            hostnames_checked=1,
+        ).assert_consistent()
+
+
+async def test_the_population_counts_are_one_statement_and_therefore_one_snapshot(
+    config, tenants
+):
+    """#107's first question, answered where it can be measured.
+
+    "Are the totals query and the ``due`` query guaranteed to see the
+    same snapshot?" They are **not** — see the companion test below —
+    so the four population counts are read by a single ``SELECT``
+    instead, which is atomic under every isolation level MySQL offers.
+
+    Asserted against the SQL the driver actually sent rather than
+    against the code that built it: ``before_cursor_execute`` is
+    downstream of SQLAlchemy, so a refactor that splits the aggregate
+    back into two statements fails here even if it reads correctly.
+    """
+    a = tenants["a"]
+    zone = f"a-jobs-{W}.example.invalid"
+    name = f"snap.{zone}"
+    await _add_hostname(a["domain_id"], name, last_ip_v4="192.0.2.61")
+    await _add_hostname(a["domain_id"], f"snap-nowrite.{zone}")
+
+    with capture_sql() as seen:
+        summary = await run_health_checks(
+            resolve=FakeResolver({(name, "A"): ["192.0.2.61"]}),
+            scope=DdnsScope.for_user_id(a["user_id"]),
+            config=DdnsConfig(health_check_enabled=True),
+        )
+
+    counting = [
+        s.replace("\n", " ")
+        for s in seen
+        if "FROM ddns_hostname" in s and "count(" in s.lower()
+    ]
+    assert len(counting) == 1, (
+        f"the population is meant to be counted by exactly one statement, so "
+        f"that its slices cannot disagree; the driver sent {len(counting)}: "
+        f"{counting}"
+    )
+    # All four counts, out of that one statement. Derived from the
+    # summary's own field names rather than a list typed here, so a
+    # count added to the dataclass and not to the query is caught.
+    flat = counting[0].lower()
+    assert flat.count("case when") == 3, (
+        f"expected three CASE arms — never_written, due, not_due — beside the "
+        f"bare COUNT(*): {counting[0]}"
+    )
+    assert (
+        summary.hostnames_considered
+        == summary.hostnames_never_written
+        + summary.hostnames_not_due
+        + summary.hostnames_due
+    )
+    summary.assert_consistent()
+
+
+async def test_a_row_that_is_due_in_sql_and_empty_in_python_cannot_pass_silently(
+    config, tenants
+):
+    """The third way a due hostname gets skipped, and it is a real one.
+
+    ``''`` is ``IS NOT NULL`` in SQL and falsy in Python. A hostname
+    whose ``last_ip_v4`` is the empty string therefore **passes** the
+    due-set filter, is loaded into the batch, and is then dropped by
+    ``_check``'s ``if not expected: continue`` — contributing no
+    records and not incrementing ``hostnames_checked``. Before #107 that
+    was invisible: the row occupied a batch slot, was never resolved,
+    and the summary reported the same numbers as a healthy tick.
+
+    Nothing in this package is known to write ``''`` today — the update
+    path stores a parsed address — but the column is a nullable
+    ``VARCHAR`` with no ``CHECK``, and a legacy import is exactly the
+    kind of thing that would.
+
+    So the two sides are made to agree: the due-set filter is
+    ``COALESCE(last_ip, '') != ''``, matching ``_check``'s own
+    ``if not expected``, and the row is counted as ``never_written`` —
+    which is what it is. The due accounting is the backstop, and it is
+    asserted here too: if the SQL and the Python ever drift apart again,
+    ``checked`` stops matching ``due`` and the run refuses instead of
+    reporting a clean sweep.
+    """
+    a = tenants["a"]
+    zone = f"a-jobs-{W}.example.invalid"
+    real = f"empty-ok.{zone}"
+    await _add_hostname(a["domain_id"], real, last_ip_v4="192.0.2.63")
+    await _add_hostname(a["domain_id"], f"empty-ip.{zone}", last_ip_v4="")
+
+    resolver = FakeResolver({(real, "A"): ["192.0.2.63"]})
+    summary = await run_health_checks(
+        resolve=resolver,
+        scope=DdnsScope.for_user_id(a["user_id"]),
+        config=DdnsConfig(health_check_enabled=True),
+    )
+
+    assert summary.hostnames_considered == 2
+    assert summary.hostnames_never_written == 1, (
+        f"the empty-string row is in the due set rather than in the n/a "
+        f"slice, so it occupies a batch slot it can never use: "
+        f"{summary.as_log_fields()}"
+    )
+    assert (summary.hostnames_due, summary.hostnames_checked) == (1, 1)
+    assert (summary.hostnames_deferred, summary.hostnames_moved) == (0, 0)
+    summary.assert_consistent()
+    # Never resolved, not resolved-and-discarded — the resolver's own
+    # call log, which is a different instrument from the summary.
+    assert [n for n, _ in resolver.calls] == [real]
+
+
+class _FactoryThatStampsBetweenTheTwoReads:
+    """A ``session_factory`` that lands a committed write in the gap.
+
+    ``run_health_checks`` counts the population with one statement and
+    fetches the due rows with the next. #107's second hypothesis was
+    that something wrote ``dns_checked_at`` between them. Rather than
+    wait for a 60 s worker tick to collide with a millisecond, this
+    puts the write exactly there — on a **separate session**, so it is
+    a genuinely concurrent commit and not the sweep seeing its own
+    uncommitted work.
+
+    It uses the ``session_factory=`` seam the function already exposes
+    for the tests, so nothing in ``worker_jobs`` grows a hook that
+    exists only for this file.
+    """
+
+    def __init__(self, names: list[str]) -> None:
+        self.names = names
+        self.stamped = False
+
+    def __call__(self) -> "_FactoryThatStampsBetweenTheTwoReads":
+        return self
+
+    async def __aenter__(self) -> Any:
+        self._cm = get_session_factory()()
+        inner = await self._cm.__aenter__()
+        return _SessionThatStamps(inner, self) if not self.stamped else inner
+
+    async def __aexit__(self, *exc: Any) -> Any:
+        return await self._cm.__aexit__(*exc)
+
+
+class _SessionThatStamps:
+    def __init__(self, inner: Any, owner: Any) -> None:
+        self._inner = inner
+        self._owner = owner
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._inner, item)
+
+    async def execute(self, statement: Any, *args: Any, **kwargs: Any) -> Any:
+        result = await self._inner.execute(statement, *args, **kwargs)
+        rendered = str(statement).lower()
+        if (
+            not self._owner.stamped
+            and "count(" in rendered
+            and "ddns_hostname" in rendered
+        ):
+            self._owner.stamped = True
+            factory = get_session_factory()
+            async with factory() as other:
+                await other.execute(
+                    sa.text(
+                        "UPDATE ddns_hostname SET dns_checked_at = :t "
+                        "WHERE name IN :n"
+                    ).bindparams(sa.bindparam("n", expanding=True)),
+                    {"t": _now(), "n": self._owner.names},
+                )
+                await other.commit()
+        return result
+
+
+async def test_a_write_between_the_count_and_the_fetch_is_reported_not_swallowed(
+    config, tenants
+):
+    """#107's other horn, produced on purpose — and the guard biting.
+
+    Four due hostnames counted, two of them stamped by a concurrent
+    committed write before the row fetch runs, two rows returned. The
+    summary reads ``considered=5 never_written=1 checked=2`` — #107's
+    reading again, reached by the *other* mechanism — and this time
+    ``hostnames_moved=2`` says which two and why the arithmetic still
+    closes.
+
+    Without the reconciliation this run is indistinguishable from a
+    healthy sweep with nothing due, which is precisely what the issue
+    says must stop being true.
+    """
+    a = tenants["a"]
+    zone = f"a-jobs-{W}.example.invalid"
+    names = [f"race{i}.{zone}" for i in range(4)]
+    for name in names:
+        await _add_hostname(a["domain_id"], name, last_ip_v4="192.0.2.62")
+    await _add_hostname(a["domain_id"], f"race-nowrite.{zone}")
+
+    factory = _FactoryThatStampsBetweenTheTwoReads(names[:2])
+    summary = await run_health_checks(
+        resolve=FakeResolver({(n, "A"): ["192.0.2.62"] for n in names}),
+        scope=DdnsScope.for_user_id(a["user_id"]),
+        config=DdnsConfig(health_check_enabled=True),
+        session_factory=factory,
+    )
+
+    assert factory.stamped, "the probe never fired — it proves nothing"
+    assert summary.hostnames_considered == 5
+    assert summary.hostnames_never_written == 1
+    assert summary.hostnames_due == 4
+    assert summary.hostnames_checked == 2
+    assert summary.hostnames_moved == 2, (
+        f"two rows counted as due were not returned by the fetch and the "
+        f"summary did not say so: {summary.as_log_fields()}"
+    )
+    assert summary.hostnames_deferred == 0
+    assert summary.truncated is False
+    # The gap is attributed, so the accounting closes. That is the
+    # point: `moved` is a measurement of a benign concurrent write, not
+    # an error — what it may not be is absent.
+    summary.assert_consistent()
+    assert summary.as_log_fields()["hostnames_moved"] == 2
+
+
+async def test_two_statements_in_one_session_are_two_snapshots(tenants):
+    """The premise the design above rests on, measured two ways.
+
+    #107 asked whether the totals query and the ``due`` query read one
+    snapshot. The engine ``app/db.py`` builds is pinned to **READ
+    COMMITTED** — deliberately, so the worker's
+    ``SELECT … FOR UPDATE SKIP LOCKED`` claim on ``scheduled_jobs``
+    takes a record lock rather than gap locks (atrium #152) — and under
+    READ COMMITTED every statement gets a fresh read view. So two reads
+    in one ``async with`` block are two snapshots no matter how the
+    block is written, and ``run_health_checks`` cannot get one by
+    grouping statements.
+
+    Two instruments, because a settings value and a behaviour are not
+    the same claim: the server's own ``@@transaction_isolation``, and a
+    *behavioural* probe that commits a row from a second session
+    between two reads in the first. If either ever disagrees, the
+    reasoning in ``run_health_checks``' docstring is stale and the
+    single-statement aggregate is the thing keeping it correct.
+    """
+    factory = get_session_factory()
+    async with factory() as a:
+        level = (
+            await a.execute(sa.text("SELECT @@transaction_isolation"))
+        ).scalar_one()
+        assert level.replace("-", " ").upper() == "READ COMMITTED", (
+            f"the engine's isolation level is {level!r}, not READ COMMITTED. "
+            f"run_health_checks' docstring and its single-statement population "
+            f"count are written against READ COMMITTED; re-read both."
+        )
+
+        # Namespaced per xdist worker and per tenant, like everything
+        # else this file creates: ten workers share one MySQL.
+        marker = f"snapshot-probe.a-jobs-{W}.example.invalid"
+        count = sa.text("SELECT COUNT(*) FROM ddns_hostname WHERE name = :n")
+        first = (await a.execute(count, {"n": marker})).scalar_one()
+
+        # A second session commits between the two reads in the first.
+        await _add_hostname(tenants["a"]["domain_id"], marker)
+
+        second = (await a.execute(count, {"n": marker})).scalar_one()
+
+    assert (first, second) == (0, 1), (
+        f"two reads in one session saw {first} then {second}; under a snapshot "
+        f"isolation they would both read {first}. Both instruments have to "
+        f"agree, and here they do: the session is not snapshot-isolated."
+    )
 
 
 async def test_the_health_check_does_not_reach_outside_its_scope(config, tenants):
