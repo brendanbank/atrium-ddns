@@ -401,7 +401,7 @@ export async function chooseFromSelect(
 export async function seedZoneDeviceAndName(
   page: Page,
   opts: { zone: string; deviceName: string },
-): Promise<{ hostname: string; deviceId: number; family: 'A' }> {
+): Promise<SeededName> {
   const api = page.request;
   const zoneRes = await api.post(`${API_URL}/atrium_ddns/domains`, {
     data: { name: opts.zone },
@@ -414,17 +414,42 @@ export async function seedZoneDeviceAndName(
   });
   const issued = await devRes.json();
   const deviceId = (issued.device ?? issued).id as number;
+  const username = (issued.device ?? issued).username as string;
+  const secret = (issued.secret ?? issued.password) as string;
 
   const hostname = `home.${opts.zone}`;
   await api.post(`${API_URL}/atrium_ddns/hostnames`, {
     data: { name: hostname, domain_id: domainId, device_id: deviceId },
   });
 
-  await deviceCallsIn(api, {
-    username: (issued.device ?? issued).username as string,
-    secret: (issued.secret ?? issued.password) as string,
+  await deviceCallsIn(api, { username, secret, hostname, ip: DOC_ADDRESS_V4 });
+  return {
     hostname,
-    ip: DOC_ADDRESS_V4,
-  });
-  return { hostname, deviceId, family: 'A' };
+    domainId,
+    deviceId,
+    deviceName: opts.deviceName,
+    username,
+    secret,
+    family: 'A',
+  };
+}
+
+/** What {@link seedZoneDeviceAndName} leaves behind.
+ *
+ * The device's own credentials are part of it because the log is the one
+ * surface where *a second call from the same device* is the fixture:
+ * every line on it is written by the wire, so a spec that needs two
+ * lines needs to be able to call in twice. Returning them beats a
+ * second seeding path that re-issues a device to get at them.
+ */
+export interface SeededName {
+  hostname: string;
+  domainId: number;
+  deviceId: number;
+  deviceName: string;
+  /** The DDNS username the device authenticates with, not the account's. */
+  username: string;
+  /** Shown once by `POST /devices` and never again. Fixture-only. */
+  secret: string;
+  family: 'A';
 }

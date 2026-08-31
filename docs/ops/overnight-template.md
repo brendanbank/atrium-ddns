@@ -769,12 +769,19 @@ made the gate cheaper and would not have prevented any of this.
 
 The full gate is six commands, but only two of them are expensive, and the
 expense is not the tests. Measured on the V1M7 tip: `make test-backend` is
-**833 tests in 16.66s** and `make test-e2e` is **20 specs in 40.3s**. What
+**833 tests in 16.66s** and `make test-e2e`'s specs run in **~30s**. What
 costs is the scaffolding around them — `pnpm install`, `make up` building an
 image, and `make test-e2e` running a whole `e2e-up` (image build,
 force-recreate, both alembic chains, seed admin, seed bundle,
 `check-bundle-fresh`) before the first spec executes. That happens on every
 invocation.
+
+**No spec count, for `9a93e32`'s reason.** This sentence used to say *"20
+specs in 40.3s"*. #113 added five and the wall clock moved from 29.8s to
+32.1s on the same machine — which is the argument the paragraph is making,
+and the count was the half of it that goes stale. The gate card stopped
+carrying test counts the same evening; a count in the *tier* table is the
+same inherited number one section further down.
 
 So pick the tier by what the diff can reach. **The orchestrator picks it and
 names it in the dispatch brief**; an agent that thinks the tier is wrong says
