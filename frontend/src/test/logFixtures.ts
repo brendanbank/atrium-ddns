@@ -101,6 +101,11 @@ export function page(overrides: Partial<EventPage> = {}): EventPage {
     // a page comes back empty, and the default page has a row.
     any_rows_in_scope: null,
     unmatchable_filters: [],
+    // `null` is *not asked*, and it is the honest default for the same
+    // reason: the server measures this only when the caller filtered on
+    // a partially-attributed response code. A default of `{ rows: 0 }`
+    // would make every fixture assert a measurement nobody took.
+    unattributable: null,
     ...overrides,
   };
 }

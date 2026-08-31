@@ -51,6 +51,7 @@ name produces collisions that read as flakiness.
 from __future__ import annotations
 
 import os
+import zlib
 from datetime import datetime, timedelta
 from typing import Any, AsyncIterator
 
@@ -76,7 +77,7 @@ from atrium_ddns.router import (
     EVENT_TYPES,
     EVENTS_MAX_LIMIT,
     RESPONSE_CODES,
-    UNATTRIBUTED_RESPONSE_CODES,
+    PARTIALLY_ATTRIBUTED_RESPONSE_CODES,
     EventFilters,
     build_events_query,
     decode_cursor,
@@ -91,6 +92,23 @@ from atrium_ddns.scope import (
 )
 
 W = os.environ.get("PYTEST_XDIST_WORKER", "serial")
+
+#: The address every unattributable row this module writes comes from.
+#:
+#: Per worker, and that is not tidiness. The tally in
+#: ``router._unattributable_tally`` counts rows with ``user_id IS NULL``
+#: and is **deliberately unscoped** — there is no tenant those rows
+#: belong to — so it is the one figure on this surface that ten parallel
+#: workers sharing one MySQL can move under each other. Every
+#: ``badauth`` row ``test_router_nic.py`` writes with no credentials
+#: lands in the same population.
+#:
+#: ``client_ip`` is a column an ownerless row *does* carry, so the tally
+#: honours it, and filtering on this address turns an installation-wide
+#: count into a per-worker one. Asserting a bare count instead would be
+#: flaky in exactly the way the template calls "diagnosed by sweeping,
+#: not by re-running".
+UNATTRIBUTED_IP = f"2001:db8:64::{zlib.crc32(W.encode()) & 0xFFFF:x}"
 
 #: The three ``.manage`` codes an ordinary tenant role holds. Named here
 #: so the "reads the log holding none of them" test is visibly holding
@@ -846,35 +864,35 @@ def test_unmatchable_is_silent_on_every_offered_value() -> None:
 
     Derived over the shipped vocabulary rather than spot-checked, so an
     option added to either list is covered without this test changing.
+
+    ``badauth`` is now inside this sweep rather than exempted from it.
+    Before #64 it was the one offered value a tenant *was* flagged on,
+    because no tenant-scoped query could match it; the writer now
+    attributes those rows, so flagging the filter would be a false
+    statement about a query that works.
     """
     from atrium_ddns.router import _vocabulary
 
     vocabulary = _vocabulary()
 
     def flags(filters: EventFilters) -> list[str]:
-        return [
-            f.filter for f in unmatchable(filters, vocabulary, cross_tenant=True)
-        ]
+        return [f.filter for f in unmatchable(filters, vocabulary)]
 
     for value in vocabulary.event_types:
         assert flags(EventFilters(event_type=value)) == []
     for value in vocabulary.response_codes:
-        # `cross_tenant=True`, because the unattributed-row warning is a
-        # property of the *caller* and is asserted in its own test.
         assert flags(EventFilters(response_code=value)) == []
     for value in [*vocabulary.backend_types, vocabulary.backend_type_none]:
         assert flags(EventFilters(backend_type=value)) == []
-    # Vacuity: the function is capable of returning something.
+    # Vacuity, three ways: the function is capable of returning
+    # something on each of the three filters it inspects. Without this
+    # the sweep above passes on a function that returns [] always.
     assert flags(EventFilters(event_type="nope")) != []
-    # And the tenant-scoped reading of the same offered value does flag,
-    # so "silent on every offered value" above is about the reach and
-    # not about the function being inert.
-    assert [
-        f.filter
-        for f in unmatchable(
-            EventFilters(response_code="badauth"), vocabulary, cross_tenant=False
-        )
-    ] == ["response_code=badauth"]
+    assert flags(EventFilters(response_code="nope")) != []
+    assert flags(EventFilters(backend_type="nope")) != []
+    # And specifically: the value that used to be flagged is not.
+    for code in PARTIALLY_ATTRIBUTED_RESPONSE_CODES:
+        assert flags(EventFilters(response_code=code)) == [], code
 
 
 # --------------------------------------------------------------------- #
@@ -923,20 +941,13 @@ def test_the_null_backend_sentinel_cannot_collide_with_a_provider() -> None:
     assert known_services(), "the provider registry is empty — vacuous"
 
 
-def test_unattributed_codes_are_derived_from_the_writer_not_listed() -> None:
-    """Read off ``router_nic``'s AST: which ``record_event`` calls omit ``auth``.
+def _record_event_call_sites() -> tuple[dict[str, set[str]], int]:
+    """Walk ``router_nic`` for every ``record_event`` call, by actor kwarg.
 
-    A hardcoded ``{'badauth'}`` is the identical defect one release
-    later — a writer that stops passing ``auth`` on some other refusal
-    would silently join the set, and the surface would keep serving that
-    filter a false zero to every tenant.
-
-    So the set is re-derived here from the writer's own call sites:
-    every ``record_event(...)`` in ``router_nic`` that does **not** pass
-    ``auth=`` writes a row with no tenant, and the ``response_code`` it
-    passes is the code that becomes unattributable. The AST rather than
-    a grep, so a call spanning lines or carrying a comment does not
-    change the answer.
+    Returns ``({actor_kwarg_or_'none': {response_code, ...}}, n_calls)``.
+    The AST rather than a grep, so a call spanning lines or carrying a
+    comment does not change the answer, and the *keyword name* rather
+    than a type, because the source is all an AST can see.
     """
     import ast
     import inspect
@@ -948,8 +959,12 @@ def test_unattributed_codes_are_derived_from_the_writer_not_listed() -> None:
         if isinstance(value, str)
     }
 
-    derived: set[str] = set()
-    seen_calls = 0
+    by_actor: dict[str, set[str]] = {
+        "auth": set(),
+        "failed_auth": set(),
+        "none": set(),
+    }
+    seen = 0
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -957,48 +972,88 @@ def test_unattributed_codes_are_derived_from_the_writer_not_listed() -> None:
         name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
         if name != "record_event":
             continue
-        seen_calls += 1
+        seen += 1
         kwargs = {kw.arg: kw.value for kw in node.keywords}
-        if "auth" in kwargs:
-            continue  # the row carries a device, and therefore a tenant
+        actor = (
+            "auth"
+            if "auth" in kwargs
+            else "failed_auth"
+            if "failed_auth" in kwargs
+            else "none"
+        )
         code = kwargs.get("response_code")
         if isinstance(code, ast.Name) and code.id in constants:
-            derived.add(constants[code.id])
+            by_actor[actor].add(constants[code.id])
         elif isinstance(code, ast.Constant) and isinstance(code.value, str):
-            derived.add(code.value)
+            by_actor[actor].add(code.value)
+        else:
+            # A computed response code — the call site carries an actor
+            # but no literal to attribute. Recorded rather than dropped,
+            # so a set that quietly shrinks is visible.
+            by_actor[actor].add("<computed>")
+    return by_actor, seen
+
+
+def test_partially_attributed_codes_are_derived_from_the_writer_not_listed() -> None:
+    """Read off ``router_nic``'s AST: which ``record_event`` calls pass
+    ``failed_auth=``.
+
+    A hardcoded ``{'badauth'}`` is the identical defect one release
+    later. The set is re-derived from the writer's own call sites: a
+    call passing ``failed_auth=`` writes a row whose ``user_id`` is
+    populated *only when the submitted username resolved*, so the code
+    it carries is attributable sometimes and not always — which is
+    exactly what the log surface has to say out loud.
+    """
+    by_actor, seen = _record_event_call_sites()
 
     # Vacuity, both ways: the walk found call sites at all, and it found
-    # some that *do* pass `auth` — otherwise "these omit auth" is true of
-    # everything and the derivation says nothing.
-    assert seen_calls >= 3, seen_calls
-    assert derived, "no record_event call omits auth= — the derivation is vacuous"
-    assert derived != {c for c in constants.values()}, "the filter did nothing"
+    # some in *each* category — otherwise "these pass failed_auth" is
+    # true of everything or of nothing and the derivation says nothing.
+    assert seen >= 3, seen
+    assert by_actor["auth"], "no record_event call passes auth= — derivation vacuous"
+    assert by_actor["failed_auth"], (
+        "no record_event call passes failed_auth= — the derivation is vacuous, "
+        "and #64's attribution has been reverted or renamed"
+    )
+    assert by_actor["auth"] != by_actor["failed_auth"], "the filter did nothing"
 
-    assert set(UNATTRIBUTED_RESPONSE_CODES) == derived, (
-        set(UNATTRIBUTED_RESPONSE_CODES),
-        derived,
+    assert set(PARTIALLY_ATTRIBUTED_RESPONSE_CODES) == by_actor["failed_auth"], (
+        set(PARTIALLY_ATTRIBUTED_RESPONSE_CODES),
+        by_actor["failed_auth"],
     )
 
 
-@pytest.mark.asyncio
-async def test_a_tenant_scoped_badauth_filter_is_named_not_served_a_zero(
-    tenants: dict[str, Any],
-) -> None:
-    """The false negative that would have read as "my credentials are fine".
+def test_no_event_writer_omits_an_actor_entirely() -> None:
+    """The guard that replaced ``UNATTRIBUTED_RESPONSE_CODES``.
 
-    ``badauth`` rows are written before any device is identified, so
-    they carry no ``user_id`` and are invisible to every tenant — which
-    is the correct tenancy answer and the wrong *log search* answer,
-    because zero is also what a healthy account looks like. Found by
-    running real ``/nic/update`` traffic and reading the result, not by
-    reading the code.
+    That constant named the codes whose rows could carry no tenant *at
+    all*, and it existed because ``_admit`` wrote ``badauth`` with no
+    actor. #64 emptied it, and an empty constant guarding nothing is
+    worse than no constant: the branch that read it becomes unreachable
+    and no mutation can show it biting.
 
-    Asserted from both ends: the tenant is told, the cross-tenant reader
-    is not (because for them the filter matches normally), and the row
-    genuinely is invisible to the tenant rather than merely flagged.
+    So the property is asserted directly instead. Every ``record_event``
+    call passes an actor — ``auth=`` for a verified device,
+    ``failed_auth=`` for a refusal that may or may not resolve one. A
+    writer added later that passes neither reintroduces a response code
+    no tenant can ever see, and it fails **here**, on the commit that
+    adds it, rather than by serving every tenant a silent zero.
     """
-    a = tenants["a"]
-    # The shape the writer produces: no user, no device, no names.
+    by_actor, seen = _record_event_call_sites()
+    assert seen >= 3, seen
+    assert by_actor["none"] == set(), (
+        "these response codes are written with no actor at all, so their "
+        f"rows carry user_id NULL and no tenant can ever see them: "
+        f"{sorted(by_actor['none'])}. Pass auth= (a verified device) or "
+        "failed_auth= (a refusal, attributed when the username resolved). "
+        "A tenant filtering the log for one of these gets zero, and zero is "
+        "also what a healthy account looks like."
+    )
+
+
+async def _add_unattributed_badauth(client_ip: str = UNATTRIBUTED_IP) -> None:
+    """The shape ``_admit`` writes when the username resolved to nothing."""
     await _add_event(
         created_at=_now(),
         user_id=None,
@@ -1011,41 +1066,175 @@ async def test_a_tenant_scoped_badauth_filter_is_named_not_served_a_zero(
         hostname=None,
         event_type=router_nic.EVENT_AUTH,
         response_code="badauth",
-        client_ip="203.0.113.10",
+        client_ip=client_ip,
         ip=None,
         backend_type=None,
         message=None,
     )
-    await _add_event(**_line(a))
+
+
+@pytest.mark.asyncio
+async def test_a_tenant_sees_their_own_badauth_and_the_rest_is_counted(
+    tenants: dict[str, Any],
+) -> None:
+    """#64, and #109's exit-criterion clause 2, from the reading end.
+
+    Three populations, deliberately distinguishable:
+
+    * a ``badauth`` row attributed to tenant **a** — their router,
+      failing. It must appear in their log, which it could not before.
+    * a ``badauth`` row attributed to tenant **b** — someone else's
+      router. It must not.
+    * a ``badauth`` row attributed to nobody — a username no device
+      holds. Invisible to both, and *counted* rather than ignored.
+
+    The counted third is what the acceptance criterion is about: a
+    tenant's zero must not read the same as a tenant's zero with lines
+    they cannot see.
+    """
+    a, b = tenants["a"], tenants["b"]
+
+    await _add_event(
+        **_line(a, event_type=router_nic.EVENT_AUTH, response_code="badauth")
+    )
+    await _add_event(
+        **_line(b, event_type=router_nic.EVENT_AUTH, response_code="badauth")
+    )
+    await _add_unattributed_badauth()
+    await _add_unattributed_badauth()
 
     mine = (await _events(a["user"], response_code="badauth")).json()
-    assert mine["rows"] == [], "an unattributed row reached a tenant's log"
-    assert [f["filter"] for f in mine["unmatchable_filters"]] == [
-        "response_code=badauth"
-    ]
-    reason = mine["unmatchable_filters"][0]["reason"]
-    assert "no account" in reason
-    # The sentence has to say what the zero is *not* evidence of. That
-    # is the whole point of writing it.
-    assert "not evidence" in reason
 
-    # The control, and it is what stops this being a blanket warning:
-    # for a cross-tenant reader the same filter matches, so it must not
-    # be flagged.
+    # Clause 2's first half: the tenant sees their own failure. Before
+    # #64 this list was empty for every tenant, always.
+    assert len(mine["rows"]) == 1, mine["rows"]
+    assert mine["rows"][0]["user_id"] == a["user_id"]
+
+    # The filter matches, so it must not be described as unmatchable.
+    assert mine["unmatchable_filters"] == []
+
+    # Clause 2's second half: the residue is a measurement with its
+    # population named, not an absence. Narrowed to this worker's own
+    # address — see `UNATTRIBUTED_IP` — because the tally is unscoped by
+    # construction and ten workers share one database.
+    scoped = (
+        await _events(
+            a["user"], response_code="badauth", client_ip=UNATTRIBUTED_IP
+        )
+    ).json()
+    tally = scoped["unattributable"]
+    assert tally is not None, "a badauth filter was served no tally at all"
+    assert tally["response_code"] == "badauth"
+    assert tally["rows"] == 2, tally
+    assert tally["since"] is not None
+    assert tally["ignored_filters"] == []
+
+    # The unnarrowed tally is a superset, never a smaller number. That
+    # is the vacuity guard on the narrowing above: if `client_ip` were
+    # silently ignored the two would be equal by accident, and this
+    # inequality still holds — so the *previous* assertion is what
+    # proves it was honoured, and this one proves the population is real.
+    assert mine["unattributable"]["rows"] >= 2, mine["unattributable"]
+
+    # The other tenant's view is the control: their own row, not a's.
+    theirs = (await _events(b["user"], response_code="badauth")).json()
+    assert {r["user_id"] for r in theirs["rows"]} == {b["user_id"]}
+
+    # The admin path the acceptance asks for: the grant that already
+    # exists shows every row, attributed or not. Narrowed to this
+    # worker's rows for the same reason.
     across = (
         await _events(
             a["user"],
             permissions={EVENTS_CROSS_TENANT_PERMISSION},
             response_code="badauth",
+            client_ip=UNATTRIBUTED_IP,
         )
     ).json()
-    assert across["unmatchable_filters"] == []
-    assert len(across["rows"]) >= 1
+    assert len(across["rows"]) == 2, across["rows"]
+    assert all(r["user_id"] is None for r in across["rows"])
 
     # And an ordinary successful filter is not flagged either, or the
     # signal means nothing.
     ok = (await _events(a["user"], response_code="good")).json()
     assert ok["unmatchable_filters"] == []
+
+
+@pytest.mark.asyncio
+async def test_the_tally_is_not_asked_unless_the_filter_needs_it(
+    tenants: dict[str, Any],
+) -> None:
+    """``None`` is *not asked* and ``0`` is *asked, and none* — two states.
+
+    The probe question, answered explicitly: with no unattributable rows
+    in the store the tally prints ``rows=0`` and is still an object,
+    which is a different string from the ``null`` an unrelated filter
+    gets. Were those the same value the field would be decoration.
+    """
+    a = tenants["a"]
+    await _add_event(**_line(a))
+
+    unrelated = (await _events(a["user"], response_code="good")).json()
+    assert unrelated["unattributable"] is None
+
+    # Narrowed to an address nothing wrote from, so "asked, and there
+    # were none" is a fact about this query rather than a bet on what
+    # nine other workers are doing.
+    none_at_all = (
+        await _events(
+            a["user"], response_code="badauth", client_ip=UNATTRIBUTED_IP
+        )
+    ).json()
+    assert none_at_all["unattributable"] is not None
+    assert none_at_all["unattributable"]["rows"] == 0
+
+    # No filter at all: still not asked. The tally answers a question
+    # about one code, and a page-wide count would be a different figure
+    # wearing the same name.
+    unfiltered = (await _events(a["user"])).json()
+    assert unfiltered["unattributable"] is None
+
+
+@pytest.mark.asyncio
+async def test_the_tally_names_the_filters_it_could_not_honour(
+    tenants: dict[str, Any],
+) -> None:
+    """A filter an ownerless row cannot carry would zero it by construction.
+
+    ``device_id`` is NULL on every unattributable row — that NULL is
+    what makes it unattributable. Narrowing the count by one would
+    return ``0`` for every installation forever: a probe that cannot
+    fail. The filter is dropped and **named**, so the reader can see the
+    population the count is really over.
+
+    ``client_ip`` is the control: an ownerless row does carry it, so it
+    is honoured, not named, and the count moves when it is applied.
+    """
+    a = tenants["a"]
+    other = f"{UNATTRIBUTED_IP}:1"
+    await _add_unattributed_badauth(UNATTRIBUTED_IP)
+    await _add_unattributed_badauth(UNATTRIBUTED_IP)
+    await _add_unattributed_badauth(other)
+
+    dropped = (
+        await _events(
+            a["user"],
+            response_code="badauth",
+            device_id=99,
+            client_ip=UNATTRIBUTED_IP,
+        )
+    ).json()
+    # `device_id` was dropped and named; `client_ip` was honoured. Both
+    # halves in one reading: 2 and not 3 proves the honoured one bit, and
+    # 2 rather than 0 proves the dropped one did not.
+    assert dropped["unattributable"]["ignored_filters"] == ["device_id=99"]
+    assert dropped["unattributable"]["rows"] == 2, dropped["unattributable"]
+
+    honoured = (
+        await _events(a["user"], response_code="badauth", client_ip=other)
+    ).json()
+    assert honoured["unattributable"]["ignored_filters"] == []
+    assert honoured["unattributable"]["rows"] == 1, "client_ip was not honoured"
 
 
 # --------------------------------------------------------------------- #

@@ -18,6 +18,23 @@
  * `null` never reaches here: it means *not measured*, which the server
  * returns only when the page had rows, and a page with rows is not
  * empty. That is asserted rather than assumed — see the `null` branch.
+ *
+ * ## What this component deliberately does *not* say
+ *
+ * There is a fourth nothing and it is not one of these three:
+ * *rows exist, they are about you, and they belong to no account so no
+ * scope can reach them*. Before #64 that was every `badauth` line and
+ * it arrived here as an `unmatchable_filters` entry — a filter reported
+ * as structurally unmatchable. It is not that any more: `badauth` rows
+ * are now attributed to the owner of the username presented, so the
+ * filter matches, and describing it as unmatchable would be an
+ * assertion on the report rather than on the thing reported.
+ *
+ * The residue — an attempt against a username no device holds — is
+ * *counted*, not described, and it renders beside this panel as
+ * `LogUnattributable`. Keeping it out of here is deliberate: this
+ * component answers "which nothing is this", and that count is a
+ * measurement that applies just as much when the page is full.
  */
 import { Alert, Button, Stack, Text } from '@mantine/core';
 
