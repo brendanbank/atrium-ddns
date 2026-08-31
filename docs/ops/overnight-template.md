@@ -29,7 +29,7 @@ are listed again at the bottom of this card.
 | `<BOARD>` | Projects v2 board **2**, *atrium-ddns delivery* (`OVERNIGHT_PROJECT=2`), `Status` = Todo / In Progress / Done. Claim with `find_ready.py --claim <issue> --slug overnight`, then `find_ready.py --verify <issue>` — the claim is not a claim until the board moved. `bootstrap-github.sh --check`: setup COMPLETE. |
 | `<READY_CHECK>` | `find_ready.py --list` / `--graph`. Reads `Depends on:` from each issue body; every issue this repo opens must carry one (`Depends on: none` if free). |
 | `<GATE>` | see *Gate* below — four commands, measured 2026-08-15 on the scaffold. |
-| `<DEPLOY>` | `git bundle` over the deploy key → `docker compose up -d --build` on the host → verified by content with `scripts/deploy-verify.sh`. Identity file is `backend/src/atrium_ddns/router.py`, compared byte-for-byte against the **installed** package at `/opt/venv/.../site-packages/atrium_ddns/router.py`. **Not `/opt/host_app`** — the image copies `backend/` there *and* pip-installs it, and only the installed copy is on `sys.path`, so comparing `/opt/host_app` asserts about a tree the app never imports (found by #36). `compose up` exiting 0 proves nothing, and neither does hashing the wrong file. |
+| `<DEPLOY>` | `git bundle` over the deploy key → `docker compose up -d --build` on the host → verified by content with `scripts/deploy-verify.sh` (vendored here from the skill by #38; the skill's own copy is unchanged and still carries the defect below). Identity file is `backend/src/atrium_ddns/router.py`, compared byte-for-byte against the **installed** package at `/opt/venv/.../site-packages/atrium_ddns/router.py`. **Not `/opt/host_app`** — the image copies `backend/` there *and* pip-installs it, and only the installed copy is on `sys.path`, so comparing `/opt/host_app` asserts about a tree the app never imports (found by #36). `compose up` exiting 0 proves nothing, and neither does hashing the wrong file. **And the path is no longer taken on trust:** `OVERNIGHT_IDENTITY_MODULE=atrium_ddns.router` is resolved inside the container with `importlib.util.find_spec`, run under the interpreter the service runs, so the file being hashed is the file `import` would load — by definition, not by convention. The configured literal path is kept as the second instrument: a disagreement verifies the resolved path *and* fails the run (exit 5), so an image bump that moves the path is still loud. `scripts/deploy-verify.sh --self-test` shows the check FAILING — deliberate digest mismatch, missing path, unresolvable module, and a path the app does not import — against stubbed ssh, touching no host. |
 | `<DEPLOY_HOST>` | ssh alias **`atrium-ddns-deploy`** — one host, serial, one deployer (the orchestrator). The alias resolves in `~/.ssh/config`; the hostname is never in the repo, so `OVERNIGHT_DEPLOY_HOST` is safe to commit. Ubuntu 24.04, docker 29.1.3, 3 containers already running (the old service among them), 31 G free, 2.9 G RAM available, **port 8443 free**. The new stack goes up **beside** the old one on 8443 (`API_HOST_PORT=8443`, a distinct `MYSQL_HOST_PORT`, explicit `COMPOSE_PROJECT_NAME`). See plan § 5b — 8443 implies TLS and atrium does not terminate it. |
 | `<PROMOTION>` | **yes, this repo has one.** Atrium reads branding, feature flags, PAT policy and `system.host_bundle_url` from the `app_settings` KV table, not from the merged file. A merged bundle that nothing points at does not run: `make seed-bundle` (or an equivalent write to `system.host_bundle_url`) is the promotion step. Same for any `register_namespace` default a migration seeds. |
 | `<SMOKE>` | `scripts/smoke.sh` (`make smoke`) — 11 local checks against a running stack, exits non-zero on any failure. Later joined by `tests/smoke_test_dns.sh`, ported from `dyndns-route53`. `smoke_test_dns.sh` performs **real DNS writes** against whatever zone it is pointed at — allow-list is a dedicated test zone, never a zone carrying live records. Widening it is the operator's call. |
@@ -1002,6 +1002,17 @@ Five times in one milestone, **the faulty thing was an instrument's own report**
 - A grant audit read `information_schema` **as the wrong account** and got an
   empty result — not an error. Two independent ways that instrument renders `0`,
   and `0` is what a healthy store looks like on exactly the rows that matter.
+- The **deploy verifier** byte-compared a file chosen *by convention* rather than
+  resolved. The image carries two copies of the host source and only one is on
+  `sys.path`, so the assertion was true, checkable, green — and about a tree
+  nothing imports. Nothing checked that the convention had picked the live
+  artefact, which is the same shape as #36's bind mount one level down: a guard
+  comparing a tree equal to the worktree *by construction*, which could only
+  ever pass, reporting 358 passed over 19 genuinely failing tests. The subject
+  of a check needs choosing as carefully as the assertion: resolve it with the
+  machinery the process itself uses (`importlib.util.find_spec` inside the
+  container, under the service's interpreter), and keep the configured value as
+  a second instrument that goes red when the two disagree (#38).
 
 ### Prove the guard bites
 
@@ -1029,6 +1040,14 @@ A test that cannot fail is worth less than no test, because it is believed.
 - **A guard invalidated by an unrelated merge is a guard whose subject was
   borrowed rather than owned.** Assert the property directly, with a vacuity
   guard.
+- **A verifier that has only ever been seen passing proves nothing about
+  itself** — a check hardcoded to `exit 0` looks exactly like a check that
+  works. `scripts/deploy-verify.sh --self-test` re-invokes the real script with
+  `ssh` stubbed and asserts the exit code and wording of each way it must fail:
+  a deliberate digest mismatch, a path absent from the container, a module that
+  does not resolve, a repo path missing from the commit, and a configured path
+  the app does not import. No host, no container, no network — so "prove the
+  deploy check bites" is not a thing that needs a deploy to demonstrate.
 
 ### Local green is not deployed correct
 
