@@ -241,11 +241,22 @@ def _pin_config(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> DdnsConfig
 
     ``atrium_ddns``'s KV row is **one row for the whole compose
     project**: this worktree's worker container reads it on every tick,
-    and ``test_worker_jobs.py`` legitimately pins
-    ``health_check_enabled=False`` into it for the length of its own
-    module. Ten xdist workers share that database, so a test here that
-    wrote the cooldown into the row would be racing a file it never
+    and ``test_worker_jobs.py`` legitimately moves it for the length of
+    its own tests. Ten xdist workers share that database, so a test here
+    that wrote the cooldown into the row would be racing a file it never
     imports — and the symptom would be a ``429`` that came and went.
+
+    **What a monkeypatch cannot do, and what now does it instead.**
+    This is in-process, and the worker *container* is a different
+    process reading the row directly. #117 measured that row absent for
+    **91.8 %** of a full run, and absent means the container falls back
+    to ``health_check_enabled=True`` and sweeps cross-tenant — including
+    over the two tests here that create ``last_ip`` rows and then assert
+    on the persisted ``dns_*`` columns. That half is closed by
+    ``conftest._pin_ddns_config``, which holds the row present and the
+    sweep off for the whole session and refuses a session that ends
+    otherwise. Nothing in this file had to change for it, which is the
+    point: the protection is structural rather than per-test.
 
     So the seam is ``load_config``, the module global each caller
     resolves at call time — patched in **both** modules, because

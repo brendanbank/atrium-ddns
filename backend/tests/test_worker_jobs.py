@@ -47,11 +47,15 @@ executing the same two jobs on a 60 s / 3600 s tick, cross-tenant,
 against this database. A test that seeds a due hostname and then
 asserts nothing stamped it is racing a real scheduler.
 
-Two things make it deterministic. The namespace is pinned to
-``health_check_enabled=False`` for the whole file (``config`` fixture),
-so the deployed worker's tick returns immediately; and the direct calls
-pass their own :class:`DdnsConfig`. The tests that must exercise the
-namespace path assert on values the worker cannot move — a cutoff
+Two things make it deterministic. The namespace holds
+``health_check_enabled=False`` for the whole **session** — not for the
+whole file, and this sentence used to say "file" while the fixture
+deleted the row between every pair of tests (#117; measured absent for
+91.8 % of a run). ``conftest._pin_ddns_config`` seeds that baseline
+before any test and refuses a session that ends anywhere else, so the
+deployed worker's tick returns immediately throughout. And the direct
+calls pass their own :class:`DdnsConfig`. The tests that must exercise
+the namespace path assert on values the worker cannot move — a cutoff
 computed inside the call, a summary flag — rather than on rows.
 
 Everything created here is namespaced by ``PYTEST_XDIST_WORKER``.
@@ -76,9 +80,13 @@ import pytest_asyncio
 import sqlalchemy as sa
 from app.db import get_engine, get_session_factory
 from app.models.auth import User
-from app.models.ops import AppSetting
-from app.services.app_config import NAMESPACES, get_namespace, put_namespace
-from conftest import fixture_writes, purge_tenants, unusable_password_hash
+from app.services.app_config import NAMESPACES, get_namespace
+from conftest import (
+    fixture_writes,
+    purge_tenants,
+    remove_ddns_config_row,
+    unusable_password_hash,
+)
 
 from atrium_ddns import models as m
 from atrium_ddns import worker_jobs as wj
@@ -160,39 +168,29 @@ async def tenants():
 
 
 @pytest_asyncio.fixture
-async def config():
-    """Own the ``atrium_ddns`` KV row for the duration, and restore it.
+async def config(ddns_config):
+    """This module's name for ``conftest.ddns_config`` — #117.
 
-    Pins ``health_check_enabled=False`` on entry so the stack's own
-    worker container stops sweeping while these tests assert on rows.
+    It used to own the row here: read it on entry, pin
+    ``health_check_enabled=False``, restore what it read on the way out.
+    The restore was the defect. On a fresh database ``app_settings``
+    holds only ``brand`` and ``worker_heartbeat``, so "what it read" was
+    *nothing*, and the teardown **deleted** the row — measured, the row
+    was absent for **91.8 %** of a full suite run, and absence is the
+    one state in which the worker container falls back to
+    ``health_check_enabled=True`` and sweeps cross-tenant.
+
+    The other half is that this was the suite's only writer of a row
+    sixteen connections read 277 times per run, with no lock. #108's
+    agent measured the consequence next door as ``assert 30 == 90``.
+
+    Both are conftest's problem now: one owner, a present baseline
+    restored to rather than absence, and a cross-worker lock held for
+    the length of the test. The alias stays so this file's 25 call sites
+    keep reading as ``config`` (25 of 48 tests, measured rather than
+    inherited from #117's 24 of 47 — #116 added six tests since).
     """
-    factory = get_session_factory()
-    async with factory() as s:
-        before = (
-            await s.execute(
-                sa.select(AppSetting.value).where(AppSetting.key == CONFIG_NAMESPACE)
-            )
-        ).scalar_one_or_none()
-
-    async def _write(cfg: DdnsConfig) -> None:
-        async with factory() as s:
-            await put_namespace(s, CONFIG_NAMESPACE, cfg.model_dump(mode="json"))
-
-    await _write(DdnsConfig(health_check_enabled=False))
-    yield _write
-
-    async with factory() as s:
-        if before is None:
-            await s.execute(
-                sa.delete(AppSetting).where(AppSetting.key == CONFIG_NAMESPACE)
-            )
-        else:
-            await s.execute(
-                sa.update(AppSetting)
-                .where(AppSetting.key == CONFIG_NAMESPACE)
-                .values(value=before)
-            )
-        await s.commit()
+    return ddns_config
 
 
 @contextlib.contextmanager
@@ -364,11 +362,18 @@ def test_importing_the_host_module_is_enough_to_register_the_namespace(module: s
 
 
 async def test_get_namespace_answers_with_the_defaults_when_nothing_is_seeded(config):
-    """``get_namespace`` must not need a migration to have written a row."""
+    """``get_namespace`` must not need a migration to have written a row.
+
+    The one test whose subject is the row's *absence*, so it is the one
+    test that removes it. It takes ``config`` first, which means it
+    holds :data:`conftest.DDNS_CONFIG_LOCK` while the row is gone and
+    the fixture teardown puts the baseline back — the window no other
+    worker can be inside. The delete itself goes through
+    ``conftest.remove_ddns_config_row`` so the census in
+    ``test_harness_guards`` can still answer *one file writes this row*.
+    """
     factory = get_session_factory()
-    async with factory() as s:
-        await s.execute(sa.delete(AppSetting).where(AppSetting.key == CONFIG_NAMESPACE))
-        await s.commit()
+    await remove_ddns_config_row()
     async with factory() as s:
         value = await get_namespace(s, CONFIG_NAMESPACE)
     assert isinstance(value, DdnsConfig)
