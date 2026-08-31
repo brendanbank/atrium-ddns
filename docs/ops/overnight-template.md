@@ -698,6 +698,40 @@ forever if the condition *errors* rather than turning true, and the run looks
 hung for no reason anyone can see. Bound every wait with a maximum number of
 attempts and fail loudly when they are exhausted.
 
+### How to run a long command — read this before the tiers
+
+The tiers below reduce how much you run. **This section is about how you wait,
+and it is the more important of the two**, because the failure it prevents is a
+stall rather than a cost.
+
+**Run the gate in the foreground, with an explicit `timeout`.** The Bash tool
+accepts up to 600000 ms; the full gate on this repo is roughly 4–6 minutes and
+fits inside it comfortably. A foreground call blocks, returns the output, and
+is over. There is nothing to poll and nothing to race.
+
+**Never background a wait.** A backgrounded `until …; done; echo READY` does
+not wait — it detaches and returns instantly with no output. The caller learns
+nothing, asks again, and leaves the previous waiter running. That is a positive
+feedback loop, and it is how one issue accumulated **nine** concurrent waiters.
+
+**Never `pgrep -f` for a string your own command contains.** `pgrep -f`
+matches full command lines, so `until ! pgrep -f "76_gate.sh"` matches *itself*
+and every sibling waiter. The loop cannot exit even in principle, and the
+script it waits on has usually already finished.
+
+**If something genuinely cannot fit in the foreground**, background it once
+with the harness's own mechanism and wait for the completion notification. Do
+not poll. If you must poll, bound it — `for i in $(seq 1 N)` with a loud
+failure when the attempts run out — and poll a *sentinel the job writes on
+exit*, never a process table.
+
+Measured, on #76 of V1M7. 180 Bash calls; `timeout` set on **5** of them, and
+only on the last; the gate backgrounded on call 1 and never once run in the
+foreground; 24 of the 38 gate-related calls backgrounded, including the waits.
+The gate itself had passed with `exit=0` long before the orchestrator
+intervened. **None of the time was spent testing.** The tiers below would have
+made the gate cheaper and would not have prevented any of this.
+
 ### Gate tiers — run the cheapest one that could fail
 
 The full gate is six commands, but only two of them are expensive, and the
