@@ -668,34 +668,24 @@ GATE_BASE ?= $(or $(OVERNIGHT_MILESTONE_BRANCH),$(GATE_CONF_BRANCH),$(OVERNIGHT_
 # shell scripts reach no pytest and no vitest, so a diff confined to them used
 # to print "this diff reaches no test" and that was the whole reading. The
 # `.env` guard's own `--self-test` is the test they reach.
-gate:  ## the unit tests — frontend always, backend only if backend changed
-	@# LIGHT is the point. The frontend suite needs no docker and runs in
-	@# seconds; the backend suite needs an image build, MySQL and two alembic
-	@# chains. Running the expensive half for a change that cannot reach it
-	@# burns minutes per agent and proves nothing.
+gate:  ## the frontend unit tests. No docker. That is the whole gate.
+	@# Operator decision, 2026-09-01, after three attempts at "light" that
+	@# were not light. THE GATE TOUCHES NO DOCKER. No image build, no MySQL,
+	@# no migrations, no stack, under any condition.
 	@#
-	@# One condition, not three. The 2026-09-01 rewrite that ran both halves
-	@# unconditionally was wrong: this milestone is four frontend issues and
-	@# one backend, so it built an image and ran 933 backend tests per agent
-	@# to check a CSS change.
+	@# Each agent worktree is its own compose project, so its image tag is
+	@# unique and `up` builds a 301 MB image from scratch. That tag is
+	@# deliberate (compose.yaml:31 — a shared tag let two worktrees overwrite
+	@# each other and run each other's code), so the cost cannot be shared
+	@# away. The only way not to pay it is not to raise a stack.
+	@#
+	@# Backend tests are now an explicit, separate step: `make test-backend`,
+	@# run deliberately by whoever needs it, not smuggled into the gate.
 	@set -e; \
-	base="$(GATE_BASE)"; \
-	git rev-parse --verify -q "origin/$$base" >/dev/null 2>&1 && base="origin/$$base"; \
-	changed=$$( { git diff --name-only "$$base"...HEAD 2>/dev/null; git diff --name-only; git ls-files -o --exclude-standard; } | sort -u ); \
-	be=$$(printf '%s\n' "$$changed" | grep -cE '^(backend/|tests/|scripts/.*\.py)' || true); \
-	echo "gate: frontend unit tests"; \
 	( cd frontend && pnpm install --frozen-lockfile >/dev/null && pnpm typecheck && pnpm test --run ); \
 	echo; \
-	if [ "$$be" -gt 0 ]; then \
-		echo "gate: backend touched ($$be file(s)) -> stack + backend unit tests"; \
-		$(MAKE) --no-print-directory up migrate; \
-		$(MAKE) --no-print-directory test-backend; \
-	else \
-		echo "gate: SKIP backend — nothing under backend/, tests/ or scripts/*.py changed."; \
-		echo "gate:   no image build, no database, no migrations."; \
-	fi; \
-	echo; \
-	echo "gate: e2e and smoke are NOT run here — e2e runs once on the release PR into $(or $(OVERNIGHT_TRUNK),master)."; \
+	echo "gate: frontend unit tests only — no docker was started."; \
+	echo "gate: backend tests are \`make test-backend\`, run it deliberately if your diff needs it."; \
 	echo "gate: PASS"
 
 typecheck:  ## tsc --noEmit on the host bundle
