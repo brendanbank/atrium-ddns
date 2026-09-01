@@ -1053,6 +1053,7 @@ def test_the_fixture_lock_is_not_a_no_op() -> None:
     )
 
 
+@pytest.mark.functional  # asserts GET_LOCK excludes a second holder — MySQL-only by definition
 @pytest.mark.asyncio
 async def test_the_lock_actually_excludes() -> None:
     """Show the lock biting, rather than trusting that it does.

@@ -292,6 +292,7 @@ def test_the_matcher_bites(label: str, source: str, expect_defect: bool) -> None
 # --------------------------------------------------------------------- #
 
 
+@pytest.mark.functional  # spawns the real script as a subprocess; it gets no test engine
 def test_a_one_shot_script_exits_with_clean_stderr() -> None:
     """The half a source read cannot do.
 
