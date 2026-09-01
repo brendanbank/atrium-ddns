@@ -35,25 +35,34 @@ it front to back. It is an archive, and it grows every run.
 workers sharing one database. Its shared state is what generates this
 project's races. It is not the gate. Run it deliberately.
 
-## Testing: the default is NO new test
+## Testing
 
-**Write a test only when one of these is true:**
+**Write the unit test.** They are fast, they are the guard, and they are
+not what makes this expensive. A test for a moved control or a new
+`disabled` prop is a few minutes and it is worth it.
 
-1. The change is a **guard** — it exists to prevent a defect class.
-2. It fixes a bug **no existing test caught** and that would recur
-   **silently**.
-3. The behaviour cannot be seen by e2e or by looking at the app.
+**The budget rule: proving the test should not cost more than writing the
+change.** If it does, you are doing ceremony, not testing.
 
-Otherwise: make the change, let typecheck and the existing suite catch
-regressions, and let e2e catch it at the milestone. Moving a control,
-removing an icon, changing copy, adjusting a layout — **no new test.**
+What is expensive is the apparatus that grew around the tests, and by
+default you owe **none** of it:
 
-**When you do write one**, it gets a mutation proof. When you do not, you
-owe nothing: no baseline measurement, no two-instrument reading, no sweep.
+| not owed by default | what it costs |
+|---|---|
+| measuring suite totals before and after | a full run each side, and "210 → 216" tells nobody anything |
+| a second instrument on those totals | another full run |
+| mutation proof — revert the fix, watch it redden, restore | several runs, plus a rebuild if the backend is involved |
+| a negative-result sweep of related code | an open-ended read of the tree |
+| `merge-tip-check.sh` on a frontend-only diff | raises a stack to run tests that cannot see the change |
+| a docblock table of the pass/fail split | prose |
+| a PR body of more than a screen | prose |
 
-Rationale, measured on V2M9: six agents averaged 16 minutes and 160,000
-tokens per issue on changes averaging 15 lines. The e2e suite that would
-have caught any of them costs 64 seconds, once.
+**Assert on the new behaviour, not on the suite's total.** `247 passed` is
+not evidence about your change; the three tests you added are.
+
+Escalate to the apparatus above when the change is **guard-tier** — see the
+table below. That is where a test that cannot fail is genuinely dangerous,
+because it will be believed.
 
 ## Evidence, scaled to risk
 
@@ -62,8 +71,8 @@ never down.
 
 | tier | example | owed |
 |---|---|---|
-| **cosmetic** | move a control, copy, layout | the diff + `make gate` |
-| **behavioural** | refusals, auth, wire responses | + a test, shown failing |
+| **cosmetic** | move a control, copy, layout | the diff + a unit test + `make gate` |
+| **behavioural** | refusals, auth, wire responses | + the test shown failing once |
 | **guard** | protects a defect class | + mutation proof, + two instruments on any number that matters |
 
 Only guard-tier work needs the ledger's rigour. Most work is not
