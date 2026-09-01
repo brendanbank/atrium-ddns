@@ -89,18 +89,18 @@ from atrium_ddns.providers import (
 from atrium_ddns.providers import nsupdate as nsupdate_mod
 
 from tsig_receiver import (
-
-# Container-only. The receiver binds port 53 because `nsupdate.py` sends to
-# 53 and has no port setting — #131 declined to add one purely to make
-# testing easier, which was the right call and is why these cannot run as
-# unit tests on a laptop. Functional by nature, not by accident.
-pytestmark = pytest.mark.functional
     HANG_SECONDS,
     RCODE_BEHAVIOURS,
     REFUSAL_BEHAVIOURS,
     TsigReceiver,
     can_bind,
 )
+
+# Container-only. The receiver binds port 53 because `nsupdate.py` sends to
+# 53 and has no port setting — #131 declined to add one purely to make
+# testing easier, which was the right call and is why these cannot run as
+# unit tests on a laptop. Functional by nature, not by accident.
+pytestmark = pytest.mark.functional
 
 #: The key the receiver holds. 32 bytes of base64 —
 #: ``dns.tsigkeyring.from_text`` really parses it and
