@@ -671,6 +671,28 @@ async def write_ddns_config(cfg: DdnsConfig) -> None:
     """
     factory = get_session_factory()
     async with factory() as s:
+        if not _needs_advisory_lock():
+            # atrium's `put_namespace` builds a MySQL `INSERT … ON DUPLICATE
+            # KEY UPDATE`, which SQLite cannot compile. The upsert exists
+            # because ten workers share one row; on a per-worker in-memory
+            # database the row cannot already exist, so a plain write is the
+            # same operation without the dialect.
+            #
+            # atrium-pa reaches the same place from the other side: its
+            # `_stub_app_config` replaces get_namespace/put_namespace with an
+            # in-memory cell for its unit lane. Neither repo changes atrium.
+            #
+            # The cost, stated: `put_namespace` validates against the
+            # registered model, and this does not. A test pinning a field the
+            # model dropped would store it here instead of failing. The MySQL
+            # lane still runs the validating path.
+            row = await s.get(AppSetting, CONFIG_NAMESPACE)
+            if row is None:
+                s.add(AppSetting(key=CONFIG_NAMESPACE, value=cfg.model_dump(mode="json")))
+            else:
+                row.value = cfg.model_dump(mode="json")
+            await s.commit()
+            return
         await put_namespace(s, CONFIG_NAMESPACE, cfg.model_dump(mode="json"))
 
 
@@ -757,9 +779,36 @@ async def ddns_config_lock(owner: str = "?") -> AsyncIterator[None]:
             )
 
 
+@pytest_asyncio.fixture(scope="session", autouse=True)
+async def _sqlite_schema() -> AsyncIterator[None]:
+    """Create the schema on a non-MySQL engine.
+
+    On MySQL the suite runs against a database alembic has already
+    migrated, so this does nothing. On a per-worker in-memory SQLite there
+    is no migration to run — the chain is written in MySQL's dialect — so
+    the schema comes from the metadata instead.
+
+    That is a real difference and worth naming: the MySQL lane tests the
+    schema the migrations produce, this one tests the schema the models
+    declare. They are supposed to agree; only the MySQL lane can prove it.
+    """
+    if _needs_advisory_lock():
+        yield
+        return
+    from app.db import Base as _AtriumBase
+    import app.models  # noqa: F401  — registers atrium's tables
+    from atrium_ddns.models import HostBase as _HostBase
+
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await conn.run_sync(_AtriumBase.metadata.create_all)
+        await conn.run_sync(_HostBase.metadata.create_all)
+    yield
+
+
 @harness_guard
 @pytest_asyncio.fixture(scope="session", autouse=True)
-async def _pin_ddns_config() -> AsyncIterator[None]:
+async def _pin_ddns_config(_sqlite_schema: None) -> AsyncIterator[None]:
     """Put the shared row on its baseline, and refuse a session that
     ends with it anywhere else.
 

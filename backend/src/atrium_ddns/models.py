@@ -103,6 +103,17 @@ TTL_MAX = 86400
 #: The same `with_variant` shape `SecretBlob` already uses below.
 UTC_DATETIME = DateTime().with_variant(MysqlDATETIME(fsp=6), "mysql")
 
+#: A ``BIGINT`` primary key that still auto-increments on SQLite.
+#:
+#: SQLite only auto-increments a column typed exactly ``INTEGER PRIMARY
+#: KEY`` — a ``BIGINT`` primary key is an ordinary NOT NULL column, so
+#: every insert without an explicit id fails. That single fact accounted
+#: for 299 of the 343 errors in the first SQLite run of this suite.
+#:
+#: MySQL keeps BIGINT. Nothing about the deployed schema changes: alembic
+#: owns the production DDL and still emits BIGINT.
+BIGINT_PK = BigInteger().with_variant(Integer, "sqlite")
+
 
 def _utcnow_col(**kwargs: Any) -> Any:
     """A ``DATETIME(6)`` defaulting to the server clock.
@@ -194,7 +205,7 @@ class Domain(HostBase, TimestampMixin):
 
     __tablename__ = "ddns_domain"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BIGINT_PK, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(
         Integer,
         HostForeignKey("users.id", ondelete="CASCADE"),
@@ -257,7 +268,7 @@ class DomainBackend(HostBase, TimestampMixin):
 
     __tablename__ = "ddns_domain_backend"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BIGINT_PK, primary_key=True, autoincrement=True)
     domain_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("ddns_domain.id", ondelete="CASCADE"),
@@ -350,7 +361,7 @@ class Device(HostBase, TimestampMixin):
 
     __tablename__ = "ddns_device"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BIGINT_PK, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(
         Integer,
         HostForeignKey("users.id", ondelete="CASCADE"),
@@ -422,7 +433,7 @@ class Hostname(HostBase, TimestampMixin):
 
     __tablename__ = "ddns_hostname"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BIGINT_PK, primary_key=True, autoincrement=True)
     domain_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("ddns_domain.id", ondelete="CASCADE"),
@@ -581,7 +592,7 @@ class HostnameBackend(HostBase):
 
     __tablename__ = "ddns_hostname_backend"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BIGINT_PK, primary_key=True, autoincrement=True)
     hostname_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("ddns_hostname.id", ondelete="CASCADE"),
@@ -706,7 +717,7 @@ class DnsEvent(HostBase):
 
     __tablename__ = "ddns_event"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BIGINT_PK, primary_key=True, autoincrement=True)
     created_at: Mapped[datetime] = _utcnow_col(nullable=False)
 
     # --- who / what, by reference ------------------------------------ #
@@ -820,7 +831,7 @@ class RateLimitEvent(HostBase):
 
     __tablename__ = "ddns_rate_limit_event"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BIGINT_PK, primary_key=True, autoincrement=True)
     device_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("ddns_device.id", ondelete="CASCADE"),
