@@ -330,6 +330,9 @@ dev-up:  ## raise the stack + seed YOUR admin from 1Password (see scripts/dev-ad
 	done; \
 	if [ "$$ready" != "1" ]; then \
 		echo "the api at $(DEV_BASE_URL) did not become ready in 120s"; \
+		echo "  /api/readyz answered:"; \
+		curl -sS -m 5 $(DEV_BASE_URL)/api/readyz 2>&1 | head -c 400 | sed 's/^/    /'; \
+		echo; \
 		$(COMPOSE) logs --tail 50 api; \
 		exit 1; \
 	fi
@@ -784,6 +787,9 @@ e2e-up:  ## raise + migrate + seed the stack the e2e specs run against
 	done; \
 	if [ "$$ready" != "1" ]; then \
 		echo "the api at $(E2E_BASE_URL) did not become ready in 120s"; \
+		echo "  /api/readyz answered:"; \
+		curl -sS -m 5 $(E2E_BASE_URL)/api/readyz 2>&1 | head -c 400 | sed 's/^/    /'; \
+		echo; \
 		$(COMPOSE) logs --tail 50 api; \
 		exit 1; \
 	fi
