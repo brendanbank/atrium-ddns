@@ -89,12 +89,32 @@ def _now() -> datetime:
 
 
 @pytest_asyncio.fixture
-async def tenants() -> AsyncIterator[dict[str, Any]]:
+async def tenants(installation_wide_sweep: None) -> AsyncIterator[dict[str, Any]]:
     """Two tenants, each with a domain and a device.
 
     Two rather than one because the scope is asserted behaviourally:
     tenant A asks for the board and tenant B's rows must not be in it.
     A single-tenant fixture cannot fail that assertion.
+
+    **Why this fixture takes `installation_wide_sweep` — #149.** Every
+    test that takes it seeds `last_ip_*` and then asserts on the board's
+    `answered` station, which is `worker_jobs.stored_dns_status` read
+    off `dns_checked_at`, `dns_ip_v4`, `dns_ip_v6` and
+    `dns_check_error`. Those are the four columns a forced cross-tenant
+    health-check sweep rewrites, and the suite has exactly one such
+    sweep — `test_router_health_checks.test_an_admin_run_reaches_every_tenant`
+    — on another xdist worker under `--dist=loadfile`. It is bounded by
+    `health_check_batch_size` (200) and by nothing else: measured over
+    five full runs it stamped 18, 11, 7, 2 and 11 rows against 2 of its
+    own, so a row seeded here with `dns_ip_v4='203.0.113.7'` can come
+    back `NULL` — which reads as MISSING, i.e. as a state this file's
+    tests are written to distinguish.
+
+    Declared as a fixture *argument* rather than taken per test so the
+    lock is acquired before `fixture_writes` below: lock order is
+    config-then-fixture and `conftest.ddns_config_lock` refuses the
+    reverse, because a cycle between two 30-second `GET_LOCK`s presents
+    as a hung suite with no failing test to name.
     """
     emails = [f"ddns-board-a-{W}@example.invalid", f"ddns-board-b-{W}@example.invalid"]
     await purge_tenants(emails, owner="test_router_board.tenants")
