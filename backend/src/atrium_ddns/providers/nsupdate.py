@@ -17,6 +17,25 @@ the four where they belong. A ``nsupdate_secret`` found in ``config`` is
 **refused and logged**, not used: ``config`` is a plain JSON column and
 treating it as a place a TSIG secret may live would quietly undo the
 encryption.
+
+**The response rcode is not read, and a refused update is reported as
+``good``.** Both ``dns.query.tcp`` calls below discard what they return.
+A nameserver that answers ``REFUSED`` — the ordinary shape of an
+``update-policy`` denying a key — sends a well-formed, correctly
+TSIG-signed message, so dnspython raises nothing and the tenant is told
+the write succeeded over an unchanged zone. Same for ``SERVFAIL``.
+
+Recorded here rather than fixed, for three reasons and none of them is
+that it is acceptable. The legacy adapter does the same
+(``lib/account/nsupdate.py:61`` binds ``response`` and never reads it),
+so this is a ported divergence and not a rewrite regression; the frozen
+wire table cannot adjudicate it, because every backend it declares is a
+scripted stub and no case in it reaches this module; and correcting it
+changes what a live tenant sees on ``/nic/update``, which is a product
+decision rather than a tidy-up. Measured over a real socket and pinned
+by ``backend/tests/test_nsupdate_receiver.py::TestTheRcodeIsNotRead``,
+which goes red when it is fixed — deliberately, so the fix is a visible
+edit rather than a silent drift. Tracked as #142.
 """
 from __future__ import annotations
 
