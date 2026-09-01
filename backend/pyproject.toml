@@ -64,6 +64,7 @@ asyncio_mode = "auto"
 # instead. Same registry, same name, two carriers, because pytest forbids
 # the first one on fixtures — see `conftest.harness_guard`.
 markers = [
+    "functional: needs real infrastructure — a migrated MySQL schema (its FKs, ON UPDATE clauses and seeded rows exist only in the alembic chain), a bindable privileged port, or dialect-specific SQL such as EXPLAIN. Deselected by the unit lane, which runs on in-memory SQLite with no container; run by the container lane.",
     "harness_guard: a check whose subject is the test harness itself — it fails when the suite's own instruments have stopped being trustworthy, not when the product is wrong. The population clause 3 of V1M7 is swept over; see backend/tests/test_harness_guards.py.",
 ]
 

@@ -1569,6 +1569,7 @@ async def test_a_write_between_the_count_and_the_fetch_is_reported_not_swallowed
     assert summary.as_log_fields()["hostnames_moved"] == 2
 
 
+@pytest.mark.functional  # migrated MySQL schema / dialect-specific
 async def test_two_statements_in_one_session_are_two_snapshots(tenants):
     """The premise the design above rests on, measured two ways.
 

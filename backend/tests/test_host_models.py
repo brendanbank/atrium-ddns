@@ -230,6 +230,7 @@ async def test_autogenerate_proposes_nothing_against_the_migrated_database():
     assert diffs == [], f"schema and models disagree: {diffs}"
 
 
+@pytest.mark.functional  # migrated MySQL schema / dialect-specific
 async def test_the_include_object_filter_bites():
     """Prove the guard is load-bearing by removing it.
 
@@ -296,6 +297,7 @@ def _declared_host_fks() -> set[tuple[str, str, str, str]]:
     return out
 
 
+@pytest.mark.functional  # migrated MySQL schema / dialect-specific
 async def test_cross_base_foreign_keys_reached_the_database():
     """Model markers vs ``information_schema``.
 
@@ -336,6 +338,7 @@ async def test_cross_base_foreign_keys_reached_the_database():
     )
 
 
+@pytest.mark.functional  # migrated MySQL schema / dialect-specific
 async def test_every_users_id_reference_is_an_int_column():
     """``users.id`` is MySQL ``int``.
 
@@ -386,6 +389,7 @@ async def test_every_users_id_reference_is_an_int_column():
 # --------------------------------------------------------------------- #
 
 
+@pytest.mark.functional  # migrated MySQL schema / dialect-specific
 async def test_updated_at_carries_on_update_in_the_database():
     """The scaffold's ``atrium_ddns_state.updated_at`` does not, and never has.
 
@@ -416,6 +420,7 @@ async def test_updated_at_carries_on_update_in_the_database():
     )
 
 
+@pytest.mark.functional  # migrated MySQL schema / dialect-specific
 async def test_updated_at_moves_when_the_row_changes(tenants):
     """The behavioural half. A DDL reading can be right and inert."""
     domain_id = tenants["a"]["domain_id"]
@@ -449,6 +454,7 @@ async def test_updated_at_moves_when_the_row_changes(tenants):
 # --------------------------------------------------------------------- #
 
 
+@pytest.mark.functional  # migrated MySQL schema / dialect-specific
 async def test_seeded_permissions_match_the_model_constant():
     """The migration spells the codes literally; the models export them.
 
@@ -472,6 +478,7 @@ async def test_seeded_permissions_match_the_model_constant():
     assert expected <= seeded, f"declared but not seeded: {sorted(expected - seeded)}"
 
 
+@pytest.mark.functional  # migrated MySQL schema / dialect-specific
 async def test_permission_grants_landed_on_the_right_roles():
     factory = get_session_factory()
     async with factory() as s:
@@ -575,6 +582,7 @@ async def test_one_tenants_credentials_do_not_decrypt_in_anothers_row(tenants):
             row.credentials.reveal()
 
 
+@pytest.mark.functional  # migrated MySQL schema / dialect-specific
 async def test_the_ciphertext_column_is_a_mediumblob():
     """``SecretBlob`` does not widen on its own — an upstream defect.
 
@@ -759,6 +767,7 @@ async def test_an_event_stays_readable_after_its_device_is_deleted(tenants):
     assert row[2] == "good"
 
 
+@pytest.mark.functional  # migrated MySQL schema / dialect-specific
 async def test_deleting_a_user_destroys_their_domains_devices_and_credentials(
     tenants,
 ):

@@ -366,6 +366,7 @@ async def test_the_migration_writes_no_rows():
     )
 
 
+@pytest.mark.functional  # migrated MySQL schema / dialect-specific
 async def test_ttl_is_nullable_with_no_default_in_the_live_schema():
     """The schema half. NULL is the state `0004` leaves every row in.
 
