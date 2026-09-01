@@ -54,11 +54,11 @@ import sqlalchemy as sa
 from app.db import get_session_factory
 from app.models.auth import User
 from conftest import fixture_writes, purge_tenants
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from httpx import ASGITransport
 
 from atrium_ddns import compat_stub, router_nic
-from atrium_ddns.auth_device import hash_password
+from atrium_ddns.auth_device import client_address, hash_password, normalise_address
 from atrium_ddns.compat_stub import CALLS, SLOTS, scripted_config
 from atrium_ddns.models import Device, DnsEvent, Domain, DomainBackend, Hostname
 from atrium_ddns.providers import BaseProvider
@@ -2596,3 +2596,302 @@ def test_the_effects_replay_reaches_every_host_selected_effects_case() -> None:
     # Two readings of the same population, so the count cannot be a
     # literal that quietly stopped describing the table.
     assert len(host_selected_with_effects) == len(replayed) + len(excused)
+
+
+# ===================================================================== #
+# 11. The socket peer — the `else` branch of `client_address`
+# ===================================================================== #
+#
+# `auth_device.client_address` is two branches:
+#
+#     forwarded = request.headers.get(FORWARDED_FOR)
+#     if forwarded is not None and forwarded.strip():
+#         candidate = forwarded.split(",")[-1].strip()
+#     else:
+#         candidate = request.client.host if request.client else ""
+#
+# Section 8 and the frozen table own the first. The `else` is what
+# decides a device's address when the service is reached **directly**
+# rather than through a proxy, and it is what writes that address into
+# the log a tenant reads.
+#
+# It was not uncovered. It was worse than uncovered: measured on
+# `99a4e65` with `coverage run --branch`, that line executes — every
+# request in this file that does not go through `get()` takes it, on
+# httpx's default peer of `127.0.0.1`. A line-coverage report said the
+# line was fine. **Nothing asserted it.** Three mutations of that one
+# line, each run against the whole 865-test suite:
+#
+#     candidate = "0.0.0.0"                # 865 passed
+#     candidate = ""                       # 865 passed
+#     candidate = request.client.host      # 865 passed  (guard removed)
+#
+# The first is the exact value `normalise_address`'s docstring says the
+# absent case must never be rendered as. The third deletes the
+# `request.client is None` guard outright and nothing reached it. The
+# tests below are the ones those three mutations have to break.
+
+
+def peer_client(application: FastAPI, peer: tuple[str, int]) -> httpx.AsyncClient:
+    """A client whose ASGI scope carries `peer` as the socket peer.
+
+    `ASGITransport(client=…)` is the transport's own parameter — it
+    writes `scope["client"]` and nothing else — so the request arrives
+    exactly as it would from that address with no proxy in front of it.
+    `_client` above leaves it at httpx's default `("127.0.0.1", 123)`,
+    which is why every reading here uses a documentation address the
+    default cannot produce by accident.
+    """
+    return httpx.AsyncClient(
+        transport=ASGITransport(app=application, client=peer),
+        base_url="http://nic.test",
+    )
+
+
+class _WithoutPeer:
+    """The router behind a transport that reports **no** peer at all.
+
+    `scope["client"]` is optional in ASGI and Starlette's
+    `Request.client` answers `None` for it. This is not a contrived
+    shape: `uvicorn.protocols.utils.get_remote_addr` (0.44.0, read in
+    the image) returns `None` whenever `socket.getpeername()` answers
+    something that is not a `(host, port)` tuple — which is every
+    **Unix-domain-socket** connection, the way an app is fronted when
+    the reverse proxy and the service share a host.
+
+    Written as an ASGI wrapper rather than by passing `client=None` to
+    `ASGITransport`, whose signature says `tuple[str, int]`: a test that
+    depends on a library tolerating a type violation is a test that
+    breaks on an upgrade for a reason unrelated to its subject.
+    """
+
+    def __init__(self, application: FastAPI) -> None:
+        self.application = application
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        await self.application({**scope, "client": None}, receive, send)
+
+
+def peerless_client(application: FastAPI) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        transport=ASGITransport(app=_WithoutPeer(application)),
+        base_url="http://nic.test",
+    )
+
+
+async def _client_ip_is_sql_null(event_id: int) -> bool:
+    """`client_ip IS NULL` asked of the database, not of the ORM.
+
+    The second instrument on the one distinction this section exists
+    for. `row.client_ip is None` in Python is also what the string
+    `"None"`, or a column the mapper failed to load, would look like;
+    a `WHERE client_ip IS NULL` that counts the row is the store's own
+    answer about the same cell.
+    """
+    factory = get_session_factory()
+    async with factory() as s:
+        return (
+            await s.execute(
+                sa.select(sa.func.count())
+                .select_from(DnsEvent)
+                .where(DnsEvent.id == event_id)
+                .where(DnsEvent.client_ip.is_(None))
+            )
+        ).scalar_one() == 1
+
+
+async def test_checkip_falls_back_to_the_socket_peer_with_no_forwarded_for(
+    app,
+) -> None:
+    """No `X-Forwarded-For` at all -> the peer, echoed verbatim.
+
+    Asserted with a *control* in the same test, because "checkip echoes
+    198.51.100.77" is satisfiable by an implementation that reads the
+    peer and ignores the header entirely — which is the security
+    decision this fallback sits underneath, inverted. The header must
+    still win when it is present.
+    """
+    async with peer_client(app, ("198.51.100.77", 41234)) as c:
+        no_header = await c.get("/nic/checkip", params={"format": "plain"})
+        with_header = await c.get(
+            "/nic/checkip", params={"format": "plain"}, headers=xff("203.0.113.10")
+        )
+
+    assert no_header.text == "198.51.100.77"
+    # The fallback is a fallback. The peer is not consulted while a
+    # parseable header is there, and it is not consulted *instead* of an
+    # unparseable one either — `client_ip: null` in the frozen table is
+    # arranged by sending an unparseable header precisely because the
+    # peer underneath it is perfectly parseable, which is only true if
+    # this is the ordering.
+    assert with_header.text == "203.0.113.10"
+
+
+async def test_an_update_with_no_forwarded_for_uses_the_socket_peer(
+    app, world
+) -> None:
+    """The whole path, read by four instruments of different shape.
+
+    The wire, the provider's own call log, the persisted column and the
+    event row all have to say `198.51.100.77`. The wire alone would not
+    do: #29 measured that update's reply carries the normalised address
+    and never the record type, so a host that echoes an address and
+    writes something else entirely passes every case in the table.
+    """
+    await clear_events()
+    hostname_id = world.hostnames["ok"]
+
+    async with peer_client(app, ("198.51.100.77", 41234)) as c:
+        response = await c.get(
+            "/nic/update",
+            params={"hostname": world.name("ok")},
+            headers=alice(world),
+        )
+
+    # 1. the wire
+    assert response.text == "good 198.51.100.77"
+    # 2. the provider's call log — address *and* family, neither of
+    #    which the reply can be read for
+    assert [(call.rtype, call.ip) for call in creates()] == [("A", "198.51.100.77")]
+    # 3. the persisted column
+    after = await hostname_row(hostname_id)
+    assert after.last_ip_v4 == "198.51.100.77"
+    # 4. the event row the tenant reads. `client_ip` is the address the
+    #    request came from and `ip` is the address written to DNS; with
+    #    no `myip` they are the same value arrived at two ways, and both
+    #    come off the socket peer here.
+    rows = await events_for(world.alice_id)
+    assert [row.response_code for row in rows] == ["good"]
+    assert rows[0].client_ip == "198.51.100.77"
+    assert rows[0].ip == "198.51.100.77"
+
+
+async def test_the_socket_peer_is_normalised_and_picks_the_record_family(
+    app, world
+) -> None:
+    """The peer goes through `normalise_address`, like a header value.
+
+    `2001:0DB8:0113::0077` is written in the form the wire table uses to
+    assert canonicalisation, so an implementation that echoed the peer
+    through unchanged is red on the first assertion; and there is no
+    `myip` to read a family off, so `AAAA` can only have come from the
+    peer. Both halves are invisible to line coverage — the line runs
+    either way.
+    """
+    hostname_id = world.hostnames["ok"]
+    before = await hostname_row(hostname_id)
+
+    async with peer_client(app, ("2001:0DB8:0113::0077", 41234)) as c:
+        response = await c.get(
+            "/nic/update",
+            params={"hostname": world.name("ok")},
+            headers=alice(world),
+        )
+
+    assert response.text == "good 2001:db8:113::77"
+    assert [(call.rtype, call.ip) for call in creates()] == [
+        ("AAAA", "2001:db8:113::77")
+    ]
+    after = await hostname_row(hostname_id)
+    assert after.last_ip_v6 == "2001:db8:113::77"
+    # The v4 column is a different family and this write is not about
+    # it. Compared against its own prior reading rather than asserted
+    # absolutely, so the test says "unchanged" and not "happens to be
+    # whatever the test before me left".
+    assert after.last_ip_v4 == before.last_ip_v4
+
+
+def test_no_peer_yields_none_and_the_empty_string_is_not_the_wildcard() -> None:
+    """`request.client is None` -> `""` -> `None`. **Not** `0.0.0.0`.
+
+    The unit-shaped half of the pair below, and the only reading that
+    can see the `""` in the middle. `normalise_address`'s docstring
+    calls this distinction out as one that must never be blurred, and
+    the two assertions at the end are why it can be: `0.0.0.0` is a
+    perfectly parseable address that means something — the unspecified
+    address — so folding *no address* into it does not lose a
+    formatting nicety, it invents a claim.
+    """
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/nic/checkip",
+        "raw_path": b"/nic/checkip",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [],
+        "client": None,
+        "server": ("nic.test", 80),
+    }
+    assert Request(scope).client is None
+    assert client_address(Request(scope)) is None
+
+    # The two states the `else` branch collapses into one type, told
+    # apart at the normaliser they both pass through.
+    assert normalise_address("") is None
+    assert normalise_address("0.0.0.0") == "0.0.0.0"
+
+
+async def test_checkip_renders_a_missing_peer_as_empty_not_as_a_wildcard(
+    app,
+) -> None:
+    """The wire-shaped half. `checkip` is `client_address(request) or ""`.
+
+    The control is not decoration: with the wrapper removed this
+    request goes out on httpx's default peer and answers `127.0.0.1`,
+    so a green run here is evidence the peer was really taken away and
+    not evidence that `checkip` returns `""` for everything.
+    """
+    async with peerless_client(app) as c:
+        plain = await c.get("/nic/checkip", params={"format": "plain"})
+        html = await c.get("/nic/checkip")
+    async with _client(app) as c:
+        control = await c.get("/nic/checkip", params={"format": "plain"})
+
+    assert plain.text == ""
+    assert plain.text != "0.0.0.0"
+    assert "0.0.0.0" not in html.text
+    assert control.text == "127.0.0.1"
+
+
+async def test_no_peer_and_no_myip_answers_911_and_logs_a_null_client_ip(
+    app, world
+) -> None:
+    """`update-911-no-myip-and-no-client-ip`, reached the way it happens.
+
+    The frozen table arranges this case with an unparseable
+    `X-Forwarded-For`, because over a socket there is normally a peer.
+    The other way in is the one this asserts: no header and no peer,
+    which is what a Unix-domain-socket connection produces.
+
+    The stored `client_ip` is the point. A `0.0.0.0` there is a tenant
+    reading their own log and seeing an address the request did not come
+    from; `NULL` is the log saying it does not know, which is a
+    different and true statement. Read twice — once off the ORM
+    attribute and once as the database's own `IS NULL`.
+    """
+    await clear_events()
+
+    async with peerless_client(app) as c:
+        response = await c.get(
+            "/nic/update",
+            params={"hostname": world.name("ok")},
+            headers=alice(world),
+        )
+
+    assert response.text == "911"
+    # No address means no DNS write. `911` with a call behind it would
+    # be the worse failure of the two.
+    assert CALLS == []
+
+    rows = await events_for(world.alice_id)
+    assert [row.response_code for row in rows] == ["911"]
+    row = rows[0]
+    assert row.client_ip is None
+    assert row.client_ip != "0.0.0.0"
+    assert row.client_ip != ""
+    assert row.ip is None
+    assert await _client_ip_is_sql_null(row.id)
