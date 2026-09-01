@@ -29,6 +29,57 @@
  * carries `device_id` and nothing else for exactly that reason. So both
  * are rendered as values with the reason attached, rather than as
  * disabled inputs that look like a permissions problem.
+ *
+ * ## Why delete asks in a second modal (#153)
+ *
+ * It used to ask **inline**, as an `Alert` in this form's own body. The
+ * result was one surface carrying two sets of buttons and two meanings
+ * of the word: the outer `Delete this name` *opened* the panel and the
+ * inner `Delete w3.…` *performed* it, inches apart and reading almost
+ * identically — with the form's own `Save` still live behind the
+ * confirmation, so the surface offered *save* and *destroy* at the same
+ * moment with no ordering between them.
+ *
+ * A destructive confirmation has to **interrupt**. Inline it is one
+ * more panel on a busy form and can be scrolled past. This is the shape
+ * `SecretOnceModal` established and `DeviceCard`'s own delete already
+ * borrows: a second surface, `zIndex` above the modal it sits over,
+ * that must be dismissed before the first is usable again. Reused
+ * rather than reinvented — `zIndex={400}` is the same number for the
+ * same reason, because Mantine gives every modal the same z-index and
+ * siblings otherwise stack by mount order.
+ *
+ * Two consequences worth stating, because both are load-bearing:
+ *
+ * **The form beneath is locked, not merely covered.** `locked` disables
+ * Save, Cancel and every other action while the confirmation is open.
+ * The overlay stops a *mouse*, which is not the same as the action
+ * being refused — a keyboard, an assistive technology or a test can all
+ * reach a control an overlay is merely painted over.
+ *
+ * **The delete error renders inside the confirmation.** The form's own
+ * error `Alert` is at the top of the body, behind the dialog: a failed
+ * delete would have put its diagnosis on a surface nobody was looking
+ * at. `DeviceCard` does the same thing for the same reason.
+ *
+ * ### The objection on the record, and the answer to it
+ *
+ * `ZoneModal.tsx` carries a comment arguing the opposite — *"a modal on
+ * a modal is where the `Cancel` that deleted came from — two
+ * overlapping dialogs, each with its own idea of what the buttons at
+ * the bottom mean"*. That is a real incident and it is why `locked` is
+ * not optional: **the hazard is two live `Cancel`s, not two dialogs.**
+ * Here there is one interactive button row at a time — the form's
+ * `Cancel` and `Save` are disabled while the confirmation is up — and
+ * the dismissal is spelled *Keep it*, never *Cancel*, so no two
+ * controls on screen share a word with two meanings.
+ *
+ * The comment is also **false about its own file**: `ZoneModal`'s
+ * confirmation does not replace the button row, it renders above an
+ * unconditional one, so `Delete this zone` / `Cancel` / `Save` all stay
+ * live behind it — exactly the defect this issue describes, over a
+ * larger blast radius (a zone, its stored provider credentials, and
+ * every name under it). Out of scope for #153, reported with it.
  */
 import { useState } from 'react';
 import {
@@ -240,7 +291,11 @@ function NameModalBody({
       invalidate();
       onClose();
     },
-    onError: fail,
+    // Deliberately **not** `onError: fail`. `fail` writes the form's own
+    // error `Alert`, which lives at the top of this body — behind the
+    // confirmation dialog. A failed delete would have put the server's
+    // words on a surface nobody was looking at. It is rendered inside
+    // the dialog instead, from `remove.error`.
   });
 
   const busy =
@@ -249,6 +304,18 @@ function NameModalBody({
     savePublishing.isPending ||
     publishNow.isPending ||
     remove.isPending;
+
+  /** The confirmation is open, and there is a row for it to be about.
+   *  `row` is in the condition because the dialog names the hostname. */
+  const confirming = confirmDelete && row != null;
+
+  /** What every control on the form beneath is disabled by.
+   *
+   *  Not decoration. Mantine's overlay stops a mouse; it does not stop a
+   *  keyboard, an assistive technology or a test, and "cannot be saved
+   *  while the confirmation is open" is a statement about the action,
+   *  not about what is painted over what. */
+  const locked = busy || confirming;
 
   if (!ready) return <Text size="sm">Loading…</Text>;
   if (!creating && !row) {
@@ -450,7 +517,7 @@ function NameModalBody({
                   <Button
                     size="xs"
                     variant="default"
-                    disabled={busy}
+                    disabled={locked}
                     onClick={() =>
                       savePublishing.mutate({
                         // `null` restores *inherit*. `[]` means the same
@@ -483,7 +550,7 @@ function NameModalBody({
               <Button
                 size="xs"
                 variant="default"
-                disabled={busy || publishIp.trim() === ''}
+                disabled={locked || publishIp.trim() === ''}
                 onClick={() => publishNow.mutate(publishIp.trim())}
                 data-testid="publish-now"
               >
@@ -499,42 +566,99 @@ function NameModalBody({
         </>
       )}
 
-      {confirmDelete && row ? (
-        <Alert color="gray" variant="light" title="Delete this name?" data-testid="name-delete-confirm">
-          <Stack gap="sm">
+      {/* Its own surface, over this one. `zIndex` is the number
+          `SecretOnceModal` uses and for the identical reason: this modal
+          has to outrank a modal that is already open, and Mantine gives
+          every modal the same z-index, so siblings stack by mount order
+          until a re-render changes it.
+
+          The testid is on the body rather than on `Modal`, because
+          Mantine does not forward `data-testid` to a node a DOM query
+          can reach — `deviceCard.test.tsx` records the same. */}
+      <Modal
+        opened={confirming}
+        onClose={() => {
+          remove.reset();
+          setConfirmDelete(false);
+        }}
+        title="Delete this name?"
+        zIndex={400}
+      >
+        {/* Portalled to `document.body`, outside `[data-ddns-root]`, so
+            without this the dialog renders with none of `ddns.css` — and
+            `.ddns-data` is what sets the hostname apart from the prose
+            around it. */}
+        <DdnsPortalScope>
+          <Stack gap="sm" data-testid="name-delete-confirm">
+            {/* Verbatim, and it stays verbatim. This is the sentence
+                users get wrong: deleting here does not un-publish
+                anything, and the record keeps answering with nothing
+                left to maintain it. */}
             <Text size="sm">
-              This removes <span className="ddns-data">{row.name}</span> from
-              this service. It does <strong>not</strong> remove the record your
+              This removes{' '}
+              <span className="ddns-data">{row?.name}</span> from this
+              service. It does <strong>not</strong> remove the record your
               provider has already published — that stays in the zone with
               nothing maintaining it.
             </Text>
+            {remove.error ? (
+              <Alert color="gray" variant="light" data-testid="name-delete-error">
+                <Text size="sm" ff="monospace">
+                  {(remove.error as Error).message}
+                </Text>
+              </Alert>
+            ) : null}
             <Group justify="flex-end">
-              <Button size="xs" variant="default" disabled={busy} onClick={() => setConfirmDelete(false)}>
+              <Button
+                size="xs"
+                variant="default"
+                disabled={busy}
+                onClick={() => {
+                  remove.reset();
+                  setConfirmDelete(false);
+                }}
+                data-testid="name-delete-keep"
+              >
                 Keep it
               </Button>
-              <Button size="xs" color="red" disabled={busy} onClick={() => remove.mutate()} data-testid="name-delete-confirmed">
-                Delete {row.name}
+              <Button
+                size="xs"
+                color="red"
+                disabled={busy}
+                onClick={() => remove.mutate()}
+                data-testid="name-delete-confirmed"
+              >
+                Delete {row?.name}
               </Button>
             </Group>
           </Stack>
-        </Alert>
-      ) : null}
+        </DdnsPortalScope>
+      </Modal>
 
       <Group justify="space-between">
         {creating ? (
           <span />
         ) : (
-          <Button size="xs" variant="default" disabled={busy} onClick={() => setConfirmDelete(true)} data-testid="name-delete">
+          <Button
+            size="xs"
+            variant="default"
+            disabled={locked}
+            onClick={() => {
+              remove.reset();
+              setConfirmDelete(true);
+            }}
+            data-testid="name-delete"
+          >
             Delete this name
           </Button>
         )}
         <Group gap="sm">
-          <Button size="xs" variant="default" disabled={busy} onClick={onClose}>
+          <Button size="xs" variant="default" disabled={locked} onClick={onClose}>
             Cancel
           </Button>
           <Button
             size="xs"
-            disabled={busy || (creating && (willSend === '' || zone === null))}
+            disabled={locked || (creating && (willSend === '' || zone === null))}
             onClick={() =>
               creating
                 ? create.mutate({
