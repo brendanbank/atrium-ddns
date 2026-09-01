@@ -362,24 +362,42 @@ export function BoardTable({
               <span className="ddns-boardtable__mark" aria-hidden="true">
                 {tone === "diverged" ? "!" : ""}
               </span>
-              {row.device ? (
-                /* The device cell. One control: the name, which opens the
-                   device card. It carried a trash icon as well until #155
-                   — a one-click delete of the *device*, and of every name
-                   assigned to it, on a row that is about a *hostname*.
-                   The same device repeats once per name, so the same
-                   destructive control appeared several times over, and two
-                   rows differing only in their hostname read identically
-                   in that cell. Deleting is still reachable, from the card
-                   the name opens, which asks first and says how many names
-                   go with the device — the same argument that took the
-                   edit icon off this row earlier: the control was a
-                   duplicate of a safer path.
+              {/* The device cell. Two things, pushed apart: the device
+                  name on the left, which opens the card, and the
+                  add-a-name `+` on the right.
 
-                   The `Group` stays with one child on purpose. It is what
-                   the name cell below uses, and #154 puts the add-a-name
-                   `+` in here beside the name. */
-                <Group gap={4} wrap="nowrap" align="center">
+                  It carried a trash icon until #155 — a one-click delete
+                  of the *device*, and of every name assigned to it, on a
+                  row that is about a *hostname*. Deleting is still
+                  reachable, from the card the name opens, which asks
+                  first and says how many names go with the device.
+
+                  The `+` moved in here from the name cell in #154, and
+                  the reason is the column, not the tidiness. The name
+                  column is `minmax(12rem, 1fr)` and
+                  `.ddns-boardtable__row > *` is `overflow: hidden` with
+                  `white-space: nowrap`, so on a long name the cell ran
+                  out of room and the thing pushed past the edge was the
+                  **control** rather than the text — the ellipsis landed
+                  on the affordance. It vanished silently and it vanished
+                  precisely on the longest names. The device column is
+                  `max-content`: it is sized to what it holds, so there
+                  is no room for it to run out of.
+
+                  It also reads correctly here, which the placement
+                  beside the name never did. "Add a name" is an action on
+                  the *device* — `boardNameNewHref(row.device?.id)`
+                  presets it, and has since #128 — so beside the hostname
+                  it looked like an action on that hostname, which it
+                  never was.
+
+                  `justify="space-between"` is what right-aligns it. In a
+                  `max-content` track the group is exactly as wide as the
+                  widest row's contents, so the `+` sits on the column's
+                  right edge and the shorter device names do not drag it
+                  left with them. */}
+              <Group gap={4} wrap="nowrap" align="center" justify="space-between">
+                {row.device ? (
                   <button
                     type="button"
                     className="ddns-data ddns-boardtable__device"
@@ -388,35 +406,62 @@ export function BoardTable({
                   >
                     {row.device.name}
                   </button>
-                </Group>
-              ) : (
-                <span className="ddns-cell" data-tone="quiet">
-                  no device
-                </span>
-              )}
-              {row.hostname ? (
-                <Group gap={4} wrap="nowrap" align="center">
-                  <a className="ddns-data" href={boardNameHref(row.hostname.id)}>
-                    {row.hostname.name}
-                  </a>
-                  {/* Adding a name is the other thing you come to this row for,
-                      and it was reachable only from the header. Carries the return
-                      address so finishing lands back here rather than stranding
-                      you on the names page, which has no nav entry. */}
-                  <Tooltip label="Add a name" withArrow>
+                ) : (
+                  <span className="ddns-cell" data-tone="quiet">
+                    no device
+                  </span>
+                )}
+                {/* Only on rows that *have* a name. The "no names yet"
+                    row has its own add control in the cell below, which
+                    is the row where it matters most and where it reads
+                    as the answer to the text beside it; a second one
+                    here would be the duplicate this issue removed.
+
+                    A row with no device still gets one. It presets
+                    nothing — `boardNameNewHref(undefined)` omits `for=`
+                    — but the whole argument for this table is that the
+                    columns stay where they were, and a `+` that is in
+                    the device column on most rows and missing on some
+                    is the shape-changing layout the flat table replaced. */}
+                {row.hostname ? (
+                  <Tooltip
+                    label={
+                      row.device
+                        ? `Add a name for ${row.device.name}`
+                        : "Add a name"
+                    }
+                    withArrow
+                  >
                     <ActionIcon
                       component="a"
                       href={boardNameNewHref(row.device?.id)}
                       variant="subtle"
                       color="gray"
                       size="sm"
-                      aria-label="Add a name"
+                      aria-label={
+                        row.device
+                          ? `Add a name for ${row.device.name}`
+                          : "Add a name"
+                      }
                       data-testid={`board-add-name-${row.hostname.name}`}
                     >
                       <IconPlus size={15} />
                     </ActionIcon>
                   </Tooltip>
-                </Group>
+                ) : null}
+              </Group>
+              {row.hostname ? (
+                /* The name, and only the name. It is the direct grid
+                   child now rather than the first item of a group, which
+                   is what puts `.ddns-boardtable__row > *`'s
+                   `text-overflow: ellipsis` on the anchor itself — so a
+                   name too long for the column truncates with an
+                   ellipsis, which is what that rule was written to do.
+                   With a wrapper in between, the rule applied to the
+                   wrapper and the anchor overflowed it intact. */
+                <a className="ddns-data" href={boardNameHref(row.hostname.id)}>
+                  {row.hostname.name}
+                </a>
               ) : (
                 <Group gap={4} wrap="nowrap" align="center">
                   <span className="ddns-cell" data-tone="quiet">
