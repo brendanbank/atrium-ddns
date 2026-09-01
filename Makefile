@@ -233,8 +233,15 @@ check-env:  ## refuse to start a stack whose .env cannot produce a living api
 check-env-self-test:  ## show the .env guard refusing, against synthetic files
 	@./scripts/check-env.sh --self-test
 
-up: check-env  ## start the stack
-	$(COMPOSE) up -d
+up: check-env  ## start the stack. NEVER builds — see below.
+	@# `--no-build` is not a tidy-up. Each worktree is its own compose
+	@# project, so its image tag is unique and a plain `up` builds a
+	@# 301 MB image from scratch, silently, as a side effect of starting
+	@# a stack. Twelve of those were built in one day before anyone
+	@# noticed. Building is now `make build`, explicitly, by someone who
+	@# meant it. If this refuses with "needs to be built", that is the
+	@# guard working: run `make build` if you actually want to pay for it.
+	$(COMPOSE) up -d --no-build
 
 down:  ## stop the stack (keeps data volume)
 	$(COMPOSE) down
