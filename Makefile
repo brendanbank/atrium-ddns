@@ -123,7 +123,7 @@ endef
 
 .PHONY: help dev-bootstrap dev-up dev-down up down build logs ps migrate gate \
 	seed-admin seed-bundle seed-compat-fixture verify-compat-rehash \
-	test test-frontend test-backend test-compat \
+	test test-frontend test-backend test-compat check-compat-executed \
 	check-fresh check-compat-fresh check-backend-fresh check-host-pkg-fresh \
 	test-backend-serial test-backend-file typecheck smoke \
 	e2e-up e2e-deps e2e-down test-e2e check-bundle-fresh \
@@ -137,7 +137,103 @@ dev-bootstrap: build up migrate  ## build, start, migrate; run me first
 	@echo "Stack is up. Next: make seed-admin EMAIL=you@example.com PASSWORD=..."
 	@echo "Then: make seed-bundle && open http://localhost:8000"
 
-up:  ## start the stack
+# --- .env, and refusing to start a stack that cannot live (#137) ------------
+#
+# `.env.example` ships `replace-me-with-openssl-rand-hex-32` for
+# SECRET_ENCRYPTION_KEY. atrium checks that key's SHAPE in every environment,
+# so a `.env` that is a straight copy of the example boots an api that raises
+# ValidationError, is restarted by `restart: unless-stopped`, and raises it
+# again — while `make up` prints "Started" and exits 0. Measured here on
+# 2026-09-01: exit 0, RestartCount climbing 5→8, curl on the published port
+# refused. The defect is the successful report over something already dead.
+#
+# Two answers, and they are not exclusive:
+#
+#   `make env`   mints a working `.env` — the targets that already created one
+#                behind your back (dev-up, e2e-up) now create a live one
+#                instead of a dead one.
+#   `check-env`  refuses before compose is called, naming the key and the fix.
+#
+# The guard is the one that generalises, so it is a prerequisite of `up` rather
+# than a step inside it: it runs on every path that reaches `up`, including
+# `dev-bootstrap` and `make gate`'s own `$(MAKE) up migrate`.
+#
+# Note `up` does NOT create `.env`. It never did, and a target that starts a
+# stack is the wrong place to learn that a file was written for you. It refuses
+# and names `make env`.
+env:  ## create .env from .env.example with freshly generated secrets
+	@# ONE shell, deliberately. This was five separate recipe lines, and make
+	@# runs each in its own shell — so the `exit $$?` that follows "already
+	@# exists" ended only *that* shell, and make went straight on to
+	@# `cp .env.example .env`. The target printed "left untouched" and
+	@# overwrote the file in the same breath.
+	@#
+	@# It cost real data before it was found: a developer .env holding the
+	@# credentials a running MySQL volume had been initialised with was
+	@# replaced by the example's defaults, leaving a database nothing could
+	@# authenticate to, and CI's e2e .env was replaced mid-run — which moved
+	@# API_HOST_PORT from 8000 to 8053 while make had already expanded
+	@# E2E_BASE_URL from the old value, so the readiness probe polled a port
+	@# nothing was listening on and timed out after 120s naming neither cause.
+	@#
+	@# Guarded by `make check-env-idempotent`, which asserts the file is
+	@# byte-identical after a second run.
+	@set -e; \
+	if [ -f .env ]; then \
+		echo "make env: .env already exists — left untouched"; \
+		exec ./scripts/check-env.sh; \
+	fi; \
+	cp .env.example .env; \
+	for spec in "APP_SECRET_KEY 48" "JWT_SECRET 48" "SECRET_ENCRYPTION_KEY 32"; do \
+		set -- $$spec; key=$$1; bytes=$$2; \
+		val=$$(openssl rand -hex $$bytes); \
+		tmp=$$(mktemp); \
+		awk -v k="$$key" -v v="$$val" '$$0 ~ "^" k "=" && !seen { print k "=" v; seen=1; next } { print }' \
+			.env > $$tmp && mv $$tmp .env; \
+	done; \
+	chmod 600 .env; \
+	echo "make env: wrote .env from .env.example, with fresh values for"; \
+	echo "          APP_SECRET_KEY, JWT_SECRET and SECRET_ENCRYPTION_KEY."; \
+	echo "          Back SECRET_ENCRYPTION_KEY up: lose it and every stored"; \
+	echo "          provider credential is unrecoverable."; \
+	echo "          Ports are still the .env.example defaults — change"; \
+	echo "          API_HOST_PORT / MYSQL_HOST_PORT if they collide."; \
+	./scripts/check-env.sh
+
+check-env-idempotent:  ## `make env` must never modify an existing .env
+	@# Runs the REAL recipe in the REAL directory, against a valid .env, and
+	@# compares the file's digest. The first version of this guard ran make
+	@# from a temp dir with no scripts/, so check-env.sh was not found and
+	@# `set -e` aborted before the cp — in BOTH the fixed and broken recipes.
+	@# It printed PASS against a deliberately reintroduced defect: a probe
+	@# that could not fail, written while guarding against that very family.
+	@#
+	@# Two conditions are load-bearing. The .env must be VALID, because the
+	@# broken recipe only reached its `cp` when check-env.sh exited 0. And the
+	@# assertion is on the file, not the output: the broken version printed
+	@# "left untouched" and overwrote it in the same breath.
+	@set -e; \
+	had=0; bak=""; \
+	if [ -f .env ]; then had=1; bak=$$(mktemp); cp .env $$bak; else $(MAKE) --no-print-directory env >/dev/null; fi; \
+	before=$$(md5 -q .env 2>/dev/null || md5sum .env | cut -d" " -f1); \
+	set +e; $(MAKE) --no-print-directory env >/dev/null 2>&1; set -e; \
+	after=$$(md5 -q .env 2>/dev/null || md5sum .env | cut -d" " -f1); \
+	if [ "$$had" = 1 ]; then cp $$bak .env; rm -f $$bak; else rm -f .env; fi; \
+	if [ "$$before" != "$$after" ]; then \
+		echo "check-env-idempotent: FAIL — make env modified an existing .env"; \
+		echo "  before $$before"; \
+		echo "  after  $$after"; \
+		exit 1; \
+	fi; \
+	echo "check-env-idempotent: PASS — an existing .env is byte-identical after make env"
+
+check-env:  ## refuse to start a stack whose .env cannot produce a living api
+	@./scripts/check-env.sh
+
+check-env-self-test:  ## show the .env guard refusing, against synthetic files
+	@./scripts/check-env.sh --self-test
+
+up: check-env  ## start the stack
 	$(COMPOSE) up -d
 
 down:  ## stop the stack (keeps data volume)
@@ -188,7 +284,12 @@ DEV_MYSQL_HOST_PORT := $(shell sed -n 's/^MYSQL_HOST_PORT=//p' .env 2>/dev/null 
 DEV_BASE_URL ?= http://localhost:$(or $(DEV_API_HOST_PORT),8053)
 
 dev-up:  ## raise the stack + seed YOUR admin from 1Password (see scripts/dev-admin.sh)
-	@if [ ! -f .env ]; then echo "creating .env from .env.example"; cp .env.example .env; fi
+	@# Was `cp .env.example .env`, which produced a file whose
+	@# SECRET_ENCRYPTION_KEY atrium refuses — a dead api behind a green start.
+	@# `make env` copies the same file and mints real values into it, and ends
+	@# in the guard, so an existing hand-edited `.env` is checked rather than
+	@# overwritten. See the block above `up` (#137).
+	@$(MAKE) --no-print-directory env
 	@# Refuse before building anything. A five-minute image build that ends
 	@# in "the 1Password CLI is not signed in" is a worse way to learn it.
 	./scripts/dev-admin.sh --check
@@ -387,9 +488,15 @@ check-host-pkg-fresh:  ## fail if the INSTALLED atrium_ddns is not this worktree
 	$(call CHECK_FRESH,check-host-pkg-fresh,backend/src/$(HOST_PKG),pkg:$(HOST_PKG),the installed $(HOST_PKG) package)
 
 # The wire table. NOT part of `make test` and NOT part of the gate: it replays
-# 114 cases against a running service, and which service that is has to be
-# stated, not guessed. Defaulting either option to make this target "work" is
-# the bug #8 was written about.
+# the frozen table against a running service, and which service that is has to
+# be stated, not guessed. Defaulting either option to make this target "work"
+# is the bug #8 was written about.
+#
+# No case count in this sentence, deliberately. It read "114 cases" for three
+# freezes after the table stopped having 114 of them, which is the inherited
+# number `docs/ops/overnight-template.md` keeps telling agents not to write
+# down. The runner prints its own accounting block on every run, derived from
+# the table it actually loaded; that is the reading, and it cannot go stale.
 #
 # BASE_URL is resolved from inside the api container, because that is the one
 # environment guaranteed to have pytest and PyYAML. `http://api:8000` is this
@@ -424,6 +531,94 @@ test-compat:  ## wire table vs a live service (TARGET=legacy|host BASE_URL=http:
 	@$(MAKE) --no-print-directory check-compat-fresh
 	$(COMPOSE) exec -T api /opt/venv/bin/python -m pytest $(COMPAT_TESTS)/compat \
 		--target "$(TARGET)" --base-url "$(BASE_URL)" -ra $(PYTEST_ARGS)
+
+# Did the table actually run, or did it merely exit 0?
+#
+# `test-compat` above answers "did anything fail". It does NOT answer "did
+# anything run", and the two come apart in exactly the ways that matter:
+#
+#   $ make test-compat TARGET=host BASE_URL=... PYTEST_ARGS='-k checkip-default-is-html'
+#   1 passed ... NOT RUN 126
+#
+# — exit 0, a green summary line, and one case of the table exercised. A CI job
+# whose only instrument is `make test-compat`'s exit code reports that as a
+# clean wire table. So CI captures the run and reads the runner's own
+# accounting block back, and this target is what does the reading.
+#
+# Four ways it goes red, and none of them is "a case failed" (test-compat owns
+# that): the freshness guard's PASS line is absent, so the table may have been
+# replayed out of a stale image; the runner printed NOT RUN, in either of its
+# two spellings — the whole table (no `--target`) or a shortfall (`-k`, or
+# collection stopping early); the accounting block is unreadable, which is NOT
+# zero and NOT a pass; or fewer cases passed than the block says were
+# executable.
+#
+# Deliberately NOT folded into `test-compat`. That target is also the
+# diagnostic — `PYTEST_ARGS='-k one-case'` is how anyone bisects a failing
+# case, and a guard that refuses a filtered run is a guard standing in front of
+# the diagnosis. The vacuity question belongs to the unattended caller, which
+# is CI, and it is asked there.
+#
+# No expected count in here. The invariants are relational (`passed` equals
+# `executable`, shortfall is nought), so freezing the table at a different size
+# cannot make this target stale — which is the one property a hardcoded 124
+# would not have had.
+check-compat-executed:  ## assert a captured `make test-compat` log really ran the table (LOG=<file>)
+	@set -u; \
+	log="$(LOG)"; \
+	if [ -z "$$log" ]; then \
+		echo "usage: make check-compat-executed LOG=<file>"; \
+		echo; \
+		echo "  <file> is what a \`make test-compat ... 2>&1 | tee <file>\` run wrote."; \
+		exit 2; \
+	fi; \
+	if [ ! -s "$$log" ]; then \
+		echo "check-compat-executed: '$$log' is missing or empty."; \
+		echo "  An absent log is not a clean run. Refusing."; \
+		exit 1; \
+	fi; \
+	fail=0; \
+	if ! grep -q 'check-compat-fresh: container matches worktree' "$$log"; then \
+		echo "check-compat-executed: the freshness guard's PASS line is not in '$$log'."; \
+		echo "  Either check-compat-fresh never ran, or the run routed around it."; \
+		echo "  A table replayed from a stale image reports green for the wrong"; \
+		echo "  cases, which is worse than not running it."; \
+		fail=1; \
+	fi; \
+	if grep -q 'NOT RUN' "$$log"; then \
+		echo "check-compat-executed: the runner reported cases NOT RUN:"; \
+		grep 'NOT RUN' "$$log" | sed 's/^/    /'; \
+		fail=1; \
+	fi; \
+	if ! grep -q '^  reachability probe ' "$$log"; then \
+		echo "check-compat-executed: no reachability probe in '$$log' — the runner"; \
+		echo "  never established that anything answered at --base-url."; \
+		fail=1; \
+	fi; \
+	executable=`awk '$$1=="executable" && $$2 ~ /^[0-9]+$$/ {print $$2}' "$$log" | tail -1`; \
+	passed=`awk '/^  ran this session /{for(i=1;i<=NF;i++) if($$i ~ /^passed/) print $$(i-1)}' "$$log" | tail -1`; \
+	if [ -z "$$executable" ] || [ -z "$$passed" ]; then \
+		echo "check-compat-executed: could not read the accounting block from '$$log'"; \
+		echo "  (executable='$$executable' passed='$$passed')."; \
+		echo "  An unreadable block is not nought and is not a pass. Refusing."; \
+		fail=1; \
+	elif [ "$$executable" -lt 1 ]; then \
+		echo "check-compat-executed: executable=$$executable — the table selected"; \
+		echo "  no case at all for this target. That is not a green wire table."; \
+		fail=1; \
+	elif [ "$$passed" -ne "$$executable" ]; then \
+		echo "check-compat-executed: $$passed passed, but the accounting block says"; \
+		echo "  $$executable were executable. Every executable case must be one of"; \
+		echo "  them."; \
+		fail=1; \
+	fi; \
+	if [ "$$fail" -eq 0 ]; then \
+		echo "check-compat-executed: $$passed of $$executable executable cases passed,"; \
+		echo "  0 selected-but-unexecuted, freshness guard PASSED, service probed."; \
+	else \
+		echo "check-compat-executed: REFUSING to call '$$log' a wire-table run."; \
+	fi; \
+	exit $$fail
 
 # Gated: this reports the same "the backend suite passed" claim as
 # test-backend, one worker at a time, and a stale image lies the same way.
@@ -465,6 +660,11 @@ test-backend-file:  ## one file, verbose — the way to diagnose a hang (FILE=te
 GATE_CONF_BRANCH := $(shell sed -n 's/^OVERNIGHT_MILESTONE_BRANCH=//p' .overnight.conf 2>/dev/null | tail -n1)
 GATE_BASE ?= $(or $(OVERNIGHT_MILESTONE_BRANCH),$(GATE_CONF_BRANCH),$(OVERNIGHT_TRUNK),master)
 
+# A third scope, added by #137: a guard nothing invokes is a guard that passes
+# because it never ran. `Makefile`, `compose.yaml`, `.env.example` and the
+# shell scripts reach no pytest and no vitest, so a diff confined to them used
+# to print "this diff reaches no test" and that was the whole reading. The
+# `.env` guard's own `--self-test` is the test they reach.
 gate:  ## run exactly the checks this diff can reach (auto-scoped; GATE_BASE=...)
 	@set -e; \
 	base="$(GATE_BASE)"; \
@@ -473,6 +673,7 @@ gate:  ## run exactly the checks this diff can reach (auto-scoped; GATE_BASE=...
 	if [ -z "$$changed" ]; then echo "gate: no changes against $$base — nothing to check"; exit 0; fi; \
 	fe=$$(printf '%s\n' "$$changed" | grep -cE '^frontend/(src/|tests-e2e/|[^/]+\.(json|ts|cts|mts))' || true); \
 	be=$$(printf '%s\n' "$$changed" | grep -cE '^(backend/|tests/|scripts/.*\.py)' || true); \
+	sw=$$(printf '%s\n' "$$changed" | grep -cE '^(Makefile|compose\.yaml|\.env\.example|scripts/.*\.sh)$$' || true); \
 	echo "gate: $$(printf '%s\n' "$$changed" | wc -l | tr -d ' ') file(s) changed against $$base"; \
 	printf '%s\n' "$$changed" | sed 's/^/  /'; \
 	echo; \
@@ -491,7 +692,15 @@ gate:  ## run exactly the checks this diff can reach (auto-scoped; GATE_BASE=...
 		echo "gate: SKIP stack + backend unit tests — no backend/, tests/ or python script changed"; \
 	fi; \
 	echo; \
-	if [ "$$fe" -eq 0 ] && [ "$$be" -eq 0 ]; then \
+	if [ "$$sw" -gt 0 ]; then \
+		echo "gate: stack wiring touched ($$sw file(s)) -> .env guard self-test"; \
+		$(MAKE) --no-print-directory check-env-self-test; \
+		$(MAKE) --no-print-directory check-env-idempotent; \
+	else \
+		echo "gate: SKIP .env guard self-test — no Makefile, compose.yaml, .env.example or shell script changed"; \
+	fi; \
+	echo; \
+	if [ "$$fe" -eq 0 ] && [ "$$be" -eq 0 ] && [ "$$sw" -eq 0 ]; then \
 		echo "gate: this diff reaches no test. That is the result, not a skipped step."; \
 		echo "gate: evidence for such a change is the diff itself plus a direct"; \
 		echo "gate: demonstration of the behaviour it changes."; \
@@ -563,7 +772,10 @@ E2E_IMAGE := $(shell $(COMPOSE) config --images 2>/dev/null | grep -v '^mysql' |
 # served bundle was 801,320 bytes where the freshly built image held 815,012.
 # The containers are cheap to replace and the confusion is not.
 e2e-up:  ## raise + migrate + seed the stack the e2e specs run against
-	@if [ ! -f .env ]; then echo "creating .env from .env.example"; cp .env.example .env; fi
+	@# Same substitution as dev-up, and this is the line issue #137 was
+	@# written from: it was the first thing a fresh worktree ran, and it wrote
+	@# a `.env` whose SECRET_ENCRYPTION_KEY the api refuses.
+	@$(MAKE) --no-print-directory env
 	ATRIUM_DDNS_COMPAT_STUB=1 $(COMPOSE) up -d --build
 	ATRIUM_DDNS_COMPAT_STUB=1 $(COMPOSE) up -d --force-recreate --no-deps api worker
 	@ready=0; for i in $$(seq 1 40); do \

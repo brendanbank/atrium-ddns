@@ -107,9 +107,14 @@ jobs:
     # invocation used to fail before collecting anything, and being the literal
     # command is what stops the fix regressing.
     #
-    # The 101-case wire table is NOT run here and must not be: it needs a live
+    # The 131-case wire table is NOT run here and must not be: it needs a live
     # service and an explicit --target/--base-url pair (`make test-compat`).
     # The run prints "the wire table was NOT RUN" rather than nought failures.
+    # It runs in `compat-wire-table` below, which raises that service — added
+    # by #130, which also corrected this number. It read "101-case" from #10's
+    # freeze through every later one (tests/compat/README.md records 110 and
+    # 114 on the way to today's 131), so the comment justifying why the table
+    # is not run here could not name the thing it was declining to run.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -172,7 +177,7 @@ jobs:
 
       - name: Wait for API
         run: |
-          for i in $(seq 1 40); do
+          for _ in $(seq 1 40); do
             if curl -fsS http://localhost:8000/api/readyz > /dev/null; then exit 0; fi
             sleep 3
           done
@@ -188,6 +193,171 @@ jobs:
 
       - name: Backend smoke tests
         run: make test-backend
+
+      - name: Dump stack logs on failure
+        if: failure()
+        run: docker compose logs
+
+  compat-wire-table:
+    # The frozen wire table, replayed against a live host stack. Until #130
+    # this ran NOWHERE automatically — `compat-guards` above runs the
+    # service-free half and says so, `smoke` raises a stack and never asks it
+    # a protocol question, and the local gate excludes the table by design
+    # because it needs a service named on the command line. So the one
+    # artefact this repository exists to preserve — the byte-exact behaviour
+    # of `/nic/update`, `/nic/delete` and `/nic/checkip` — was verified only
+    # when somebody remembered to type `make test-compat`.
+    #
+    # ## What #130 expected to be here, and why it is not
+    #
+    # #130 asked for a `moto`-backed Route 53 on loopback, on the premise
+    # that the host cases cannot run without one. Measured on this branch,
+    # that premise is wrong, and the measurement is short: the table's
+    # `fixture:` block asks for `service: stub` on every backend it declares,
+    # `make seed-compat-fixture` writes those as `stub1`/`stub2`/`stub3` plus
+    # one deliberately-unknown `no-such-service`, and
+    # `grep -i 'route53\|aws\|boto' tests/compat/protocol_cases.yaml` matches
+    # exactly one line — the upstream repository's name, in a comment. The
+    # host provider under test on this path is `atrium_ddns.compat_stub`,
+    # whose whole point (see its module docstring) is that it sits below
+    # `hostnameperzone` and touches no network.
+    #
+    # Run here with no AWS credentials, no `AWS_ENDPOINT_URL` and boto3
+    # resolving to the real `https://route53.amazonaws.com`, the table is
+    # 124 of 124 executable cases green. A moto server added to this job
+    # would receive no request from any of the 131 cases — a service that
+    # cannot be reached cannot go red, which makes it the "probe that could
+    # not fail" of `docs/ops/overnight-template.md` in its most literal form,
+    # and it would have sat in `backend/pyproject.toml` as a pinned
+    # dependency nothing imports. So no moto, and `backend/pyproject.toml` is
+    # untouched. (`moto` 5.2.3 is indeed current on PyPI, checked 2026-09-01;
+    # the issue was right about the version and wrong about the need.)
+    #
+    # The Route 53 adapter is not left unexercised by this. `make_client` is
+    # the module's single network boundary and `backend/tests/test_providers.py`
+    # replaces it with `FakeRoute53Client` under a `_no_network` fixture that
+    # denies `socket.connect` outright — an instrument moto could not be
+    # substituted into without first re-enabling sockets.
+    #
+    # ## Two steps, deliberately
+    #
+    # `make test-compat` answers "did a case fail". It does NOT answer "did a
+    # case run", and it exits 0 on a session that executed one case of the
+    # hundred-and-twenty-seven. `make check-compat-executed` reads the
+    # runner's own accounting block back out of the captured log and answers
+    # the second question. Both must pass. See the Makefile for the four ways
+    # the second one goes red.
+    #
+    # ## Same trigger as the rest of this file
+    #
+    # `master` only. A PR into a milestone branch gets no CI, so the first
+    # time this job runs is the release PR — which is where the milestone's
+    # combined work first meets the frozen table, and is the honest place for
+    # a compatibility check to sit.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Same shape as `smoke`'s, and a copy for the same stated reason: these
+      # jobs raise differently configured stacks, and one shared file would
+      # hide that. The difference that matters is NOT in here — see below.
+      - name: Prepare compat .env
+        run: |
+          cat > .env <<'EOF'
+          ENVIRONMENT=dev
+          APP_TIMEZONE=UTC
+          APP_SECRET_KEY=compat-secret
+          API_HOST_PORT=8000
+          MYSQL_HOST_PORT=3306
+          APP_BASE_URL=http://localhost:8000
+          SECRET_ENCRYPTION_KEY=0000000000000000000000000000000000000000000000000000000000000000
+          MYSQL_ROOT_PASSWORD=compat-root-pw
+          MYSQL_DATABASE=atrium_ddns
+          MYSQL_USER=atrium_ddns
+          MYSQL_PASSWORD=compat-pw
+          DATABASE_URL=mysql+aiomysql://atrium_ddns:compat-pw@mysql:3306/atrium_ddns
+          JWT_SECRET=compat-jwt-secret
+          JWT_ACCESS_TOKEN_EXPIRE_MINUTES=10080
+          WEBAUTHN_RP_ID=localhost
+          WEBAUTHN_RP_NAME=Atrium Ddns
+          WEBAUTHN_ORIGIN=http://localhost:8000
+          MAIL_BACKEND=console
+          MAIL_FROM=no-reply@example.com
+          ATRIUM_IMAGE=ghcr.io/brendanbank/atrium:0.29.0
+          EOF
+
+      # ATRIUM_DDNS_COMPAT_STUB=1 is set in the ENVIRONMENT of this one
+      # command and not written into `.env`, which is the same discipline
+      # `make e2e-up` follows and for the same reason: a `.env` key outlives
+      # the job that wanted it, and the next plain `docker compose up` would
+      # silently inherit a stack with fake DNS backends registered. The stub
+      # has a second gate of its own (`ENVIRONMENT` must not be `prod`), so
+      # this cannot be pasted onto a production stack and work.
+      - name: Build + start the stack with the compat stub registered
+        env:
+          ATRIUM_DDNS_COMPAT_STUB: "1"
+        run: docker compose up -d --build
+
+      - name: Wait for API
+        run: |
+          for _ in $(seq 1 40); do
+            if curl -fsS http://localhost:8000/api/readyz > /dev/null; then exit 0; fi
+            sleep 3
+          done
+          echo "API did not become ready" >&2
+          docker compose logs api
+          exit 1
+
+      - name: Run migrations
+        run: make migrate
+
+      # Without this the table answers `nohost` to every case that resolves a
+      # hostname, which reads exactly like a compatibility finding. The script
+      # reads the fixture out of protocol_cases.yaml rather than restating it,
+      # and refuses outright when the stub provider is not registrable — so a
+      # stack raised without the env var above stops here rather than
+      # producing a world whose backends nothing can resolve.
+      - name: Seed the frozen table's fixture world
+        run: make seed-compat-fixture
+
+      # TARGET and BASE_URL are passed explicitly. The Makefile refuses to
+      # invent either (#8) and that refusal is the point: it is what stops a
+      # run pointing the host table at the legacy service and reporting green.
+      # BASE_URL is resolved from INSIDE the api container, so it is
+      # `http://api:8000` and not the published port.
+      #
+      # `make test-compat` runs `check-compat-fresh` itself. Not bypassed and
+      # not reimplemented here — a table read from a stale image reports green
+      # for the wrong cases.
+      #
+      # The log goes to $RUNNER_TEMP rather than into the checkout. Nothing in
+      # `.gitignore` covers a `*.log` at the repo root, and an untracked file
+      # nothing ignores is the shape of trap `docs/ops/overnight-template.md`
+      # records under § Repo-specific traps. The runner's temp dir is outside
+      # the workspace, so there is nothing to ignore in the first place.
+      - name: Replay the wire table against the host
+        run: |
+          set -o pipefail
+          make test-compat TARGET=host BASE_URL=http://api:8000 2>&1 \
+            | tee "$RUNNER_TEMP/compat-run.log"
+
+      # The second instrument, and the one that makes the first trustworthy.
+      # Reads the runner's own accounting block back: freshness guard passed,
+      # nothing reported NOT RUN, the service was probed, and every executable
+      # case is one of the ones that passed. Relational, so it cannot go stale
+      # when the table is re-frozen at a different size.
+      - name: The table must have actually run
+        if: always()
+        run: make check-compat-executed LOG="$RUNNER_TEMP/compat-run.log"
+
+      - name: Upload the wire-table log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: compat-run-log
+          path: ${{ runner.temp }}/compat-run.log
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Dump stack logs on failure
         if: failure()

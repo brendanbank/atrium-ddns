@@ -7,7 +7,10 @@
 #
 # Usage (from this directory):
 #
-#   cp .env.example .env  # fill in JWT_SECRET, DB password
+#   make env              # .env.example + real secrets. NOT a bare `cp`: the
+#                         # example's SECRET_ENCRYPTION_KEY is a placeholder
+#                         # atrium refuses, and the api crash-loops behind a
+#                         # `up` that exited 0. `make up` guards this.
 #   docker compose up -d --build
 #   make migrate
 #   make seed-admin EMAIL=you@example.com PASSWORD=...
