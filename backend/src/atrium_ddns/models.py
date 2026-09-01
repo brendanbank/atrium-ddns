@@ -48,6 +48,7 @@ from app.host_sdk.crypto import SecretBlob, UserSecret
 from app.host_sdk.db import HostForeignKey
 from sqlalchemy import (
     JSON,
+    DateTime,
     BigInteger,
     ForeignKey,
     Index,
@@ -55,6 +56,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
     text,
 )
 from sqlalchemy.dialects import mysql
@@ -89,6 +91,19 @@ TTL_MIN = 30
 TTL_MAX = 86400
 
 
+#: ``DATETIME(6)`` on MySQL, plain ``DATETIME`` elsewhere.
+#:
+#: The suite builds its schema from this metadata on in-memory SQLite, so
+#: a bare ``mysql.DATETIME`` made the models unloadable there and forced
+#: every backend test through a real MySQL in a container — which is what
+#: made ten xdist workers share one database, which is what produced the
+#: races in #117 and #149. Production DDL is unaffected: alembic owns it
+#: and still emits ``DATETIME(6)`` verbatim.
+#:
+#: The same `with_variant` shape `SecretBlob` already uses below.
+UTC_DATETIME = DateTime().with_variant(MysqlDATETIME(fsp=6), "mysql")
+
+
 def _utcnow_col(**kwargs: Any) -> Any:
     """A ``DATETIME(6)`` defaulting to the server clock.
 
@@ -99,8 +114,11 @@ def _utcnow_col(**kwargs: Any) -> Any:
     keyset pagination over the compound index double-counts.
     """
     return mapped_column(
-        MysqlDATETIME(fsp=6),
-        server_default=text("CURRENT_TIMESTAMP(6)"),
+        UTC_DATETIME,
+        # `func.now()` rather than `CURRENT_TIMESTAMP(6)`: the literal is a
+        # syntax error in SQLite DDL. Only `create_all` reads this — the
+        # deployed default comes from the migration.
+        server_default=func.now(),
         **kwargs,
     )
 
@@ -130,7 +148,7 @@ class TimestampMixin:
 
     created_at: Mapped[datetime] = _utcnow_col(nullable=False)
     updated_at: Mapped[datetime] = _utcnow_col(
-        nullable=False, server_onupdate=text("CURRENT_TIMESTAMP(6)")
+        nullable=False, server_onupdate=func.now()
     )
 
 
@@ -152,10 +170,10 @@ class AtriumDdnsState(HostBase):
         BigInteger, nullable=False, default=0
     )
     updated_at: Mapped[datetime] = mapped_column(
-        MysqlDATETIME(fsp=6),
+        UTC_DATETIME,
         nullable=False,
-        server_default=text("CURRENT_TIMESTAMP(6)"),
-        server_onupdate=text("CURRENT_TIMESTAMP(6)"),
+        server_default=func.now(),
+        server_onupdate=func.now(),
     )
 
 
@@ -357,7 +375,7 @@ class Device(HostBase, TimestampMixin):
     # from zero updates in a window. Three states, three renderings;
     # collapsing them into 0 is how a status board lies.
     last_seen_at: Mapped[datetime | None] = mapped_column(
-        MysqlDATETIME(fsp=6), nullable=True
+        UTC_DATETIME, nullable=True
     )
     last_ip_v4: Mapped[str | None] = mapped_column(String(IPV4_LEN), nullable=True)
     last_ip_v6: Mapped[str | None] = mapped_column(String(IPV6_LEN), nullable=True)
@@ -451,7 +469,7 @@ class Hostname(HostBase, TimestampMixin):
     last_ip_v4: Mapped[str | None] = mapped_column(String(IPV4_LEN), nullable=True)
     last_ip_v6: Mapped[str | None] = mapped_column(String(IPV6_LEN), nullable=True)
     last_updated_at: Mapped[datetime | None] = mapped_column(
-        MysqlDATETIME(fsp=6), nullable=True
+        UTC_DATETIME, nullable=True
     )
 
     # What the authoritative nameserver answered, last time the health
@@ -467,7 +485,7 @@ class Hostname(HostBase, TimestampMixin):
     dns_ip_v4: Mapped[str | None] = mapped_column(String(IPV4_LEN), nullable=True)
     dns_ip_v6: Mapped[str | None] = mapped_column(String(IPV6_LEN), nullable=True)
     dns_checked_at: Mapped[datetime | None] = mapped_column(
-        MysqlDATETIME(fsp=6), nullable=True
+        UTC_DATETIME, nullable=True
     )
     dns_check_error: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
