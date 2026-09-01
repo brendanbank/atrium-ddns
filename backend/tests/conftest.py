@@ -464,6 +464,19 @@ async def purge_tenants(
                 ).bindparams(sa.bindparam("ids", expanding=True)),
                 {"ids": user_ids},
             )
+            # atrium's audit rows too. `audit_log.actor_user_id` is a real
+            # FK on the migrated schema, so MySQL cascades them away with the
+            # user; `create_all` has no constraint, the rows survive, and the
+            # next test's "exactly one audit row" assertion counts the last
+            # test's as well. Passes alone, fails in a full run — the shape
+            # that reads as flakiness.
+            await s.execute(
+                sa.text(
+                    "DELETE FROM audit_log WHERE actor_user_id IN :ids"
+                    " OR impersonator_user_id IN :ids"
+                ).bindparams(sa.bindparam("ids", expanding=True)),
+                {"ids": user_ids},
+            )
             for _t in ("ddns_domain", "ddns_device"):
                 await s.execute(
                     sa.text(f"DELETE FROM {_t} WHERE user_id IN :ids").bindparams(
