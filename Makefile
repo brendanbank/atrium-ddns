@@ -700,7 +700,21 @@ gate:  ## unit tests only. No docker, ever. Only what the diff can reach.
 	base="$(GATE_BASE)"; \
 	git rev-parse --verify -q "origin/$$base" >/dev/null 2>&1 && base="origin/$$base"; \
 	changed=$$( { git diff --name-only "$$base"...HEAD 2>/dev/null; git diff --name-only; git ls-files -o --exclude-standard; } | sort -u ); \
-	if [ -z "$$changed" ]; then echo "gate: no changes against $$base — nothing to check"; exit 0; fi; \
+	if [ -z "$$changed" ]; then \
+		trunk="$(or $(OVERNIGHT_TRUNK),master)"; \
+		if [ "$$base" != "origin/$$trunk" ] && git rev-parse --verify -q "origin/$$trunk" >/dev/null 2>&1; then \
+			echo "gate: nothing differs from $$base — you are on the tip. Comparing against origin/$$trunk instead."; \
+			base="origin/$$trunk"; \
+			changed=$$( { git diff --name-only "$$base"...HEAD 2>/dev/null; git diff --name-only; git ls-files -o --exclude-standard; } | sort -u ); \
+		fi; \
+	fi; \
+	if [ -z "$$changed" ]; then \
+		echo "gate: NOTHING WAS VERIFIED. This tree is identical to $$base, so there"; \
+		echo "gate: is no change to check. That is not a pass — it is the absence of"; \
+		echo "gate: a question. Run it on a branch with a diff, or name one with"; \
+		echo "gate: GATE_BASE=<ref>."; \
+		exit 0; \
+	fi; \
 	fe=$$(printf '%s\n' "$$changed" | grep -cE '^frontend/' || true); \
 	sf=$$(printf '%s\n' "$$changed" | grep -cE '^(tests/|scripts/.*\.py)' || true); \
 	bk=$$(printf '%s\n' "$$changed" | grep -cE '^backend/' || true); \
