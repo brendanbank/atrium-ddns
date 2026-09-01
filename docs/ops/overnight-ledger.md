@@ -1,3 +1,20 @@
+# Overnight ledger — incidents, not instructions
+
+**This file is NOT required reading.** The binding rules are in
+`overnight-contract.md`, which is 102 lines.
+
+This is the archive of failures those rules came from. Cite an entry when
+a rule looks like fussiness and someone is about to delete it. Search it
+when you hit something strange. Do not read it front to back before
+starting work — it grew from 915 lines to 1,555 in two weeks, it grows
+every run, and requiring every agent to read it cost roughly 20,000 tokens
+per agent for rules that mostly did not apply to their issue.
+
+Append freely. Nothing here has to be read to start work, so it can grow
+without costing anything.
+
+---
+
 # Overnight task template — portable
 
 A contract for running a milestone unattended: **one agent per issue, each in
