@@ -474,7 +474,15 @@ test-unit: $(TEST_VENV)/bin/python  ## backend unit tests. SQLite, no docker, ~8
 	 $(TEST_VENV)/bin/python -m pytest backend/tests -q --no-header \
 	   -p no:cacheprovider -m "not functional" $(PYTEST_ARGS)
 
-test-functional: ## the 71 that need real infrastructure (container + MySQL)
+test-functional: up migrate  ## the 71 that need real infrastructure (container + MySQL)
+	@# Depends on `up migrate` deliberately. This is the lane whose whole
+	@# reason for existing is that its tests need a migrated MySQL, a
+	@# bindable port 53, or atrium's MySQL-only SQL — so raising the stack is
+	@# the job, not an accident. The unit lane (`make test-unit`) starts
+	@# nothing.
+	@#
+	@# `up` carries --no-build, so if the image is missing this refuses and
+	@# names `make build` rather than quietly spending five minutes.
 	$(COMPOSE) exec -T api /opt/venv/bin/python -m pytest $(HOST_APP)/tests -m functional -ra $(PYTEST_ARGS)
 
 test-backend: check-fresh  ## backend tests + service-free compat guards, in the api container
