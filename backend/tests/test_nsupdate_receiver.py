@@ -59,6 +59,20 @@ would leave the socket, the signature and the refusals silently
 uncovered while the suite went on reporting green, which is the same
 shape as a stale image reporting the baseline for a file you just
 edited.
+
+Port 53 is held exclusively, so **two concurrent runs on one host collide**
+— one binds, the other fails immediately with no retry. CI never produces
+that: each job is its own runner, and ``--dist=loadfile`` keeps this whole
+file on a single xdist worker. Locally it happens if you run
+``make test-functional`` and ``make test-backend`` at the same time, which
+is how it was first seen.
+
+The bind is deliberately *not* made tolerant. A retry with backoff would
+also swallow a real "something else already owns port 53" — a resolver on
+the host, a stray container — and turn an immediate, accurate failure into
+a slow, quiet one. That is the same argument ``tsig_receiver`` makes for
+refusing a ``port=`` parameter, one layer out: this file's value is that
+nothing here is softened.
 """
 from __future__ import annotations
 
