@@ -54,3 +54,121 @@ letsencrypt/
 # is machine-local — so it protected this checkout and nobody else's. Tracked
 # here instead now that the repository is public and clones are other people's.
 .context/
+
+# --- What a deploy host writes into its own checkout (#76) -----------------
+#
+# `certs/` and `letsencrypt/` above cover the two directories this stack
+# creates by itself. Everything below covers the loose files an *operator*
+# leaves in the checkout while running the cutover runbook — the class that
+# a hurried `git add -A` during a cutover window turns into a commit.
+#
+# The incident: a deploy directory held a `.admin-credential` file, mode
+# 0600, untracked and matched by no pattern here, so `git status` listed it
+# as `??`. It was mitigated on that host by appending it to
+# `.git/info/exclude`, which is local to one checkout and travels nowhere.
+#
+# **Nothing in this repository writes that file, and nothing needs to.**
+# The issue proposed "show it once instead of persisting it" as the better
+# fix; there was no writer to change. Checked three ways rather than
+# assumed: a repo-wide grep for the name returns zero hits; `make
+# seed-admin` passes `--email/--password` to `app.scripts.seed_admin` and
+# that module — atrium's, read in the upstream checkout — contains no
+# `open(`, no `write`, no `Path(`, and prints its result; and
+# `scripts/dev-admin.sh` reads the login out of 1Password and writes no
+# file at all — it only *tells* the operator to create
+# `.devstack.local.conf`, which is ignored above. The "shown once"
+# discipline the device secrets follow is what the code already does. The
+# file was made by hand.
+#
+# So nothing below persists because it *must*. Two entries are the
+# exception and carry their reason:
+#
+#  * `certs/` and `letsencrypt/` (above) hold TLS material that has to
+#    exist on disk for the proxy to read, and are covered as directories.
+#  * `*.db` / `*.db-wal` / `*.db-shm` — `scripts/copy-legacy-db.sh` has to
+#    land the legacy copy somewhere the operator chooses, and the runbook
+#    keeps it deliberately (§ 8.2, indefinitely, off the host). It has to
+#    persist; it must not be stageable.
+#
+# Everything else is shaped as a *family* rather than as one filename,
+# because the leak that has already happened is the one you cannot have
+# again: a `.gitignore` line matching exactly `.admin-credential` stops
+# matching the day someone types `admin-cred.txt`.
+#
+# Two things to know before widening this section further. Word-shaped
+# patterns are root-anchored on purpose — `frontend/src/api/credentials.ts`
+# is real source and an unanchored `*credential*` would silently un-stage
+# the next file like it; `git ls-files --cached --ignored --exclude-standard`
+# is the one-line check that no tracked file has been swallowed, and it is
+# empty here. And macOS checkouts default to `core.ignorecase=true`, so
+# `git check-ignore` on a laptop cannot tell `/*credential*` from
+# `/*Credential*` — both spellings are present because the deploy host is
+# Linux, and `git -c core.ignorecase=false check-ignore -v` is the reading
+# that answers for it.
+
+# Credential drops. Root-anchored, for the reason above.
+/*credential*
+/*Credential*
+/*secret*
+/*Secret*
+/secrets/
+*.credential
+*.credentials
+.htpasswd
+.netrc
+.pgpass
+.my.cnf
+
+# Keys and certificates. `TLS_CERT_DIR` and `ACME_STORE_DIR` default to
+# `./certs` and `./letsencrypt` (both covered above) but are overridable,
+# so the material is only reliably caught by its extension. The `.tmp`
+# forms are `scripts/extract-acme-cert.sh`'s atomic-write intermediates,
+# which survive an interrupted extraction.
+*.pem
+*.pem.tmp
+*.key
+*.key.tmp
+*.crt
+*.cer
+*.der
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.ppk
+acme.json
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+deploy_key*
+
+# Copies of the legacy database and anything dumped out of MySQL. The
+# SQLite copy `scripts/copy-legacy-db.sh` takes is written to a path the
+# operator names, and it carries the fleet's bcrypt hashes and the Fernet
+# ciphertext of the Route 53 credential (docs/ops/cutover.md § 8.2). The
+# `-wal` / `-shm` siblings appear beside any WAL database that gets opened
+# in WAL mode — § 3 of that runbook is about exactly that.
+#
+# These three lines are not hypothetical and were not suggested by the
+# issue. Sweeping the untracked files of every real checkout of this repo
+# on the workstation — 41 of them, 123 distinct paths — found a legacy
+# `dyndns.db` and an `events.db`, each with its `-wal` and `-shm`, sitting
+# untracked and unignored at mode 0644, with a `users` table carrying
+# `password_hash` and `totp_secret` columns. Same defect as the issue's, in
+# a different file family, on a different machine.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sql
+*.sql.gz
+*.dump
+*.bak
+/instance/
+
+# Release bundles. `scripts/dev-release.sh` writes `dist/<tag>.bundle`,
+# which `dist/` already covers; `scripts/deploy-dev.sh` is handed a path,
+# and a bundle carries the whole history including anything in it.
+*.bundle

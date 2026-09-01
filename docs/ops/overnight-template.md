@@ -29,7 +29,7 @@ are listed again at the bottom of this card.
 | `<BOARD>` | Projects v2 board **2**, *atrium-ddns delivery* (`OVERNIGHT_PROJECT=2`), `Status` = Todo / In Progress / Done. Claim with `find_ready.py --claim <issue> --slug overnight`, then `find_ready.py --verify <issue>` — the claim is not a claim until the board moved. `bootstrap-github.sh --check`: setup COMPLETE. |
 | `<READY_CHECK>` | `find_ready.py --list` / `--graph`. Reads `Depends on:` from each issue body; every issue this repo opens must carry one (`Depends on: none` if free). |
 | `<GATE>` | see *Gate* below — four commands, measured 2026-08-15 on the scaffold. |
-| `<DEPLOY>` | `git bundle` over the deploy key → `docker compose up -d --build` on the host → verified by content with `scripts/deploy-verify.sh`. Identity file is `backend/src/atrium_ddns/router.py`, compared byte-for-byte against the **installed** package at `/opt/venv/.../site-packages/atrium_ddns/router.py`. **Not `/opt/host_app`** — the image copies `backend/` there *and* pip-installs it, and only the installed copy is on `sys.path`, so comparing `/opt/host_app` asserts about a tree the app never imports (found by #36). `compose up` exiting 0 proves nothing, and neither does hashing the wrong file. |
+| `<DEPLOY>` | `git bundle` over the deploy key → `docker compose up -d --build` on the host → verified by content with `scripts/deploy-verify.sh` (vendored here from the skill by #38; the skill's own copy is unchanged and still carries the defect below). Identity file is `backend/src/atrium_ddns/router.py`, compared byte-for-byte against the **installed** package at `/opt/venv/.../site-packages/atrium_ddns/router.py`. **Not `/opt/host_app`** — the image copies `backend/` there *and* pip-installs it, and only the installed copy is on `sys.path`, so comparing `/opt/host_app` asserts about a tree the app never imports (found by #36). `compose up` exiting 0 proves nothing, and neither does hashing the wrong file. **And the path is no longer taken on trust:** `OVERNIGHT_IDENTITY_MODULE=atrium_ddns.router` is resolved inside the container with `importlib.util.find_spec`, run under the interpreter the service runs, so the file being hashed is the file `import` would load — by definition, not by convention. The configured literal path is kept as the second instrument: a disagreement verifies the resolved path *and* fails the run (exit 5), so an image bump that moves the path is still loud. `scripts/deploy-verify.sh --self-test` shows the check FAILING — deliberate digest mismatch, missing path, unresolvable module, and a path the app does not import — against stubbed ssh, touching no host. |
 | `<DEPLOY_HOST>` | ssh alias **`atrium-ddns-deploy`** — one host, serial, one deployer (the orchestrator). The alias resolves in `~/.ssh/config`; the hostname is never in the repo, so `OVERNIGHT_DEPLOY_HOST` is safe to commit. Ubuntu 24.04, docker 29.1.3, 3 containers already running (the old service among them), 31 G free, 2.9 G RAM available, **port 8443 free**. The new stack goes up **beside** the old one on 8443 (`API_HOST_PORT=8443`, a distinct `MYSQL_HOST_PORT`, explicit `COMPOSE_PROJECT_NAME`). See plan § 5b — 8443 implies TLS and atrium does not terminate it. |
 | `<PROMOTION>` | **yes, this repo has one.** Atrium reads branding, feature flags, PAT policy and `system.host_bundle_url` from the `app_settings` KV table, not from the merged file. A merged bundle that nothing points at does not run: `make seed-bundle` (or an equivalent write to `system.host_bundle_url`) is the promotion step. Same for any `register_namespace` default a migration seeds. |
 | `<SMOKE>` | `scripts/smoke.sh` (`make smoke`) — 11 local checks against a running stack, exits non-zero on any failure. Later joined by `tests/smoke_test_dns.sh`, ported from `dyndns-route53`. `smoke_test_dns.sh` performs **real DNS writes** against whatever zone it is pointed at — allow-list is a dedicated test zone, never a zone carrying live records. Widening it is the operator's call. |
@@ -47,12 +47,54 @@ agent **measures its own baseline** — do not inherit these numbers.
 ```bash
 cd frontend && pnpm install --frozen-lockfile
 pnpm typecheck                     # tsc --noEmit — 0 errors
-pnpm test                          # vitest — 2 passed (2)
+pnpm test                          # vitest
 cd .. && make up && make migrate    # both alembic chains to head
-make test-backend                  # host tests 532 passed + compat 31 passed, 3 skipped
-make smoke PASS=<pw> EMAIL=<addr>  # scripts/smoke.sh — 11 passed (11)
-make test-e2e                      # Playwright — 16 passed (5 spec files), ~35s once the stack is up
+make test-backend                  # host tests + compat guards
 ```
+
+**No counts here, deliberately.** They were `2` and `532` for a fortnight
+against a real 200 and 833; re-measured on 2026-08-31 they were stale again
+within hours — `4d10e37`, the re-measure commit itself, ran 835 and the tip ran
+841 the same evening, because every issue in this milestone adds tests. This
+file's own rule applies to this file: *prefer deleting a derived number to
+maintaining one — an uncounted list cannot be miscounted.* Every agent measures
+its own baseline and reports it in the PR, which is the reading that matters,
+taken on the tree it actually ran against.
+
+Better: **`make gate`**, which reads the diff and runs exactly the above subset
+that the change can reach, printing what it skipped and why. One command, no
+judgement for a brief or an agent to get wrong.
+
+**Unit tests only.** `make smoke` and `make test-e2e` are both out of the
+per-issue gate by operator decision (V1M7). Smoke needs a stack and asserts
+about deployment wiring — bundle promotion, router mounting, migration heads —
+none of which a per-issue diff changes; e2e is covered by CI on the release PR.
+Both belong to the milestone merge, where they are asserting about the thing
+they actually describe.
+
+**`make test-e2e` is NOT in the per-issue gate.** Operator decision, V1M7. It
+runs **once**, on the release PR from `<MILESTONE_BRANCH>` into `<TRUNK>` —
+where GitHub CI runs it anyway, because the workflow fires on PRs into
+`master` and carries an `e2e` job. Running it per issue is therefore not an
+extra opinion, it is the same opinion paid for N times.
+
+The cost is not the specs — 20 of them run in ~40s. It is that every
+invocation stands a stack up first: `e2e-up` builds the image,
+force-recreates api and worker, runs both alembic chains, seeds the admin and
+the bundle, and checks bundle freshness. Per issue, per agent, per re-run.
+
+If your change is one an e2e spec could plausibly catch — a route, a nav
+item, the host bundle contract, anything that renders — **say so in the PR
+body** so the milestone merge knows where to look. Do not run it yourself.
+
+**Re-measured 2026-08-31 on the V1M7 tip.** The figures above were the
+2026-08-15 scaffold's and had drifted badly — vitest read `2 passed` against a
+real 200, and the backend `532` against a real 833. Nobody was misled, because
+every brief says *measure your own baseline* and #85's agent did exactly that
+and reported the discrepancy. That is the rule working, not the numbers being
+harmless: a stale figure in the contract is the same **inherited number** the
+gate section warns about, one indirection further back, and the contract is the
+one document every agent reads.
 
 **`make test-e2e` is in the gate from #91, and it is the only instrument
 here that renders anything.** Everything above it is HTTP: the endpoints,
@@ -144,7 +186,16 @@ against 800 rather than against today's suite.
 **Parallel agents need distinct host ports.** Compose isolation now covers the
 image tag and the volume, but `API_HOST_PORT` / `MYSQL_HOST_PORT` come from
 `.env`, which each worktree copies from the same example. Two agents on the
-defaults collide. Docker fails loudly on the bind (`port is already allocated`),
+defaults collide.
+
+**`COMPOSE_PROJECT_NAME` in `.env` is inert — set `COMPOSE_PROJECT` instead.**
+The Makefile now passes `-p $(COMPOSE_PROJECT)` explicitly, derived from the
+*resolved* directory basename so a symlinked path and its target address one
+project. An explicit `-p` beats compose's own `COMPOSE_PROJECT_NAME`, so the
+`.env` key does nothing. Isolation still holds for parallel agents, but by
+worktree basename rather than by the name anyone set — which means it holds by
+accident and reads as if it holds by instruction. Found by #85's agent while
+this very brief was telling agents to set the inert key. Docker fails loudly on the bind (`port is already allocated`),
 so this is a stall rather than a silent corruption — but pick your own pair and
 set `COMPOSE_PROJECT_NAME` too. If you find a stack you did not create, stop and
 report it; do not reuse it and do not tear it down.
@@ -159,13 +210,20 @@ same typecheck, same vitest suite, same backend tests, same Playwright specs
 (CI's `e2e` job, added by #91), plus a smoke test against a stack it stood up
 itself, which CI's `smoke` job also does but only after a full image build.
 
-Two consequences an agent must not get wrong:
+Three consequences an agent must not get wrong:
 
 - **Running the gate is not optional and not delegable to CI.** There is no
   green tick coming later to catch what you skipped. An issue whose PR was
   opened without a full local gate run has been merged unverified.
 - **Report the gate's real numbers in the PR body**, measured in your own
   worktree. They are the only record that it ran.
+- **The gate is about your branch. The tip you merge into is a separate
+  question, and it has been red before** — `4ff2da4` was red on arrival and
+  stayed so across two merges, with every instrument above reporting green.
+  Answering it does not mean reversing the decision in this paragraph; it
+  means running the same backend commands against the merge tree, which
+  `scripts/merge-tip-check.sh` does in about 40 seconds. See *After the
+  merge*.
 
 **The gate as scaffolded was not green.** `pnpm test` failed to collect every
 suite — `@brendanbank/atrium-host-bundle-utils@0.27.0` ships extensionless
@@ -610,7 +668,11 @@ hurriedly is the wrong way to do it; that decision belongs in a fresh session.
 8. **Merge, then hold.** Deploys are serial and belong to the orchestrator, so
    the deployed half of the evidence runs after the orchestrator deploys the
    wave and **verifies the deploy contains this merge**.
-9. **Close** with a comment summarising what was done, the deployed evidence,
+9. **Check the tip you just made.** `scripts/merge-tip-check.sh` — see *After
+   the merge* below. **Do not move the board item to Done on a red tip.** The
+   gate you ran at step 5 was about your branch; this is about the tree that
+   now exists, which nobody has gated.
+10. **Close** with a comment summarising what was done, the deployed evidence,
    and anything measured that contradicts the issue body — and move the board
    item to Done in the same step.
 
@@ -680,6 +742,128 @@ forever if the condition *errors* rather than turning true, and the run looks
 hung for no reason anyone can see. Bound every wait with a maximum number of
 attempts and fail loudly when they are exhausted.
 
+### How to run a long command — read this before the tiers
+
+The tiers below reduce how much you run. **This section is about how you wait,
+and it is the more important of the two**, because the failure it prevents is a
+stall rather than a cost.
+
+**Run the gate in the foreground, with an explicit `timeout`.** The Bash tool
+accepts up to 600000 ms; the full gate on this repo is roughly 4–6 minutes and
+fits inside it comfortably. A foreground call blocks, returns the output, and
+is over. There is nothing to poll and nothing to race.
+
+**Never background a wait.** A backgrounded `until …; done; echo READY` does
+not wait — it detaches and returns instantly with no output. The caller learns
+nothing, asks again, and leaves the previous waiter running. That is a positive
+feedback loop, and it is how one issue accumulated **nine** concurrent waiters.
+
+**Never `pgrep -f` for a string your own command contains.** `pgrep -f`
+matches full command lines, so `until ! pgrep -f "76_gate.sh"` matches *itself*
+and every sibling waiter. The loop cannot exit even in principle, and the
+script it waits on has usually already finished.
+
+**If something genuinely cannot fit in the foreground**, background it once
+with the harness's own mechanism and wait for the completion notification. Do
+not poll. If you must poll, bound it — `for i in $(seq 1 N)` with a loud
+failure when the attempts run out — and poll a *sentinel the job writes on
+exit*, never a process table.
+
+Measured, on #76 of V1M7. 180 Bash calls; `timeout` set on **5** of them, and
+only on the last; the gate backgrounded on call 1 and never once run in the
+foreground; 24 of the 38 gate-related calls backgrounded, including the waits.
+The gate itself had passed with `exit=0` long before the orchestrator
+intervened. **None of the time was spent testing.** The tiers below would have
+made the gate cheaper and would not have prevented any of this.
+
+### Gate tiers — run the cheapest one that could fail
+
+The full gate is six commands, but only two of them are expensive, and the
+expense is not the tests. Measured on the V1M7 tip: `make test-backend` is
+**833 tests in 16.66s** and `make test-e2e`'s specs run in **~30s**. What
+costs is the scaffolding around them — `pnpm install`, `make up` building an
+image, and `make test-e2e` running a whole `e2e-up` (image build,
+force-recreate, both alembic chains, seed admin, seed bundle,
+`check-bundle-fresh`) before the first spec executes. That happens on every
+invocation.
+
+**No spec count, for `9a93e32`'s reason.** This sentence used to say *"20
+specs in 40.3s"*. #113 added five and the wall clock moved from 29.8s to
+32.1s on the same machine — which is the argument the paragraph is making,
+and the count was the half of it that goes stale. The gate card stopped
+carrying test counts the same evening; a count in the *tier* table is the
+same inherited number one section further down.
+
+So pick the tier by what the diff can reach. **The orchestrator picks it and
+names it in the dispatch brief**; an agent that thinks the tier is wrong says
+so with the file and the mechanism rather than silently escalating.
+
+| tier | when the diff touches | run |
+|---|---|---|
+| **1 — none** | only docs, `.gitignore`, CI yaml, `scripts/` not imported by the app | `git diff --stat` proving no code path, plus the direct proof of the behaviour changed. **No stack.** |
+| **2 — backend** | `backend/`, `tests/`, python under `scripts/` | `make test-backend`. **No `pnpm`, no smoke, no e2e.** |
+| **3 — frontend** | `frontend/src/` | `pnpm typecheck`, `pnpm test` |
+| **4 — cross-cutting** | routes, migrations, the host bundle contract, anything in two of the above | tiers 2 + 3 together |
+
+No tier includes e2e. It is a milestone-merge step, not a per-issue one.
+
+Tier 1 is not a skipped gate, and the PR body must not read like one. It is
+`git diff --stat` showing the change cannot reach a test, plus the proof that
+the thing actually changed — for an ignore pattern, `git check-ignore -v` and a
+`git add -A` that stages nothing. That is *stronger* evidence about the change
+than a green Playwright run, which says only that something unrelated still
+works.
+
+**A tier is a floor, not a ceiling, and re-running is not free.** Re-run a
+tier when your diff changed, not to gain confidence in a result you already
+have.
+
+**Never wait with `until`, and never `pgrep -f` a string your own command
+contains.** The real cost of the #76 incident was neither the gate nor its
+repetition: the agent backgrounded a gate script and then spawned **nine**
+waiters shaped like
+
+    until ! pgrep -f "76_gate.sh" >/dev/null; do sleep 30; done
+
+`pgrep -f` matches full command lines, so each waiter matched *itself* and its
+siblings and could never exit — while the script it waited on had already
+finished with `exit=0`. Each stall prompted another waiter. Run the thing in
+the foreground and let it block, or bound the poll with
+`for i in $(seq 1 N)` and fail loudly when the attempts run out. `until` cannot
+tell *not yet true* from *errored*, so it hangs where a bounded loop would
+report.
+
+**Scope the gate to what the change can reach — and say who scoped it.**
+The gate is mandatory, not ceremonial, and those are different claims. A
+change confined to `.gitignore` and `docs/` cannot be reached by a Playwright
+suite, a docker stack, a backend pytest session or a smoke test: there is no
+code path between them. Running them anyway does not raise confidence, it
+manufactures a **probe that cannot fail** and puts it in the gate, which is the
+defect family this file is most insistent about.
+
+Measured, on #76 of V1M7: an agent told to "run the full gate" on a
+two-line ignore-pattern change ran the whole suite — including Playwright —
+against a diff that could not reach any of it, and had pushed no branch and
+opened no PR long after the gate had passed. The brief was wrong, not the
+agent; it did exactly as instructed.
+
+**And the first write-up of this incident was itself wrong, which is the more
+useful half.** The orchestrator reported "invoked `make test-e2e` 36 times"
+from a `grep -c` over the agent's transcript. Counted properly — parsing the
+transcript's `tool_use` records instead of grepping its text — the real figure
+is **1 direct invocation** out of 180 Bash calls, plus two inside a gate script
+it ran once. The 36 were occurrences of the *string*: in prose, in the script's
+own source, and in the waiters that referenced it. An assertion about a report
+rather than about the thing being reported, made by the orchestrator, in the
+act of documenting that very family. Count invocations, not mentions.
+
+So: run the cheapest gate that could conceivably fail because of *this* diff,
+and put the reasoning in the PR body where a reader sees a decision on the
+record rather than a skipped step. For a change touching no code that is
+`git diff --stat` plus the direct proof of the behaviour changed. **The
+scoping is the orchestrator's call, not the agent's** — an agent that thinks
+the gate is disproportionate names the file and the mechanism and asks.
+
 **Measure your own baseline; never inherit one.** An orchestrator propagated a
 branch-local suite count as the milestone-branch count and two separate agents
 had to correct it. Every brief since says: measure your own.
@@ -699,6 +883,77 @@ spent drifting to fourteen minutes — `conftest.py` did still own the only
 container *of the kind it knew about*. Eleven fixtures had grown up outside it.
 **A warning phrased as "the thing I know about is still fine" cannot see the
 thing it does not know about; a count can.**
+
+### After the merge — the tip is a tree nobody gated
+
+**Two green branches can merge into a red one.** `v1m4-migration-cutover`
+merged `v1m3-host-ui` at `4ff2da4`: #65's harness guard came from one side,
+#50's rehearsal fixture from the other, and `git cat-file -e` on each parent
+shows neither parent held both files. Both PRs were correct against the tree
+they were reviewed on; the merge commit was the first tree in which the guard
+could see the fixture, and it was red the moment it existed. It stayed red
+across two further merges and was found by an unrelated issue's gate run,
+whose PR touched zero files under `backend/` or `tests/`.
+
+Every instrument in the contract says green about that state, and each for a
+good reason. CI does not run on milestone branches (deliberate; see the gate
+card). The gate is per-issue — it answers *is my branch green*, never *is the
+branch I merged into green*. And a merge with no textual conflict emits no
+signal at all: nothing conflicted here, the semantics did.
+
+So **step 9 of the per-issue workflow runs the gate against the merge tree**:
+
+```bash
+scripts/merge-tip-check.sh            # the milestone branch tip, fetched first
+scripts/merge-tip-check.sh --commit <sha>
+```
+
+Same commands, different tree. Not a second quality bar — it is the first bar,
+applied to the one tree nothing else looks at. It materialises the commit with
+`git archive` into its own directory, raises its own stack on ports it asks the
+kernel for, and tears both down; it cannot disturb your worktree, your branch
+or another agent's stack.
+
+**A red run is not a verdict, and the script does not report one.** This
+repository has a measured background rate, all of it on byte-identical trees:
+PR #111 recorded five full e2e runs at 18/20, 19/20, 20/20, 20/20, 20/20; PR
+#110 one more spec; PR #112 one non-reproducing backend failure. A check that
+called any of those a regression would be ignored inside a week. Three things
+follow:
+
+- **It runs the instrument with the low rate.** Backend only. e2e is not
+  reinstated here — its rate is far too high for an unattended accusation.
+- **It confirms before it accuses**, re-running the *full* suite rather than
+  the failing node ids, because re-running a subset changes the parallel
+  contention that produced the failure and would file a real xdist bug as a
+  flake. Only failures in the intersection of every run count.
+- **Its positive verdict is comparative, not repetitive** — and this is the
+  part that matters, because *"an intermittent failure is diagnosed by
+  sweeping, not by re-running"* is the rule two paragraphs up. The verdict is
+  *reproducibly red here **and** not red on either parent*. A flake would have
+  to hit the same node on every run of the merge tree and on no run of either
+  parent. Where a failing file simply does not exist on a parent, `git
+  cat-file -e` settles that parent in milliseconds and no stack is raised for
+  it.
+
+**The report names the merge, not the last PR.** That is the diagnosis half,
+and it is the half #78 actually cost: the natural reading of a red tip is "the
+last PR broke it", and there the last PR had not touched the files. Every
+verdict prints the commit and all of its parents.
+
+| exit | verdict | what it means |
+|---|---|---|
+| 0 | `GREEN` | clean, or the only failure did not reproduce — which is **reported, not swallowed** |
+| 3 | `MERGE-INDUCED` / `INTRODUCED HERE` | reproducibly red here, no parent is. Open the issue against **this commit**, naming both parents and which file came from which side |
+| 4 | `INHERITED` | red here *and* on a parent. It arrived broken; go to that parent's history |
+| 5 | `UNRESOLVED` | reproducibly red, parent evidence inconclusive. Reported rather than rounded to either verdict |
+| 6 | `INFRASTRUCTURE` | docker, build, migrate or the freshness guard failed. **Not** a red tip |
+
+Measured on this box, 2026-08-31: **40s** for the green path on the V1M7 tip
+(materialise, build, up, migrate, one full suite), **71s** for `4ff2da4` with
+two confirming runs and one parent replayed, **98s** for the worst case of
+three stacks. Against a merge that costs an agent a whole issue's work, that
+is the cheapest instrument in this file.
 
 ---
 
@@ -845,6 +1100,17 @@ Five times in one milestone, **the faulty thing was an instrument's own report**
 - A grant audit read `information_schema` **as the wrong account** and got an
   empty result — not an error. Two independent ways that instrument renders `0`,
   and `0` is what a healthy store looks like on exactly the rows that matter.
+- The **deploy verifier** byte-compared a file chosen *by convention* rather than
+  resolved. The image carries two copies of the host source and only one is on
+  `sys.path`, so the assertion was true, checkable, green — and about a tree
+  nothing imports. Nothing checked that the convention had picked the live
+  artefact, which is the same shape as #36's bind mount one level down: a guard
+  comparing a tree equal to the worktree *by construction*, which could only
+  ever pass, reporting 358 passed over 19 genuinely failing tests. The subject
+  of a check needs choosing as carefully as the assertion: resolve it with the
+  machinery the process itself uses (`importlib.util.find_spec` inside the
+  container, under the service's interpreter), and keep the configured value as
+  a second instrument that goes red when the two disagree (#38).
 
 ### Prove the guard bites
 
@@ -872,6 +1138,14 @@ A test that cannot fail is worth less than no test, because it is believed.
 - **A guard invalidated by an unrelated merge is a guard whose subject was
   borrowed rather than owned.** Assert the property directly, with a vacuity
   guard.
+- **A verifier that has only ever been seen passing proves nothing about
+  itself** — a check hardcoded to `exit 0` looks exactly like a check that
+  works. `scripts/deploy-verify.sh --self-test` re-invokes the real script with
+  `ssh` stubbed and asserts the exit code and wording of each way it must fail:
+  a deliberate digest mismatch, a path absent from the container, a module that
+  does not resolve, a repo path missing from the commit, and a configured path
+  the app does not import. No host, no container, no network — so "prove the
+  deploy check bites" is not a thing that needs a deploy to demonstrate.
 
 ### Local green is not deployed correct
 
@@ -1097,7 +1371,13 @@ When every issue in the milestone is closed:
 5. **Re-run at close-out rather than quoting the reading on file** — the estate
    moves. One re-run found a *third* gap that had not existed when the criterion
    was first demonstrated.
-6. Open a release PR from `<MILESTONE_BRANCH>` into `<TRUNK>`, merge, and close
+6. **Run the e2e suite once, here.** It is deliberately absent from the
+   per-issue gate, so the release PR is the first and only time the browser
+   sees the milestone's combined work. Opening the PR into `<TRUNK>` also
+   triggers CI's own `e2e` job, which is a second instrument on the same
+   question — report both, and treat a disagreement between them as the
+   finding rather than as noise.
+7. Open a release PR from `<MILESTONE_BRANCH>` into `<TRUNK>`, merge, and close
    the milestone.
 7. **Leave the milestone open if a clause is genuinely time-bound.** Closing an
    epic whose own AC says "exit criterion met" when it is not is the failure this
@@ -1172,3 +1452,41 @@ fussiness and gets dropped by the next person tidying the file — and the two
 warnings in the original version of this template that *were* kept, and *were*
 still walked into, are the reason each is now written as a story rather than an
 instruction.
+
+**A `.git/info/exclude` fix is a fix for exactly one checkout.** #76: a deploy
+directory held a `.admin-credential` file, mode 0600, untracked and matched by
+nothing in `.gitignore`, so `git status` listed it as `??` — during a cutover
+window, which is the one hour an operator is typing git commands under time
+pressure. It was mitigated on that host by appending the name to
+`.git/info/exclude`. That is machine-local: it protected that checkout and no
+other, and it is invisible to anyone reading the repository, so the next host
+inherits the foot-gun and not the answer. The same mistake had already been
+made once and corrected — `.context/` was excluded that way before it was moved
+into `.gitignore`.
+
+Three things the fix taught that a `.gitignore` line alone would not have:
+
+* **Nothing in the repo wrote the file.** `make seed-admin` takes the password
+  on argv and prints; atrium's `app.scripts.seed_admin` performs no filesystem
+  write at all; a repo-wide grep for the name returns zero hits. The issue
+  proposed "display it once instead of persisting it" as the better fix, and
+  there was no writer to change. **The premise was about an operator habit, not
+  about code** — which is precisely why the pattern has to cover a family
+  rather than a filename.
+* **A macOS reading cannot answer this question.** macOS checkouts default to
+  `core.ignorecase=true`, so `git check-ignore` on this workstation matched
+  `.admin-credential` against `/*Credential*` — a pattern that does **not**
+  match it on the Linux deploy host. A laptop reading would have reported the
+  host as covered on the strength of a line that is dead there.
+  `git -c core.ignorecase=false check-ignore -v` is the reading that answers
+  for the host, and it is what the PR body records.
+* **The real find came from a population nobody authored.** The synthetic
+  candidate list is written by the same person as the fix, so agreement
+  between them proves little. Sweeping the *actual* untracked files across
+  all 41 real checkouts of this repo on the workstation — 123 distinct paths
+  — turned up six that no synthetic list had suggested and that the old
+  `.gitignore` left stageable: a copy of the legacy SQLite database and its
+  `-wal` / `-shm` siblings, mode 0644, carrying `users.password_hash` and
+  `users.totp_secret`. **The defect the issue described on the deploy host was
+  also sitting on the workstation, in a different file family.** An accidental
+  find is not a sampling method; sweep a population you did not write.

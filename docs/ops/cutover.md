@@ -447,6 +447,50 @@ docker compose exec -T -u 0 api chmod 0644 /tmp/fernet.key   # readable by uid 1
 
 and delete it from the container when the import is done (§ 8).
 
+### 2.7 GATE: `git status` on the deploy host is clean, and `git add -A` is safe
+
+One command, in the checkout on the deploy host, before the window opens:
+
+```bash
+git status --porcelain --untracked-files=all      # expect: no output at all
+```
+
+**Why this is a gate and not housekeeping.** #76: that checkout held a
+`.admin-credential` file — mode 0600, correct, untracked, and matched by no
+pattern in `.gitignore`. So it showed as `??`, and § 5 is the one place in
+the whole runbook where an operator is typing git commands under time
+pressure. A hurried `git add -A` commits it, and the repository is public.
+It was mitigated at the time by appending the name to `.git/info/exclude`,
+which is local to that one checkout and travels to no other host — a
+perfectly good *stopgap*, and the way to tell a stopgap from a fix is that
+a stopgap is invisible to every other clone. The fix is the `#76` block in
+`.gitignore`.
+
+Three things worth knowing before you reach for that block:
+
+* **Nothing in this repository writes that file, and nothing needs to.**
+  `make seed-admin` passes the password to `app.scripts.seed_admin`, which
+  prints its result and performs no filesystem write; `scripts/dev-admin.sh`
+  reads the login out of 1Password and writes nothing either. The file was
+  made by hand — so the patterns cover *families* (`*credential*`, `*.key`,
+  `*.pem`, `*.db`, `*.sql`, `*.bundle`) rather than the one name, because
+  the next hand-made one will be spelled differently.
+* **`make seed-admin` puts the password in your shell history** (README says
+  so, and § 2.5 is where you will be doing it). Clear the history entry
+  afterwards. Do not solve it by writing the password to a file here.
+* **A non-empty `git status` is the finding, not the noise.** If something
+  appears that this block does not cover, it is a file family nobody
+  anticipated: add it to `.gitignore` so the next host inherits the answer
+  rather than the discovery.
+
+If you want the pattern-level reading rather than the behavioural one —
+which of the two spellings actually matched, and whether it would still
+match on this Linux host rather than only on a case-insensitive laptop:
+
+```bash
+git -c core.ignorecase=false check-ignore -v -- <path>
+```
+
 ---
 
 ## 3. ⛔ Copy, never open. Never `immutable`.
@@ -660,6 +704,39 @@ built to refuse.
 
 The dry run reports target counts as `n/a — NOT MEASURED, because nothing was
 committed`, explicitly not as `0`.
+
+#### The two lines to read before anything else — the pre-cutover check (#83)
+
+Since #83 the plan block prints two counts unconditionally, and on the
+population this runbook was written against **both are zero**:
+
+```
+  per-name TTL              -> 0 of 11 ddns_hostname.ttl written (0 zone(s) disagreed)
+  per-name backend choice   -> 0 ddns_hostname_backend row(s) for 0 name(s), from 11 legacy binding(s)
+```
+
+**Anything other than `0` on either line means this import is doing something
+no rehearsal has ever done.** That is not a reason to stop — the importer now
+migrates both states, where before #83 it refused them outright — but it is a
+reason to read the NOTE that comes with the count and to re-check the affected
+names after step 5.6, because no run against real data has ever taken those
+branches.
+
+The zeroes are measured, and by two differently-shaped instruments:
+
+| | reading | instrument |
+|---|---|---|
+| hostnames whose zone disagrees about TTL | **0** | `refactor-plan.md` §3.3.1, "ttl \| uniformly 60" — #49, direct query against the WAL-safe copy, 2026-08-15 |
+| hostnames selecting a strict subset of their zone's backends | **0** | same table, "hostname_backends \| 11 rows … degenerate (each hostname lists exactly its domain's backends)" |
+| both, together | **0** | #50's four-run rehearsal completed against that same copy while the importer still *refused* both states. A run that reached either one could not have finished, so its completion is an independent reading of the same two counts |
+
+**Both numbers are inherited, not re-taken.** They date from 2026-08-15. V1M7
+does not touch the deploy host, so #83 had no legacy database to re-measure and
+did not invent one; the widened branches are exercised against a synthetic
+source built for them (`backend/tests/test_import_legacy.py` §7), end to end
+through `apply`, `verify` and `/nic/update`. **A re-import is a re-measurement**
+— the two lines above are where it reports, which is the whole reason they
+print even when they are zero.
 
 *Rollback:* the importer **refuses to run twice** rather than merging —
 
@@ -1098,6 +1175,21 @@ rm -rf /tmp/cutover                                # workstation
 The copies carry real bcrypt hashes and Fernet ciphertext. They are not the
 archive; § 8.2's are. Verified empty on both sides before the session ends.
 
+And the checkout itself, which § 2.7 gated going in:
+
+```bash
+git status --porcelain --untracked-files=all       # expect: nothing
+```
+
+`.gitignore` covers the loose key, database-copy and dump files this
+sequence produces (#76), so the expected output is empty. **Empty because
+the files are gone is not the same result as empty because they are
+ignored** — `ls` the directory as well, since § 8.2 says the legacy copy is
+kept indefinitely and only § 8.4's *working* copies are deleted. If
+something untracked does appear, it is a file family nobody anticipated:
+add it to `.gitignore` so the next host inherits the answer rather than the
+discovery.
+
 ---
 
 ## 9. Named gaps — the questions a dry read-through would still ask
@@ -1203,5 +1295,5 @@ estimated.
 * `infra/traefik/dynamic-acme.yml` — the router after the hand-over, and the fallback's side effect
 * `scripts/test-acme-handover.sh` — the gate test behind § 2.2.4 (`make test-acme-handover`)
 * `scripts/verify-acme-handover.sh` — step 5.4(e) (`make acme-verify`)
-* `backend/src/atrium_ddns/scripts/import_legacy.py` — the importer and its ten refusals
+* `backend/src/atrium_ddns/scripts/import_legacy.py` — the importer and the states it refuses (eleven mutations of a good world, one per rule; #83 retired two of them and added one)
 * `backend/src/atrium_ddns/scripts/rehearse_migration.py` — the rehearsal harness (#50)

@@ -528,9 +528,13 @@ function ZoneModalBody({
             label={f.label}
             value={fieldValues[f.key] ?? ''}
             withAsterisk={f.required}
-            onChange={(event) =>
-              setFieldValues((c) => ({ ...c, [f.key]: event.currentTarget.value }))
-            }
+            onChange={(event) => {
+              // Read *before* entering the updater — the same rule
+              // `BackendForm` carries, and for the same reason. See
+              // the credential field below for the full account.
+              const value = event.currentTarget.value;
+              setFieldValues((c) => ({ ...c, [f.key]: value }));
+            }}
             data-testid={`zone-setting-${f.key}`}
           />
         ),
@@ -599,9 +603,32 @@ function ZoneModalBody({
                 autosize
                 minRows={1}
                 value={secrets[key] ?? ''}
-                onChange={(event) =>
-                  setSecrets((current) => ({ ...current, [key]: event.currentTarget.value }))
-                }
+                onChange={(event) => {
+                  // Read the value *before* entering the updater, and
+                  // this is not style. A functional `setState` is only
+                  // run eagerly when the fiber has no update already
+                  // pending; otherwise React defers it to the render
+                  // phase, and by then `executeDispatch`'s `finally`
+                  // has set `event.currentTarget` back to `null`. The
+                  // lazy spelling therefore throws `Cannot read
+                  // properties of null (reading 'value')` *during
+                  // render*, which — with no error boundary over the
+                  // host tree — makes React unmount the whole host
+                  // root. The dialog and the list vanish together and
+                  // the `main` landmark is left empty, which reads
+                  // like the route swapped rather than like a typing
+                  // handler throwing.
+                  //
+                  // Whether an update is already pending depends on
+                  // whether a react-query refetch happened to land in
+                  // the same tick, so it is intermittent by nature and
+                  // gets *more* likely the busier the machine is. It
+                  // was diagnosed once already on `BackendForm`'s
+                  // credential field; this form is the copy that was
+                  // written from the old one and kept the defect.
+                  const value = event.currentTarget.value;
+                  setSecrets((current) => ({ ...current, [key]: value }));
+                }}
                 data-testid={`zone-credential-field-${key}`}
               />
             ))

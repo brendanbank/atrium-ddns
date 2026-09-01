@@ -339,10 +339,25 @@ def test_every_subject_the_issue_named_has_cases(cases):
 
 
 def test_the_family_sensitive_subjects_do_not_treat_ipv4_as_the_only_case(cases):
-    """Production is IPv6-first: 10 of 11 hostnames track a v6 address against 4
-    with v4 (plan 3.3.1). Every subject whose behaviour differs by address
-    family must therefore say so somewhere, or it has been written against the
-    less common path."""
+    """Production is IPv6-first: **305 IPv6 against 143 IPv4** across 448 events
+    (plan §3.3.1, measured 2026-08-15 on `events.ip_address`). Every subject
+    whose behaviour differs by address family must therefore say so somewhere,
+    or it has been written against the less common path.
+
+    The figure this docstring used to cite — *10 of 11 hostnames track a v6
+    address* — was **retracted**, and the retraction is the more useful half.
+    It was read from `hostnames.last_ip_v6`, which `dyndns.py` seeds from
+    `dns.resolver.resolve()` at boot for any hostname with no tracked IP. So it
+    counted hostnames with an AAAA record *in the zone*, including ones no
+    client has ever touched — a different population from the one the claim was
+    about, rendered in the same type. `events.ip_address` is the traffic.
+
+    The conclusion is unchanged and slightly stronger, which is why this is a
+    citation fix rather than a test change. It is fixed at all because a
+    retracted number in a docstring is worse than one in prose: a docstring
+    reads as the reason the test exists, and this one names a plan section as
+    its authority — so the next reader to check finds the plan and the
+    docstring disagreeing, and has to work out which is current."""
     family_sensitive = {"provider", "health_check", "ip_tracking", "event_log"}
     v6 = re.compile(r"\bAAAA\b|\bIPv6\b|\bv6\b|2001:", re.I)
     silent = []

@@ -730,7 +730,10 @@ cases:
       at boot*, not from client traffic. So the 10/11 figure counts hostnames
       that have an AAAA record in the zone, which is not the same population as
       hostnames whose clients send AAAA updates. The instrument for the traffic
-      claim is `events.ip_address` on dns_update rows, and it has not been read.
+      claim is `events.ip_address` on dns_update rows, and it has now been
+      read: 448 events, 143 IPv4 against 305 IPv6, on 2026-08-15. The gap
+      this note described is closed; the figure it corrects is retracted
+      rather than merely refined.
       The conclusion -- exercise AAAA at least as hard as A -- is unaffected
       and is if anything reinforced, since both readings would have to be wrong
       in the same direction to overturn it.
@@ -888,6 +891,17 @@ cases:
       v6 and only 4 track v4, so the mixed case is the *common* one and a
       naive implementation returning nochg would report a successful delete as
       a no-op for most of the estate.
+
+      The 10-of-11 reading is retracted *for the traffic question* and is
+      still correct here, which is why it survives this sweep. It comes
+      from `hostnames.last_ip_v6`, seeded from live DNS at boot, so it
+      counts hostnames carrying an AAAA record **in the zone** -- the
+      wrong population for "do clients send v6 updates" (that is
+      `events.ip_address`: 143 v4 / 305 v6) and exactly the right one
+      for "does a delete have two families to remove". Same number, two
+      questions, one of which it can answer. Do not replace it with the
+      event counts: those would be the wrong instrument in the other
+      direction.
 
   - id: provider-any-api-failure-is-dnserr-never-an-exception
     subject: provider

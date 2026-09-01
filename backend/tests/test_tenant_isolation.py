@@ -857,6 +857,19 @@ _SESSION_READERS = frozenset({"get"})
 #: scope. Every entry is a claim in writing; the tests below refuse an
 #: empty one and refuse a stale one.
 READ_PATHS_NOT_SCOPED: dict[str, str] = {
+    "router.py:_unattributable_tally": (
+        "#64. It counts ddns_event rows whose user_id IS NULL — "
+        "authentication failures whose submitted username matched no "
+        "device, so there is nobody they could belong to. DdnsScope "
+        "applied to that population matches NOTHING by construction "
+        "(user_id == uid is never true for NULL), so scoping it would "
+        "return a structural zero and publish it as a measurement: the "
+        "exact defect the tally exists to remove one layer up. It "
+        "selects COUNT(*) and no column, so no row, username, address, "
+        "device or other tenant's data can leave through it, and it "
+        "runs only when the caller filtered on a response code in "
+        "PARTIALLY_ATTRIBUTED_RESPONSE_CODES."
+    ),
     "auth_device.py:authenticate_device": (
         "This is the query that ESTABLISHES the tenant. A device presents "
         "HTTP Basic credentials and there is no atrium session, no cookie "

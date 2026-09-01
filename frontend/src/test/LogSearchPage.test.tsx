@@ -358,36 +358,130 @@ describe('empty is three states, and a fourth that must not pass for one', () =>
     expect(screen.queryByTestId('log-empty-filtered')).not.toBeInTheDocument();
   });
 
-  test('a tenant-scoped badauth filter says the zero is not evidence', async () => {
-    // The defect this branch exists for, found by running real
-    // `/nic/update` traffic and reading the result: `badauth` rows are
-    // written before any device is identified, so they carry no
-    // `user_id` and are invisible to every tenant. Zero is also what a
-    // healthy account looks like, so the surface built to answer *why
-    // is my router not updating* would answer it wrongly.
+  test('a badauth zero renders differently from a badauth zero with unattributable lines', async () => {
+    // #64's acceptance, and the pair is the assertion. `badauth` rows
+    // are attributed to the owner of the username presented, so this
+    // filter matches for a tenant now — but an attempt against a
+    // username no device holds still belongs to nobody, and that is
+    // exactly what a router configured with a typo produces. So an
+    // empty page has two meanings and they must not render the same.
+    //
+    // The probe question: what would each print if the thing it
+    // measures were absent? A caption would print one string for both.
+    // These print different strings, and the counts are on the DOM.
     setLocation('?response_code=badauth');
+
+    // (a) nothing at all — a measured zero on both halves.
     payload = page({
       rows: [],
       any_rows_in_scope: true,
       cross_tenant: false,
-      unmatchable_filters: [
-        {
-          filter: 'response_code=badauth',
-          reason:
-            'these lines are written before any device is identified, so ' +
-            'they belong to no account and cannot appear in your log. A ' +
-            'zero here is not evidence that your credentials are working.',
-        },
-      ],
+      filters: { ...page().filters, response_code: 'badauth' },
+      unattributable: {
+        response_code: 'badauth',
+        rows: 0,
+        since: '2026-08-01T00:00:00',
+        until: null,
+        ignored_filters: [],
+      },
+    });
+    const clean = renderLog();
+    expect(await screen.findByTestId('log-unattributable')).toHaveAttribute(
+      'data-rows',
+      '0',
+    );
+    const cleanText = screen.getByTestId('log-unattributable').textContent;
+    // A zero must not be described as unmatchable: the filter matched,
+    // there were simply none.
+    expect(screen.queryByTestId('log-empty-unmatchable')).not.toBeInTheDocument();
+    clean.unmount();
+
+    // (b) the same empty page, with lines that cannot be attributed.
+    // The location changes because the react-query key is the filter
+    // set: rendering the identical query again is served from cache and
+    // would assert about part (a)'s payload — which is the "two
+    // instruments that were actually one" defect, in a test file.
+    setLocation('?response_code=badauth&client_ip=203.0.113.9');
+    payload = page({
+      rows: [],
+      any_rows_in_scope: true,
+      cross_tenant: false,
+      filters: { ...page().filters, response_code: 'badauth' },
+      unattributable: {
+        response_code: 'badauth',
+        rows: 41,
+        since: '2026-08-01T00:00:00',
+        until: null,
+        ignored_filters: [],
+      },
+    });
+    renderLog();
+    const loud = await screen.findByTestId('log-unattributable');
+    expect(loud).toHaveAttribute('data-rows', '41');
+    expect(screen.getByTestId('log-unattributable-count')).toHaveTextContent(
+      '41',
+    );
+    expect(loud).toHaveTextContent('mistyped username');
+    // The admin path the acceptance asks for, named on the surface.
+    expect(screen.getByTestId('log-unattributable-admin')).toHaveTextContent(
+      'atrium_ddns.events.read.all',
+    );
+    // The whole criterion, in one assertion: two different zeroes, two
+    // different strings.
+    expect(loud.textContent).not.toEqual(cleanText);
+  });
+
+  test('the tally is silent when it was not asked, and when the reader is cross-tenant', async () => {
+    // `null` is *not asked* and must render as nothing — not as a
+    // measured zero. And a cross-tenant reader sees the ownerless rows
+    // in the ledger itself, so a separate count would restate what is
+    // already on screen and imply they are hidden.
+    setLocation('?response_code=good');
+    payload = page({ rows: [], any_rows_in_scope: true });
+    const notAsked = renderLog();
+    expect(await screen.findByTestId('log-empty-filtered')).toBeInTheDocument();
+    expect(screen.queryByTestId('log-unattributable')).not.toBeInTheDocument();
+    notAsked.unmount();
+
+    setLocation('?response_code=badauth');
+    payload = page({
+      rows: [],
+      any_rows_in_scope: true,
+      cross_tenant: true,
+      unattributable: {
+        response_code: 'badauth',
+        rows: 41,
+        since: '2026-08-01T00:00:00',
+        until: null,
+        ignored_filters: [],
+      },
+    });
+    renderLog();
+    expect(await screen.findByTestId('log-empty-filtered')).toBeInTheDocument();
+    expect(screen.queryByTestId('log-unattributable')).not.toBeInTheDocument();
+  });
+
+  test('a filter the tally could not honour is named rather than silently dropped', async () => {
+    // A row with no owner carries no `device_id`, so a tally narrowed
+    // by one would be 0 for every installation, forever — a probe that
+    // cannot fail. The server drops it and says so.
+    setLocation('?response_code=badauth&device_id=7');
+    payload = page({
+      rows: [],
+      any_rows_in_scope: true,
+      cross_tenant: false,
+      unattributable: {
+        response_code: 'badauth',
+        rows: 9,
+        since: '2026-08-01T00:00:00',
+        until: null,
+        ignored_filters: ['device_id=7'],
+      },
     });
     renderLog();
     expect(
-      await screen.findByTestId('log-empty-unmatchable'),
-    ).toBeInTheDocument();
-    // The sentence has to say what the zero is *not* evidence of.
-    expect(screen.getByTestId('log-unmatchable-values')).toHaveTextContent(
-      'not evidence that your credentials are working',
-    );
+      await screen.findByTestId('log-unattributable-ignored'),
+    ).toHaveTextContent('device_id=7');
   });
 
   test('the unmeasured fourth state renders as a bug, not as an empty log', async () => {

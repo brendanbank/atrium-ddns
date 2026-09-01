@@ -453,12 +453,65 @@ class HealthCheckSummary:
     resolved. The three record-status counters sum to
     ``records_checked``. :meth:`assert_consistent` is what stops this
     block becoming an accounting that reads like a pass.
+
+    Why the population is split four ways rather than three (#107)
+    -------------------------------------------------------------
+    It used to be three numbers — considered, never-written, checked —
+    and the gap between them had no name. A tick that reported
+    ``considered=5 never_written=1 checked=2`` was *arithmetically
+    silent*: the two missing names could have been legitimately
+    not-due, could have been past the batch ceiling, or could have
+    disappeared between the two statements that read them, and the
+    summary rendered all three identically and returned success. #107
+    is that exact reading, observed once and never reproduced, and the
+    reason it was worth fixing rather than retrying is that in
+    production the symptom is **hostnames silently skipped by a
+    health-check sweep**.
+
+    So every hostname in ``hostnames_considered`` now lands in exactly
+    one named bucket:
+
+    ==========================  ==============================================
+    ``hostnames_never_written`` no ``last_ip`` — nothing to compare against
+    ``hostnames_not_due``       has a ``last_ip``, checked recently enough
+    ``hostnames_checked``       resolved on this tick
+    ``hostnames_deferred``      due, but past ``batch_size``
+    ``hostnames_moved``         due when counted, absent when fetched
+    ==========================  ==============================================
+
+    and :meth:`assert_consistent` refuses any run whose buckets do not
+    add up. The gap is still allowed to be non-zero — batching and
+    staleness legitimately leave rows unchecked — but it can no longer
+    be *unattributed*.
     """
 
     enabled: bool = True
     hostnames_considered: int = 0
     hostnames_never_written: int = 0
+    #: Carry a ``last_ip`` but were checked more recently than
+    #: ``health_check_interval_minutes`` ago, so this tick skipped them
+    #: on purpose. Always ``0`` on a forced run, where the staleness
+    #: clause is a literal ``true``.
+    hostnames_not_due: int = 0
+    #: Carry a ``last_ip`` and passed the staleness clause — the work
+    #: this tick *should* do, counted before the batch ceiling is
+    #: applied. Read in the same statement as the three counts above,
+    #: so it is one snapshot of the population by construction.
+    hostnames_due: int = 0
     hostnames_checked: int = 0
+    #: Due, but beyond ``batch_size`` — real work this tick did not do,
+    #: and the number ``truncated=True`` used to assert without
+    #: quantifying.
+    hostnames_deferred: int = 0
+    #: Counted as due by the aggregate statement and **not returned** by
+    #: the row fetch that followed it. Under the engine's READ
+    #: COMMITTED isolation those are two snapshots unless something
+    #: makes them one, so this is the residue of a concurrent writer —
+    #: normally ``0``, negative if the population *grew*. It is a
+    #: measurement, not an error code: a manual run stamping
+    #: ``dns_checked_at`` a millisecond earlier is benign, and what is
+    #: not acceptable is it being invisible. See :func:`run_health_checks`.
+    hostnames_moved: int = 0
     #: ``True`` when the staleness filter was skipped — i.e. this run
     #: re-checked everything in reach rather than what was due. Carried
     #: on the summary rather than left to the caller to remember,
@@ -491,6 +544,41 @@ class HealthCheckSummary:
                 f"ok={self.ok} mismatch={self.mismatch} missing={self.missing} "
                 f"error={self.error} != records_checked={self.records_checked}"
             )
+        # #107. Two invariants, and they fail for different reasons.
+        #
+        # The first says the four population counts *partition* the
+        # population. They come out of one SQL statement built from one
+        # `has_last_ip` expression and one `staleness` expression, so it
+        # holds by construction — until three-valued logic, an edited
+        # predicate or a `NOT` that does not distribute breaks it, which
+        # are the ways this class of SQL actually goes wrong.
+        by_population = (
+            self.hostnames_never_written + self.hostnames_not_due + self.hostnames_due
+        )
+        if by_population != self.hostnames_considered:
+            raise AssertionError(
+                f"health check population does not partition: "
+                f"never_written={self.hostnames_never_written} "
+                f"not_due={self.hostnames_not_due} due={self.hostnames_due} "
+                f"sum to {by_population}, but considered="
+                f"{self.hostnames_considered}"
+            )
+        # The second says every hostname the run *counted* as due was
+        # then accounted for — resolved, deferred past the batch
+        # ceiling, or explicitly recorded as having moved between the
+        # count and the fetch. This is the one that would have fired on
+        # #107's recorded run had `hostnames_moved` been the mechanism:
+        # `checked=2` against `due=4` with nothing named for the other
+        # two is exactly the state that reported success.
+        by_due = self.hostnames_checked + self.hostnames_deferred + self.hostnames_moved
+        if by_due != self.hostnames_due:
+            raise AssertionError(
+                f"health check due accounting does not balance: "
+                f"checked={self.hostnames_checked} "
+                f"deferred={self.hostnames_deferred} "
+                f"moved={self.hostnames_moved} sum to {by_due}, but due="
+                f"{self.hostnames_due}"
+            )
         by_liveness = (
             self.devices_never_seen
             + self.devices_last_call_failed
@@ -506,7 +594,11 @@ class HealthCheckSummary:
         return {
             "hostnames_considered": self.hostnames_considered,
             "hostnames_never_written": self.hostnames_never_written,
+            "hostnames_not_due": self.hostnames_not_due,
+            "hostnames_due": self.hostnames_due,
             "hostnames_checked": self.hostnames_checked,
+            "hostnames_deferred": self.hostnames_deferred,
+            "hostnames_moved": self.hostnames_moved,
             "records_checked": self.records_checked,
             "ok": self.ok,
             "mismatch": self.mismatch,
@@ -776,6 +868,42 @@ async def run_health_checks(
     counted in ``hostnames_never_written`` rather than resolved. Nor
     does it drop ``health_check_batch_size``; a forced run over a large
     estate returns ``truncated=True`` and says how much it did.
+
+    One snapshot, and what happens when it is two (#107)
+    ----------------------------------------------------
+    #107 recorded a tick that reported ``hostnames_considered=5``,
+    ``hostnames_never_written=1`` and ``hostnames_checked=2`` — a
+    population query and a ``due`` query that could not both be right —
+    and asked whether the two are guaranteed to read one snapshot. They
+    were **not**, and not by accident: ``app/db.py`` creates the engine
+    with ``isolation_level="READ COMMITTED"`` so the worker's
+    ``SELECT … FOR UPDATE SKIP LOCKED`` on ``scheduled_jobs`` takes a
+    record lock instead of gap locks (atrium #152). Under READ
+    COMMITTED every statement gets a fresh read view, so two statements
+    in one transaction are two snapshots however the ``async with``
+    block is written. The isolation level is three modules away from
+    here and set for a reason that has nothing to do with this job,
+    which is exactly why it was worth writing down at the call site.
+
+    Two things follow, and both are implemented below rather than
+    asserted in prose:
+
+    * the **counts** — population, never-written, due, not-due — come
+      out of a **single** ``SELECT``, which is one snapshot under any
+      isolation level, instead of being two statements that happened to
+      share a session;
+    * the **row fetch** is necessarily a second statement, so it is
+      *reconciled* against the count rather than trusted. The
+      difference is published as ``hostnames_moved`` and logged at
+      warning, and :meth:`HealthCheckSummary.assert_consistent` refuses
+      a run whose buckets do not add up.
+
+    What can write ``dns_checked_at`` between the two statements, since
+    the answer is small and worth stating: this function (the worker
+    container's own 60 s tick sweeps **cross-tenant**, so it reaches
+    rows a tenant-scoped caller is looking at) and
+    :func:`clear_health_check_results`, which writes it back to
+    ``NULL``. Nothing else in this package touches the column.
     """
     factory = session_factory or get_session_factory()
     scope = scope or _sweep_scope()
@@ -795,35 +923,34 @@ async def run_health_checks(
         now = _now()
         stale_before = now - timedelta(minutes=config.health_check_interval_minutes)
 
-        # The population, and the slice of it we cannot check. Counted,
-        # not dropped: "0 problems" over an unstated population is the
-        # shape this whole file is written against.
-        totals = (
-            await session.execute(
-                scope.select(
-                    Hostname,
-                    sa.func.count().label("total"),
-                    sa.func.sum(
-                        sa.case(
-                            (
-                                sa.and_(
-                                    Hostname.last_ip_v4.is_(None),
-                                    Hostname.last_ip_v6.is_(None),
-                                ),
-                                1,
-                            ),
-                            else_=0,
-                        )
-                    ).label("never_written"),
-                ).select_from(Hostname)
-            )
-        ).one()
-        summary.hostnames_considered = int(totals.total or 0)
-        summary.hostnames_never_written = int(totals.never_written or 0)
-
+        # The two predicates, built once and used by both statements
+        # below. Spelled as values rather than repeated inline because a
+        # population count and a row fetch that disagree about what
+        # "due" means is the same defect as reading two snapshots, and
+        # the copy-paste version is how it happens.
+        #
+        # Neither expression is ever NULL: `IS NULL` / `IS NOT NULL` and
+        # `COALESCE` all return a value for a NULL column, so
+        # `sa.not_()` over them partitions cleanly rather than
+        # swallowing rows into the three-valued hole.
+        #
+        # `COALESCE(…, '') != ''` rather than `IS NOT NULL`, because
+        # `''` is **not NULL in SQL and falsy in Python** (#107). A row
+        # whose `last_ip_v4` is the empty string passed the old
+        # `IS NOT NULL` filter, was loaded into the batch, and was then
+        # dropped by `_check`'s `if not expected: continue` — occupying
+        # a batch slot it could never use and contributing nothing to
+        # any count. That is the same defect
+        # `test_the_never_written_slice_is_excluded_by_the_query_not_just_the_loop`
+        # documents for NULL, spelled differently; the two sides now
+        # agree on what "has something to compare against" means, so
+        # such a row is counted as `never_written`, which is what it is.
+        has_last_ip = sa.or_(
+            sa.func.coalesce(Hostname.last_ip_v4, "") != "",
+            sa.func.coalesce(Hostname.last_ip_v6, "") != "",
+        )
         # The staleness clause, or a literal `true` when the caller
-        # forced the run. Spelled as a value rather than as two branches
-        # building two statements: one statement, one place the ordering
+        # forced the run. One value, so there is one place the ordering
         # and the batch ceiling are applied.
         staleness = (
             sa.or_(
@@ -834,15 +961,50 @@ async def run_health_checks(
             else sa.true()
         )
 
+        # The population, split into the three slices that partition it.
+        # Counted, not dropped: "0 problems" over an unstated population
+        # is the shape this whole file is written against, and #107 is
+        # what an *unstated slice* costs — a tick that checked 2 of 4 due
+        # names logged `hostnames_checked=2` and returned success,
+        # because the two it skipped had nowhere to be counted.
+        #
+        # **One statement, therefore one snapshot** — this is the part
+        # #107 asked to be made explicit rather than left incidental.
+        # `app/db.py` creates the engine with
+        # `isolation_level="READ COMMITTED"` (atrium #152: it drops the
+        # gap locks that deadlocked the `scheduled_jobs` claim against
+        # concurrent API inserts), so two statements in one transaction
+        # here are two snapshots, not one. Rather than raise this
+        # block's isolation and re-import that deadlock, the three
+        # counts and the due count are read by a single `SELECT`, which
+        # is atomic under every isolation level MySQL offers.
+        totals = (
+            await session.execute(
+                scope.select(
+                    Hostname,
+                    sa.func.count().label("total"),
+                    sa.func.sum(
+                        sa.case((sa.not_(has_last_ip), 1), else_=0)
+                    ).label("never_written"),
+                    sa.func.sum(
+                        sa.case((sa.and_(has_last_ip, staleness), 1), else_=0)
+                    ).label("due"),
+                    sa.func.sum(
+                        sa.case(
+                            (sa.and_(has_last_ip, sa.not_(staleness)), 1), else_=0
+                        )
+                    ).label("not_due"),
+                ).select_from(Hostname)
+            )
+        ).one()
+        summary.hostnames_considered = int(totals.total or 0)
+        summary.hostnames_never_written = int(totals.never_written or 0)
+        summary.hostnames_due = int(totals.due or 0)
+        summary.hostnames_not_due = int(totals.not_due or 0)
+
         due_stmt = (
             scope.select(Hostname)
-            .where(
-                sa.or_(
-                    Hostname.last_ip_v4.is_not(None),
-                    Hostname.last_ip_v6.is_not(None),
-                ),
-                staleness,
-            )
+            .where(has_last_ip, staleness)
             # NULLs first: a hostname that has never been checked is more
             # interesting than one checked an hour ago, and without an
             # explicit order a batch-limited sweep can starve them
@@ -853,6 +1015,29 @@ async def run_health_checks(
         due = list((await session.execute(due_stmt)).scalars().all())
         summary.truncated = len(due) > config.health_check_batch_size
         due = due[: config.health_check_batch_size]
+
+        # The count and the fetch are two statements, so they are two
+        # snapshots. Reconcile them instead of trusting them: `expected`
+        # is what the fetch should have returned given the count and the
+        # ceiling, `deferred` is the honest remainder above the ceiling,
+        # and `moved` is whatever the two readings disagree by. Negative
+        # `moved` means the population *grew* between them.
+        expected = min(summary.hostnames_due, config.health_check_batch_size)
+        summary.hostnames_deferred = summary.hostnames_due - expected
+        summary.hostnames_moved = expected - len(due)
+        if summary.hostnames_moved:
+            # Not an error — a concurrent manual run or another sweep
+            # stamping `dns_checked_at` between the two statements is
+            # benign and expected on a busy installation. What is not
+            # acceptable is it being invisible, which is the whole of
+            # #107.
+            log.warning(
+                "atrium_ddns.health_check.population_moved",
+                counted_due=summary.hostnames_due,
+                fetched=len(due),
+                expected=expected,
+                batch_size=config.health_check_batch_size,
+            )
 
     if not due:
         summary.assert_consistent()

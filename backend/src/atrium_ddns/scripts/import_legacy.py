@@ -84,25 +84,68 @@ session after the commit, and the two are printed side by side. The
 hostname → device mapping is compared as a whole set, not sampled, and
 the provider credential is compared by SHA-256 of its canonical JSON —
 which never prints the value and still fails if a single byte moved.
+Since #83 the pair also compares **where each name would publish and
+at what TTL**: :attr:`Plan.publication` derives it from the legacy
+columns through the legacy service's own rules, and :func:`verify`
+derives it from the target through
+:func:`atrium_ddns.models.resolve_backends` and
+:func:`~atrium_ddns.models.resolve_ttl` — the functions ``/nic/update``
+itself calls. A column copied correctly into a row that resolves
+differently is the failure that reading columns cannot see.
+
+**The legacy TTL and the per-name backend choice both survive** —
+since #83, and only since ``0004_hostname_backends_and_ttl``
+-------------------------------------------------------------------
+
+Both of these were refusals before, and both were the *right* refusal
+at the time: under ``0002`` this schema hung TTL and backend choice off
+the zone, so migrating a per-name value would have changed its meaning
+without saying so. ``0004`` added ``ddns_hostname.ttl`` and
+``ddns_hostname_backend``, which made them expressible, and #83 turned
+each refusal into a mapping.
+
+* **``hostnames.ttl``.** A zone whose hostnames **agree** behaves
+  exactly as it did before: the one value goes into
+  ``ddns_domain_backend.config['ttl']`` and every
+  ``ddns_hostname.ttl`` stays NULL, so the names keep tracking their
+  binding. Production is uniformly 60, which is also ``DEFAULT_TTL`` —
+  but it is written explicitly rather than left to a default, so a
+  later change to the default cannot silently retune migrated zones. A
+  zone whose hostnames **disagree** pins every name in it on
+  ``ddns_hostname.ttl`` and puts the zone's most common value in the
+  binding for whatever is created next.
+* **``hostname_backends``.** Plan §3.3.1 recorded it empty on
+  2026-08-15; it is not — it holds one row per hostname, every one of
+  them naming the zone's only backend. That is the degenerate case,
+  and **both** schemas spell it as an *absent* selection (legacy
+  ``Hostname.get_backends()``,
+  :func:`atrium_ddns.models.resolve_backends`), so it still writes no
+  row and the name still tracks its zone. A *strict subset* now
+  becomes ``ddns_hostname_backend`` rows.
+  The one shape still refused is a binding naming a backend that is
+  not on the hostname's own zone: ``resolve_backends`` filters a
+  selection against ``domain.backends``, so such a row would resolve
+  to nothing and leave the name publishing nowhere.
+
+  The cost, stated because it is real: a degenerate legacy binding is
+  not carried across as an explicit one, so a name that legacy had
+  pinned-to-everything will pick up a backend added to its zone later,
+  where legacy would not have. Nothing in the measured population can
+  tell the two readings apart, and ``0004``'s and the frozen table's
+  reading is the one that keeps the zone live.
+
+**Whether either branch has ever run against real data: no.** Measured
+on the 2026-08-15 WAL-safe copy (``refactor-plan.md`` §3.3.1) both
+counts are **zero** — TTL uniformly 60, every binding degenerate — and
+this run had no access to a legacy database to re-take that reading.
+Both branches are exercised by ``backend/tests/test_import_legacy.py``
+against synthetic sources built for them, end to end through
+:func:`apply` and :func:`verify`, and the counts are printed by every
+run so a re-import that does reach them says so out loud.
 
 What this deliberately does not carry
 -------------------------------------
 
-* **The legacy TTL column.** ``hostnames.ttl`` is per hostname in the
-  old schema and per *backend* here (``ddns_domain_backend.config``
-  ``["ttl"]``, read by :func:`atrium_ddns.router_nic._backend_plan`).
-  A domain whose hostnames disagree about TTL is not expressible, so it
-  is a refusal; a domain whose hostnames agree writes the one value
-  into the backend config. Production is uniformly 60, which is also
-  ``DEFAULT_TTL`` — but it is written explicitly rather than left to a
-  default, so a later change to the default cannot silently retune
-  migrated zones.
-* **``hostname_backends``.** Plan §3.3.1 recorded it empty on
-  2026-08-15; it is not. Every hostname is bound to the domain's only
-  backend, which is exactly what "use all of this domain's backends"
-  means, so the target is unaffected. The rows are read and asserted to
-  be that degenerate case; a *selective* binding cannot be represented
-  (this schema hangs backends off the domain) and is a refusal.
 * **``rate_limit_configs``.** The global row becomes the namespace
   default, which #17 already registers. A per-user override on a row
   that becomes a *device* would change behaviour silently, so it is a
@@ -609,6 +652,21 @@ class PlannedHostname:
     last_ip_v4: str | None
     last_ip_v6: str | None
     last_updated_at: datetime | None
+    #: What the legacy row published at. Always an int — the legacy
+    #: column is NOT NULL — and kept separately from :attr:`ttl`
+    #: because it is the *expectation* the second instrument compares
+    #: against, not a thing that is written anywhere.
+    legacy_ttl: int = 0
+    #: ``ddns_hostname.ttl``, or ``None`` to inherit the binding's
+    #: ``config['ttl']``. Set only for a zone whose hostnames disagree
+    #: (see :func:`build_plan`); NULL everywhere else, so a zone that
+    #: agreed keeps tracking its binding exactly as it did before #83.
+    ttl: int | None = None
+    #: Legacy ``domain_backends.id`` values this name is pinned to.
+    #: Empty means *inherit every backend on the zone*, which is what
+    #: both schemas mean by an absent selection — so a degenerate
+    #: legacy binding lands here as empty, not as "all of them".
+    selected_legacy_backend_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -631,6 +689,55 @@ class Plan:
         """
         by_user = {d.legacy_user_id: d.username for d in self.devices}
         return {h.name: by_user[h.legacy_user_id] for h in self.hostnames}
+
+    @property
+    def publication(self) -> dict[str, tuple[tuple[str, int], ...]]:
+        """``hostname -> ((backend type, TTL), …)`` **as legacy answered it**.
+
+        The source-side half of #83's assertion, and deliberately not a
+        restatement of what :func:`apply` is about to write. It is
+        derived from the legacy columns only — ``hostnames.ttl`` and
+        ``hostname_backends`` — through the legacy service's own two
+        rules:
+
+        * ``Hostname.get_backends()`` is *the rows if there are any,
+          otherwise the domain's* — so an empty selection here means
+          every backend on the zone, in the zone's order;
+        * ``hostnames.ttl`` is per name and applies to every backend
+          that name publishes through. The legacy schema has no
+          per-backend TTL at all.
+
+        :func:`verify` builds the same mapping out of the **target**,
+        through :func:`atrium_ddns.models.resolve_backends` and
+        :func:`~atrium_ddns.models.resolve_ttl` — the functions
+        ``/nic/update`` itself calls — and :func:`compare` refuses when
+        the two differ. So the claim being checked is not "the columns
+        were copied" but *"this name would be published to the same
+        places at the same TTL as before"*, which is the only form of
+        it a router in the field can tell apart.
+
+        Keyed on ``backend_type`` rather than on an id because
+        ``UNIQUE(domain_id, backend_type)`` makes it unique within a
+        zone and it survives the renumbering the import performs; the
+        tuple is ordered, because the order decides the aggregate
+        status ``/nic/update`` returns.
+        """
+        by_domain: dict[int, list[PlannedBackend]] = {}
+        for backend in self.backends:
+            by_domain.setdefault(backend.legacy_domain_id, []).append(backend)
+        out: dict[str, tuple[tuple[str, int], ...]] = {}
+        for hostname in self.hostnames:
+            available = by_domain.get(hostname.legacy_domain_id) or []
+            chosen = set(hostname.selected_legacy_backend_ids)
+            used = [
+                b
+                for b in available
+                if not chosen or b.legacy_backend_id in chosen
+            ]
+            out[hostname.name] = tuple(
+                (b.backend_type, hostname.legacy_ttl) for b in used
+            )
+        return out
 
 
 def _identifiable(password_hash: str) -> bool:
@@ -776,11 +883,17 @@ def build_plan(snapshot: Snapshot, *, fernet_key: str | None) -> Plan:
     * a stored hash ``auth_device`` cannot identify, or one longer than
       the column;
     * a hostname whose domain or owner does not exist;
-    * two hostnames in one domain disagreeing about TTL, which this
-      schema hangs off the backend and cannot express per hostname;
-    * a selective ``hostname_backends`` binding, which this schema
-      cannot express either;
+    * a ``hostname_backends`` row naming a backend that is not on that
+      hostname's own zone, or a hostname that does not exist;
     * a per-user rate limit on a row that becomes a device.
+
+    **Two refusals were removed by #83, and neither was a bug.** Until
+    ``0004_hostname_backends_and_ttl`` this schema could not hold a
+    per-name TTL or a per-name backend selection, so both were refusals
+    — the right failure, since the alternative was migrating a row
+    whose meaning had quietly changed. ``0004`` made both
+    representable, so they are now mappings; what remains a refusal is
+    the one case ``0004`` did *not* make representable, above.
     """
     notes: list[str] = []
 
@@ -908,51 +1021,79 @@ def build_plan(snapshot: Snapshot, *, fernet_key: str | None) -> Plan:
             f"Legacy hostname ids {[h.id for h in orphans]} (names withheld)."
         )
 
-    ttl_by_domain: dict[int, set[int]] = {}
+    ttl_by_domain: dict[int, list[int]] = {}
     for row in snapshot.hostnames:
-        ttl_by_domain.setdefault(row.domain_id, set()).add(row.ttl)
-    disagreeing = {d: t for d, t in ttl_by_domain.items() if len(t) > 1}
+        ttl_by_domain.setdefault(row.domain_id, []).append(row.ttl)
+    zone_ttl = {d: _modal_ttl(t) for d, t in ttl_by_domain.items()}
+    disagreeing = {d for d, t in ttl_by_domain.items() if len(set(t)) > 1}
+    ttl_override: dict[int, int | None] = {}
+    for row in snapshot.hostnames:
+        # A zone that agrees writes NOTHING per name, exactly as it did
+        # before #83: `ddns_hostname.ttl` stays NULL and the name keeps
+        # tracking its binding's `config['ttl']`. That is the whole
+        # measured production population (`refactor-plan.md` §3.3.1,
+        # "ttl | uniformly 60"), so the rehearsed path is unchanged and
+        # the branch below has never run against real data.
+        ttl_override[row.id] = row.ttl if row.domain_id in disagreeing else None
     if disagreeing:
-        raise MigrationRefused(
-            "the legacy TTL is per hostname and this schema's is per backend "
-            "(ddns_domain_backend.config['ttl']). These domains' hostnames "
-            f"disagree: {sorted(disagreeing)} with TTLs "
-            f"{ {d: sorted(t) for d, t in disagreeing.items()} }. Pick one "
-            "per zone in the legacy service first, or split the zone."
+        notes.append(
+            f"{len(disagreeing)} zone(s) hold hostnames that DISAGREE about "
+            f"TTL, so {sum(1 for h in snapshot.hostnames if h.domain_id in disagreeing)} "
+            "name(s) in them are pinned individually on ddns_hostname.ttl and "
+            "the binding's config['ttl'] carries the zone's most common value "
+            "(ties resolve to the lowest). Every name in such a zone is "
+            "pinned, including the ones that happen to equal the zone value: "
+            "where the source never said 'this zone has a TTL', letting some "
+            "names inherit one would invent an answer that a later edit to "
+            "the binding would silently apply to a subset."
         )
 
     backends_by_domain: dict[int, list[LegacyBackend]] = {}
     for backend in snapshot.backends:
         backends_by_domain.setdefault(backend.domain_id, []).append(backend)
 
+    selection: dict[int, tuple[int, ...]] = {}
     if snapshot.hostname_backends:
-        selective = _selective_bindings(snapshot, backends_by_domain)
-        if selective:
+        unrepresentable = _bindings_off_the_domain(snapshot, backends_by_domain)
+        if unrepresentable:
+            # NOT widened, and this is the one that stays a refusal.
+            # A binding naming a backend that is not on the hostname's
+            # own zone has no honest target row: `resolve_backends`
+            # filters the selection against `domain.backends`, so
+            # writing it would produce a row that resolves to nothing
+            # and a name that publishes nowhere — "publish nowhere" by
+            # accident, which is precisely the state `0004` made
+            # unspellable on purpose.
             raise MigrationRefused(
-                "hostname_backends selects a SUBSET of a domain's backends "
-                f"for {len(selective)} hostname(s) (legacy ids "
-                f"{sorted(selective)}). This schema hangs backends off the "
-                "domain, so a per-hostname selection cannot be represented "
-                "and migrating it would silently widen those hostnames to "
-                "every backend of their zone."
+                f"{len(unrepresentable)} hostname_backends row(s) bind a "
+                "hostname to a backend that is not on that hostname's own "
+                f"domain (legacy hostname ids {sorted(unrepresentable)}). "
+                "resolve_backends() filters a selection against the zone's "
+                "own bindings, so migrating these would leave those names "
+                "publishing nowhere. Fix the source binding first."
             )
+        selection = _selected_bindings(snapshot, backends_by_domain)
+        pinned = {h: ids for h, ids in selection.items() if ids}
         notes.append(
-            f"hostname_backends holds {len(snapshot.hostname_backends)} row(s) "
-            "and every one of them binds a hostname to a backend its own "
-            "domain already has — the degenerate 'use all of this domain's "
-            "backends' case. Not migrated because there is nothing to "
-            "migrate. (Plan §3.3.1 recorded this table EMPTY on 2026-08-15; "
-            "it is not, and the target is unaffected.)"
+            f"hostname_backends holds {len(snapshot.hostname_backends)} row(s); "
+            f"{len(pinned)} hostname(s) select a strict SUBSET of their zone's "
+            f"backends and become {sum(len(v) for v in pinned.values())} "
+            "ddns_hostname_backend row(s). The rest bind a name to every "
+            "backend its own domain has — the degenerate case, which both "
+            "schemas spell as an ABSENT selection (legacy "
+            "`Hostname.get_backends()`, `models.resolve_backends`), so no row "
+            "is written for it and the name keeps tracking its zone. "
+            "(Plan §3.3.1 recorded this table EMPTY on 2026-08-15; it is not, "
+            "and on the measured population every row is degenerate.)"
         )
 
     planned_backends: list[PlannedBackend] = []
     for backend in snapshot.backends:
         canonical = _resolve_backend_type(backend.backend_type)
         credentials = decrypt_credentials(backend, fernet_key)
-        ttls = ttl_by_domain.get(backend.domain_id) or set()
         config: dict[str, Any] = {}
-        if ttls:
-            config["ttl"] = next(iter(ttls))
+        if backend.domain_id in zone_ttl:
+            config["ttl"] = zone_ttl[backend.domain_id]
         planned_backends.append(
             PlannedBackend(
                 legacy_backend_id=backend.id,
@@ -1001,6 +1142,9 @@ def build_plan(snapshot: Snapshot, *, fernet_key: str | None) -> Plan:
             last_ip_v4=h.last_ip_v4,
             last_ip_v6=h.last_ip_v6,
             last_updated_at=h.last_updated_at,
+            legacy_ttl=h.ttl,
+            ttl=ttl_override[h.id],
+            selected_legacy_backend_ids=selection.get(h.id, ()),
         )
         for h in snapshot.hostnames
     )
@@ -1045,29 +1189,96 @@ def build_plan(snapshot: Snapshot, *, fernet_key: str | None) -> Plan:
     )
 
 
-def _selective_bindings(
-    snapshot: Snapshot, backends_by_domain: Mapping[int, list[LegacyBackend]]
-) -> set[int]:
-    """Legacy hostname ids whose backend set is a strict subset.
+def _modal_ttl(values: Sequence[int]) -> int:
+    """The most common TTL in a zone; ties resolve to the lowest.
 
-    ``hostname_backends`` empty for a hostname means "all of its
-    domain's backends" (``Hostname.get_backends`` in the legacy model),
-    and so does a binding that names all of them. Anything in between
-    is a selection this schema cannot hold.
+    Only ever consulted for a zone whose hostnames disagree — where
+    every name is pinned individually, so this decides nothing about
+    the migrated rows. What it decides is what a hostname **added
+    afterwards** inherits, which is why it is the mode of the zone
+    rather than, say, ``values[0]``: the commonest answer is the least
+    surprising default, and an arbitrary one would be a number nobody
+    chose sitting in the place an operator reads the zone's TTL from.
+
+    Lowest-on-tie is arbitrary but *fixed*: an unstable tie-break makes
+    the same source database import to two different configs, and the
+    second instrument would then be comparing against a coin toss.
     """
-    domain_of = {h.id: h.domain_id for h in snapshot.hostnames}
+    counts: dict[int, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return min(counts, key=lambda ttl: (-counts[ttl], ttl))
+
+
+def _bound_backends(snapshot: Snapshot) -> dict[int, set[int]]:
+    """``legacy hostname id -> the backend ids it names``, as stored."""
     bound: dict[int, set[int]] = {}
     for hostname_id, backend_id in snapshot.hostname_backends:
         bound.setdefault(hostname_id, set()).add(backend_id)
-    selective: set[int] = set()
-    for hostname_id, chosen in bound.items():
+    return bound
+
+
+def _bindings_off_the_domain(
+    snapshot: Snapshot, backends_by_domain: Mapping[int, list[LegacyBackend]]
+) -> set[int]:
+    """Hostname ids naming a backend their own zone does not have.
+
+    Includes a binding for a hostname row that does not exist, which
+    lands here for the same reason: there is no zone to check it
+    against and therefore no target row to write.
+
+    This is the part of ``hostname_backends`` that #83 did **not**
+    widen. Every other shape is now migrated; this one still refuses,
+    because :func:`atrium_ddns.models.resolve_backends` filters a
+    selection against ``domain.backends``, so a row surviving this
+    check would resolve to the empty set and leave the name publishing
+    nowhere. Refusing beats writing a row whose only effect is silence.
+    """
+    domain_of = {h.id: h.domain_id for h in snapshot.hostnames}
+    stray: set[int] = set()
+    for hostname_id, chosen in _bound_backends(snapshot).items():
         domain_id = domain_of.get(hostname_id)
-        available = {
-            b.id for b in (backends_by_domain.get(domain_id) or ())
-        }
-        if chosen != available:
-            selective.add(hostname_id)
-    return selective
+        available = {b.id for b in (backends_by_domain.get(domain_id) or ())}
+        if chosen - available:
+            stray.add(hostname_id)
+    return stray
+
+
+def _selected_bindings(
+    snapshot: Snapshot, backends_by_domain: Mapping[int, list[LegacyBackend]]
+) -> dict[int, tuple[int, ...]]:
+    """``legacy hostname id -> the backends to pin it to``.
+
+    ``hostname_backends`` empty for a hostname means "all of its
+    domain's backends" (``Hostname.get_backends`` in the legacy model),
+    and so does a binding that names all of them — and
+    :func:`atrium_ddns.models.resolve_backends` spells the same thing
+    the same way, as an absent selection. So the degenerate case maps
+    to **no rows**, and only a strict subset becomes
+    ``ddns_hostname_backend`` rows.
+
+    The alternative — carrying every binding across verbatim, including
+    the complete ones — is faithful in a narrow sense and wrong in a
+    wider one. It agrees with legacy today and diverges from it the
+    moment a backend is added to a zone: legacy would keep publishing
+    the old set, atrium would too, and the eleven names in the measured
+    population would silently stop tracking a zone they have tracked
+    since ``0004`` argued for exactly that reading. The cost is stated
+    rather than hidden: a *degenerate* legacy binding does not survive
+    as an explicit one, so a name that had been pinned-to-everything
+    picks up a backend added later. Nothing in the measured population
+    distinguishes the two, and the reading that keeps the zone live is
+    ``0004``'s and the frozen table's.
+    """
+    domain_of = {h.id: h.domain_id for h in snapshot.hostnames}
+    selected: dict[int, tuple[int, ...]] = {}
+    for hostname_id, chosen in _bound_backends(snapshot).items():
+        domain_id = domain_of.get(hostname_id)
+        available = {b.id for b in (backends_by_domain.get(domain_id) or ())}
+        selected[hostname_id] = (
+            () if chosen == available else tuple(sorted(chosen))
+        )
+    return selected
 
 
 # --------------------------------------------------------------------- #
@@ -1084,6 +1295,12 @@ class Written:
     domains: int
     backends: int
     hostnames: int
+    #: ``ddns_hostname.ttl`` values written — i.e. names in a zone whose
+    #: hostnames disagreed. ``0`` on the measured population.
+    ttl_overrides: int = 0
+    #: ``ddns_hostname_backend`` rows written. ``0`` on the measured
+    #: population, where every legacy binding is degenerate.
+    selections: int = 0
 
 
 async def assert_target_is_empty(session: Any, plan: Plan) -> None:
@@ -1239,7 +1456,7 @@ async def apply(
     """
     from app.host_sdk.crypto import unlock_user_secrets
 
-    from ..models import Device, Domain, DomainBackend, Hostname
+    from ..models import Device, Domain, DomainBackend, Hostname, HostnameBackend
 
     # Emptiness first, owner second: the collision check is the cheap
     # refusal and `_resolve_owner` may *create* a user. A rollback would
@@ -1277,6 +1494,7 @@ async def apply(
         await session.flush()
         domain_ids[legacy_id] = domain.id
 
+    backend_ids: dict[int, int] = {}
     for backend in plan.backends:
         row = DomainBackend(
             domain_id=domain_ids[backend.legacy_domain_id],
@@ -1293,18 +1511,38 @@ async def apply(
         # the legacy primary-key order rather than the session's flush
         # order — the aggregate status on `/nic/update` depends on it.
         await session.flush()
+        backend_ids[backend.legacy_backend_id] = row.id
 
+    selections = 0
     for hostname in plan.hostnames:
-        session.add(
-            Hostname(
-                domain_id=domain_ids[hostname.legacy_domain_id],
-                device_id=device_ids[hostname.legacy_user_id],
-                name=hostname.name,
-                last_ip_v4=hostname.last_ip_v4,
-                last_ip_v6=hostname.last_ip_v6,
-                last_updated_at=hostname.last_updated_at,
-            )
+        record = Hostname(
+            domain_id=domain_ids[hostname.legacy_domain_id],
+            device_id=device_ids[hostname.legacy_user_id],
+            name=hostname.name,
+            last_ip_v4=hostname.last_ip_v4,
+            last_ip_v6=hostname.last_ip_v6,
+            last_updated_at=hostname.last_updated_at,
+            # NULL unless this name's zone disagreed about TTL — see
+            # `build_plan`. NULL is "inherit the binding", which is the
+            # state every hostname in the measured population is in.
+            ttl=hostname.ttl,
         )
+        session.add(record)
+        if hostname.selected_legacy_backend_ids:
+            # Flushed here rather than in one batch at the end because
+            # the selection row needs this hostname's id, and the id
+            # does not exist until the insert has gone out. Names with
+            # no selection — the whole measured population — cost no
+            # extra round trip.
+            await session.flush()
+            for legacy_backend_id in hostname.selected_legacy_backend_ids:
+                session.add(
+                    HostnameBackend(
+                        hostname_id=record.id,
+                        backend_id=backend_ids[legacy_backend_id],
+                    )
+                )
+                selections += 1
     await session.flush()
 
     return Written(
@@ -1315,6 +1553,8 @@ async def apply(
         domains=len(plan.domains),
         backends=len(plan.backends),
         hostnames=len(plan.hostnames),
+        ttl_overrides=sum(1 for h in plan.hostnames if h.ttl is not None),
+        selections=selections,
     )
 
 
@@ -1359,6 +1599,19 @@ class Reading:
     credential_digests: Mapping[tuple[str, str], str]
     password_hashes: Mapping[str, str]
     hostname_ips: Mapping[str, tuple[str | None, str | None]]
+    #: ``hostname -> ((backend type, TTL), …)`` — where each migrated
+    #: name would publish, and at what TTL, resolved through
+    #: :func:`atrium_ddns.models.resolve_backends` and
+    #: :func:`~atrium_ddns.models.resolve_ttl` rather than by reading
+    #: ``ddns_hostname.ttl`` and ``ddns_hostname_backend`` directly.
+    #: Compared against :attr:`Plan.publication`, which is derived from
+    #: the legacy columns alone. Default ``{}`` only so a hand-built
+    #: :class:`Reading` in a test stays constructible; :func:`compare`
+    #: treats a missing entry as a disagreement, not as "nothing to
+    #: check".
+    hostname_publication: Mapping[str, tuple[tuple[str, Any], ...]] = field(
+        default_factory=dict
+    )
 
 
 async def verify(session: Any, owner_id: int) -> Reading:
@@ -1374,7 +1627,7 @@ async def verify(session: Any, owner_id: int) -> Reading:
     from app.host_sdk.crypto import unlock_user_secrets
     from sqlalchemy.orm import selectinload
 
-    from ..models import Device, Domain, Hostname
+    from ..models import Device, Domain, Hostname, resolve_backends, resolve_ttl
     from ..scope import DdnsScope
 
     await unlock_user_secrets(session, owner_id)
@@ -1411,7 +1664,17 @@ async def verify(session: Any, owner_id: int) -> Reading:
         (
             await session.execute(
                 scope.select(Hostname)
-                .options(selectinload(Hostname.device))
+                .options(
+                    selectinload(Hostname.device),
+                    # Exactly the eager loads `router_nic` uses.
+                    # `resolve_backends` is a pure function over ORM
+                    # state and cannot lazy-load: a lazy load inside it
+                    # is a synchronous database call on the event loop,
+                    # which raises `MissingGreenlet` rather than being
+                    # slow.
+                    selectinload(Hostname.domain).selectinload(Domain.backends),
+                    selectinload(Hostname.selected_backends),
+                )
                 .order_by(Hostname.name)
             )
         )
@@ -1446,6 +1709,12 @@ async def verify(session: Any, owner_id: int) -> Reading:
         credential_digests=digests,
         password_hashes={d.username: d.password_hash for d in devices},
         hostname_ips={h.name: (h.last_ip_v4, h.last_ip_v6) for h in hostnames},
+        hostname_publication={
+            h.name: tuple(
+                (b.backend_type, resolve_ttl(h, b)) for b in resolve_backends(h)
+            )
+            for h in hostnames
+        },
     )
 
 
@@ -1530,7 +1799,50 @@ def compare(plan: Plan, written: Written, reading: Reading) -> list[str]:
                 "not survive"
             )
 
+    # #83's assertion, and the one that decides whether widening the
+    # two refusals was safe. The left-hand side is derived from the
+    # legacy columns through the legacy service's own rules; the
+    # right-hand side is read out of MySQL through `resolve_backends`
+    # and `resolve_ttl`, which is what `/nic/update` calls. Equal means
+    # every migrated name publishes to the same providers at the same
+    # TTL as before; unequal is the only failure a router in the field
+    # could ever notice.
+    expected_publication = plan.publication
+    for name, want in expected_publication.items():
+        got_pub = reading.hostname_publication.get(name)
+        if got_pub != want:
+            problems.append(
+                f"hostname (legacy id "
+                f"{next(h.legacy_id for h in plan.hostnames if h.name == name)}"
+                f"): would publish through {_render_publication(got_pub)}, the "
+                f"legacy row published through {_render_publication(want)} "
+                "(names withheld)"
+            )
+    unexpected = sorted(set(reading.hostname_publication) - set(expected_publication))
+    if unexpected:
+        problems.append(
+            f"{len(unexpected)} migrated hostname(s) are not in the plan at "
+            "all (names withheld)"
+        )
+
     return problems
+
+
+def _render_publication(
+    entry: tuple[tuple[str, Any], ...] | None,
+) -> str:
+    """``[route53@60, hetzner@300]`` — provider and TTL, never a name.
+
+    ``None`` is rendered as ``NOTHING`` rather than as ``[]``: a
+    hostname the target does not hold at all and one that publishes
+    nowhere are different failures, and ``[]`` would read as the second
+    while meaning the first.
+    """
+    if entry is None:
+        return "NOTHING (the target has no such hostname)"
+    if not entry:
+        return "[] (no backend at all)"
+    return "[" + ", ".join(f"{name}@{ttl}" for name, ttl in entry) + "]"
 
 
 # --------------------------------------------------------------------- #
@@ -1564,6 +1876,27 @@ def _print_plan(plan: Plan, *, source: Path) -> None:
         )
     )
     print(f"  {len(plan.hostnames)} hostname(s)             -> {len(plan.hostnames)} ddns_hostname")
+    # The two counts #83 exists for, printed on EVERY run including
+    # `--dry-run`, and printed even when they are zero. Both were
+    # refusals until `0004` made them representable, and both were
+    # measured at zero on the 2026-08-15 population — so a later
+    # re-import that is not zero here is doing something no rehearsal
+    # has ever done, and this line is where that becomes visible
+    # instead of silent. `docs/ops/cutover.md` § 5.3 records the
+    # rehearsed values to compare against.
+    pinned = sum(1 for h in plan.hostnames if h.ttl is not None)
+    zones = len({h.legacy_domain_id for h in plan.hostnames if h.ttl is not None})
+    rows = sum(len(h.selected_legacy_backend_ids) for h in plan.hostnames)
+    names = sum(1 for h in plan.hostnames if h.selected_legacy_backend_ids)
+    print(
+        f"  per-name TTL              -> {pinned} of {len(plan.hostnames)} "
+        f"ddns_hostname.ttl written ({zones} zone(s) disagreed)"
+    )
+    print(
+        f"  per-name backend choice   -> {rows} ddns_hostname_backend row(s) "
+        f"for {names} name(s), from "
+        f"{len(plan.snapshot.hostname_backends)} legacy binding(s)"
+    )
     print()
     spread: dict[str, int] = {}
     for device in plan.hostname_to_device.values():

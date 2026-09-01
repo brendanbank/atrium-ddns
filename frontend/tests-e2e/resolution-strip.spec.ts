@@ -20,6 +20,7 @@ import {
   loginAsUser,
   uniqueDeviceName,
   uniqueZoneName,
+  watchPageErrors,
 } from './helpers';
 
 /**
@@ -73,8 +74,15 @@ test.describe('the §3.3.1 walk, through the UI', () => {
     // it, and the operator ruled that a form whose only escape hatch
     // produces that state is offering a trap. The zone is created with
     // its provider in one submission.
-    const pageErrors: Error[] = [];
-    page.on('pageerror', (error) => pageErrors.push(error));
+    // `stillAlive()` is checked between steps rather than only at the
+    // end, and that is the whole of #122's second half. An uncaught
+    // throw inside the host tree makes React unmount the *root* — the
+    // dialog and the list go together and the `main` landmark is left
+    // empty — so the next locator assertion fails with "element(s) not
+    // found" and names the element instead of the crash. Three agents
+    // read that report and called it a flake. Asserting the error
+    // channel between steps makes the spec say what actually happened.
+    const stillAlive = watchPageErrors(page);
 
     const zone = uniqueZoneName();
     const deviceName = uniqueDeviceName();
@@ -101,6 +109,10 @@ test.describe('the §3.3.1 walk, through the UI', () => {
     for (const [key, value] of Object.entries(DEMO_CREDENTIAL)) {
       await zoneModal.getByTestId(`zone-credential-field-${key}`).fill(value);
     }
+    // #122's crash landed exactly here — on the credential field's
+    // change handler, which read `event.currentTarget.value` from
+    // inside a functional `setState`.
+    await stillAlive('after filling the credential fields');
     // Assert the select took before touching the submit. `zone-submit`
     // is disabled until a provider is chosen, so a click after a
     // select that silently missed does not fail — it waits for the
@@ -135,6 +147,7 @@ test.describe('the §3.3.1 walk, through the UI', () => {
     ).find((d) => d.name === zone)!.id;
     await bindScriptedBackend(page.request, domainId);
 
+    await stillAlive('while creating the zone and its provider');
     // --- 3. the device ------------------------------------------------
     await page.goto(DEVICES_PATH);
     await page.getByTestId('add-device').click();
@@ -149,6 +162,7 @@ test.describe('the §3.3.1 walk, through the UI', () => {
     const password = await page.getByTestId('issued-secret').innerText();
     await page.getByTestId('dismiss-secret').click();
 
+    await stillAlive('while creating the device');
     // --- 4. the name --------------------------------------------------
     await page.goto(NAMES_PATH);
     await page.getByTestId('add-hostname').click();
@@ -179,6 +193,7 @@ test.describe('the §3.3.1 walk, through the UI', () => {
     expect(update.status, 'the wire did not answer 200').toBe(200);
     expect(update.body, 'the wire did not answer good').toContain('good');
 
+    await stillAlive('while creating the name');
     // --- 6. the board, as a table -------------------------------------
     await page.goto('/atrium-ddns');
     const row = page.getByTestId(`board-row-${hostname}-A`);
@@ -186,6 +201,7 @@ test.describe('the §3.3.1 walk, through the UI', () => {
     await expect(row).toContainText(DOC_ADDRESS_V4);
     await expect(row).toContainText(deviceName);
 
+    await stillAlive('while rendering the board');
     // --- 7. the strip, where it still lives ---------------------------
     await row.getByTestId(`board-open-${deviceName}`).click();
     const card = page.getByTestId('device-detail');
@@ -208,6 +224,6 @@ test.describe('the §3.3.1 walk, through the UI', () => {
       contentType: 'image/png',
     });
 
-    expect(pageErrors, 'the page threw while rendering').toEqual([]);
+    await stillAlive('at the end of the walk');
   });
 });

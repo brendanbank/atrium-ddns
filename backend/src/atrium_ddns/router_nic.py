@@ -75,6 +75,7 @@ from sqlalchemy.orm import selectinload
 
 from .auth_device import (
     DeviceAuth,
+    FailedAuth,
     authenticate_device,
     check_rate_limit,
     client_address,
@@ -553,6 +554,7 @@ def record_event(
     event_type: str,
     response_code: str | None,
     auth: DeviceAuth | None = None,
+    failed_auth: FailedAuth | None = None,
     plan: HostnamePlan | None = None,
     client_ip: str | None = None,
     ip: str | None = None,
@@ -600,16 +602,47 @@ def record_event(
     ``preserve``, and a free-text column that sometimes carries a
     provider name and sometimes a refusal reason is not something a
     filter can index.
+
+    **``auth`` versus ``failed_auth`` — #64.** A row is written for a
+    verified device (``auth``) or for a refused credential
+    (``failed_auth``), never both. The second is why a ``badauth`` row
+    can now carry a tenant: :func:`~atrium_ddns.auth_device.
+    authenticate_device` resolves the submitted username before it
+    verifies anything, and a refusal that resolved a device names its
+    owner. A refusal that resolved *nothing* leaves ``user_id`` NULL,
+    and that NULL is the meaning — *no account this attempt could
+    belong to* — not a value the writer failed to supply.
+
+    The distinction is visible to the log surface: ``router.py``
+    derives ``PARTIALLY_ATTRIBUTED_RESPONSE_CODES`` from which call
+    sites below pass ``failed_auth=``, so a code whose rows are
+    *sometimes* attributable is told apart from one whose rows always
+    are — and the surface can then say what a zero on that filter does
+    and does not rule out.
     """
+    # `auth` and `failed_auth` are the same question — *whose row is
+    # this* — asked of a verified device and of a refused credential.
+    # They are two parameters rather than one union because the AST
+    # derivation in `test_router_events.py` reads the call sites to
+    # decide which response codes can carry a tenant *always* and which
+    # only *sometimes*, and it can see a keyword name where it cannot
+    # see a type. Passing both is a caller bug and is refused.
+    if auth is not None and failed_auth is not None:  # pragma: no cover
+        raise ValueError("a row is written for a verified device or a refusal")
+    actor: DeviceAuth | FailedAuth | None = auth or failed_auth
+    # `FailedAuth.device` is None when the username resolved to nothing;
+    # `DeviceAuth.device` never is. One expression covers both, and the
+    # `getattr` is not defensive — it is the union's only difference.
+    device = getattr(actor, "device", None) if actor is not None else None
     session.add(
         DnsEvent(
             created_at=_now(),
-            user_id=auth.user_id if auth else None,
-            device_id=auth.device.id if auth else None,
+            user_id=actor.user_id if actor else None,
+            device_id=device.id if device is not None else None,
             domain_id=plan.domain_id if plan else None,
             hostname_id=plan.hostname_id if plan else None,
-            user_email=auth.user_email if auth else None,
-            device_name=auth.device.name if auth else None,
+            user_email=actor.user_email if actor else None,
+            device_name=device.name if device is not None else None,
             domain_name=plan.domain_name if plan else None,
             hostname=plan.requested[:255] if plan else None,
             event_type=event_type,
@@ -683,16 +716,29 @@ async def _admit(
     until the credential verifies.
     """
     credentials = parse_basic_auth(request.headers.get("authorization"))
-    auth = await authenticate_device(session, credentials)
-    if auth is None:
+    outcome = await authenticate_device(session, credentials)
+    if isinstance(outcome, FailedAuth):
+        # #64. The row is attributed to the owner of the username that
+        # was presented, whenever that username resolved to a device —
+        # a wrong password, or a correct password on a deactivated
+        # account. It is left unattributed when it resolved to nothing,
+        # because there is then no owner, and that NULL is the meaning
+        # rather than a gap.
+        #
+        # This is the one line that turns `response_code=badauth` from a
+        # filter that answers every tenant zero into one that answers
+        # them their own failures. `authenticate_device` had already
+        # fetched the device row; before this it was discarded.
         record_event(
             session,
             event_type=EVENT_AUTH,
             response_code=STATUS_BADAUTH,
+            failed_auth=outcome,
             client_ip=client_ip,
             message=None,
         )
         return Admission(auth=None, refusal=STATUS_BADAUTH)
+    auth = outcome
 
     _touch_device(auth, request, client_ip)
 

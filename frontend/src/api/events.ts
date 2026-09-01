@@ -120,17 +120,51 @@ export interface EventPage {
    *  Collapsed into a boolean, a working filter looks like an empty
    *  account. */
   any_rows_in_scope: boolean | null;
-  /** Filters that ran and structurally cannot have matched **for this
-   *  caller**, each with its reason.
+  /** Filters that ran and structurally cannot have matched, each with
+   *  its reason.
    *
-   * Two ways it happens and they are different sentences. A typo'd
-   * provider returns zero rows and reads like "no traffic for that
-   * provider". A tenant-scoped `response_code=badauth` returns zero
-   * rows and reads like "my credentials are fine" — those lines are
-   * written before any device is identified, so they belong to no
-   * account. Both are false negatives carrying the authority of a
-   * measurement. */
+   * A typo'd provider returns zero rows and reads like "no traffic for
+   * that provider" — a false negative carrying the authority of a
+   * measurement.
+   *
+   * `response_code=badauth` used to be reported here as well, because
+   * those rows carried no owner and no tenant could ever see one. #64
+   * changed the writer: a failure against a username that resolves to a
+   * device is now attributed to that device's owner, so the filter
+   * matches and must not be described as one that cannot. What is left
+   * of the problem arrives as `unattributable` — a count, not a claim. */
   unmatchable_filters: UnmatchableFilter[];
+  /** How many rows carrying the filtered response code belong to **no
+   *  account at all**, over the same window.
+   *
+   * **Three states, and `0` is not the absent one.** `null` — not
+   * asked, because the filter is not on a partially-attributed code.
+   * `{ rows: 0 }` — asked, and there were none. `{ rows: 41 }` — asked,
+   * and forty-one authentication failures in this window belong to
+   * nobody.
+   *
+   * Why it exists after #64 attributed what it could: an attempt whose
+   * username matches no device has no owner, and that is exactly the
+   * shape a router configured with a mistyped username produces. Without
+   * this count, "no failures" and "failures that cannot be yours" render
+   * as the same empty panel. */
+  unattributable: UnattributableTally | null;
+}
+
+/** The count, with the population it was counted over.
+ *
+ * `since` / `until` and `ignored_filters` are not decoration: an
+ * ownerless row carries no `user_id`, `device_id`, `domain_id` or
+ * `hostname_id`, so a tally narrowed by any of those would be `0` by
+ * construction for every installation. The server drops those filters
+ * and names them here, so the reader can see the population the count
+ * is really over rather than assuming it is their own query. */
+export interface UnattributableTally {
+  response_code: string;
+  rows: number;
+  since: string;
+  until: string | null;
+  ignored_filters: string[];
 }
 
 export interface UnmatchableFilter {

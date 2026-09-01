@@ -5,7 +5,7 @@ allowed to look at a hostname. Split out of :mod:`atrium_ddns.router_nic`
 because all of it is testable without a request and none of it is
 about the DynDNS wire format.
 
-Four things here are load-bearing and none of them are obvious from
+Five things here are load-bearing and none of them are obvious from
 the code.
 
 **There is no atrium user on this path.** The caller is a router with
@@ -33,6 +33,17 @@ states for boto3.
 below, "no such device" returns in microseconds and "wrong password"
 returns in ~50 ms, so the response time enumerates the device list.
 The dummy is computed once at import against a value nothing knows.
+
+**A refusal names its reason and, when there is one, its owner.**
+:func:`authenticate_device` answers :class:`DeviceAuth` or
+:class:`FailedAuth` — never ``None``. Four refusals share one wire
+answer and must not share one log row: a wrong password against a real
+device belongs to that device's owner, and a username matching nothing
+belongs to nobody. Collapsing both into an unattributed row is what
+made ``response_code=badauth`` answer every tenant zero (#64). The
+distinction costs no extra query — the ``Device``/``User`` pair is
+already fetched below — and no extra disclosure, because the only
+reader of the resulting row is the owner of the username tried.
 """
 from __future__ import annotations
 
@@ -196,6 +207,65 @@ async def _burn_dummy_verify(presented: str) -> None:
     await anyio.to_thread.run_sync(_verify_sync, _DUMMY_HASH, presented or "-")
 
 
+#: The four refusals :func:`authenticate_device` distinguishes.
+#:
+#: They are **one answer on the wire** — ``badauth``, always, because
+#: telling them apart there tells an attacker which usernames exist.
+#: They are four in the log, and two of them resolved a real device
+#: before refusing, which is what makes the row attributable.
+AUTH_FAILED_ABSENT = "absent_or_empty_credentials"
+AUTH_FAILED_UNKNOWN_USERNAME = "unknown_username"
+AUTH_FAILED_BAD_PASSWORD = "bad_password"
+AUTH_FAILED_INACTIVE_OWNER = "inactive_owner"
+
+#: The refusals that resolved a device, and therefore an owner.
+#:
+#: Derived from nothing — it is a claim, and
+#: ``test_auth_device``/``test_router_nic`` check it against the
+#: function's real behaviour rather than against this tuple.
+ATTRIBUTABLE_AUTH_FAILURES = (
+    AUTH_FAILED_BAD_PASSWORD,
+    AUTH_FAILED_INACTIVE_OWNER,
+)
+
+
+@dataclass(frozen=True)
+class FailedAuth:
+    """A refused credential, and whom the attempt is attributable to.
+
+    The counterpart to :class:`DeviceAuth`, and the reason
+    :func:`authenticate_device` no longer answers ``None``. A bare
+    ``None`` collapses four conditions into one, and the caller then
+    writes a ``badauth`` row carrying no tenant **for all four** — which
+    is how the log came to answer every tenant *zero* to
+    ``response_code=badauth`` however many times their router failed.
+
+    ``user_id`` is populated exactly when the submitted username
+    resolved to a device: a wrong password against a real device, or a
+    correct password held by a deactivated owner. It is ``None`` when
+    the username matched nothing, because there is then nobody to
+    attribute the attempt to — and that ``None`` is a *meaning*, not a
+    missing value.
+
+    **This costs no extra query and no extra disclosure.**
+    :func:`authenticate_device` already fetches the ``Device``/``User``
+    pair before it verifies anything; this class carries the row that
+    was being thrown away. Nothing changes on the wire, nothing changes
+    in the timing, and the only party who can read the resulting row is
+    the owner of the username that was tried.
+    """
+
+    reason: str
+    device: Device | None = None
+    user_id: int | None = None
+    user_email: str | None = None
+
+    @property
+    def attributable(self) -> bool:
+        """Whether a log row written from this carries a tenant."""
+        return self.user_id is not None
+
+
 @dataclass(frozen=True)
 class DeviceAuth:
     """A verified device, and the tenant it belongs to."""
@@ -219,14 +289,30 @@ class DeviceAuth:
 
 async def authenticate_device(
     session: AsyncSession, credentials: BasicCredentials | None
-) -> DeviceAuth | None:
-    """Resolve and verify a device, or ``None`` for every refusal.
+) -> DeviceAuth | FailedAuth:
+    """Resolve and verify a device, or say which refusal it was.
 
-    One ``None`` for four different conditions — no credentials, no
-    such device, wrong password, owner deactivated — because the wire
-    has one answer for all of them (``badauth``) and telling them apart
-    on the wire tells an attacker which usernames exist. The log tells
-    them apart.
+    **One answer on the wire, four in the log.** No credentials, no
+    such device, wrong password, owner deactivated — the wire says
+    ``badauth`` to all four, because telling them apart there tells an
+    attacker which usernames exist. This function used to say ``None``
+    to all four as well, and that is the defect #64 is about: the
+    caller then wrote a ``badauth`` row with no ``user_id`` in every
+    case, so a tenant filtering their log for ``badauth`` was served
+    **zero** however many times their own router had failed — and zero
+    is also what a healthy account looks like.
+
+    So the refusal is now a :class:`FailedAuth` carrying the row this
+    function had already fetched. Two of the four reasons resolved a
+    real device and therefore a real owner (``bad_password``,
+    ``inactive_owner``); the other two resolved nothing and stay
+    unattributable, which is a state and not a gap.
+
+    **Nothing about the wire, the timing or the disclosure changes.**
+    The query below already ran before any of this; the dummy verify on
+    an unknown username still burns the same distribution; every caller
+    still answers ``badauth``. The only new reader of the resolution is
+    the tenant who owns the username that was tried.
 
     **The owner's ``is_active`` is checked here**, not on the device.
     ``ddns_device`` has no active flag; the fixture's ``dave`` is an
@@ -244,7 +330,7 @@ async def authenticate_device(
         # timing tell this leaves is "an empty password", which is not
         # a fact about the account.
         log.info("ddns.auth.absent_or_empty_credentials")
-        return None
+        return FailedAuth(reason=AUTH_FAILED_ABSENT)
 
     row = (
         await session.execute(
@@ -257,7 +343,10 @@ async def authenticate_device(
     if row is None:
         await _burn_dummy_verify(credentials.password)
         log.info("ddns.auth.unknown_device", username=credentials.username)
-        return None
+        # Nobody to attribute this to. Not "attributed to nobody as a
+        # fallback" — there is genuinely no owner, and the log row's
+        # NULL user_id is that fact rather than a missing value.
+        return FailedAuth(reason=AUTH_FAILED_UNKNOWN_USERNAME)
 
     device, user = row
 
@@ -270,7 +359,12 @@ async def authenticate_device(
             username=credentials.username,
             device_id=device.id,
         )
-        return None
+        return FailedAuth(
+            reason=AUTH_FAILED_BAD_PASSWORD,
+            device=device,
+            user_id=user.id,
+            user_email=user.email,
+        )
 
     if upgraded is not None:
         # The fleet migrates itself as routers check in — plan §3.2.
@@ -285,7 +379,12 @@ async def authenticate_device(
         log.info(
             "ddns.auth.inactive_owner", device_id=device.id, user_id=user.id
         )
-        return None
+        return FailedAuth(
+            reason=AUTH_FAILED_INACTIVE_OWNER,
+            device=device,
+            user_id=user.id,
+            user_email=user.email,
+        )
 
     return DeviceAuth(device=device, user_id=user.id, user_email=user.email)
 
@@ -432,10 +531,16 @@ async def check_rate_limit(
 
 
 __all__ = [
+    "ATTRIBUTABLE_AUTH_FAILURES",
+    "AUTH_FAILED_ABSENT",
+    "AUTH_FAILED_BAD_PASSWORD",
+    "AUTH_FAILED_INACTIVE_OWNER",
+    "AUTH_FAILED_UNKNOWN_USERNAME",
     "FORWARDED_FOR",
     "RATE_LIMIT_WINDOW",
     "BasicCredentials",
     "DeviceAuth",
+    "FailedAuth",
     "authenticate_device",
     "check_rate_limit",
     "client_address",
