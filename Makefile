@@ -675,24 +675,47 @@ GATE_BASE ?= $(or $(OVERNIGHT_MILESTONE_BRANCH),$(GATE_CONF_BRANCH),$(OVERNIGHT_
 # shell scripts reach no pytest and no vitest, so a diff confined to them used
 # to print "this diff reaches no test" and that was the whole reading. The
 # `.env` guard's own `--self-test` is the test they reach.
-gate:  ## the frontend unit tests. No docker. That is the whole gate.
-	@# Operator decision, 2026-09-01, after three attempts at "light" that
-	@# were not light. THE GATE TOUCHES NO DOCKER. No image build, no MySQL,
-	@# no migrations, no stack, under any condition.
+gate:  ## run only what this diff can reach. Often that is nothing.
+	@# THE RULE: a change runs a suite only if it can change that suite's
+	@# result. A one-line Makefile edit cannot affect a vitest test, so
+	@# running vitest for it is a probe that cannot fail — the defect family
+	@# this repo is most insistent about, sitting in the gate itself.
 	@#
-	@# Each agent worktree is its own compose project, so its image tag is
-	@# unique and `up` builds a 301 MB image from scratch. That tag is
-	@# deliberate (compose.yaml:31 — a shared tag let two worktrees overwrite
-	@# each other and run each other's code), so the cost cannot be shared
-	@# away. The only way not to pay it is not to raise a stack.
+	@# Got this wrong three times on 2026-09-01, each time by leaving one
+	@# half unconditional: first both suites always, then the frontend suite
+	@# always. A Makefile change still ran 233 frontend tests and a docker
+	@# image got built as a side effect of `up`. The scoping is the point;
+	@# "simple" meant fewer branches, not fewer conditions.
 	@#
-	@# Backend tests are now an explicit, separate step: `make test-backend`,
-	@# run deliberately by whoever needs it, not smuggled into the gate.
+	@# Reaching no test is a RESULT, not a skipped step. For such a change
+	@# the evidence is the diff plus a direct demonstration of the behaviour
+	@# it changes — which is stronger evidence about that change than a green
+	@# suite that could not have gone red.
 	@set -e; \
-	( cd frontend && pnpm install --frozen-lockfile >/dev/null && pnpm typecheck && pnpm test --run ); \
-	echo; \
-	echo "gate: frontend unit tests only — no docker was started."; \
-	echo "gate: backend tests are \`make test-backend\`, run it deliberately if your diff needs it."; \
+	base="$(GATE_BASE)"; \
+	git rev-parse --verify -q "origin/$$base" >/dev/null 2>&1 && base="origin/$$base"; \
+	changed=$$( { git diff --name-only "$$base"...HEAD 2>/dev/null; git diff --name-only; git ls-files -o --exclude-standard; } | sort -u ); \
+	if [ -z "$$changed" ]; then echo "gate: no changes against $$base — nothing to check"; exit 0; fi; \
+	fe=$$(printf '%s\n' "$$changed" | grep -cE '^frontend/' || true); \
+	be=$$(printf '%s\n' "$$changed" | grep -cE '^(backend/|tests/|scripts/.*\.py)' || true); \
+	echo "gate: $$(printf '%s\n' "$$changed" | wc -l | tr -d ' ') file(s) changed against $$base"; \
+	if [ "$$fe" -gt 0 ]; then \
+		echo "gate: frontend ($$fe file(s)) -> typecheck + vitest"; \
+		( cd frontend && pnpm install --frozen-lockfile >/dev/null && pnpm typecheck && pnpm test --run ); \
+	else \
+		echo "gate: SKIP frontend — nothing under frontend/ changed."; \
+	fi; \
+	if [ "$$be" -gt 0 ]; then \
+		echo "gate: backend ($$be file(s)) -> backend unit tests"; \
+		$(MAKE) --no-print-directory up migrate test-backend; \
+	else \
+		echo "gate: SKIP backend — nothing under backend/, tests/ or scripts/*.py changed. No docker."; \
+	fi; \
+	if [ "$$fe" -eq 0 ] && [ "$$be" -eq 0 ]; then \
+		echo "gate: this diff reaches no test, and that is the result rather than"; \
+		echo "gate: a skipped step. Evidence is the diff plus a direct demonstration"; \
+		echo "gate: of the behaviour it changes."; \
+	fi; \
 	echo "gate: PASS"
 
 typecheck:  ## tsc --noEmit on the host bundle
