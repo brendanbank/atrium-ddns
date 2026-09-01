@@ -765,13 +765,10 @@ gate:  ## unit tests only. No docker, ever. Only what the diff can reach.
 		.gate-venv/bin/python -m pytest tests/ -q; \
 	fi; \
 	if [ "$$bk" -gt 0 ]; then \
-		echo "gate: backend ($$bk file(s)) changed, and THERE IS NO DOCKER-FREE SUITE FOR IT."; \
-		echo "gate:   \`pytest tests/\` is a different tree and does not contain backend/tests/,"; \
-		echo "gate:   so running it here would print a green from a suite that cannot see"; \
-		echo "gate:   your change. Reported rather than done."; \
-		echo "gate:   The suite that covers it is \`make test-backend\` — functional, needs"; \
-		echo "gate:   MySQL, deliberately not in the gate. Run it yourself if the change"; \
-		echo "gate:   warrants it, and say so in the PR."; \
+		echo "gate: backend ($$bk file(s)) -> unit tests on SQLite, no container"; \
+		$(MAKE) --no-print-directory test-unit; \
+		echo "gate:   the 71 \`functional\` tests are NOT run here — they need a"; \
+		echo "gate:   container. \`make test-functional\` runs them."; \
 	fi; \
 	if [ "$$fe" -eq 0 ] && [ "$$sf" -eq 0 ] && [ "$$bk" -eq 0 ]; then \
 		echo "gate: this diff reaches no test, and that is the result rather than"; \
