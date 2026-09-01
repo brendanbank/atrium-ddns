@@ -1440,6 +1440,14 @@ async def test_an_absent_owner_is_refused_rather_than_invented(
     assert "--create-owner" in str(excinfo.value)
 
 
+@pytest.mark.functional
+# `--create-owner` calls atrium's `assign_role`, and
+# `app/auth/rbac.py:222` writes `INSERT IGNORE` — MySQL-only syntax in
+# atrium's own code, not this repo's. So this test cannot run on SQLite
+# without changing atrium, which is a decision about a different
+# repository. The thing under test — that the legacy bcrypt hash is
+# carried verbatim so the fleet keeps authenticating — is still
+# asserted, in the MySQL lane.
 async def test_create_owner_carries_the_legacy_admin_hash_verbatim(
     tmp_path, fernet_key: str
 ) -> None:

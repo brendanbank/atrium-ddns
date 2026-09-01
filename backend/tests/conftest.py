@@ -170,6 +170,45 @@ from sqlalchemy.ext.asyncio import AsyncSession
 #: This worker's namespace. Ten workers share one MySQL, so anything a
 #: test creates carries it — a hardcoded email or device name produces
 #: collisions that read as flakiness.
+# --- unit lane: in-memory SQLite ---
+#
+# Seeded at conftest IMPORT time, before anything calls `app.db.get_engine()`,
+# because that function caches its engine in a module global and passes
+# `isolation_level="READ COMMITTED"` — which SQLite rejects. Doing this in a
+# fixture would run too late.
+#
+# Opt-in: nothing happens unless DATABASE_URL names sqlite, so `make
+# test-backend` against MySQL is untouched.
+if os.environ.get("DATABASE_URL", "").startswith("sqlite"):
+    import app.db as _atrium_db
+    from sqlalchemy import event as _event
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession as _AS,
+        async_sessionmaker as _asm,
+        create_async_engine as _cae,
+    )
+    from sqlalchemy.pool import StaticPool as _StaticPool
+
+    if _atrium_db._engine is None:
+        _atrium_db._engine = _cae(
+            "sqlite+aiosqlite:///:memory:",
+            poolclass=_StaticPool,          # `:memory:` is per-connection
+            connect_args={"check_same_thread": False},
+        )
+        _atrium_db._session_factory = _asm(
+            _atrium_db._engine, class_=_AS, expire_on_commit=False
+        )
+
+        @_event.listens_for(_atrium_db._engine.sync_engine, "connect")
+        def _sqlite_foreign_keys(dbapi_connection, _record):  # noqa: ANN001
+            # SQLite ignores foreign keys unless asked. Off by default means
+            # ON DELETE CASCADE silently does nothing — "no error, wrong
+            # data", which is the worst way for this to present.
+            cur = dbapi_connection.cursor()
+            cur.execute("PRAGMA foreign_keys=ON")
+            cur.close()
+
+
 WORKER = os.environ.get("PYTEST_XDIST_WORKER", "serial")
 
 #: The advisory lock every fixture write takes. Server-wide, and the
@@ -250,6 +289,18 @@ def unusable_password_hash() -> str:
     return PasswordHelper().hash("unusable-" + "x" * 24)
 
 
+def _needs_advisory_lock() -> bool:
+    """True only on MySQL.
+
+    ``GET_LOCK`` exists here to serialise xdist workers that share one
+    MySQL. On a per-worker in-memory SQLite there is nothing shared to
+    serialise, and the function does not exist — so the guard is not
+    "skipped for convenience", it is inapplicable. That distinction is
+    why this is a dialect test and not a flag.
+    """
+    return get_engine().dialect.name == "mysql"
+
+
 @asynccontextmanager
 async def fixture_writes(owner: str = "?") -> AsyncIterator[AsyncSession]:
     """A session whose transaction no other xdist worker overlaps.
@@ -277,6 +328,16 @@ async def fixture_writes(owner: str = "?") -> AsyncIterator[AsyncSession]:
         )
 
     engine = get_engine()
+    if not _needs_advisory_lock():
+        _HELD_BY = owner
+        try:
+            factory = get_session_factory()
+            async with factory() as session:
+                yield session
+                await session.commit()
+        finally:
+            _HELD_BY = None
+        return
     async with engine.connect() as guard:
         got = (
             await guard.execute(
@@ -390,6 +451,78 @@ async def purge_tenants(
                 ),
                 {"ids": user_ids},
             )
+            # The host tables, explicitly, before the users they hang off.
+            #
+            # `DELETE FROM users` cleans these up on a *migrated* schema,
+            # because alembic emits the `ON DELETE CASCADE` that
+            # `HostForeignKey` only records as a marker — it registers no
+            # ForeignKey against the metadata, so anything built by
+            # `create_all` has no constraint and no cascade at all.
+            #
+            # Relying on the cascade made this cleanup silently dependent on
+            # DDL that only one of the two schemas has. It presented as ~196
+            # unrelated-looking UNIQUE failures the first time the suite was
+            # pointed at SQLite: the user went, its devices and domains
+            # stayed, and the next test collided.
+            #
+            # EVERY delete below is scoped to `user_ids`, including the
+            # tables that have no `user_id` of their own — they are reached
+            # through the device or domain that does. An unscoped
+            # `DELETE FROM ddns_hostname` would pass on SQLite, where each
+            # worker owns its database, and delete nine other workers' rows
+            # on the shared MySQL. That is the #117 / #149 failure exactly,
+            # reintroduced by a cleanup written to fix it.
+            await s.execute(
+                sa.text(
+                    "DELETE FROM ddns_hostname_backend WHERE hostname_id IN ("
+                    "  SELECT id FROM ddns_hostname WHERE device_id IN ("
+                    "    SELECT id FROM ddns_device WHERE user_id IN :ids)"
+                    "  OR domain_id IN (SELECT id FROM ddns_domain WHERE user_id IN :ids))"
+                ).bindparams(sa.bindparam("ids", expanding=True)),
+                {"ids": user_ids},
+            )
+            await s.execute(
+                sa.text(
+                    "DELETE FROM ddns_hostname WHERE device_id IN ("
+                    "  SELECT id FROM ddns_device WHERE user_id IN :ids)"
+                    " OR domain_id IN (SELECT id FROM ddns_domain WHERE user_id IN :ids)"
+                ).bindparams(sa.bindparam("ids", expanding=True)),
+                {"ids": user_ids},
+            )
+            await s.execute(
+                sa.text(
+                    "DELETE FROM ddns_domain_backend WHERE domain_id IN ("
+                    "  SELECT id FROM ddns_domain WHERE user_id IN :ids)"
+                ).bindparams(sa.bindparam("ids", expanding=True)),
+                {"ids": user_ids},
+            )
+            await s.execute(
+                sa.text(
+                    "DELETE FROM ddns_rate_limit_event WHERE device_id IN ("
+                    "  SELECT id FROM ddns_device WHERE user_id IN :ids)"
+                ).bindparams(sa.bindparam("ids", expanding=True)),
+                {"ids": user_ids},
+            )
+            # atrium's audit rows too. `audit_log.actor_user_id` is a real
+            # FK on the migrated schema, so MySQL cascades them away with the
+            # user; `create_all` has no constraint, the rows survive, and the
+            # next test's "exactly one audit row" assertion counts the last
+            # test's as well. Passes alone, fails in a full run — the shape
+            # that reads as flakiness.
+            await s.execute(
+                sa.text(
+                    "DELETE FROM audit_log WHERE actor_user_id IN :ids"
+                    " OR impersonator_user_id IN :ids"
+                ).bindparams(sa.bindparam("ids", expanding=True)),
+                {"ids": user_ids},
+            )
+            for _t in ("ddns_domain", "ddns_device"):
+                await s.execute(
+                    sa.text(f"DELETE FROM {_t} WHERE user_id IN :ids").bindparams(
+                        sa.bindparam("ids", expanding=True)
+                    ),
+                    {"ids": user_ids},
+                )
             await s.execute(
                 sa.text(
                     "DELETE FROM user_secret_keys WHERE user_id IN :ids"
@@ -649,6 +782,28 @@ async def write_ddns_config(cfg: DdnsConfig) -> None:
     """
     factory = get_session_factory()
     async with factory() as s:
+        if not _needs_advisory_lock():
+            # atrium's `put_namespace` builds a MySQL `INSERT … ON DUPLICATE
+            # KEY UPDATE`, which SQLite cannot compile. The upsert exists
+            # because ten workers share one row; on a per-worker in-memory
+            # database the row cannot already exist, so a plain write is the
+            # same operation without the dialect.
+            #
+            # atrium-pa reaches the same place from the other side: its
+            # `_stub_app_config` replaces get_namespace/put_namespace with an
+            # in-memory cell for its unit lane. Neither repo changes atrium.
+            #
+            # The cost, stated: `put_namespace` validates against the
+            # registered model, and this does not. A test pinning a field the
+            # model dropped would store it here instead of failing. The MySQL
+            # lane still runs the validating path.
+            row = await s.get(AppSetting, CONFIG_NAMESPACE)
+            if row is None:
+                s.add(AppSetting(key=CONFIG_NAMESPACE, value=cfg.model_dump(mode="json")))
+            else:
+                row.value = cfg.model_dump(mode="json")
+            await s.commit()
+            return
         await put_namespace(s, CONFIG_NAMESPACE, cfg.model_dump(mode="json"))
 
 
@@ -704,6 +859,13 @@ async def ddns_config_lock(owner: str = "?") -> AsyncIterator[None]:
         )
 
     engine = get_engine()
+    if not _needs_advisory_lock():
+        _CONFIG_HELD_BY = owner
+        try:
+            yield
+        finally:
+            _CONFIG_HELD_BY = None
+        return
     async with engine.connect() as guard:
         got = (
             await guard.execute(
@@ -730,7 +892,52 @@ async def ddns_config_lock(owner: str = "?") -> AsyncIterator[None]:
 
 @harness_guard
 @pytest_asyncio.fixture(scope="session", autouse=True)
-async def _pin_ddns_config() -> AsyncIterator[None]:
+async def _sqlite_schema() -> AsyncIterator[None]:
+    """Create the schema on a non-MySQL engine.
+
+    On MySQL the suite runs against a database alembic has already
+    migrated, so this does nothing. On a per-worker in-memory SQLite there
+    is no migration to run — the chain is written in MySQL's dialect — so
+    the schema comes from the metadata instead.
+
+    That is a real difference and worth naming: the MySQL lane tests the
+    schema the migrations produce, this one tests the schema the models
+    declare. They are supposed to agree; only the MySQL lane can prove it.
+    """
+    if _needs_advisory_lock():
+        yield
+        return
+    from app.db import Base as _AtriumBase
+    import app.models  # noqa: F401  — registers atrium's tables
+    from atrium_ddns.models import HostBase as _HostBase
+
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await conn.run_sync(_AtriumBase.metadata.create_all)
+        await conn.run_sync(_HostBase.metadata.create_all)
+        # The three system roles. `create_all` builds tables, not rows, and
+        # atrium seeds these in its init migration — which this lane never
+        # runs, because the chain is written in MySQL's dialect. Without them
+        # `assign_role` raises NoResultFound and anything that creates a user
+        # with a role fails for a reason that looks nothing like the cause.
+        #
+        # Copied from atrium's `0001_atrium_init`. If that list ever grows,
+        # this is where it diverges — the MySQL lane is what would catch it,
+        # which is one of the things that lane is for.
+        await conn.execute(
+            sa.text(
+                "INSERT INTO roles (code, name, is_system) VALUES"
+                " ('super_admin', 'Super admin', 1),"
+                " ('admin', 'Admin', 1),"
+                " ('user', 'User', 1)"
+            )
+        )
+    yield
+
+
+@harness_guard
+@pytest_asyncio.fixture(scope="session", autouse=True)
+async def _pin_ddns_config(_sqlite_schema: None) -> AsyncIterator[None]:
     """Put the shared row on its baseline, and refuse a session that
     ends with it anywhere else.
 
@@ -822,3 +1029,97 @@ async def ddns_config(
             yield write_ddns_config
         finally:
             await write_ddns_config(baseline)
+
+
+# --------------------------------------------------------------------- #
+# The second surface that cannot be namespaced — #149
+# --------------------------------------------------------------------- #
+#
+# The section above is about one shared *row*. This is about shared
+# *rows*, and it is a different mechanism over a different table that
+# happens to have the same answer.
+#
+# ``run_health_checks(scope=<cross-tenant>, due_only=False)`` — what
+# ``POST /api/atrium_ddns/health-checks/run`` calls when the caller
+# holds ``atrium_ddns.admin``, and deliberately the scheduled job's own
+# function object rather than a second implementation (#75) — selects
+# **every** hostname in the installation carrying a published address,
+# orders ``dns_checked_at IS NULL`` first, caps at
+# ``health_check_batch_size`` (default 200) and writes
+# ``dns_checked_at``, ``dns_ip_v4``, ``dns_ip_v6`` and
+# ``dns_check_error`` on every row it reaches. ``due_only=False`` is the
+# part that makes the population the whole database: it drops the
+# staleness clause, so a row checked a millisecond ago is still
+# eligible.
+#
+# There is nothing to namespace. A hostname's tenancy is exactly what a
+# cross-tenant scope is defined to ignore, so ten xdist workers writing
+# ``PYTEST_XDIST_WORKER`` into every name they create does not help —
+# the sweep does not select on the name.
+#
+# **Why #117's fix cannot cover this, stated because the two look
+# alike.** #117 pinned ``app_settings['atrium_ddns']`` to
+# ``health_check_enabled=False`` for the whole session, which stops the
+# *worker container's* 60 s tick, and it was right to. This sweep never
+# reads that row: ``test_router_health_checks.pinned_config`` is autouse
+# and monkeypatches ``load_config`` in **both** ``router`` and
+# ``worker_jobs`` to return ``DdnsConfig()``, whose default is
+# ``health_check_enabled=True``. The baseline is structurally invisible
+# to it. Two surfaces, two mechanisms, one answer.
+#
+# What was measured before this existed, on this box, over five full
+# ``make test-backend`` runs (933 tests, ``-n auto --dist=loadfile``),
+# with the sweep instrumented to report its own population:
+#
+#     considered  30  23  17   4  21
+#     checked     18  11   7   2  11
+#     its own      2   2   2   2   2
+#
+# — so 16, 9, 5, 0 and 9 rows belonging to *other files* had their
+# health-check columns rewritten, on four runs in five. Extended to name
+# them, one run caught ``b0.a-jobs-gw5.example.invalid`` in the eligible
+# set: a row ``test_worker_jobs.py``'s
+# ``test_the_health_check_batch_ceiling_reports_itself`` had created
+# three statements earlier, on another worker. That test is #149.
+#
+# The failure is deterministic once the interleaving is forced. The same
+# call injected between that test's seeding and its assertion gives
+# ``assert 0 == 2``, with ``hostnames_due=0`` and ``hostnames_not_due=3``
+# on the summary — the sweep had stamped all three rows non-due.
+#
+# **Deliberately :data:`DDNS_CONFIG_LOCK` and not a third named lock.**
+# Two named locks with one documented order (config-then-fixture) is a
+# thing a reader can hold in their head and a thing
+# :func:`ddns_config_lock` refuses to violate; three named locks is a
+# cycle waiting to be introduced, and a cycle between 30-second
+# ``GET_LOCK``s presents as a hung suite with no failing test to name —
+# the failure that second refusal exists to prevent. The two uses are
+# also the same claim from two directions: the config row is the switch
+# that arms an installation-wide sweep, and this *is* an
+# installation-wide sweep. Nothing needs both at once, and the nesting
+# refusal makes an attempt fail loudly rather than block.
+
+
+@pytest_asyncio.fixture
+async def installation_wide_sweep(request: Any) -> AsyncIterator[None]:
+    """Exclusive right to run a sweep that reaches every tenant's rows.
+
+    Taken by the one test that performs an installation-wide
+    ``ddns_hostname`` write, and by every test whose assertions are
+    about the ``dns_*`` columns of rows it owns. Both halves are
+    required: a lock only one side takes excludes nothing, which is the
+    shape of guard this repository keeps finding in its own code.
+
+    Held for the **length of the test**, not for the write, for
+    :func:`ddns_config`'s reason — the race is between a writer on one
+    worker and a *reader* on another, and a reader that lands between
+    the write and the end of the test sees the same damage.
+
+    The population on both sides is a census rather than a habit:
+    ``test_harness_guards.test_the_cross_tenant_sweep_has_one_writer``
+    derives it from the tests' own source and fails when a second writer
+    appears.
+    """
+    owner = f"installation_wide_sweep[{getattr(request.node, 'nodeid', '?')}]"
+    async with ddns_config_lock(owner=owner):
+        yield

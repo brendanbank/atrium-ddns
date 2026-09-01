@@ -13,11 +13,22 @@
  * ## The three things this card must not get wrong
  *
  * **1. The rate limit's third state.** `null` is a *value* on that field
- * and means *inherit the installation default*. It is offered as an
+ * and means *inherit the installation default*; `0` is *muted* and is a
+ * different thing. #73's `DeviceUpdateIn` docstring records why
+ * conflating *omitted* with *null* silently un-mutes a device somebody
+ * muted on purpose, so the card never omits the key: an untouched box
+ * sends back the **stored** value and a cleared box sends `null`.
+ *
+ * This paragraph used to say the third state was *"offered as an
  * explicit choice — a radio the operator selects — rather than being
- * what happens when the box is left empty, because #73's `DeviceUpdateIn`
- * docstring records why conflating *omitted* with *null* silently
- * un-mutes a device somebody muted on purpose.
+ * what happens when the box is left empty"*. **#106 removed that radio**
+ * (`1a75107`, 2026-08-31) and left the sentence, so the file described
+ * a control it does not render and a policy it had inverted: clearing
+ * the box is now exactly how you go back to inheriting, which is the
+ * thing the old wording said had been rejected. Corrected with #160,
+ * whose brief asked whether this surface carried a `Radio.Group` —
+ * `ZoneModal`'s does not forward `disabled` to its children — and the
+ * answer is that it carries no radio at all, only the claim of one.
  *
  * **2. The installation default is only knowable when it is inherited.**
  * `effective_rate_limit_per_minute` is the resolved number; when
@@ -42,6 +53,50 @@
  * by §17: §17 is about how the *card* is reached, not about how a field
  * inside it is edited, and putting a second modal over the first to
  * rename would hide the thing being renamed behind two overlays.
+ *
+ * ## Why the card is locked under its own confirmations (#160)
+ *
+ * This card is the surface #153 (`NameModal`) and #159 (`ZoneModal`)
+ * were told to copy, and it taught two thirds of the pattern. It had
+ * the right *shape* — a real `Modal` at `SecretOnceModal`'s
+ * `zIndex={400}`, an error rendered inside the dialog rather than on the
+ * form behind it — and it was **missing the lock**. `Save`'s disabled
+ * condition read `trimmed === '' || !dirty || saveSettings.isPending`
+ * and said nothing about a confirmation being open, so with *"Delete
+ * this device?"* on screen the form underneath still accepted a Save:
+ * two live actions, one of them destructive, with no ordering between
+ * them. Both issues that copied this file had to notice the gap rather
+ * than inherit it.
+ *
+ * `locked = busy || confirming` disables **every control in this body**.
+ * Not decoration and not the overlay's job: Mantine's overlay stops a
+ * *mouse*, and it does not stop a keyboard, an assistive technology or a
+ * test. *"This card cannot be saved while a confirmation is open"* is a
+ * statement about the action, which is why `submit()` refuses as well as
+ * the button being disabled — the prop and the handler are two
+ * instruments, and a handler wired past the prop would keep the prop.
+ *
+ * **Two confirmations, not one.** #160 names the delete dialog; this
+ * card also asks before rotating, and the same lock has to cover both.
+ * With only `confirmDelete` in the condition, `Delete this device` stays
+ * live under *"Rotate this secret?"* — and clicking it stacks a second
+ * confirmation on the first, which is exactly the *"two overlapping
+ * dialogs, each with its own idea of what the buttons at the bottom
+ * mean"* incident `ZoneModal` recorded. So `confirming` is either of
+ * them.
+ *
+ * **And the dismissal is spelled `Keep it`, never `Cancel`.** The delete
+ * dialog's dismiss used to say `Cancel`, inches above the form's own
+ * `Cancel` — two live controls sharing one word with two meanings, which
+ * is #159's reading of that incident: the hazard is two `Cancel`s, not
+ * two dialogs. Renamed here so all three surfaces say the same thing.
+ *
+ * One control is deliberately **not** locked: `detail-names-link` is an
+ * `<a href>`, and a link is not disable-able in the DOM. Following it
+ * navigates away and takes the whole card with it, which is a departure
+ * rather than a second action competing with the confirmation — the
+ * hazard `locked` exists for is a control that *acts on this device*
+ * while a dialog about destroying it is open.
  */
 import { useState } from 'react';
 import {
@@ -163,6 +218,17 @@ export function DeviceCard({ deviceId, onClose, onDeleted }: DeviceCardProps) {
 
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  /** A confirmation is up — **either** of the two this card asks.
+   *
+   *  #160 names the delete dialog. `confirmRotate` is in here because a
+   *  lock that covered only delete would leave `Delete this device` live
+   *  underneath *"Rotate this secret?"*, and one click would stack a
+   *  second confirmation on the first. Declared here, off plain state,
+   *  so `submit()` below can refuse on it without reaching forward past
+   *  the mutations for `locked`. */
+  const confirming = confirmDelete || confirmRotate;
+
   // --- the editable settings, one form with one Save -------------------
   //
   // Lifted out of a `DeviceSettings` child so its Save and Cancel can be
@@ -245,6 +311,12 @@ export function DeviceCard({ deviceId, onClose, onDeleted }: DeviceCardProps) {
 
   const submit = () => {
     if (!data || trimmed === '' || saveSettings.isPending || !dirty) return;
+    // The second instrument on the same rule. `Save` is disabled while a
+    // confirmation is open, but `disabled` is a prop this component set
+    // on itself and the name box submits on Enter as well — so the
+    // refusal is stated here too, where it is about the action rather
+    // than about what is painted over what (#160).
+    if (confirming) return;
     saveSettings.mutate({
       id: data.id,
       name: trimmed,
@@ -296,6 +368,16 @@ export function DeviceCard({ deviceId, onClose, onDeleted }: DeviceCardProps) {
     onError: (err: Error) => setRotateError(refusalText(err)),
   });
 
+  /** Any of this card's three requests is in flight. It used to be read
+   *  per-control — the name box watched only `saveSettings`, `Rotate`
+   *  only `rotate` — so a delete in flight left the form live and
+   *  saveable. One name, all three, the way `NameModal` and `ZoneModal`
+   *  spell it. */
+  const busy = saveSettings.isPending || remove.isPending || rotate.isPending;
+
+  /** What every control in this body is disabled by. See the docblock:
+   *  the overlay stops a mouse, this stops the action. */
+  const locked = busy || confirming;
 
   if (!canRead) {
     return (
@@ -360,7 +442,7 @@ export function DeviceCard({ deviceId, onClose, onDeleted }: DeviceCardProps) {
           <TextInput
             label="Name"
             value={name}
-            disabled={saveSettings.isPending}
+            disabled={locked}
             onChange={(event) => setName(event.currentTarget.value)}
             onKeyDown={(event) => {
               if (event.key === 'Enter') submit();
@@ -374,7 +456,7 @@ export function DeviceCard({ deviceId, onClose, onDeleted }: DeviceCardProps) {
             aria-label="Updates per minute"
             value={limit}
             min={0}
-            disabled={saveSettings.isPending}
+            disabled={locked}
             placeholder="inherit"
             onChange={(next) => {
               setLimitTouched(true);
@@ -475,7 +557,7 @@ export function DeviceCard({ deviceId, onClose, onDeleted }: DeviceCardProps) {
           <Button
             size="xs"
             variant="default"
-            disabled={rotate.isPending}
+            disabled={locked}
             onClick={() => setConfirmRotate(true)}
             data-testid="detail-rotate"
           >
@@ -490,8 +572,15 @@ export function DeviceCard({ deviceId, onClose, onDeleted }: DeviceCardProps) {
             <Button
               size="xs"
               color="red"
-              disabled={remove.isPending || saveSettings.isPending}
-              onClick={() => setConfirmDelete(true)}
+              disabled={locked}
+              onClick={() => {
+                // A refusal from a previous attempt must not greet the
+                // next one. `NameModal` and `ZoneModal` spell this
+                // `remove.reset()` / `dropZone.reset()`; here the error
+                // is held in state, so it is cleared directly.
+                setDeleteError(null);
+                setConfirmDelete(true);
+              }}
               data-testid="detail-delete"
             >
               Delete this device
@@ -499,7 +588,7 @@ export function DeviceCard({ deviceId, onClose, onDeleted }: DeviceCardProps) {
             <Button
               size="xs"
               variant="default"
-              disabled={saveSettings.isPending}
+              disabled={locked}
               onClick={cancelEdits}
               data-testid="device-cancel"
             >
@@ -507,7 +596,11 @@ export function DeviceCard({ deviceId, onClose, onDeleted }: DeviceCardProps) {
             </Button>
             <Button
               size="xs"
-              disabled={trimmed === '' || !dirty || saveSettings.isPending}
+              // `locked` is what #160 added. It read `trimmed === '' ||
+              // !dirty || saveSettings.isPending` — nothing about a
+              // confirmation being open, so "delete this device?" and a
+              // live Save were on screen together.
+              disabled={locked || trimmed === '' || !dirty}
               onClick={submit}
               data-testid="device-save"
             >
@@ -568,9 +661,25 @@ export function DeviceCard({ deviceId, onClose, onDeleted }: DeviceCardProps) {
         </Stack>
       </Modal>
 
+      {/* `zIndex` is `SecretOnceModal`'s number, and `NameModal` and
+          `ZoneModal` borrow it from here: this has to outrank a modal
+          that is already open, and Mantine gives every modal the same
+          z-index, so siblings stack by mount order until a re-render
+          changes it.
+
+          `detail-delete-confirm` sits on Mantine's `Modal` **root**,
+          which is in the DOM whether the modal is open or shut — so
+          `findByTestId` on it resolves in both states and asserts
+          nothing. Measured by #155's agent; #161 owns the sweep of that
+          class, so it is left exactly as it is here and the tests below
+          reach the dialog through a control that only exists when it is
+          open. Do not query this one. */}
       <Modal
         opened={confirmDelete}
-        onClose={() => setConfirmDelete(false)}
+        onClose={() => {
+          setDeleteError(null);
+          setConfirmDelete(false);
+        }}
         title="Delete this device?"
         zIndex={400}
         data-testid="detail-delete-confirm"
@@ -591,14 +700,27 @@ export function DeviceCard({ deviceId, onClose, onDeleted }: DeviceCardProps) {
               </Alert>
             ) : null}
             <Group justify="flex-end">
+              {/* `Keep it`, not `Cancel`. It said `Cancel` inches above
+                  the form's own `Cancel` — two live controls sharing one
+                  word with two meanings, which is the incident
+                  `ZoneModal`'s comment records and #159's reading of it.
+                  Renamed with #160 so all three destructive
+                  confirmations in this bundle dismiss with the same
+                  word. `disabled` stays `remove.isPending` and not
+                  `locked`: this button is *inside* the dialog, and
+                  locking it on `confirming` would lock the only way out
+                  of the dialog that is open. */}
               <Button
                 size="xs"
                 variant="default"
                 disabled={remove.isPending}
-                onClick={() => setConfirmDelete(false)}
-                data-testid="detail-delete-cancel"
+                onClick={() => {
+                  setDeleteError(null);
+                  setConfirmDelete(false);
+                }}
+                data-testid="detail-delete-keep"
               >
-                Cancel
+                Keep it
               </Button>
               <Button
                 size="xs"

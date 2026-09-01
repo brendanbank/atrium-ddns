@@ -172,3 +172,5 @@ deploy_key*
 # which `dist/` already covers; `scripts/deploy-dev.sh` is handed a path,
 # and a bundle carries the whole history including anything in it.
 *.bundle
+.gate-venv/
+.test-venv/

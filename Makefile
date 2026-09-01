@@ -130,7 +130,13 @@ endef
 	atrium-bump
 
 help:  ## show this help
-	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-21s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@# The character class includes 0-9 deliberately. Without it every
+	@# target with a digit in its name was filtered out of this listing —
+	@# which was exactly `e2e-up`, `e2e-deps`, `test-e2e` and `e2e-down`,
+	@# and nothing else. They worked; they were just undiscoverable, so the
+	@# command you reach for before a milestone merge could only be learned
+	@# by asking someone. Present since the 2026-08-15 scaffold.
+	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_-]+:.*?## / {printf "  %-21s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 dev-bootstrap: build up migrate  ## build, start, migrate; run me first
 	@echo
@@ -233,8 +239,15 @@ check-env:  ## refuse to start a stack whose .env cannot produce a living api
 check-env-self-test:  ## show the .env guard refusing, against synthetic files
 	@./scripts/check-env.sh --self-test
 
-up: check-env  ## start the stack
-	$(COMPOSE) up -d
+up: check-env  ## start the stack. NEVER builds — see below.
+	@# `--no-build` is not a tidy-up. Each worktree is its own compose
+	@# project, so its image tag is unique and a plain `up` builds a
+	@# 301 MB image from scratch, silently, as a side effect of starting
+	@# a stack. Twelve of those were built in one day before anyone
+	@# noticed. Building is now `make build`, explicitly, by someone who
+	@# meant it. If this refuses with "needs to be built", that is the
+	@# guard working: run `make build` if you actually want to pay for it.
+	$(COMPOSE) up -d --no-build
 
 down:  ## stop the stack (keeps data volume)
 	$(COMPOSE) down
@@ -438,6 +451,40 @@ test-frontend:  ## frontend unit tests via vitest
 # `--target`, and the wire table is reported as NOT RUN rather than as nought
 # failures. The table itself is `make test-compat`, which is not in the gate
 # because it needs a live service named on the command line.
+ATRIUM_SRC ?= /Users/brendan/src/atrium/backend
+TEST_VENV  ?= .test-venv
+
+$(TEST_VENV)/bin/python:  ## the unit lane's venv — atrium's deps, no container
+	@echo "creating $(TEST_VENV) (one time)"
+	@python3 -m venv $(TEST_VENV)
+	@awk '/^dependencies = \[/{f=1;next} f&&/^\]/{exit} f' $(ATRIUM_SRC)/pyproject.toml \
+	  | grep -oE '"[^"]+"' | tr -d '"' > /tmp/.atrium-reqs
+	@awk '/^dependencies = \[/{f=1;next} f&&/^\]/{exit} f' backend/pyproject.toml \
+	  | grep -oE '"[^"]+"' | tr -d '"' >> /tmp/.atrium-reqs
+	@printf 'aiosqlite\npytest\npytest-asyncio\npytest-xdist\n' >> /tmp/.atrium-reqs
+	@$(TEST_VENV)/bin/pip install -q --disable-pip-version-check -r /tmp/.atrium-reqs
+	@echo "$(TEST_VENV) ready"
+
+test-unit: $(TEST_VENV)/bin/python  ## backend unit tests. SQLite, no docker, ~8s
+	@# No container, no MySQL, no migrations. `-m "not functional"` drops the
+	@# 71 tests that genuinely need infrastructure — a bindable port 53, a
+	@# migrated schema, or atrium's MySQL-only SQL. Those run in `test-backend`.
+	@PYTHONPATH=$(ATRIUM_SRC):backend/src \
+	 DATABASE_URL='sqlite+aiosqlite:///:memory:' \
+	 $(TEST_VENV)/bin/python -m pytest backend/tests -q --no-header \
+	   -p no:cacheprovider -m "not functional" $(PYTEST_ARGS)
+
+test-functional: up migrate  ## the 71 that need real infrastructure (container + MySQL)
+	@# Depends on `up migrate` deliberately. This is the lane whose whole
+	@# reason for existing is that its tests need a migrated MySQL, a
+	@# bindable port 53, or atrium's MySQL-only SQL — so raising the stack is
+	@# the job, not an accident. The unit lane (`make test-unit`) starts
+	@# nothing.
+	@#
+	@# `up` carries --no-build, so if the image is missing this refuses and
+	@# names `make build` rather than quietly spending five minutes.
+	$(COMPOSE) exec -T api /opt/venv/bin/python -m pytest $(HOST_APP)/tests -m functional -ra $(PYTEST_ARGS)
+
 test-backend: check-fresh  ## backend tests + service-free compat guards, in the api container
 	$(COMPOSE) exec -T api /opt/venv/bin/python -m pytest $(HOST_APP)/tests $(PYTEST_ARGS)
 	$(COMPOSE) exec -T api /opt/venv/bin/python -m pytest $(COMPAT_TESTS) -ra $(PYTEST_ARGS)
@@ -668,47 +715,66 @@ GATE_BASE ?= $(or $(OVERNIGHT_MILESTONE_BRANCH),$(GATE_CONF_BRANCH),$(OVERNIGHT_
 # shell scripts reach no pytest and no vitest, so a diff confined to them used
 # to print "this diff reaches no test" and that was the whole reading. The
 # `.env` guard's own `--self-test` is the test they reach.
-gate:  ## run exactly the checks this diff can reach (auto-scoped; GATE_BASE=...)
+gate:  ## unit tests only. No docker, ever. Only what the diff can reach.
+	@# TWO RULES, both operator decisions of 2026-09-01:
+	@#
+	@# 1. UNIT TESTS ONLY. `make test-backend` is NOT a unit suite — it is 933
+	@#    tests against a real MySQL, ten xdist workers sharing one database.
+	@#    That is a functional suite, and its shared state is what generates
+	@#    the race conditions this project keeps chasing (#117, #149). It runs
+	@#    deliberately, or at the milestone e2e, never here.
+	@#
+	@# 2. NO DOCKER. A unit test does not need a container. Both suites below
+	@#    run on the host: vitest, and the service-free `pytest tests/` that
+	@#    CI runs as `compat-guards` with nothing but pytest and pyyaml.
+	@#
+	@# And a change runs a suite only if it can change that suite's result.
+	@# Reaching no test is a RESULT, not a skipped step.
 	@set -e; \
 	base="$(GATE_BASE)"; \
 	git rev-parse --verify -q "origin/$$base" >/dev/null 2>&1 && base="origin/$$base"; \
 	changed=$$( { git diff --name-only "$$base"...HEAD 2>/dev/null; git diff --name-only; git ls-files -o --exclude-standard; } | sort -u ); \
-	if [ -z "$$changed" ]; then echo "gate: no changes against $$base — nothing to check"; exit 0; fi; \
-	fe=$$(printf '%s\n' "$$changed" | grep -cE '^frontend/(src/|tests-e2e/|[^/]+\.(json|ts|cts|mts))' || true); \
-	be=$$(printf '%s\n' "$$changed" | grep -cE '^(backend/|tests/|scripts/.*\.py)' || true); \
-	sw=$$(printf '%s\n' "$$changed" | grep -cE '^(Makefile|compose\.yaml|\.env\.example|scripts/.*\.sh)$$' || true); \
+	if [ -z "$$changed" ]; then \
+		trunk="$(or $(OVERNIGHT_TRUNK),master)"; \
+		if [ "$$base" != "origin/$$trunk" ] && git rev-parse --verify -q "origin/$$trunk" >/dev/null 2>&1; then \
+			echo "gate: nothing differs from $$base — you are on the tip. Comparing against origin/$$trunk instead."; \
+			base="origin/$$trunk"; \
+			changed=$$( { git diff --name-only "$$base"...HEAD 2>/dev/null; git diff --name-only; git ls-files -o --exclude-standard; } | sort -u ); \
+		fi; \
+	fi; \
+	if [ -z "$$changed" ]; then \
+		echo "gate: NOTHING WAS VERIFIED. This tree is identical to $$base, so there"; \
+		echo "gate: is no change to check. That is not a pass — it is the absence of"; \
+		echo "gate: a question. Run it on a branch with a diff, or name one with"; \
+		echo "gate: GATE_BASE=<ref>."; \
+		exit 0; \
+	fi; \
+	fe=$$(printf '%s\n' "$$changed" | grep -cE '^frontend/' || true); \
+	sf=$$(printf '%s\n' "$$changed" | grep -cE '^(tests/|scripts/.*\.py)' || true); \
+	bk=$$(printf '%s\n' "$$changed" | grep -cE '^backend/' || true); \
 	echo "gate: $$(printf '%s\n' "$$changed" | wc -l | tr -d ' ') file(s) changed against $$base"; \
-	printf '%s\n' "$$changed" | sed 's/^/  /'; \
-	echo; \
 	if [ "$$fe" -gt 0 ]; then \
-		echo "gate: frontend touched ($$fe file(s)) -> typecheck + vitest"; \
+		echo "gate: frontend ($$fe file(s)) -> typecheck + vitest"; \
 		( cd frontend && pnpm install --frozen-lockfile >/dev/null && pnpm typecheck && pnpm test --run ); \
 	else \
-		echo "gate: SKIP typecheck + vitest — no frontend source, spec or config changed"; \
+		echo "gate: SKIP frontend — nothing under frontend/ changed."; \
 	fi; \
-	echo; \
-	if [ "$$be" -gt 0 ]; then \
-		echo "gate: backend touched ($$be file(s)) -> stack + backend unit tests"; \
-		$(MAKE) --no-print-directory up migrate; \
-		$(MAKE) --no-print-directory test-backend; \
-	else \
-		echo "gate: SKIP stack + backend unit tests — no backend/, tests/ or python script changed"; \
+	if [ "$$sf" -gt 0 ]; then \
+		echo "gate: compat/scripts ($$sf file(s)) -> service-free unit tests"; \
+		[ -x .gate-venv/bin/python ] || { python3 -m venv .gate-venv && .gate-venv/bin/pip install -q --disable-pip-version-check pytest pyyaml; }; \
+		.gate-venv/bin/python -m pytest tests/ -q; \
 	fi; \
-	echo; \
-	if [ "$$sw" -gt 0 ]; then \
-		echo "gate: stack wiring touched ($$sw file(s)) -> .env guard self-test"; \
-		$(MAKE) --no-print-directory check-env-self-test; \
-		$(MAKE) --no-print-directory check-env-idempotent; \
-	else \
-		echo "gate: SKIP .env guard self-test — no Makefile, compose.yaml, .env.example or shell script changed"; \
+	if [ "$$bk" -gt 0 ]; then \
+		echo "gate: backend ($$bk file(s)) -> unit tests on SQLite, no container"; \
+		$(MAKE) --no-print-directory test-unit; \
+		echo "gate:   the 71 \`functional\` tests are NOT run here — they need a"; \
+		echo "gate:   container. \`make test-functional\` runs them."; \
 	fi; \
-	echo; \
-	if [ "$$fe" -eq 0 ] && [ "$$be" -eq 0 ] && [ "$$sw" -eq 0 ]; then \
-		echo "gate: this diff reaches no test. That is the result, not a skipped step."; \
-		echo "gate: evidence for such a change is the diff itself plus a direct"; \
-		echo "gate: demonstration of the behaviour it changes."; \
+	if [ "$$fe" -eq 0 ] && [ "$$sf" -eq 0 ] && [ "$$bk" -eq 0 ]; then \
+		echo "gate: this diff reaches no test, and that is the result rather than"; \
+		echo "gate: a skipped step. Evidence is the diff plus a direct demonstration."; \
 	fi; \
-	echo "gate: e2e is NOT run here — it runs once on the release PR into $(or $(OVERNIGHT_TRUNK),master)."; \
+	echo "gate: no container was started."; \
 	echo "gate: PASS"
 
 typecheck:  ## tsc --noEmit on the host bundle

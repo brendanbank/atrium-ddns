@@ -28,23 +28,15 @@
 import { useState } from "react";
 import {
   ActionIcon,
-  Alert,
   Button,
   Group,
-  Modal,
   Select,
-  Stack,
-  Text,
   Tooltip,
 } from "@mantine/core";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { IconListSearch, IconPlus, IconTrash } from "@tabler/icons-react";
+import { IconListSearch, IconPlus } from "@tabler/icons-react";
 
 import type { Board, BoardDevice, BoardHostname, Strip } from "../api/board";
-import { BOARD_QUERY_KEY } from "../api/board";
-import { DEVICES_QUERY_KEY, deleteDevice } from "../api/devices";
 import { LogLink } from "../LogSearchPage";
-import { DdnsPortalScope } from "../host/DdnsRoot";
 import { absoluteTitle, formatAge } from "./format";
 import { boardNameHref, boardNameNewHref } from "../paths";
 
@@ -97,6 +89,29 @@ function toneOf(strip: Strip | null): "diverged" | "quiet" | "plain" {
     return "diverged";
   }
   return "plain";
+}
+
+/** Why the row is accented, in the vocabulary the strip already uses.
+ *
+ *  The two joints mean different things and imply different actions, so
+ *  this names which one diverged rather than collapsing both to "out of
+ *  sync". `n/a` is not `agreed`: a joint with nothing to compare is not
+ *  described as having agreed.
+ */
+function divergenceReason(strip: Strip | null): string | null {
+  if (strip === null) return null;
+  const upper = strip.upper_joint === "diverged";
+  const lower = strip.lower_joint === "diverged";
+  if (upper && lower) {
+    return "DNS does not carry what we last published, and this device is reporting a different address than this name carries.";
+  }
+  if (upper) {
+    return "DNS does not carry what we last published for this name — the record was changed somewhere other than here.";
+  }
+  if (lower) {
+    return "This device is reporting a different address than this name carries — the device moved and the name has not followed.";
+  }
+  return null;
 }
 
 function answeredText(strip: Strip | null): string {
@@ -155,27 +170,12 @@ export function BoardTable({
    *  used to draw itself. */
   initialDeviceFilter?: string | null;
 }) {
-  const client = useQueryClient();
-  /** Delete asks first. The board is the landing page, the icon is a 16px
-   *  target beside two others, and deleting a device destroys every
-   *  hostname assignment pointing at it — the same reasoning `DeviceList`
-   *  records for its own row, applied to the surface that now carries the
-   *  same control. */
-  const [confirmDelete, setConfirmDelete] = useState<BoardDevice | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const remove = useMutation({
-    mutationFn: deleteDevice,
-    onSuccess: () => {
-      setConfirmDelete(null);
-      setError(null);
-      // Both: the board is what this page draws, and the devices list is
-      // what every other surface reads. Invalidating one leaves the other
-      // showing a device that no longer exists.
-      void client.invalidateQueries({ queryKey: BOARD_QUERY_KEY });
-      void client.invalidateQueries({ queryKey: DEVICES_QUERY_KEY });
-    },
-    onError: (err: Error) => setError(err.message),
-  });
+  /* This component holds no mutation. It draws rows and filters them;
+     every write a row can reach — delete, rename, rotate, add a name —
+     belongs to the card or the form the row links to. #155 removed the
+     one exception, a `deleteDevice` mutation driven by a trash icon in
+     the device cell, together with the query invalidation and the error
+     state that existed only to serve it. */
 
   /** The view filters over the rows already on screen. `zone` is seeded
    *  from `?zone=` so the zone list can link here focused on one zone —
@@ -382,11 +382,56 @@ export function BoardTable({
             >
               {/* The marker column. Present on every row so the accent does
                 not shift the grid when it appears. */}
-              <span className="ddns-boardtable__mark" aria-hidden="true">
-                {tone === "diverged" ? "!" : ""}
-              </span>
-              {row.device ? (
-                <Group gap={4} wrap="nowrap" align="center">
+              {tone === "diverged" ? (
+                <Tooltip label={divergenceReason(row.strip) ?? ""} withArrow multiline w={280}>
+                  <span
+                    className="ddns-boardtable__mark"
+                    role="img"
+                    aria-label={divergenceReason(row.strip) ?? "diverged"}
+                    data-testid={`board-mark-${row.hostname?.name ?? row.device?.name}`}
+                  >
+                    !
+                  </span>
+                </Tooltip>
+              ) : (
+                <span className="ddns-boardtable__mark" aria-hidden="true" />
+              )}
+              {/* The device cell. Two things, pushed apart: the device
+                  name on the left, which opens the card, and the
+                  add-a-name `+` on the right.
+
+                  It carried a trash icon until #155 — a one-click delete
+                  of the *device*, and of every name assigned to it, on a
+                  row that is about a *hostname*. Deleting is still
+                  reachable, from the card the name opens, which asks
+                  first and says how many names go with the device.
+
+                  The `+` moved in here from the name cell in #154, and
+                  the reason is the column, not the tidiness. The name
+                  column is `minmax(12rem, 1fr)` and
+                  `.ddns-boardtable__row > *` is `overflow: hidden` with
+                  `white-space: nowrap`, so on a long name the cell ran
+                  out of room and the thing pushed past the edge was the
+                  **control** rather than the text — the ellipsis landed
+                  on the affordance. It vanished silently and it vanished
+                  precisely on the longest names. The device column is
+                  `max-content`: it is sized to what it holds, so there
+                  is no room for it to run out of.
+
+                  It also reads correctly here, which the placement
+                  beside the name never did. "Add a name" is an action on
+                  the *device* — `boardNameNewHref(row.device?.id)`
+                  presets it, and has since #128 — so beside the hostname
+                  it looked like an action on that hostname, which it
+                  never was.
+
+                  `justify="space-between"` is what right-aligns it. In a
+                  `max-content` track the group is exactly as wide as the
+                  widest row's contents, so the `+` sits on the column's
+                  right edge and the shorter device names do not drag it
+                  left with them. */}
+              <Group gap={4} wrap="nowrap" align="center" justify="space-between">
+                {row.device ? (
                   <button
                     type="button"
                     className="ddns-data ddns-boardtable__device"
@@ -395,47 +440,62 @@ export function BoardTable({
                   >
                     {row.device.name}
                   </button>
-                  <Tooltip label="Delete this device" withArrow>
-                    <ActionIcon
-                      variant="subtle"
-                      color="gray"
-                      size="sm"
-                      aria-label={`Delete ${row.device.name}`}
-                      onClick={() => setConfirmDelete(row.device)}
-                      data-testid={`board-delete-${row.device.name}`}
-                    >
-                      <IconTrash size={15} />
-                    </ActionIcon>
-                  </Tooltip>
-                </Group>
-              ) : (
-                <span className="ddns-cell" data-tone="quiet">
-                  no device
-                </span>
-              )}
-              {row.hostname ? (
-                <Group gap={4} wrap="nowrap" align="center">
-                  <a className="ddns-data" href={boardNameHref(row.hostname.id)}>
-                    {row.hostname.name}
-                  </a>
-                  {/* Adding a name is the other thing you come to this row for,
-                      and it was reachable only from the header. Carries the return
-                      address so finishing lands back here rather than stranding
-                      you on the names page, which has no nav entry. */}
-                  <Tooltip label="Add a name" withArrow>
+                ) : (
+                  <span className="ddns-cell" data-tone="quiet">
+                    no device
+                  </span>
+                )}
+                {/* Only on rows that *have* a name. The "no names yet"
+                    row has its own add control in the cell below, which
+                    is the row where it matters most and where it reads
+                    as the answer to the text beside it; a second one
+                    here would be the duplicate this issue removed.
+
+                    A row with no device still gets one. It presets
+                    nothing — `boardNameNewHref(undefined)` omits `for=`
+                    — but the whole argument for this table is that the
+                    columns stay where they were, and a `+` that is in
+                    the device column on most rows and missing on some
+                    is the shape-changing layout the flat table replaced. */}
+                {row.hostname ? (
+                  <Tooltip
+                    label={
+                      row.device
+                        ? `Add a name for ${row.device.name}`
+                        : "Add a name"
+                    }
+                    withArrow
+                  >
                     <ActionIcon
                       component="a"
                       href={boardNameNewHref(row.device?.id)}
                       variant="subtle"
                       color="gray"
                       size="sm"
-                      aria-label="Add a name"
+                      aria-label={
+                        row.device
+                          ? `Add a name for ${row.device.name}`
+                          : "Add a name"
+                      }
                       data-testid={`board-add-name-${row.hostname.name}`}
                     >
                       <IconPlus size={15} />
                     </ActionIcon>
                   </Tooltip>
-                </Group>
+                ) : null}
+              </Group>
+              {row.hostname ? (
+                /* The name, and only the name. It is the direct grid
+                   child now rather than the first item of a group, which
+                   is what puts `.ddns-boardtable__row > *`'s
+                   `text-overflow: ellipsis` on the anchor itself — so a
+                   name too long for the column truncates with an
+                   ellipsis, which is what that rule was written to do.
+                   With a wrapper in between, the rule applied to the
+                   wrapper and the anchor overflowed it intact. */
+                <a className="ddns-data" href={boardNameHref(row.hostname.id)}>
+                  {row.hostname.name}
+                </a>
               ) : (
                 <Group gap={4} wrap="nowrap" align="center">
                   <span className="ddns-cell" data-tone="quiet">
@@ -513,55 +573,12 @@ export function BoardTable({
           );
         })}
       </div>
-      {/* Delete asks first, and names what goes with the device.
-          `DeviceList` records why: delete used to fire straight from the
-          row with no dialog and no undo, and one misplaced click destroyed
-          a device and every hostname assignment pointing at it. The icon
-          that triggers it here is a 16px target beside another. */}
-      <Modal
-        opened={confirmDelete !== null}
-        onClose={() => setConfirmDelete(null)}
-        title="Delete this device?"
-        data-testid="board-delete-confirm"
-      >
-        <DdnsPortalScope>
-          <Stack gap="sm">
-            <Text size="sm">
-              <strong>{confirmDelete?.name}</strong> is deleted, along with
-              its DDNS credential. Any name it updates is left with no
-              device, so nothing will update it until you assign another.
-              This cannot be undone.
-            </Text>
-            {error ? (
-              <Alert color="gray" variant="light" data-testid="board-delete-error">
-                <Text size="sm" ff="monospace">
-                  {error}
-                </Text>
-              </Alert>
-            ) : null}
-            <Group justify="flex-end">
-              <Button
-                size="xs"
-                variant="default"
-                disabled={remove.isPending}
-                onClick={() => setConfirmDelete(null)}
-                data-testid="board-delete-cancel"
-              >
-                Cancel
-              </Button>
-              <Button
-                size="xs"
-                color="red"
-                disabled={remove.isPending}
-                onClick={() => confirmDelete && remove.mutate(confirmDelete.id)}
-                data-testid="board-delete-confirmed"
-              >
-                Delete {confirmDelete?.name}
-              </Button>
-            </Group>
-          </Stack>
-        </DdnsPortalScope>
-      </Modal>
+      {/* No delete-confirmation modal here. It went with the trash icon in
+          #155, because it was the only thing that opened it — a modal
+          nothing can open is the same artefact as a metric nothing writes.
+          The confirmation the operator sees is `DeviceCard`'s own, which
+          is reached by clicking the device name, and it says the same
+          sentence from a surface that is actually about the device. */}
     </>
   );
 }

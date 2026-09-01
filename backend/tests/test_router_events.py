@@ -449,6 +449,7 @@ def _possible(plan: dict[str, Any]) -> set[str]:
 # data volume, including zero.
 
 
+@pytest.mark.functional  # migrated MySQL schema / dialect-specific
 @pytest.mark.asyncio
 async def test_every_filter_is_servable_by_an_index(
     tenants: dict[str, Any],
@@ -489,6 +490,7 @@ async def test_every_filter_is_servable_by_an_index(
         assert _possible(plan), (filters, plan)
 
 
+@pytest.mark.functional  # migrated MySQL schema / dialect-specific
 @pytest.mark.asyncio
 async def test_the_cross_tenant_view_is_still_an_indexed_query(
     tenants: dict[str, Any],
@@ -533,6 +535,7 @@ async def test_the_cross_tenant_view_is_still_an_indexed_query(
         assert index in _possible(plan), (filters, plan)
 
 
+@pytest.mark.functional  # migrated MySQL schema / dialect-specific
 @pytest.mark.asyncio
 async def test_a_non_sargable_predicate_is_visible_only_to_explain(
     tenants: dict[str, Any],

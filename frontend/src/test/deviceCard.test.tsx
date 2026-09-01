@@ -422,3 +422,128 @@ describe('rotation shows the secret in the once-only modal — PR #127', () => {
     expect(sent.filter((s) => s.url.endsWith('/rotate')).length).toBe(0);
   });
 });
+
+/** #155 — the delete control belongs to the card, and only to the card.
+ *
+ * The board row carried a trash icon immediately after the device name.
+ * It deleted the **device**, and with it every hostname assignment the
+ * device owned, from a row that is about a *hostname* — so the operator's
+ * screenshot showed two rows carrying the same device name and the same
+ * trash icon, where the thing that differed between them was the name,
+ * not the device. The same device repeats once per hostname, so the same
+ * one-click destructive control appeared several times over.
+ *
+ * This is the argument that removed the edit icon from that row earlier:
+ * **the control was a duplicate of a safer path.** Clicking the device
+ * name opens this card, which asks first and says what goes with the
+ * device.
+ *
+ * ## Why the pair, and not the absence on its own
+ *
+ * "No delete control on the row" is the weakest shape of assertion there
+ * is: it passes on a row that failed to render, on a board that threw, on
+ * a fixture with no devices in it. So the absence is measured against a
+ * row asserted to be otherwise **intact** — the device control, the name,
+ * the add-a-name `+`, the log link and the updates figure are all checked
+ * in the same row, in the same test. A render that produced nothing fails
+ * on the positive half before it reaches the negative one.
+ *
+ * The second test is the other half of the trade: this removes a
+ * *duplicate*, not the capability. If deleting a device ever stops being
+ * reachable from the card, removing it from the row stops being a
+ * simplification and becomes a regression, and that has to fail here.
+ *
+ * ## Why the negative assertion is not spelled with the old testid alone
+ *
+ * `board-delete-<device>` is checked, because that is what comes back if
+ * the change is reverted verbatim. But the assertion that actually guards
+ * the row is the role query: **no control in this row has an accessible
+ * name containing "delete"**. A trash icon reintroduced under a different
+ * testid — which is what a re-add usually looks like — is invisible to
+ * the first check and caught by the second.
+ */
+describe('deleting a device is the card’s job, not the board row’s — #155', () => {
+  /** The board on its own, with no `?device=` in the address bar: the
+   *  page a tenant lands on. */
+  async function openBoard() {
+    renderWithAtrium(<DeviceBoardPage />);
+    return (await screen.findByTestId('board-table')) as HTMLElement;
+  }
+
+  test('the row is intact, and it offers no way to delete the device', async () => {
+    await openBoard();
+    const row = screen.getByTestId('board-row-host-a.example.net-AAAA');
+
+    // --- the positive half: this row rendered, and rendered fully ---
+    // Without these, "no delete control" is satisfied by an empty row.
+    const open = within(row).getByTestId('board-open-home-router');
+    expect(open.tagName).toBe('BUTTON');
+    expect(open).toHaveTextContent('home-router');
+    expect(within(row).getByText('host-a.example.net')).toHaveAttribute('href');
+    expect(
+      within(row).getByTestId('board-add-name-host-a.example.net'),
+    ).toBeInTheDocument();
+    expect(
+      within(row).getByTestId('board-log-host-a.example.net'),
+    ).toBeInTheDocument();
+    expect(
+      within(row).getByTestId('device-home-router-updates'),
+    ).toHaveTextContent('213');
+
+    // --- the negative half, twice, differently shaped ---
+    // 1. by what the control *is*, rather than by what it was called.
+    //    This is the assertion that survives the icon coming back under
+    //    a different testid, which is what a re-add usually looks like.
+    //    Both readings were taken against the pre-#155 tree and both are
+    //    red there, so neither is standing in for the other.
+    expect(
+      within(row).queryAllByRole('button', { name: /delete/i }),
+      'a control whose accessible name says "delete" is on the board row. ' +
+        'The row is about a hostname; the only delete it can offer destroys ' +
+        'the device and every name assigned to it. It belongs on the device ' +
+        'card, which asks first and says what goes with it.',
+    ).toHaveLength(0);
+    expect(
+      within(row).queryAllByRole('link', { name: /delete/i }),
+    ).toHaveLength(0);
+    // 2. and by the testid it had, which is what comes back if the
+    //    change is reverted verbatim.
+    expect(within(row).queryByTestId('board-delete-home-router')).toBeNull();
+  });
+
+  test('and the card still deletes it, with its own confirmation', async () => {
+    // The capability, not the duplicate. Driven the way an operator
+    // drives it — open the card from the address bar, press the button,
+    // confirm — and asserted on the request that actually left the
+    // bundle, because a modal that closes without sending anything looks
+    // identical from the DOM.
+    await openCard();
+
+    fireEvent.click(screen.getByTestId('detail-delete'));
+    // Waited for on the confirm *button*, not on `detail-delete-confirm`.
+    // That testid is on Mantine's `Modal` root, and the root is in the
+    // DOM whether the modal is open or shut — measured here: it is
+    // present, and empty, before the click. `findByTestId` on it is a
+    // probe that cannot fail, and asserting its text content reads `""`
+    // in both states.
+    const confirmed = await screen.findByTestId('detail-delete-confirmed');
+    // It asks first. Nothing has been sent yet — a card that deleted on
+    // the first click would pass an assertion made only after the
+    // confirmation.
+    expect(sent.filter((s) => s.method === 'DELETE')).toHaveLength(0);
+    // And it names the device and what goes with it, which is the context
+    // the board row could not carry.
+    expect(confirmed).toHaveTextContent('Delete home-router');
+    expect(
+      screen.getByText(/along with its DDNS credential/i),
+    ).toBeInTheDocument();
+
+    fireEvent.click(confirmed);
+    await waitFor(() =>
+      expect(sent.filter((s) => s.method === 'DELETE')).toHaveLength(1),
+    );
+    expect(sent.filter((s) => s.method === 'DELETE')[0].url).toContain(
+      `/atrium_ddns/devices/${DEVICE_ID}`,
+    );
+  });
+});

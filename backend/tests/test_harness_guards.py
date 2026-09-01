@@ -1053,6 +1053,7 @@ def test_the_fixture_lock_is_not_a_no_op() -> None:
     )
 
 
+@pytest.mark.functional  # asserts GET_LOCK excludes a second holder — MySQL-only by definition
 @pytest.mark.asyncio
 async def test_the_lock_actually_excludes() -> None:
     """Show the lock biting, rather than trusting that it does.
@@ -1573,4 +1574,361 @@ async def test_the_config_baseline_is_applied_in_this_process(ddns_config) -> No
         f"  found    {row!r}\n"
         "Some test left it moved, and every reader since has been reading "
         "that value"
+    )
+
+
+# ===================================================================== #
+# #149 — the cross-tenant hostname sweep has exactly one writer
+# ===================================================================== #
+
+#: The two callables that write ``ddns_hostname``'s health-check
+#: columns, and the two routes that reach them from outside the process.
+#: Named as data rather than spelled inline so the census and its own
+#: vacuity check cannot drift apart.
+_SWEEP_CALLS = frozenset({"run_health_checks", "clear_health_check_results"})
+_SWEEP_ROUTES = ("health-checks/run", "health-checks/clear")
+
+#: What makes a sweep reach past its own tenant. ``_sweep_scope`` is the
+#: worker's own unrestricted scope; ``CROSS_TENANT_PERMISSION`` is what
+#: widens a principal's. Either one in a test that also drives a sweep
+#: means the population is the installation's.
+_WIDENERS = frozenset({"CROSS_TENANT_PERMISSION", "_sweep_scope", "cross_tenant"})
+
+#: The four columns a forced sweep rewrites. A module that reads any of
+#: them is asserting about state another worker's sweep can move.
+_HEALTH_CHECK_COLUMNS = frozenset(
+    {"dns_checked_at", "dns_ip_v4", "dns_ip_v6", "dns_check_error"}
+)
+
+
+def _string_constants(tree: ast.AST) -> dict[str, str]:
+    """Module-level ``NAME = "literal"`` bindings.
+
+    ``test_router_health_checks.py`` spells its routes as ``RUN`` and
+    ``CLEAR``, so a matcher that only looked at string arguments would
+    see ``client.post(RUN)`` and report a negative result about the one
+    call site it exists to find.
+    """
+    out: dict[str, str] = {}
+    for node in getattr(tree, "body", []):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            if isinstance(node.value.value, str):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        out[target.id] = node.value.value
+    return out
+
+
+def _column_references(node: ast.AST) -> set[str]:
+    """Column names a subtree *uses*, in the four shapes this suite spells one.
+
+    :func:`_names_referenced` sees ``hostname.dns_checked_at`` and
+    ``dns_checked_at`` and stops there. Half of the real uses are neither:
+    ``m.Hostname(dns_checked_at=…)`` is an ``ast.keyword``, and
+    ``{"dns_checked_at": _now()}`` is a dict key. A census built on names
+    alone reports a negative result about half the population — which is
+    the shape of mistake this file exists to catch, one table along.
+
+    Bare string constants are deliberately **not** matched. Every rule in
+    this module is spelled as data at the top of its section, so a matcher
+    that read loose strings would count the rule as an instance of itself.
+    """
+    used = _names_referenced(node)
+    for child in ast.walk(node):
+        if isinstance(child, ast.keyword) and child.arg:
+            used.add(child.arg)
+        elif isinstance(child, ast.Dict):
+            for key in child.keys:
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    used.add(key.value)
+    return used
+
+
+def _sweep_writers_in(source: str, filename: str) -> dict[str, list[str]]:
+    """Every test in one source text that can sweep past its own tenant.
+
+    ``{test name: [why, …]}``. Parsed rather than grepped for
+    :func:`_app_settings_writes_in`'s reason — the paragraph you are
+    reading names both callables and both routes, and a grep would
+    count this module as a writer.
+
+    Takes source rather than a path so the matcher can be pointed at a
+    synthetic snippet, which is how the direct-call shape below is shown
+    to work: no test in this suite spells it today, and a matcher whose
+    only evidence is that it found nothing is not a matcher.
+    """
+    tree = ast.parse(source, filename=filename)
+    consts = _string_constants(tree)
+    found: dict[str, list[str]] = {}
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not node.name.startswith("test_"):
+            continue
+        if not (_names_referenced(node) & _WIDENERS):
+            continue
+
+        why: list[str] = []
+        for call in ast.walk(node):
+            if not isinstance(call, ast.Call):
+                continue
+            func = call.func
+            called = (
+                func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            )
+
+            # 1. the job functions, called directly with a widened scope.
+            if called in _SWEEP_CALLS:
+                why.append(f"{call.lineno}: {called}(…)")
+                continue
+
+            # 2. the routes, reached over HTTP. The path may be a
+            #    literal or a module constant; both resolve here.
+            if called in {"post", "put", "patch", "delete"}:
+                for arg in [*call.args, *(kw.value for kw in call.keywords)]:
+                    text = None
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        text = arg.value
+                    elif isinstance(arg, ast.Name):
+                        text = consts.get(arg.id)
+                    if text and any(route in text for route in _SWEEP_ROUTES):
+                        why.append(f"{call.lineno}: HTTP {called} {text!r}")
+                        break
+        if why:
+            found[node.name] = why
+    return found
+
+
+def _requests_fixture(source: str, filename: str, test: str, fixture: str) -> bool:
+    """Does ``test`` take ``fixture``, directly or through one of its own?
+
+    One level of indirection is resolved on purpose:
+    ``test_router_board.py`` takes the lock in its ``tenants`` fixture so
+    ten tests get it from one line, and a census that only read
+    signatures would call all ten unprotected.
+    """
+    tree = ast.parse(source, filename=filename)
+    fixtures = {f.name: {a.arg for a in f.args.args} for f in _fixtures(tree)}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name != test:
+            continue
+        params = {a.arg for a in node.args.args}
+        if fixture in params:
+            return True
+        return any(fixture in fixtures.get(p, set()) for p in params)
+    return False
+
+
+def test_the_cross_tenant_sweep_has_one_writer() -> None:
+    """#149's negative result, kept rather than re-derived.
+
+    A forced cross-tenant ``run_health_checks`` selects **every**
+    hostname in the installation carrying a published address —
+    ``due_only=False`` drops the staleness clause, so recency is no
+    defence — and writes ``dns_checked_at``, ``dns_ip_v4``,
+    ``dns_ip_v6`` and ``dns_check_error`` on up to
+    ``health_check_batch_size`` (200) of them, NULLs first. Ten xdist
+    workers share one database, so that population is nine other
+    workers' rows.
+
+    Measured before the fixture existed, over five full runs with the
+    sweep reporting its own numbers: ``hostnames_considered`` of
+    30/23/17/4/21 against **2** rows of its own, stamping 18/11/7/2/11.
+    One run was caught holding ``b0.a-jobs-gw5.example.invalid``
+    eligible — a row ``test_worker_jobs.py`` had created moments earlier
+    on another worker, and the node id #149 was opened about.
+
+    The invariant is *one writer, and it holds the lock*. A second one
+    is not a second flake; it is the same one twice, and the modules
+    that would report it are not the module that caused it — which is
+    what made this cost #117 an hour on the wrong container.
+
+    Vacuity is checked in three parts, because "nobody sweeps" is also
+    what a broken matcher prints.
+    """
+    census = {
+        path.name: _sweep_writers_in(path.read_text(encoding="utf-8"), str(path))
+        for path in _test_modules()
+    }
+    writers = {
+        f"{name}::{test}": why
+        for name, tests in census.items()
+        for test, why in tests.items()
+    }
+
+    # 1. The matcher finds the one call site it exists for. Without
+    #    this, every assertion below passes against an empty census.
+    known = "test_router_health_checks.py::test_an_admin_run_reaches_every_tenant"
+    assert known in writers, (
+        "the census found no cross-tenant hostname sweep at all. The suite has "
+        f"one — {known} — so this is a broken matcher, not a clean result. "
+        f"census={writers}"
+    )
+    assert any("HTTP post" in why for why in writers[known]), (
+        f"the route shape matched nothing at {known}: {writers[known]}"
+    )
+
+    # 2. The direct-call shape has no instance in this suite, so it is
+    #    exercised against a snippet rather than left as a branch that
+    #    has never run.
+    synthetic = _sweep_writers_in(
+        "async def test_x(scope):\n"
+        "    await run_health_checks(scope=_sweep_scope(), due_only=False)\n",
+        "<synthetic>",
+    )
+    assert list(synthetic) == ["test_x"] and "run_health_checks" in synthetic["test_x"][0], (
+        "the direct-call shape does not match the call it exists for; a test "
+        f"could sweep every tenant past this census. matcher said {synthetic}"
+    )
+
+    # 3. …and it does not fire on a tenant-scoped sweep, or the census
+    #    would name every health-check test in the suite and be ignored
+    #    within a week.
+    scoped = _sweep_writers_in(
+        "async def test_y(scope):\n"
+        "    await run_health_checks(scope=DdnsScope.for_user_id(1))\n",
+        "<synthetic>",
+    )
+    assert scoped == {}, f"the census fires on a tenant-scoped sweep: {scoped}"
+
+    assert set(writers) == {known}, (
+        "an installation-wide ddns_hostname write has exactly one owner and "
+        "these are not it:\n  "
+        + "\n  ".join(f"{k} {v}" for k, v in sorted(writers.items()) if k != known)
+        + "\nThe sweep reaches every xdist worker's rows and rewrites four "
+        "columns on them. Take conftest's `installation_wide_sweep` fixture "
+        "and add the site here — see #149."
+    )
+
+    # The writer holds the lock. A census that found the site and said
+    # nothing about its protection is an inventory, not a guard.
+    #
+    # This is the *static* half and it reads a signature, so a spelling
+    # it does not recognise reads as clean. The runtime half is an
+    # assertion inside the sweep itself, on `conftest._CONFIG_HELD_BY`,
+    # taken on the way past the POST — two instruments of different
+    # shape over one claim, and the mutation that removes the fixture
+    # kills both.
+    path = TESTS_DIR / "test_router_health_checks.py"
+    assert _requests_fixture(
+        path.read_text(encoding="utf-8"),
+        str(path),
+        "test_an_admin_run_reaches_every_tenant",
+        "installation_wide_sweep",
+    ), (
+        "the one cross-tenant sweep no longer takes `installation_wide_sweep`, "
+        "so it runs unlocked against nine other workers' rows — #149"
+    )
+
+
+def test_the_readers_of_the_swept_columns_are_a_named_population() -> None:
+    """The other side of #149's ratio, in the same guard file.
+
+    A writer census answers *who sweeps*. It says nothing about *who is
+    damaged*, and the damage is the failure — ``2 own / 30 considered``
+    is a result, ``one writer`` on its own is silence.
+
+    So: the modules that assert on the four columns a forced sweep
+    rewrites are named, **and each one's protection is checked rather
+    than promised**. The first version of this guard held a
+    ``{module: "how"}`` table of prose and survived the mutation that
+    deleted the mechanism it described — a table of strings is a hand-
+    kept list, which is the defect one section up, and it passed 2/2
+    against a board fixture that had just dropped the lock.
+
+    Swept across all backend test modules rather than listed, so a fifth
+    module joining the population fails here instead of joining it
+    quietly — the hole #78 found in ``EXPECTED_PARTICIPANTS``.
+
+    The population is **three of twenty-two** modules, and the fourth
+    candidate is the useful part of the reading:
+    ``test_tenant_isolation.py`` spells ``dns_ip_v4`` too, inside a
+    ``textwrap.dedent`` snippet handed to the read-path census. It
+    executes no statement against the column, so it is not a reader —
+    and a matcher that read loose strings would have reported four and
+    sent the next person to a file with nothing wrong with it.
+    """
+    readers = {
+        path.name
+        for path in _test_modules()
+        if _HEALTH_CHECK_COLUMNS
+        & _column_references(
+            ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        )
+    }
+    assert readers, "no module reads the health-check columns — the sweep is vacuous"
+
+    #: ``module -> (fixture, what that fixture must itself take)``. Each
+    #: entry is a claim about a binding that this guard then goes and
+    #: reads. ``None`` means the module is held apart by the scheduler
+    #: rather than by a lock, and it is the one entry that cannot be
+    #: checked here — it is checked by
+    #: :func:`test_the_cross_tenant_sweep_has_one_writer`, which asserts
+    #: the writer lives in exactly this module.
+    mechanisms: dict[str, tuple[str, str] | None] = {
+        # The whole file, through its own tenant fixture — #149.
+        "test_router_board.py": ("tenants", "installation_wide_sweep"),
+        # This module's `config` is an alias for `conftest.ddns_config`,
+        # which holds DDNS_CONFIG_LOCK for the length of the test. All
+        # 19 of its health-check and prune tests already took it before
+        # #149; the second assertion below is what keeps that true.
+        "test_worker_jobs.py": ("config", "ddns_config"),
+        # The writer's own file. `--dist=loadfile` puts every test in a
+        # file on one worker, so the sweep and these readers cannot
+        # overlap: the exclusion is the scheduler's, not a lock's.
+        "test_router_health_checks.py": None,
+    }
+    unaccounted = readers - set(mechanisms)
+    assert not unaccounted, (
+        "these modules assert on columns the one cross-tenant sweep rewrites "
+        f"and nothing says how they are held apart from it: {sorted(unaccounted)}. "
+        "Take `installation_wide_sweep` (directly or in the module's tenant "
+        "fixture) and record the mechanism here — see #149."
+    )
+    stale = set(mechanisms) - readers
+    assert not stale, (
+        f"these entries excuse modules that no longer read the columns: "
+        f"{sorted(stale)}. The entry goes when the reader does."
+    )
+
+    # Every claimed binding, read off the module rather than believed.
+    for module, claim in mechanisms.items():
+        if claim is None:
+            continue
+        fixture, dependency = claim
+        path = TESTS_DIR / module
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        declared = {f.name: {a.arg for a in f.args.args} for f in _fixtures(tree)}
+        assert fixture in declared, (
+            f"{module} is recorded as protected through its `{fixture}` fixture "
+            f"and has no such fixture. Fixtures found: {sorted(declared)}"
+        )
+        assert dependency in declared[fixture], (
+            f"{module}'s `{fixture}` fixture no longer takes `{dependency}`, so "
+            "its tests read `dns_*` columns while the one installation-wide "
+            f"sweep can be running. It takes {sorted(declared[fixture])} — #149"
+        )
+
+    # …and the binding is not enough on its own for `test_worker_jobs`,
+    # where the lock is taken per test rather than by one fixture the
+    # whole file shares. A health-check or prune test added without
+    # `config` would be a reader nothing holds apart, and the `config`
+    # fixture would still exist and still take `ddns_config`.
+    path = TESTS_DIR / "test_worker_jobs.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    unlocked = sorted(
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("test_")
+        and _SWEEP_CALLS & _names_referenced(node)
+        and "config" not in {a.arg for a in node.args.args}
+    )
+    assert not unlocked, (
+        "these tests in test_worker_jobs.py run a health check without taking "
+        f"`config`, so they seed rows the one cross-tenant sweep can stamp "
+        f"while they assert on them: {unlocked}. Add `config` — see #149."
     )

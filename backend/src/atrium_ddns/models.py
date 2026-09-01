@@ -48,6 +48,7 @@ from app.host_sdk.crypto import SecretBlob, UserSecret
 from app.host_sdk.db import HostForeignKey
 from sqlalchemy import (
     JSON,
+    DateTime,
     BigInteger,
     ForeignKey,
     Index,
@@ -55,6 +56,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
     text,
 )
 from sqlalchemy.dialects import mysql
@@ -89,6 +91,30 @@ TTL_MIN = 30
 TTL_MAX = 86400
 
 
+#: ``DATETIME(6)`` on MySQL, plain ``DATETIME`` elsewhere.
+#:
+#: The suite builds its schema from this metadata on in-memory SQLite, so
+#: a bare ``mysql.DATETIME`` made the models unloadable there and forced
+#: every backend test through a real MySQL in a container — which is what
+#: made ten xdist workers share one database, which is what produced the
+#: races in #117 and #149. Production DDL is unaffected: alembic owns it
+#: and still emits ``DATETIME(6)`` verbatim.
+#:
+#: The same `with_variant` shape `SecretBlob` already uses below.
+UTC_DATETIME = DateTime().with_variant(MysqlDATETIME(fsp=6), "mysql")
+
+#: A ``BIGINT`` primary key that still auto-increments on SQLite.
+#:
+#: SQLite only auto-increments a column typed exactly ``INTEGER PRIMARY
+#: KEY`` — a ``BIGINT`` primary key is an ordinary NOT NULL column, so
+#: every insert without an explicit id fails. That single fact accounted
+#: for 299 of the 343 errors in the first SQLite run of this suite.
+#:
+#: MySQL keeps BIGINT. Nothing about the deployed schema changes: alembic
+#: owns the production DDL and still emits BIGINT.
+BIGINT_PK = BigInteger().with_variant(Integer, "sqlite")
+
+
 def _utcnow_col(**kwargs: Any) -> Any:
     """A ``DATETIME(6)`` defaulting to the server clock.
 
@@ -99,8 +125,11 @@ def _utcnow_col(**kwargs: Any) -> Any:
     keyset pagination over the compound index double-counts.
     """
     return mapped_column(
-        MysqlDATETIME(fsp=6),
-        server_default=text("CURRENT_TIMESTAMP(6)"),
+        UTC_DATETIME,
+        # `func.now()` rather than `CURRENT_TIMESTAMP(6)`: the literal is a
+        # syntax error in SQLite DDL. Only `create_all` reads this — the
+        # deployed default comes from the migration.
+        server_default=func.now(),
         **kwargs,
     )
 
@@ -130,7 +159,7 @@ class TimestampMixin:
 
     created_at: Mapped[datetime] = _utcnow_col(nullable=False)
     updated_at: Mapped[datetime] = _utcnow_col(
-        nullable=False, server_onupdate=text("CURRENT_TIMESTAMP(6)")
+        nullable=False, server_onupdate=func.now()
     )
 
 
@@ -152,10 +181,10 @@ class AtriumDdnsState(HostBase):
         BigInteger, nullable=False, default=0
     )
     updated_at: Mapped[datetime] = mapped_column(
-        MysqlDATETIME(fsp=6),
+        UTC_DATETIME,
         nullable=False,
-        server_default=text("CURRENT_TIMESTAMP(6)"),
-        server_onupdate=text("CURRENT_TIMESTAMP(6)"),
+        server_default=func.now(),
+        server_onupdate=func.now(),
     )
 
 
@@ -176,7 +205,7 @@ class Domain(HostBase, TimestampMixin):
 
     __tablename__ = "ddns_domain"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BIGINT_PK, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(
         Integer,
         HostForeignKey("users.id", ondelete="CASCADE"),
@@ -239,7 +268,7 @@ class DomainBackend(HostBase, TimestampMixin):
 
     __tablename__ = "ddns_domain_backend"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BIGINT_PK, primary_key=True, autoincrement=True)
     domain_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("ddns_domain.id", ondelete="CASCADE"),
@@ -332,7 +361,7 @@ class Device(HostBase, TimestampMixin):
 
     __tablename__ = "ddns_device"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BIGINT_PK, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(
         Integer,
         HostForeignKey("users.id", ondelete="CASCADE"),
@@ -357,7 +386,7 @@ class Device(HostBase, TimestampMixin):
     # from zero updates in a window. Three states, three renderings;
     # collapsing them into 0 is how a status board lies.
     last_seen_at: Mapped[datetime | None] = mapped_column(
-        MysqlDATETIME(fsp=6), nullable=True
+        UTC_DATETIME, nullable=True
     )
     last_ip_v4: Mapped[str | None] = mapped_column(String(IPV4_LEN), nullable=True)
     last_ip_v6: Mapped[str | None] = mapped_column(String(IPV6_LEN), nullable=True)
@@ -404,7 +433,7 @@ class Hostname(HostBase, TimestampMixin):
 
     __tablename__ = "ddns_hostname"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BIGINT_PK, primary_key=True, autoincrement=True)
     domain_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("ddns_domain.id", ondelete="CASCADE"),
@@ -451,7 +480,7 @@ class Hostname(HostBase, TimestampMixin):
     last_ip_v4: Mapped[str | None] = mapped_column(String(IPV4_LEN), nullable=True)
     last_ip_v6: Mapped[str | None] = mapped_column(String(IPV6_LEN), nullable=True)
     last_updated_at: Mapped[datetime | None] = mapped_column(
-        MysqlDATETIME(fsp=6), nullable=True
+        UTC_DATETIME, nullable=True
     )
 
     # What the authoritative nameserver answered, last time the health
@@ -467,7 +496,7 @@ class Hostname(HostBase, TimestampMixin):
     dns_ip_v4: Mapped[str | None] = mapped_column(String(IPV4_LEN), nullable=True)
     dns_ip_v6: Mapped[str | None] = mapped_column(String(IPV6_LEN), nullable=True)
     dns_checked_at: Mapped[datetime | None] = mapped_column(
-        MysqlDATETIME(fsp=6), nullable=True
+        UTC_DATETIME, nullable=True
     )
     dns_check_error: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
@@ -563,7 +592,7 @@ class HostnameBackend(HostBase):
 
     __tablename__ = "ddns_hostname_backend"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BIGINT_PK, primary_key=True, autoincrement=True)
     hostname_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("ddns_hostname.id", ondelete="CASCADE"),
@@ -688,7 +717,7 @@ class DnsEvent(HostBase):
 
     __tablename__ = "ddns_event"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BIGINT_PK, primary_key=True, autoincrement=True)
     created_at: Mapped[datetime] = _utcnow_col(nullable=False)
 
     # --- who / what, by reference ------------------------------------ #
@@ -802,7 +831,7 @@ class RateLimitEvent(HostBase):
 
     __tablename__ = "ddns_rate_limit_event"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BIGINT_PK, primary_key=True, autoincrement=True)
     device_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("ddns_device.id", ondelete="CASCADE"),
