@@ -28,23 +28,15 @@
 import { useState } from "react";
 import {
   ActionIcon,
-  Alert,
   Button,
   Group,
-  Modal,
   Select,
-  Stack,
-  Text,
   Tooltip,
 } from "@mantine/core";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { IconListSearch, IconPlus, IconTrash } from "@tabler/icons-react";
+import { IconListSearch, IconPlus } from "@tabler/icons-react";
 
 import type { Board, BoardDevice, BoardHostname, Strip } from "../api/board";
-import { BOARD_QUERY_KEY } from "../api/board";
-import { DEVICES_QUERY_KEY, deleteDevice } from "../api/devices";
 import { LogLink } from "../LogSearchPage";
-import { DdnsPortalScope } from "../host/DdnsRoot";
 import { absoluteTitle, formatAge } from "./format";
 import { boardNameHref, boardNameNewHref } from "../paths";
 
@@ -155,27 +147,12 @@ export function BoardTable({
    *  used to draw itself. */
   initialDeviceFilter?: string | null;
 }) {
-  const client = useQueryClient();
-  /** Delete asks first. The board is the landing page, the icon is a 16px
-   *  target beside two others, and deleting a device destroys every
-   *  hostname assignment pointing at it — the same reasoning `DeviceList`
-   *  records for its own row, applied to the surface that now carries the
-   *  same control. */
-  const [confirmDelete, setConfirmDelete] = useState<BoardDevice | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const remove = useMutation({
-    mutationFn: deleteDevice,
-    onSuccess: () => {
-      setConfirmDelete(null);
-      setError(null);
-      // Both: the board is what this page draws, and the devices list is
-      // what every other surface reads. Invalidating one leaves the other
-      // showing a device that no longer exists.
-      void client.invalidateQueries({ queryKey: BOARD_QUERY_KEY });
-      void client.invalidateQueries({ queryKey: DEVICES_QUERY_KEY });
-    },
-    onError: (err: Error) => setError(err.message),
-  });
+  /* This component holds no mutation. It draws rows and filters them;
+     every write a row can reach — delete, rename, rotate, add a name —
+     belongs to the card or the form the row links to. #155 removed the
+     one exception, a `deleteDevice` mutation driven by a trash icon in
+     the device cell, together with the query invalidation and the error
+     state that existed only to serve it. */
 
   /** The view filters over the rows already on screen. `zone` is seeded
    *  from `?zone=` so the zone list can link here focused on one zone —
@@ -386,6 +363,22 @@ export function BoardTable({
                 {tone === "diverged" ? "!" : ""}
               </span>
               {row.device ? (
+                /* The device cell. One control: the name, which opens the
+                   device card. It carried a trash icon as well until #155
+                   — a one-click delete of the *device*, and of every name
+                   assigned to it, on a row that is about a *hostname*.
+                   The same device repeats once per name, so the same
+                   destructive control appeared several times over, and two
+                   rows differing only in their hostname read identically
+                   in that cell. Deleting is still reachable, from the card
+                   the name opens, which asks first and says how many names
+                   go with the device — the same argument that took the
+                   edit icon off this row earlier: the control was a
+                   duplicate of a safer path.
+
+                   The `Group` stays with one child on purpose. It is what
+                   the name cell below uses, and #154 puts the add-a-name
+                   `+` in here beside the name. */
                 <Group gap={4} wrap="nowrap" align="center">
                   <button
                     type="button"
@@ -395,18 +388,6 @@ export function BoardTable({
                   >
                     {row.device.name}
                   </button>
-                  <Tooltip label="Delete this device" withArrow>
-                    <ActionIcon
-                      variant="subtle"
-                      color="gray"
-                      size="sm"
-                      aria-label={`Delete ${row.device.name}`}
-                      onClick={() => setConfirmDelete(row.device)}
-                      data-testid={`board-delete-${row.device.name}`}
-                    >
-                      <IconTrash size={15} />
-                    </ActionIcon>
-                  </Tooltip>
                 </Group>
               ) : (
                 <span className="ddns-cell" data-tone="quiet">
@@ -513,55 +494,12 @@ export function BoardTable({
           );
         })}
       </div>
-      {/* Delete asks first, and names what goes with the device.
-          `DeviceList` records why: delete used to fire straight from the
-          row with no dialog and no undo, and one misplaced click destroyed
-          a device and every hostname assignment pointing at it. The icon
-          that triggers it here is a 16px target beside another. */}
-      <Modal
-        opened={confirmDelete !== null}
-        onClose={() => setConfirmDelete(null)}
-        title="Delete this device?"
-        data-testid="board-delete-confirm"
-      >
-        <DdnsPortalScope>
-          <Stack gap="sm">
-            <Text size="sm">
-              <strong>{confirmDelete?.name}</strong> is deleted, along with
-              its DDNS credential. Any name it updates is left with no
-              device, so nothing will update it until you assign another.
-              This cannot be undone.
-            </Text>
-            {error ? (
-              <Alert color="gray" variant="light" data-testid="board-delete-error">
-                <Text size="sm" ff="monospace">
-                  {error}
-                </Text>
-              </Alert>
-            ) : null}
-            <Group justify="flex-end">
-              <Button
-                size="xs"
-                variant="default"
-                disabled={remove.isPending}
-                onClick={() => setConfirmDelete(null)}
-                data-testid="board-delete-cancel"
-              >
-                Cancel
-              </Button>
-              <Button
-                size="xs"
-                color="red"
-                disabled={remove.isPending}
-                onClick={() => confirmDelete && remove.mutate(confirmDelete.id)}
-                data-testid="board-delete-confirmed"
-              >
-                Delete {confirmDelete?.name}
-              </Button>
-            </Group>
-          </Stack>
-        </DdnsPortalScope>
-      </Modal>
+      {/* No delete-confirmation modal here. It went with the trash icon in
+          #155, because it was the only thing that opened it — a modal
+          nothing can open is the same artefact as a metric nothing writes.
+          The confirmation the operator sees is `DeviceCard`'s own, which
+          is reached by clicking the device name, and it says the same
+          sentence from a surface that is actually about the device. */}
     </>
   );
 }
