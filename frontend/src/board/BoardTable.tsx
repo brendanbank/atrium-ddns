@@ -91,6 +91,29 @@ function toneOf(strip: Strip | null): "diverged" | "quiet" | "plain" {
   return "plain";
 }
 
+/** Why the row is accented, in the vocabulary the strip already uses.
+ *
+ *  The two joints mean different things and imply different actions, so
+ *  this names which one diverged rather than collapsing both to "out of
+ *  sync". `n/a` is not `agreed`: a joint with nothing to compare is not
+ *  described as having agreed.
+ */
+function divergenceReason(strip: Strip | null): string | null {
+  if (strip === null) return null;
+  const upper = strip.upper_joint === "diverged";
+  const lower = strip.lower_joint === "diverged";
+  if (upper && lower) {
+    return "DNS does not carry what we last published, and this device is reporting a different address than this name carries.";
+  }
+  if (upper) {
+    return "DNS does not carry what we last published for this name — the record was changed somewhere other than here.";
+  }
+  if (lower) {
+    return "This device is reporting a different address than this name carries — the device moved and the name has not followed.";
+  }
+  return null;
+}
+
 function answeredText(strip: Strip | null): string {
   if (strip === null) return "nothing published";
   const { address, status } = strip.answered;
@@ -359,9 +382,20 @@ export function BoardTable({
             >
               {/* The marker column. Present on every row so the accent does
                 not shift the grid when it appears. */}
-              <span className="ddns-boardtable__mark" aria-hidden="true">
-                {tone === "diverged" ? "!" : ""}
-              </span>
+              {tone === "diverged" ? (
+                <Tooltip label={divergenceReason(row.strip) ?? ""} withArrow multiline w={280}>
+                  <span
+                    className="ddns-boardtable__mark"
+                    role="img"
+                    aria-label={divergenceReason(row.strip) ?? "diverged"}
+                    data-testid={`board-mark-${row.hostname?.name ?? row.device?.name}`}
+                  >
+                    !
+                  </span>
+                </Tooltip>
+              ) : (
+                <span className="ddns-boardtable__mark" aria-hidden="true" />
+              )}
               {/* The device cell. Two things, pushed apart: the device
                   name on the left, which opens the card, and the
                   add-a-name `+` on the right.
