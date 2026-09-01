@@ -822,3 +822,97 @@ async def ddns_config(
             yield write_ddns_config
         finally:
             await write_ddns_config(baseline)
+
+
+# --------------------------------------------------------------------- #
+# The second surface that cannot be namespaced — #149
+# --------------------------------------------------------------------- #
+#
+# The section above is about one shared *row*. This is about shared
+# *rows*, and it is a different mechanism over a different table that
+# happens to have the same answer.
+#
+# ``run_health_checks(scope=<cross-tenant>, due_only=False)`` — what
+# ``POST /api/atrium_ddns/health-checks/run`` calls when the caller
+# holds ``atrium_ddns.admin``, and deliberately the scheduled job's own
+# function object rather than a second implementation (#75) — selects
+# **every** hostname in the installation carrying a published address,
+# orders ``dns_checked_at IS NULL`` first, caps at
+# ``health_check_batch_size`` (default 200) and writes
+# ``dns_checked_at``, ``dns_ip_v4``, ``dns_ip_v6`` and
+# ``dns_check_error`` on every row it reaches. ``due_only=False`` is the
+# part that makes the population the whole database: it drops the
+# staleness clause, so a row checked a millisecond ago is still
+# eligible.
+#
+# There is nothing to namespace. A hostname's tenancy is exactly what a
+# cross-tenant scope is defined to ignore, so ten xdist workers writing
+# ``PYTEST_XDIST_WORKER`` into every name they create does not help —
+# the sweep does not select on the name.
+#
+# **Why #117's fix cannot cover this, stated because the two look
+# alike.** #117 pinned ``app_settings['atrium_ddns']`` to
+# ``health_check_enabled=False`` for the whole session, which stops the
+# *worker container's* 60 s tick, and it was right to. This sweep never
+# reads that row: ``test_router_health_checks.pinned_config`` is autouse
+# and monkeypatches ``load_config`` in **both** ``router`` and
+# ``worker_jobs`` to return ``DdnsConfig()``, whose default is
+# ``health_check_enabled=True``. The baseline is structurally invisible
+# to it. Two surfaces, two mechanisms, one answer.
+#
+# What was measured before this existed, on this box, over five full
+# ``make test-backend`` runs (933 tests, ``-n auto --dist=loadfile``),
+# with the sweep instrumented to report its own population:
+#
+#     considered  30  23  17   4  21
+#     checked     18  11   7   2  11
+#     its own      2   2   2   2   2
+#
+# — so 16, 9, 5, 0 and 9 rows belonging to *other files* had their
+# health-check columns rewritten, on four runs in five. Extended to name
+# them, one run caught ``b0.a-jobs-gw5.example.invalid`` in the eligible
+# set: a row ``test_worker_jobs.py``'s
+# ``test_the_health_check_batch_ceiling_reports_itself`` had created
+# three statements earlier, on another worker. That test is #149.
+#
+# The failure is deterministic once the interleaving is forced. The same
+# call injected between that test's seeding and its assertion gives
+# ``assert 0 == 2``, with ``hostnames_due=0`` and ``hostnames_not_due=3``
+# on the summary — the sweep had stamped all three rows non-due.
+#
+# **Deliberately :data:`DDNS_CONFIG_LOCK` and not a third named lock.**
+# Two named locks with one documented order (config-then-fixture) is a
+# thing a reader can hold in their head and a thing
+# :func:`ddns_config_lock` refuses to violate; three named locks is a
+# cycle waiting to be introduced, and a cycle between 30-second
+# ``GET_LOCK``s presents as a hung suite with no failing test to name —
+# the failure that second refusal exists to prevent. The two uses are
+# also the same claim from two directions: the config row is the switch
+# that arms an installation-wide sweep, and this *is* an
+# installation-wide sweep. Nothing needs both at once, and the nesting
+# refusal makes an attempt fail loudly rather than block.
+
+
+@pytest_asyncio.fixture
+async def installation_wide_sweep(request: Any) -> AsyncIterator[None]:
+    """Exclusive right to run a sweep that reaches every tenant's rows.
+
+    Taken by the one test that performs an installation-wide
+    ``ddns_hostname`` write, and by every test whose assertions are
+    about the ``dns_*`` columns of rows it owns. Both halves are
+    required: a lock only one side takes excludes nothing, which is the
+    shape of guard this repository keeps finding in its own code.
+
+    Held for the **length of the test**, not for the write, for
+    :func:`ddns_config`'s reason — the race is between a writer on one
+    worker and a *reader* on another, and a reader that lands between
+    the write and the end of the test sees the same damage.
+
+    The population on both sides is a census rather than a habit:
+    ``test_harness_guards.test_the_cross_tenant_sweep_has_one_writer``
+    derives it from the tests' own source and fails when a second writer
+    appears.
+    """
+    owner = f"installation_wide_sweep[{getattr(request.node, 'nodeid', '?')}]"
+    async with ddns_config_lock(owner=owner):
+        yield

@@ -61,6 +61,7 @@ from app.db import get_session_factory
 from app.models.auth import User
 from app.models.ops import AuditLog
 from app.services.app_config import get_namespace
+import conftest
 from conftest import fixture_writes, purge_tenants, unusable_password_hash
 from fastapi import FastAPI
 from httpx import ASGITransport
@@ -669,12 +670,31 @@ async def test_a_tenants_run_does_not_touch_another_tenants_rows(
 
 
 async def test_an_admin_run_reaches_every_tenant(
-    tenants: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    installation_wide_sweep: None,
+    tenants: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """The other half, so the scoping is not merely a broken query.
 
     Same endpoint, same body, one permission different. Without this,
     an implementation that checked *nothing* would pass the test above.
+
+    **`installation_wide_sweep` is not decoration — #149.** This is the
+    only test in the suite that performs an unbounded cross-tenant write
+    to `ddns_hostname`, and "every tenant" is not a figure of speech:
+    the sweep reaches every hostname in the database with a published
+    address, ten xdist workers' worth, and rewrites four columns on up
+    to `health_check_batch_size` (200) of them. Instrumented over five
+    full runs it considered 30/23/17/4/21 rows against **2** of its own,
+    and one run was caught holding `b0.a-jobs-gw5.example.invalid` —
+    a row `test_worker_jobs.py` had created moments earlier on another
+    worker, which is the non-reproducing failure #149 was opened for.
+    The fixture holds `conftest.DDNS_CONFIG_LOCK` for the length of this
+    test, so no reader of those columns is running while it sweeps.
+
+    Nothing about the assertions changes. The population is still the
+    installation's, and `>= 2` is still the honest comparison for a
+    count whose denominator this test does not own.
     """
     a, b = tenants["a"], tenants["b"]
     monkeypatch.setattr(
@@ -688,6 +708,16 @@ async def test_an_admin_run_reaches_every_tenant(
         ),
     )
     await _drop_run_audits(a["user_id"])
+    # The runtime half of #149's guard, and the half a census cannot
+    # give: `test_harness_guards.test_the_cross_tenant_sweep_has_one_writer`
+    # reads this test's *signature*, so a spelling it does not recognise
+    # reads as clean. This reads the lock itself, on the way past, and a
+    # sweep that reaches nine other workers' rows unheld fails here
+    # rather than somewhere else an hour later.
+    assert conftest._CONFIG_HELD_BY is not None, (
+        "about to sweep every tenant's hostnames without holding "
+        f"{conftest.DDNS_CONFIG_LOCK!r}. Take `installation_wide_sweep` — #149"
+    )
     async with _client(
         a["user"], permissions=ALL_PERMS | {CROSS_TENANT_PERMISSION}
     ) as client:

@@ -58,7 +58,42 @@ calls pass their own :class:`DdnsConfig`. The tests that must exercise
 the namespace path assert on values the worker cannot move — a cutoff
 computed inside the call, a summary flag — rather than on rows.
 
-Everything created here is namespaced by ``PYTEST_XDIST_WORKER``.
+Everything created here is namespaced by ``PYTEST_XDIST_WORKER`` — and
+that is not sufficient, which is #149.
+
+The second shared surface, and why the first one's fix does not cover it
+------------------------------------------------------------------------
+The paragraph above is about the shared config *row*. The rows this file
+creates are a second shared surface and they cannot be namespaced at
+all. ``POST /api/atrium_ddns/health-checks/run`` under
+``atrium_ddns.admin`` calls ``run_health_checks`` — this module's own
+function object — with a cross-tenant scope and ``due_only=False``. That
+selects **every** hostname in the installation carrying a published
+address, orders ``dns_checked_at IS NULL`` first and rewrites four
+columns on up to 200 of them. A hostname's tenancy is exactly what a
+cross-tenant scope ignores, so a worker suffix in the name changes
+nothing: the sweep does not select on the name.
+
+``test_router_health_checks.py`` holds the suite's only such sweep, and
+``--dist=loadfile`` puts it on another worker while this file runs.
+Measured over five full runs before the fix, the sweep considered
+30/23/17/4/21 hostnames against **2** of its own and stamped
+18/11/7/2/11; one run was caught holding ``b0.a-jobs-gw5.example.invalid``
+eligible, which is
+``test_the_health_check_batch_ceiling_reports_itself``'s own row three
+statements after it was created. Injecting that call between the seeding
+and the assertion turns the non-reproducing failure into ``assert 0 ==
+2`` every time, with ``hostnames_due=0`` and ``hostnames_not_due=3``.
+
+Nothing in this file changed for it. All 19 of its health-check and
+prune tests already take ``config``, which is ``conftest.ddns_config``
+and holds ``DDNS_CONFIG_LOCK`` for the length of the test; the sweep now
+takes the same lock through ``conftest.installation_wide_sweep``. The
+twentieth,
+``test_two_statements_in_one_session_are_two_snapshots``, seeds a
+hostname and runs no health check, so it asserts on no column the sweep
+writes. That the protection is structural rather than per-test is the
+point, and it is the same shape as #117's answer to the row.
 """
 from __future__ import annotations
 
