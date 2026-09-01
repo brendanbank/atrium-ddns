@@ -876,6 +876,23 @@ async def _sqlite_schema() -> AsyncIterator[None]:
     async with engine.begin() as conn:
         await conn.run_sync(_AtriumBase.metadata.create_all)
         await conn.run_sync(_HostBase.metadata.create_all)
+        # The three system roles. `create_all` builds tables, not rows, and
+        # atrium seeds these in its init migration — which this lane never
+        # runs, because the chain is written in MySQL's dialect. Without them
+        # `assign_role` raises NoResultFound and anything that creates a user
+        # with a role fails for a reason that looks nothing like the cause.
+        #
+        # Copied from atrium's `0001_atrium_init`. If that list ever grows,
+        # this is where it diverges — the MySQL lane is what would catch it,
+        # which is one of the things that lane is for.
+        await conn.execute(
+            sa.text(
+                "INSERT INTO roles (code, name, is_system) VALUES"
+                " ('super_admin', 'Super admin', 1),"
+                " ('admin', 'Admin', 1),"
+                " ('user', 'User', 1)"
+            )
+        )
     yield
 
 
