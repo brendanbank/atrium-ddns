@@ -22,6 +22,55 @@
  * 4. **Two buttons that both said Save, and one that said Cancel and
  *    deleted.** One button row, conditional on whether the zone exists.
  *
+ * ## Why delete asks in a second modal, and what this file used to claim (#159)
+ *
+ * Deleting a zone destroys the zone, its provider binding **including
+ * the stored credential**, and every name under it. It used to ask
+ * *inline*, as an `Alert` in this form's own body, with the form's own
+ * `Delete this zone` / `Cancel` / `Save` row still live beneath it — so
+ * the surface offered *save* and *destroy* at the same moment, with two
+ * sets of buttons and two meanings of the word "delete" inches apart.
+ * Same defect #153 fixed in `NameModal`, over a much larger blast
+ * radius.
+ *
+ * **This file argued against fixing it, and the argument was false
+ * about its own code.** The comment above the confirmation read: *"The
+ * confirmation replaces the button row rather than opening a second
+ * modal over the first."* It did not. The `<Group>` carrying `Delete
+ * this zone` / `Cancel` / `Save` was rendered unconditionally,
+ * immediately after the confirmation's conditional closed. So the file
+ * stated a design decision it did not implement, and a reader who
+ * trusted it would have left the worst instance of this defect in place
+ * believing it had been considered and rejected.
+ *
+ * **The incident that comment records is real, and it is the reason to
+ * lock rather than to stay inline.** *"A modal on a modal is where the
+ * `Cancel` that deleted came from"* — that happened. But the hazard is
+ * **two live `Cancel`s, not two dialogs**: two overlapping surfaces each
+ * with its own idea of what the buttons at the bottom mean. #153's
+ * answer removes the ambiguity instead of the second surface:
+ *
+ * - The confirmation is its own `Modal` at `zIndex={400}` — the number
+ *   `SecretOnceModal` uses and `NameModal` and `DeviceCard` borrow, for
+ *   the same reason: Mantine gives every modal the same z-index, so
+ *   siblings stack by mount order until a re-render changes it.
+ * - **The form beneath is locked, not merely covered.** `locked = busy
+ *   || confirming` disables every control in this body. Mantine's
+ *   overlay stops a *mouse*; it does not stop a keyboard, an assistive
+ *   technology or a test, and "cannot be saved while the confirmation
+ *   is open" is a statement about the action, not about what is painted
+ *   over what.
+ * - **The dismissal is spelled `Keep it`, never `Cancel`.** While the
+ *   confirmation is up there is no enabled control anywhere on screen
+ *   labelled `Cancel`, so no two controls share a word with two
+ *   meanings. That is the incident's actual lesson.
+ *
+ * One more consequence: **the delete error renders inside the
+ * confirmation.** This form's own error `Alert` is at the top of the
+ * body, behind the dialog — a failed delete would have put the server's
+ * words on a surface nobody was looking at. `dropZone` therefore does
+ * not use `onError: fail`.
+ *
  * ## TTL is a number, and Settings is where the rest goes
  *
  * TTL lives at `ddns_domain_backend.config['ttl']` — #74 made it the
@@ -131,16 +180,22 @@ function Disclosure({
   label,
   onToggle,
   testId,
+  disabled,
 }: {
   open: boolean;
   label: string;
   onToggle: () => void;
   testId: string;
+  /** Part of the form's lock, not a state of its own — see `locked` in
+   *  `ZoneModalBody`. `UnstyledButton` renders a real `<button>`, so
+   *  this is the DOM's own `disabled` and not a painted-over one. */
+  disabled?: boolean;
 }) {
   return (
     <UnstyledButton
       onClick={onToggle}
       aria-expanded={open}
+      disabled={disabled}
       data-testid={testId}
       style={{ display: 'flex', alignItems: 'center', gap: 6 }}
     >
@@ -288,7 +343,11 @@ function ZoneModalBody({
   const dropZone = useMutation({
     mutationFn: deleteDomain,
     onSuccess: finish,
-    onError: fail,
+    // Deliberately **not** `onError: fail`. `fail` writes this form's
+    // own error `Alert`, which lives at the top of the body — behind
+    // the confirmation dialog. A failed delete would have put the
+    // server's words on a surface nobody was looking at. It is rendered
+    // inside the dialog instead, from `dropZone.error`.
   });
 
   const busy =
@@ -297,6 +356,19 @@ function ZoneModalBody({
     editBinding.isPending ||
     rename.isPending ||
     dropZone.isPending;
+
+  /** The confirmation is open, and there is a zone for it to be about.
+   *  `domain` is in the condition because the dialog names the zone and
+   *  counts the names under it. */
+  const confirming = confirmDelete && domain != null;
+
+  /** What every control in this body is disabled by.
+   *
+   *  Not decoration, and not the overlay's job. Mantine's overlay stops
+   *  a mouse; it does not stop a keyboard, an assistive technology or a
+   *  test. "This form cannot be saved while the delete confirmation is
+   *  open" is a statement about the action. See the docblock. */
+  const locked = busy || confirming;
 
   const offered = (providers.data ?? []).map((p) => p.service);
   /** The stored provider is always selectable, even when the catalogue
@@ -478,6 +550,7 @@ function ZoneModalBody({
           className="ddns-data"
           aria-label="Zone name"
           value={name}
+          disabled={locked}
           onChange={(event) => setName(event.currentTarget.value)}
           data-testid="zone-name"
         />
@@ -497,7 +570,8 @@ function ZoneModalBody({
         // A binding's provider cannot change: the row is
         // UNIQUE(domain_id, backend_type), so a change is a different
         // row and doing it silently would leave the old one behind.
-        disabled={binding !== undefined}
+        // `locked` is the second reason, and either one is sufficient.
+        disabled={binding !== undefined || locked}
         onChange={(value) => {
           setService(value ?? '');
           setSecrets({});
@@ -517,6 +591,7 @@ function ZoneModalBody({
             data={f.choices}
             value={fieldValues[f.key] || null}
             withAsterisk={f.required}
+            disabled={locked}
             onChange={(value) =>
               setFieldValues((c) => ({ ...c, [f.key]: value ?? '' }))
             }
@@ -528,6 +603,7 @@ function ZoneModalBody({
             label={f.label}
             value={fieldValues[f.key] ?? ''}
             withAsterisk={f.required}
+            disabled={locked}
             onChange={(event) => {
               // Read *before* entering the updater — the same rule
               // `BackendForm` carries, and for the same reason. See
@@ -545,6 +621,7 @@ function ZoneModalBody({
         value={ttl ?? ''}
         min={1}
         allowDecimal={false}
+        disabled={locked}
         onChange={(value) =>
           setTtl(value === '' || value === null ? null : Number(value))
         }
@@ -557,6 +634,7 @@ function ZoneModalBody({
           onToggle={() => setSettingsOpen((v) => !v)}
           label="Settings (JSON)"
           testId="zone-settings-toggle"
+          disabled={locked}
         />
         <Collapse expanded={settingsOpen}>
           <Stack gap={4}>
@@ -569,6 +647,7 @@ function ZoneModalBody({
               autosize
               minRows={3}
               value={settingsText}
+              disabled={locked}
               onChange={(event) => setSettingsText(event.currentTarget.value)}
               data-testid="zone-settings"
             />
@@ -591,7 +670,17 @@ function ZoneModalBody({
               // it would let a zone be created with no credential at all.
               .filter((m) => (binding?.credentials_set ? true : m !== 'keep'))
               .map((m) => (
-                <Radio key={m} value={m} label={MODE_LABELS[m]} data-testid={`zone-credential-${m}`} />
+                <Radio
+                  key={m}
+                  value={m}
+                  label={MODE_LABELS[m]}
+                  // Per-`Radio` rather than on the group: Mantine's
+                  // `Radio.Group` does not forward `disabled` to its
+                  // children, so a group-level prop would read as a
+                  // lock and not be one.
+                  disabled={locked}
+                  data-testid={`zone-credential-${m}`}
+                />
               ))}
           </Stack>
         </Radio.Group>
@@ -603,6 +692,7 @@ function ZoneModalBody({
                 autosize
                 minRows={1}
                 value={secrets[key] ?? ''}
+                disabled={locked}
                 onChange={(event) => {
                   // Read the value *before* entering the updater, and
                   // this is not style. A functional `setState` is only
@@ -646,34 +736,83 @@ function ZoneModalBody({
         </Alert>
       ) : null}
 
-      {/* The confirmation replaces the button row rather than opening a
-          second modal over the first. A modal on a modal is where the
-          "Cancel" that deleted came from — two overlapping dialogs, each
-          with its own idea of what the buttons at the bottom mean. */}
-      {confirmDelete && domain ? (
-        <Alert
-          color="gray"
-          variant="light"
-          title="Delete this zone?"
-          data-testid="zone-delete-confirm"
-        >
-          <Stack gap="sm">
+      {/* Its own surface, over this one — and this comment is the
+          correction of the one that used to stand here. It read: "The
+          confirmation replaces the button row rather than opening a
+          second modal over the first."
+
+          **It did not.** The `<Group>` below rendered unconditionally,
+          immediately after this conditional closed, so `Delete this
+          zone` / `Cancel` / `Save` all stayed live behind the panel.
+          The file stated a decision it did not implement (#159).
+
+          The incident the old comment records is kept because it is
+          real: "a modal on a modal is where the `Cancel` that deleted
+          came from — two overlapping dialogs, each with its own idea of
+          what the buttons at the bottom mean". That is the reason for
+          `locked`, not a reason to stay inline. The hazard is two live
+          `Cancel`s, not two dialogs: here every control beneath is
+          disabled while this is open, and the dismissal is spelled
+          `Keep it`, never `Cancel`.
+
+          `zIndex` is the number `SecretOnceModal`, `NameModal` and
+          `DeviceCard` all use, for the identical reason: this has to
+          outrank a modal that is already open, and Mantine gives every
+          modal the same z-index, so siblings stack by mount order until
+          a re-render changes it.
+
+          The testid is on the body rather than on `Modal`, because
+          Mantine does not forward `data-testid` to a node a DOM query
+          can reach — `deviceCard.test.tsx` records the same. */}
+      <Modal
+        opened={confirming}
+        onClose={() => {
+          dropZone.reset();
+          setConfirmDelete(false);
+        }}
+        title="Delete this zone?"
+        zIndex={400}
+      >
+        {/* Portalled to `document.body`, outside `[data-ddns-root]`, so
+            without this the dialog renders with none of `ddns.css` —
+            and `.ddns-data` is what sets the zone name apart from the
+            prose around it. */}
+        <DdnsPortalScope>
+          <Stack gap="sm" data-testid="zone-delete-confirm">
+            {/* Verbatim, and it stays verbatim. It is the only place
+                the blast radius is stated: the zone, the stored
+                credential, and every name under it — and the records
+                the provider has already published, which this does
+                *not* remove. */}
             <Text size="sm">
-              This destroys <code className="ddns-data">{domain.name}</code>, its
-              provider binding — <strong>stored credentials included</strong> —
-              and the {domain.hostname_count} name
-              {domain.hostname_count === 1 ? '' : 's'} under it. It does{' '}
+              This destroys{' '}
+              <code className="ddns-data">{domain?.name}</code>, its provider
+              binding — <strong>stored credentials included</strong> — and the{' '}
+              {domain?.hostname_count} name
+              {domain?.hostname_count === 1 ? '' : 's'} under it. It does{' '}
               <strong>not</strong> remove whatever your DNS provider has already
               published for those names; those records stay in the zone with
               nothing maintaining them.
             </Text>
+            {dropZone.error ? (
+              <Alert color="gray" variant="light" data-testid="zone-delete-error">
+                <Text size="sm" ff="monospace">
+                  {(dropZone.error as Error).message}
+                </Text>
+              </Alert>
+            ) : null}
             <Group justify="flex-end">
               <Button
                 size="xs"
                 variant="default"
                 disabled={busy}
-                onClick={() => setConfirmDelete(false)}
-                data-testid="zone-delete-cancel"
+                onClick={() => {
+                  dropZone.reset();
+                  setConfirmDelete(false);
+                }}
+                // Renamed from `zone-delete-cancel`, which named the
+                // one word this dialog must not use.
+                data-testid="zone-delete-keep"
               >
                 Keep it
               </Button>
@@ -681,25 +820,30 @@ function ZoneModalBody({
                 size="xs"
                 color="red"
                 disabled={busy}
-                onClick={() => dropZone.mutate(domain.id)}
+                onClick={() => domain && dropZone.mutate(domain.id)}
                 data-testid="zone-delete-confirmed"
               >
-                Delete {domain.name}
+                Delete {domain?.name}
               </Button>
             </Group>
           </Stack>
-        </Alert>
-      ) : null}
+        </DdnsPortalScope>
+      </Modal>
 
-      {/* One button row, conditional on whether the zone exists. */}
+      {/* One button row, conditional on whether the zone exists — and
+          disabled by `locked`, not merely covered, while the
+          confirmation above is open. */}
       <Group justify="space-between">
         {domain ? (
           <Button
             size="xs"
             variant="default"
             color="gray"
-            disabled={busy}
-            onClick={() => setConfirmDelete(true)}
+            disabled={locked}
+            onClick={() => {
+              dropZone.reset();
+              setConfirmDelete(true);
+            }}
             data-testid="zone-delete"
           >
             Delete this zone
@@ -708,12 +852,12 @@ function ZoneModalBody({
           <span />
         )}
         <Group gap="sm">
-          <Button size="xs" variant="default" disabled={busy} onClick={onClose} data-testid="zone-cancel">
+          <Button size="xs" variant="default" disabled={locked} onClick={onClose} data-testid="zone-cancel">
             Cancel
           </Button>
           <Button
             size="xs"
-            disabled={busy || name.trim() === '' || service === ''}
+            disabled={locked || name.trim() === '' || service === ''}
             onClick={submit}
             data-testid="zone-submit"
           >
