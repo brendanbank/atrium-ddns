@@ -675,22 +675,21 @@ GATE_BASE ?= $(or $(OVERNIGHT_MILESTONE_BRANCH),$(GATE_CONF_BRANCH),$(OVERNIGHT_
 # shell scripts reach no pytest and no vitest, so a diff confined to them used
 # to print "this diff reaches no test" and that was the whole reading. The
 # `.env` guard's own `--self-test` is the test they reach.
-gate:  ## run only what this diff can reach. Often that is nothing.
-	@# THE RULE: a change runs a suite only if it can change that suite's
-	@# result. A one-line Makefile edit cannot affect a vitest test, so
-	@# running vitest for it is a probe that cannot fail — the defect family
-	@# this repo is most insistent about, sitting in the gate itself.
+gate:  ## unit tests only. No docker, ever. Only what the diff can reach.
+	@# TWO RULES, both operator decisions of 2026-09-01:
 	@#
-	@# Got this wrong three times on 2026-09-01, each time by leaving one
-	@# half unconditional: first both suites always, then the frontend suite
-	@# always. A Makefile change still ran 233 frontend tests and a docker
-	@# image got built as a side effect of `up`. The scoping is the point;
-	@# "simple" meant fewer branches, not fewer conditions.
+	@# 1. UNIT TESTS ONLY. `make test-backend` is NOT a unit suite — it is 933
+	@#    tests against a real MySQL, ten xdist workers sharing one database.
+	@#    That is a functional suite, and its shared state is what generates
+	@#    the race conditions this project keeps chasing (#117, #149). It runs
+	@#    deliberately, or at the milestone e2e, never here.
 	@#
-	@# Reaching no test is a RESULT, not a skipped step. For such a change
-	@# the evidence is the diff plus a direct demonstration of the behaviour
-	@# it changes — which is stronger evidence about that change than a green
-	@# suite that could not have gone red.
+	@# 2. NO DOCKER. A unit test does not need a container. Both suites below
+	@#    run on the host: vitest, and the service-free `pytest tests/` that
+	@#    CI runs as `compat-guards` with nothing but pytest and pyyaml.
+	@#
+	@# And a change runs a suite only if it can change that suite's result.
+	@# Reaching no test is a RESULT, not a skipped step.
 	@set -e; \
 	base="$(GATE_BASE)"; \
 	git rev-parse --verify -q "origin/$$base" >/dev/null 2>&1 && base="origin/$$base"; \
@@ -706,16 +705,17 @@ gate:  ## run only what this diff can reach. Often that is nothing.
 		echo "gate: SKIP frontend — nothing under frontend/ changed."; \
 	fi; \
 	if [ "$$be" -gt 0 ]; then \
-		echo "gate: backend ($$be file(s)) -> backend unit tests"; \
-		$(MAKE) --no-print-directory up migrate test-backend; \
+		echo "gate: backend ($$be file(s)) -> service-free unit tests"; \
+		[ -x .gate-venv/bin/python ] || { python3 -m venv .gate-venv && .gate-venv/bin/pip install -q --disable-pip-version-check pytest pyyaml; }; \
+		.gate-venv/bin/python -m pytest tests/ -q; \
 	else \
-		echo "gate: SKIP backend — nothing under backend/, tests/ or scripts/*.py changed. No docker."; \
+		echo "gate: SKIP backend — nothing under backend/, tests/ or scripts/*.py changed."; \
 	fi; \
 	if [ "$$fe" -eq 0 ] && [ "$$be" -eq 0 ]; then \
 		echo "gate: this diff reaches no test, and that is the result rather than"; \
-		echo "gate: a skipped step. Evidence is the diff plus a direct demonstration"; \
-		echo "gate: of the behaviour it changes."; \
+		echo "gate: a skipped step. Evidence is the diff plus a direct demonstration."; \
 	fi; \
+	echo "gate: no container was started."; \
 	echo "gate: PASS"
 
 typecheck:  ## tsc --noEmit on the host bundle
