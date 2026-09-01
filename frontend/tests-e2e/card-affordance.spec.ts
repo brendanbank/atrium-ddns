@@ -52,8 +52,8 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
 import {
+  BOARD_PATH,
   API_URL,
-  DEVICES_PATH,
   DOMAINS_PATH,
   bindScriptedBackend,
   loginAsUser,
@@ -369,14 +369,25 @@ test.describe('#97 — an interactive .ddns-data says so, at rest', () => {
 
     // The name: a link with a real href, so copy-link and middle-click
     // behave as the anchor promises.
-    const nameLink = row.getByRole('link', { name: created.hostname });
+    // `exact` matters. The row's log control carries
+    // `aria-label="Log for <name>"`, which *contains* the hostname, so
+    // the default substring match resolves to two links and fails on
+    // strict mode. Two controls in one row legitimately mention the
+    // same name; only one of them *is* the name.
+    const nameLink = row.getByRole('link', {
+      name: created.hostname,
+      exact: true,
+    });
     await expect(nameLink).toBeVisible();
     const href = await nameLink.getAttribute('href');
-    expect(href).toMatch(/\/atrium-ddns\/names\?name=\d+$/);
+    // The board itself: `/atrium-ddns/names` is gone and the name modal
+    // is `?name=` on the one tenant surface, so this is a query on the
+    // page you are already on rather than a trip to another.
+    expect(href).toMatch(/^\/atrium-ddns\?name=\d+$/);
   });
 
 
-  test('the device list opens the same card, and its route still resolves', async ({
+  test('the board row opens the card, and the address carries it', async ({
     page,
   }, testInfo) => {
     const pageErrors: string[] = [];
@@ -385,8 +396,8 @@ test.describe('#97 — an interactive .ddns-data says so, at rest', () => {
     await loginAsUser(page);
     const deviceName = uniqueDeviceName();
 
-    await page.goto(DEVICES_PATH);
-    await page.getByTestId('add-device').click();
+    await page.goto(BOARD_PATH);
+    await page.getByTestId('board-add-device').click();
     const create = page.getByRole('dialog');
     await expect(create).toBeVisible({ timeout: 8_000 });
     await create.getByTestId('device-name').fill(deviceName);
@@ -394,20 +405,30 @@ test.describe('#97 — an interactive .ddns-data says so, at rest', () => {
     await expect(page.getByTestId('device-secret-once')).toBeVisible();
     await page.getByTestId('dismiss-secret').click();
 
-    const name = page.getByTestId(`open-${deviceName}`);
-    await expect(name).toBeVisible();
-    expect(await decorationOf(name)).toContain('underline');
-    const href = await name.getAttribute('href');
-    expect(href).toBeTruthy();
+    // The device list is gone — `/atrium-ddns/devices` with it — so the
+    // row this reads is the board's own. Its control is a *button* that
+    // navigates rather than an anchor, which is why there is no `href` to
+    // assert: §18.2's point was that the name must be a real control, and
+    // a button is one. The address is still checked, below, after the
+    // click.
+    await page.goto(BOARD_PATH);
+    const name = page.getByTestId(`board-open-${deviceName}`);
+    await expect(name).toBeVisible({ timeout: 8_000 });
 
-    const listUrl = page.url();
     await name.click();
     const modal = page.getByRole('dialog');
     await expect(modal).toBeVisible({ timeout: 8_000 });
     // Same property as the zone list: the path holds, the query
     // carries the open card so a reload restores it.
-    expect(new URL(page.url()).pathname).toBe(new URL(listUrl).pathname);
+    // The query carries the open card, so a reload restores it. The
+    // *path* normalises to `/atrium-ddns`: that is the board's canonical
+    // address and the one the nav item points at, while
+    // `/atrium-ddns/board` is an alias kept so older links resolve.
+    // Opening a card from the alias lands on the canonical form, so this
+    // asserts the destination rather than "unchanged".
+    expect(new URL(page.url()).pathname).toBe('/atrium-ddns');
     expect(new URL(page.url()).search).toMatch(/^\?device=\d+$/);
+    const cardUrl = page.url();
     const modalCard = modal.getByTestId('device-detail');
     await expect(modalCard).toBeVisible();
     // The edit controls, which is what "I cannot edit" was about.
@@ -415,7 +436,10 @@ test.describe('#97 — an interactive .ddns-data says so, at rest', () => {
     // that is always a field cannot disagree with a heading about what
     // the name currently is.
     await expect(modalCard.getByTestId('device-name-input')).toBeVisible();
-    await expect(modalCard.getByTestId('detail-limit-save')).toBeVisible();
+    // One Save for the whole card now, not one per field. The limit
+    // input is still here; its own submit is what went.
+    await expect(modalCard.getByTestId('detail-limit-input')).toBeVisible();
+    await expect(modalCard.getByTestId('device-save')).toBeVisible();
     await expect(modalCard.getByTestId('detail-rotate')).toBeVisible();
     const modalShape = await cardShape(modalCard);
 
@@ -428,7 +452,10 @@ test.describe('#97 — an interactive .ddns-data says so, at rest', () => {
     await expect(modal).toBeHidden();
 
     // The route, still there and still the same card.
-    await page.goto(href as string);
+    // Reopened by address. There is no separate route any more — the card
+      // *is* `?device=` on the board — so this is the URL the click
+      // produced, which proves the address alone restores the card.
+      await page.goto(cardUrl);
     const routeCard = page.getByTestId('device-detail');
     await expect(routeCard).toBeVisible({ timeout: 8_000 });
     // The address renders the **same modal**, which is the point of

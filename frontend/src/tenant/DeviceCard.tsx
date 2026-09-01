@@ -46,6 +46,7 @@
 import { useState } from 'react';
 import {
   Alert,
+  Anchor,
   Button,
   Divider,
   Group,
@@ -58,23 +59,23 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { usePerm } from '@brendanbank/atrium-host-bundle-utils/react';
 
-import { boardQuery } from '../api/board';
+import { BOARD_QUERY_KEY } from '../api/board';
 import {
   DEVICES_QUERY_KEY,
   DEVICE_PERMISSION,
+  deleteDevice,
   deviceQuery,
   renameDevice,
   rotateDeviceSecret,
-  updateDeviceLimit,
   type Device,
   type DeviceSecret,
 } from '../api/devices';
 import { ApiError } from '../api/http';
-import { HostnameBlock } from '../board/DeviceBoard';
-import { absoluteTitle, formatAge, rateLimitSummary } from '../board/format';
+import { boardForDeviceHref } from '../paths';
+import { absoluteTitle, formatAge } from '../board/format';
 import { CARD_MODAL_PADDING_PX, CARD_MODAL_WIDTH_PX, CARD_MODAL_PROPS, CARD_MODAL_STYLES } from '../cards';
 import { DdnsPortalScope } from '../host/DdnsRoot';
-import { MigratedNotice, SecretOnce } from './SecretOnce';
+import { MigratedNotice, SecretOnceModal } from './SecretOnce';
 
 /** The server's words, verbatim.
  *
@@ -98,206 +99,37 @@ export function refusalText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** The name, edited where it is displayed. */
-function DeviceName({
-  device,
-  onSaved,
-}: {
-  device: Device;
-  onSaved: (next: Device) => void;
-}) {
-  const [draft, setDraft] = useState(device.name);
-  const [refusal, setRefusal] = useState<string | null>(null);
-
-  const rename = useMutation({
-    mutationFn: renameDevice,
-    onSuccess: (next) => {
-      setRefusal(null);
-      onSaved(next);
-    },
-    // The 409 is rendered as the server wrote it. Nothing here retries
-    // with a suffix and nothing here rewords it: "you already have a
-    // device called 'router'" is more useful than any sentence this
-    // component could compose, and it is the sentence the API contract
-    // guarantees.
-    onError: (error: Error) => setRefusal(refusalText(error)),
-  });
-
-
-  const submit = () => {
-    const name = draft.trim();
-    if (name === '' || rename.isPending) return;
-    rename.mutate({
-      id: device.id,
-      name,
-      // The **stored** limit, re-sent unchanged. See `renameDevice`:
-      // the key is required, and sending the effective value would pin
-      // an inheriting device to today's default.
-      rate_limit_per_minute: device.rate_limit_per_minute,
-    });
-  };
-
-  /* Always an input with Save beside it. No read mode, no Rename link.
-
-     The toggle existed to keep the name looking like a heading until you
-     asked to change it. The cost was a click before the most common edit
-     on the page, and two states that had to agree about what the name
-     currently is. A field that is always a field cannot disagree with
-     itself, and `Save` stays disabled until the draft differs from the
-     stored name — so the affordance still says whether there is anything
-     to do. */
-  return (
-    <Stack gap="xs">
-      <Group gap="sm" align="flex-end">
-        <TextInput
-          label="Name"
-          value={draft}
-          disabled={rename.isPending}
-          onChange={(event) => setDraft(event.currentTarget.value)}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter') submit();
-            // Escape restores the stored name. There is nothing to close.
-            if (event.key === 'Escape') setDraft(device.name);
-          }}
-          data-testid="device-name-input"
-          style={{ minWidth: 280 }}
-        />
-        <Button
-          size="xs"
-          disabled={
-            draft.trim() === '' ||
-            draft.trim() === device.name ||
-            rename.isPending
-          }
-          onClick={submit}
-          data-testid="device-name-save"
-        >
-          Save
-        </Button>
-      </Group>
-      {refusal ? (
-        <Alert
-          color="gray"
-          variant="light"
-          title="That name is taken"
-          data-testid="device-name-refusal"
-        >
-          <Text size="sm" ff="monospace">
-            {refusal}
-          </Text>
-        </Alert>
-      ) : null}
-    </Stack>
-  );
-}
-
-/** The rate limit, with *inherit* as a choice rather than as an
- *  omission. */
-function RateLimit({
-  device,
-  onSaved,
-}: {
-  device: Device;
-  onSaved: (next: Device) => void;
-}) {
-  /* One field, prefilled with the limit actually in force — the
-     per-device value if there is one, otherwise the installation default
-     the server reports. So the box always opens showing the number the
-     device is really being held to, which is what you came to read.
-
-     **Clearing the box is how you go back to inheriting.** The checkbox
-     that used to say so is gone at the operator's request, so empty is
-     the only way `null` still reaches the API — and `null` is a value on
-     this column, not an omission (#73). Without that mapping a device,
-     once opened, could never inherit again. */
-  const [value, setValue] = useState<number | ''>(
-    device.rate_limit_per_minute ?? device.effective_rate_limit_per_minute ?? '',
-  );
-  const [refusal, setRefusal] = useState<string | null>(null);
-
-  const save = useMutation({
-    mutationFn: updateDeviceLimit,
-    onSuccess: (next) => {
-      setRefusal(null);
-      onSaved(next);
-    },
-    onError: (error: Error) => setRefusal(refusalText(error)),
-  });
-
-  /* One line: heading, field, checkbox, Save.
-     The field is **prefilled with the effective limit** rather than left
-     blank when the device inherits. A blank box next to the words
-     "inherit the installation default (30)" made the operator read the
-     number off the label and type it back in to change it by one.
-
-     `inheriting` still travels as `null` on the wire — #73's rule that
-     `null` is a value on this column and not an omission. Prefilling is
-     a display choice; it does not turn an inheriting device into a
-     pinned one unless the box is ticked off. */
-  return (
-    <Stack gap="xs">
-      <Group gap="md" align="center" wrap="nowrap">
-        <span className="ddns-th">Rate limit</span>
-        <NumberInput
-          aria-label="Updates per minute"
-          value={value}
-          min={0}
-          disabled={save.isPending}
-          placeholder="inherit"
-          onChange={(next) => setValue(typeof next === 'number' ? next : '')}
-          data-testid="detail-limit-input"
-          styles={{ input: { width: 110 } }}
-          w={110}
-        />
-        <Text size="sm" c="dimmed">
-          per minute
-        </Text>
-        <Button
-          size="xs"
-          disabled={save.isPending}
-          onClick={() =>
-            save.mutate({
-              id: device.id,
-              // `null` is the *inherit* choice, made explicitly. `0`
-              // would mute the device, which is a different thing.
-              // Empty means inherit. `0` would mute the device, which is
-              // a different thing and is why this is not `|| 0`.
-              rate_limit_per_minute: value === '' ? null : value,
-            })
-          }
-          data-testid="detail-limit-save"
-        >
-          Save
-        </Button>
-      </Group>
-      <Text size="xs" c="dimmed" data-testid="detail-limit-current">
-        Currently {rateLimitSummary(device)}. Over this,{' '}
-        <code>/nic/update</code> answers <code>abuse</code> and publishes
-        nothing.
-      </Text>
-      {refusal ? (
-        <Alert
-          color="gray"
-          variant="light"
-          title="That did not work"
-          data-testid="detail-limit-refusal"
-        >
-          <Text size="sm" ff="monospace">
-            {refusal}
-          </Text>
-        </Alert>
-      ) : null}
-    </Stack>
-  );
-}
-
+/** The device's editable settings, as one form with one Save.
+ *
+ * They used to be two fields with a Save button each, which made the card
+ * disagree with itself about what "saving" meant: two requests, two
+ * refusal slots, and a modal you left by the `×` because nothing in it
+ * was the way out. Editing the name and the limit together took two round
+ * trips and could half-succeed — the rename landing while the limit was
+ * refused, with no single place saying so.
+ *
+ * One form, one PATCH. `renameDevice` already sends both keys, because
+ * `rate_limit_per_minute` is required on that route and `null` is a value
+ * on the column rather than an omission (#73) — so the single request was
+ * always the shape the API wanted.
+ */
 export interface DeviceCardProps {
   /** The device this card is about. Parsed from the pathname by the
    *  route, taken from the row by either modal. */
   deviceId: number;
+  /** Closes the surface showing this card, for Cancel. Optional because
+   *  the *route* renders this card too and has nothing to close — there
+   *  Cancel reverts the draft instead, which is the same promise on a
+   *  surface that cannot go away. */
+  onClose?: () => void;
+  /** Called after the device is deleted, so whatever is showing this card
+   *  can stop. Optional because the *route* renders this card too, and a
+   *  route has nothing to close — it shows "no such device" instead,
+   *  which is the truth once the row is gone. */
+  onDeleted?: () => void;
 }
 
-export function DeviceCard({ deviceId }: DeviceCardProps) {
+export function DeviceCard({ deviceId, onClose, onDeleted }: DeviceCardProps) {
   const client = useQueryClient();
   const hasPerm = usePerm();
   const canRead = hasPerm(DEVICE_PERMISSION);
@@ -305,12 +137,10 @@ export function DeviceCard({ deviceId }: DeviceCardProps) {
   const { data, isLoading, error } = useQuery(
     deviceQuery(deviceId, { enabled: canRead }),
   );
-  // The strips arrive from the board, computed. Every verdict on them —
-  // the five `DnsCheckStatus` values, both joint verdicts, the collapse
-  // denominator — is decided server-side, and fetching them from a
-  // second endpoint that rebuilt them would be the two-implementations
-  // defect `api/board.ts` opens by forbidding.
-  const board = useQuery(boardQuery({ enabled: canRead }));
+  // The board query used to live here, to draw this device's strips.
+  // The card links to the board instead of redrawing it, so the second
+  // request is gone with the copy it fed — one fewer fetch per card, and
+  // one fewer rendering to keep in step.
 
   // The secret lives here and nowhere else — not in the query cache,
   // not in storage, not in a ref that survives a remount.
@@ -322,8 +152,138 @@ export function DeviceCard({ deviceId }: DeviceCardProps) {
     client.setQueryData([...DEVICES_QUERY_KEY, next.id], next);
     // The list and the board both show this device, and both are now
     // one rename behind.
+    // The board is the landing page and draws the same devices and
+    // names. Invalidating only the list a surface happens to own leaves
+    // the board showing rows that no longer exist — which is what a
+    // create flow returning to the board looked like: a new device that
+    // was not there until a manual reload.
     void client.invalidateQueries({ queryKey: DEVICES_QUERY_KEY });
+    void client.invalidateQueries({ queryKey: BOARD_QUERY_KEY });
   };
+
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  // --- the editable settings, one form with one Save -------------------
+  //
+  // Lifted out of a `DeviceSettings` child so its Save and Cancel can be
+  // drawn at the *bottom* of the card beside Rotate. They were mid-modal,
+  // above the username and the names list — a set of verbs with unrelated
+  // read-only detail below them, which reads as the end of the card when
+  // it is the middle.
+  //
+  // Seeded in the render phase rather than by `useState(data.name)`,
+  // because `data` arrives from a query and a `useState` initialiser runs
+  // once, before it does. Keyed on the device's identity so reopening the
+  // card on a different device re-seeds and a re-render does not — the
+  // same pattern `ZoneModal` and `NameModal` use, and the same bug it was
+  // written for: a form that opened blank on a row that plainly had one.
+  const [seededFrom, setSeededFrom] = useState<number | undefined>(undefined);
+  const [name, setName] = useState('');
+  /* The limit box is **prefilled with the limit actually in force** — the
+     per-device value if there is one, otherwise the installation default
+     the server reports. So it always opens showing the number the device
+     is really held to, which is what you came to read.
+
+     **Clearing the box is how you go back to inheriting.** Empty is the
+     only way `null` still reaches the API, and `null` is a value on that
+     column rather than an omission (#73). Without that mapping a device,
+     once opened, could never inherit again. */
+  const [limit, setLimit] = useState<number | ''>('');
+  /* Whether the box has actually been typed in, and it is load-bearing.
+     Prefilling with the *effective* limit was safe while the limit had a
+     Save of its own; with one Save for the card, merely renaming would
+     otherwise send `30` and silently pin an inheriting device to today's
+     installation default — a rename that quietly stops a device following
+     a setting. Untouched, the **stored** value goes back unchanged. */
+  const [limitTouched, setLimitTouched] = useState(false);
+  const [refusal, setRefusal] = useState<string | null>(null);
+
+  if (data && seededFrom !== data.id) {
+    setSeededFrom(data.id);
+    setName(data.name);
+    setLimit(
+      data.rate_limit_per_minute ?? data.effective_rate_limit_per_minute ?? '',
+    );
+    setLimitTouched(false);
+    setRefusal(null);
+  }
+
+  const saveSettings = useMutation({
+    mutationFn: renameDevice,
+    onSuccess: (next) => {
+      setRefusal(null);
+      refresh(next);
+      // Saving finishes the job, so the card goes away — the same exit
+      // Cancel takes. Leaving it open made Save and Cancel look like they
+      // did unrelated things: one of them closed the card and the other
+      // appeared to do nothing, because the only visible effect was a
+      // field already showing what you had typed.
+      //
+      // Only on a surface that *can* close. On the `/devices/:id` route
+      // there is nothing to close and the card correctly stays, now
+      // showing the saved values.
+      onClose?.();
+    },
+    // The 409 is rendered as the server wrote it. Nothing here retries
+    // with a suffix and nothing here rewords it: "you already have a
+    // device called 'router'" is more useful than any sentence this
+    // component could compose, and it is the sentence the API guarantees.
+    onError: (error: Error) => setRefusal(refusalText(error)),
+  });
+
+  const trimmed = name.trim();
+  /** Empty is *inherit*, which travels as `null`. `0` is *muted* and is a
+   *  different thing, which is why this is not `|| null`. */
+  const limitValue = limitTouched
+    ? limit === ''
+      ? null
+      : limit
+    : (data?.rate_limit_per_minute ?? null);
+  const dirty =
+    data !== undefined &&
+    (trimmed !== data.name || limitValue !== data.rate_limit_per_minute);
+
+  const submit = () => {
+    if (!data || trimmed === '' || saveSettings.isPending || !dirty) return;
+    saveSettings.mutate({
+      id: data.id,
+      name: trimmed,
+      rate_limit_per_minute: limitValue,
+    });
+  };
+
+  /** Cancel means *nothing you typed is kept*. On a modal that is closing
+   *  it; on the route there is nothing to close, so it reverts instead —
+   *  the same promise, honoured the only way that surface can. */
+  const cancelEdits = () => {
+    if (onClose) {
+      onClose();
+      return;
+    }
+    if (data) {
+      setName(data.name);
+      setLimit(
+        data.rate_limit_per_minute ?? data.effective_rate_limit_per_minute ?? '',
+      );
+    }
+    setLimitTouched(false);
+    setRefusal(null);
+  };
+
+
+  const remove = useMutation({
+    mutationFn: deleteDevice,
+    onSuccess: () => {
+      setConfirmDelete(false);
+      setDeleteError(null);
+      // No `refresh(next)`: that seeds the cache with the updated row, and
+      // a deleted device has no row to seed. Drop both lists instead.
+      void client.invalidateQueries({ queryKey: DEVICES_QUERY_KEY });
+      void client.invalidateQueries({ queryKey: BOARD_QUERY_KEY });
+      onDeleted?.();
+    },
+    onError: (err: Error) => setDeleteError(err.message),
+  });
 
   const rotate = useMutation({
     mutationFn: rotateDeviceSecret,
@@ -336,8 +296,6 @@ export function DeviceCard({ deviceId }: DeviceCardProps) {
     onError: (err: Error) => setRotateError(refusalText(err)),
   });
 
-  const hostnames =
-    board.data?.devices.find((entry) => entry.id === deviceId)?.hostnames ?? [];
 
   if (!canRead) {
     return (
@@ -393,7 +351,55 @@ export function DeviceCard({ deviceId }: DeviceCardProps) {
   return (
     <Stack gap="lg" data-testid="device-detail">
       <Stack gap={4}>
-        <DeviceName device={data} onSaved={refresh} />
+        {/* One line, both labels above their own field. They were stacked
+            — a full-width name over a rate limit whose label sat beside the
+            box — so two short fields ate three rows and the two labels were
+            in different places. `flex-end` keeps the boxes aligned when the
+            labels wrap. */}
+        <Group gap="md" align="flex-end" wrap="nowrap">
+          <TextInput
+            label="Name"
+            value={name}
+            disabled={saveSettings.isPending}
+            onChange={(event) => setName(event.currentTarget.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') submit();
+              if (event.key === 'Escape') cancelEdits();
+            }}
+            data-testid="device-name-input"
+            style={{ flex: 1, minWidth: 240 }}
+          />
+          <NumberInput
+            label="Rate limit"
+            aria-label="Updates per minute"
+            value={limit}
+            min={0}
+            disabled={saveSettings.isPending}
+            placeholder="inherit"
+            onChange={(next) => {
+              setLimitTouched(true);
+              setLimit(typeof next === 'number' ? next : '');
+            }}
+            data-testid="detail-limit-input"
+            styles={{ input: { width: 110 } }}
+            w={110}
+          />
+          <Text size="sm" c="dimmed" pb={7}>
+            per minute
+          </Text>
+        </Group>
+        {refusal ? (
+          <Alert
+            color="gray"
+            variant="light"
+            title="That did not work"
+            data-testid="device-save-refusal"
+          >
+            <Text size="sm" ff="monospace">
+              {refusal}
+            </Text>
+          </Alert>
+        ) : null}
         <Group gap="md">
           {/* Prefixed: on a line that also carries "seen" and "created",
               a bare `ddns-…` string was the one item that did not say
@@ -421,32 +427,34 @@ export function DeviceCard({ deviceId }: DeviceCardProps) {
 
       <MigratedNotice origin={data.credential_origin} />
 
-      <RateLimit device={data} onSaved={refresh} />
 
-      <Stack gap="xs">
-        <span className="ddns-th">Names this device updates</span>
-        {board.isLoading ? (
-          <Text size="sm" data-testid="detail-strips-loading">
-            Loading…
-          </Text>
-        ) : hostnames.length === 0 ? (
-          <Text size="sm" data-testid="detail-no-names">
-            {/* The count on the device row and the strips below it
-                are two readings of one population, so they are
-                reported together rather than letting an empty list
-                imply a zero the other reading contradicts. */}
-            {data.hostname_count === 0
-              ? 'This device has no names. Assign one to start tracking it.'
-              : `This device has ${data.hostname_count} name${
-                  data.hostname_count === 1 ? '' : 's'
-                }, and the board has not loaded them yet.`}
-          </Text>
-        ) : (
-          hostnames.map((hostname) => (
-            <HostnameBlock key={hostname.id} hostname={hostname} />
-          ))
-        )}
-      </Stack>
+      {/* A link to the list, not a second copy of it.
+      
+          The card used to draw this device's names itself — the same rows
+          the board draws, rendered a second way, inside a modal you opened
+          to change a rate limit. Two renderings of one population is the
+          thing that goes out of step: the board grew filters, a `+` per
+          row and a log link per row, and none of that reached the copy in
+          here.
+      
+          So the card says how many and points at the real list, filtered
+          to this device. The count still comes from `hostname_count` on the
+          device itself rather than from the board payload, so it does not
+          depend on a second request having arrived. */}
+      <Group gap="sm" align="center">
+        <span className="ddns-th">Names</span>
+        <Anchor
+          href={boardForDeviceHref(data.id)}
+          size="sm"
+          data-testid="detail-names-link"
+        >
+          {data.hostname_count === 0
+            ? 'No names yet — add one on the board'
+            : `Show ${data.hostname_count} name${
+                data.hostname_count === 1 ? '' : 's'
+              } on the board`}
+        </Anchor>
+      </Group>
 
       <Divider />
 
@@ -456,8 +464,14 @@ export function DeviceCard({ deviceId }: DeviceCardProps) {
             was a warning shown before anyone had asked for anything, on a
             screen you open to read a rate limit. It now lives in the
             confirmation, answering the question you have just asked. */}
-        <Group gap="sm" align="center">
-          <span className="ddns-th">Credential</span>
+        {/* The card's one row of verbs: destructive on the left, the
+            rest on the right. They were in two places — Save and Cancel
+            mid-modal above the username and the names list, Rotate at the
+            bottom under a `Credential` heading — so the card appeared to
+            end twice. The heading is gone with them: `Rotate Credentials`
+            already says what it rotates, and a label whose only job is to
+            introduce one button is a row of chrome. */}
+        <Group justify="space-between" align="center">
           <Button
             size="xs"
             variant="default"
@@ -465,12 +479,53 @@ export function DeviceCard({ deviceId }: DeviceCardProps) {
             onClick={() => setConfirmRotate(true)}
             data-testid="detail-rotate"
           >
-            Rotate
+            Rotate Credentials
           </Button>
+          <Group gap="sm">
+            {/* A filled red button, not a subtle one: it is the only
+                action on this card that cannot be undone, and the muted
+                treatment read as a link. It still asks before it acts —
+                the confirmation is what actually protects the device, and
+                the colour is what stops the click being casual. */}
+            <Button
+              size="xs"
+              color="red"
+              disabled={remove.isPending || saveSettings.isPending}
+              onClick={() => setConfirmDelete(true)}
+              data-testid="detail-delete"
+            >
+              Delete this device
+            </Button>
+            <Button
+              size="xs"
+              variant="default"
+              disabled={saveSettings.isPending}
+              onClick={cancelEdits}
+              data-testid="device-cancel"
+            >
+              Cancel
+            </Button>
+            <Button
+              size="xs"
+              disabled={trimmed === '' || !dirty || saveSettings.isPending}
+              onClick={submit}
+              data-testid="device-save"
+            >
+              Save
+            </Button>
+          </Group>
         </Group>
-        {issued ? (
-          <SecretOnce issued={issued} onDismiss={() => setIssued(null)} />
-        ) : null}
+        {/* The same modal creation uses, not an inline block. A rotated
+            credential is the identical object shown for the identical
+            reason, and printing it inline here put it inside the card it
+            was rotated from — competing with the form and scrolling away
+            like ordinary content. `zIndex` in `SecretOnceModal` is what
+            lets it sit above this card, which is itself a modal. */}
+        <SecretOnceModal
+          issued={issued}
+          onDismiss={() => setIssued(null)}
+          title="Secret rotated"
+        />
         {rotateError ? (
           <Alert
             color="gray"
@@ -512,6 +567,52 @@ export function DeviceCard({ deviceId }: DeviceCardProps) {
           </Group>
         </Stack>
       </Modal>
+
+      <Modal
+        opened={confirmDelete}
+        onClose={() => setConfirmDelete(false)}
+        title="Delete this device?"
+        zIndex={400}
+        data-testid="detail-delete-confirm"
+      >
+        <DdnsPortalScope>
+          <Stack gap="sm">
+            <Text size="sm">
+              <strong>{data.name}</strong> is deleted, along with its DDNS
+              credential. Any name it updates is left with no device, so
+              nothing will update it until you assign another. This cannot
+              be undone.
+            </Text>
+            {deleteError ? (
+              <Alert color="gray" variant="light" data-testid="detail-delete-error">
+                <Text size="sm" ff="monospace">
+                  {deleteError}
+                </Text>
+              </Alert>
+            ) : null}
+            <Group justify="flex-end">
+              <Button
+                size="xs"
+                variant="default"
+                disabled={remove.isPending}
+                onClick={() => setConfirmDelete(false)}
+                data-testid="detail-delete-cancel"
+              >
+                Cancel
+              </Button>
+              <Button
+                size="xs"
+                color="red"
+                disabled={remove.isPending}
+                onClick={() => remove.mutate(data.id)}
+                data-testid="detail-delete-confirmed"
+              >
+                Delete {data.name}
+              </Button>
+            </Group>
+          </Stack>
+        </DdnsPortalScope>
+      </Modal>
     </Stack>
   );
 }
@@ -550,7 +651,11 @@ export function DeviceCardModal({
           none of the palette — see `DdnsPortalScope`, which was written
           after a browser measured it. */}
       <DdnsPortalScope>
-        {deviceId === null ? null : <DeviceCard deviceId={deviceId} />}
+        {deviceId === null ? null : <DeviceCard
+            deviceId={deviceId}
+            onClose={onClose}
+            onDeleted={onClose}
+          />}
       </DdnsPortalScope>
     </Modal>
   );

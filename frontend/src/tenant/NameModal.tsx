@@ -58,8 +58,9 @@ import {
 import { domainsQuery, type Domain } from '../api/domains';
 import { devicesQuery, type Device } from '../api/devices';
 import { CARD_MODAL_PROPS, CARD_MODAL_STYLES } from '../cards';
+import { BOARD_QUERY_KEY } from '../api/board';
 import { DdnsPortalScope } from '../host/DdnsRoot';
-import { composeHostname, decomposeHostname } from './HostnameList';
+import { composeHostname, decomposeHostname } from './hostnameName';
 
 /** The `value` a Mantine `Select` uses for *no device*. `Select` speaks
  *  strings and `null` clears it, so unassigned needs a sentinel. */
@@ -76,12 +77,17 @@ export function NameModal({
   nameId,
   opened,
   onClose,
+  presetDeviceId = null,
 }: {
   /** `null` is **create**. `opened` says whether anything is shown, so
    *  one value never has to mean both. */
   nameId: number | null;
   opened: boolean;
   onClose: () => void;
+  /** Which device a *new* name starts attached to. Ignored when editing:
+   *  the stored row is the truth there, and a URL that could override it
+   *  would let a stale link silently reassign a name on open. */
+  presetDeviceId?: number | null;
 }) {
   return (
     <Modal
@@ -97,7 +103,12 @@ export function NameModal({
           form renders with none of `ddns.css`. */}
       <DdnsPortalScope>
         {opened ? (
-          <NameModalBody key={nameId ?? 'new'} nameId={nameId} onClose={onClose} />
+          <NameModalBody
+            key={nameId ?? 'new'}
+            nameId={nameId}
+            presetDeviceId={presetDeviceId}
+            onClose={onClose}
+          />
         ) : null}
       </DdnsPortalScope>
     </Modal>
@@ -107,9 +118,11 @@ export function NameModal({
 function NameModalBody({
   nameId,
   onClose,
+  presetDeviceId,
 }: {
   nameId: number | null;
   onClose: () => void;
+  presetDeviceId: number | null;
 }) {
   const client = useQueryClient();
   const hostnames = useQuery(hostnamesQuery({ enabled: true }));
@@ -146,7 +159,19 @@ function NameModalBody({
   const identity = row ? row.id : creating ? null : undefined;
   if (ready && identity !== undefined && seededFrom !== identity) {
     setSeededFrom(identity);
-    setDevice(row?.device_id == null ? UNASSIGNED : String(row.device_id));
+    // Editing: the stored row wins, always. Creating: the caller's
+    // preset, which the board's per-row `+` fills in from the row you
+    // clicked — so adding a name to a device you are looking at does not
+    // ask you which device you meant.
+    setDevice(
+      row
+        ? row.device_id == null
+          ? UNASSIGNED
+          : String(row.device_id)
+        : presetDeviceId === null
+          ? UNASSIGNED
+          : String(presetDeviceId),
+    );
     setZone(row ? String(row.domain_id) : null);
     // The label, with the zone suffix removed — the composer puts it
     // back. Seeded from the row so an edit starts from what is stored
@@ -162,7 +187,13 @@ function NameModalBody({
   }
 
   const invalidate = () => {
+    // The board is the landing page and draws the same devices and
+    // names. Invalidating only the list a surface happens to own leaves
+    // the board showing rows that no longer exist — which is what a
+    // create flow returning to the board looked like: a new device that
+    // was not there until a manual reload.
     void client.invalidateQueries({ queryKey: HOSTNAMES_QUERY_KEY });
+    void client.invalidateQueries({ queryKey: BOARD_QUERY_KEY });
     if (nameId !== null) {
       void client.invalidateQueries({ queryKey: publishingQueryKey(nameId) });
     }
@@ -439,10 +470,6 @@ function NameModalBody({
 
           <Stack gap={4}>
             <span className="ddns-th">Publish now</span>
-            <Text size="xs" c="dimmed">
-              Contacts the provider immediately and spends one of the device's
-              rate-limit slots — the same budget its router uses.
-            </Text>
             <Group gap="sm" align="flex-end">
               <TextInput
                 size="xs"

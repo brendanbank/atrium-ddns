@@ -25,10 +25,28 @@
  * stations, and the joint verdicts become the row's tone rather than
  * segments between stations.
  */
+import { useState } from "react";
+import {
+  ActionIcon,
+  Alert,
+  Button,
+  Group,
+  Modal,
+  Select,
+  Stack,
+  Text,
+  Tooltip,
+} from "@mantine/core";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { IconListSearch, IconPlus, IconTrash } from "@tabler/icons-react";
+
 import type { Board, BoardDevice, BoardHostname, Strip } from "../api/board";
+import { BOARD_QUERY_KEY } from "../api/board";
+import { DEVICES_QUERY_KEY, deleteDevice } from "../api/devices";
 import { LogLink } from "../LogSearchPage";
+import { DdnsPortalScope } from "../host/DdnsRoot";
 import { absoluteTitle, formatAge } from "./format";
-import { namesHrefForName } from "../paths";
+import { boardNameHref, boardNameNewHref } from "../paths";
 
 /** One line of the table. A name with no strips still gets a row —
  *  "nothing published yet" is a state, not an absence, and dropping it
@@ -107,12 +125,105 @@ function nothingChecked(board: Board): boolean {
 export function BoardTable({
   board,
   onOpenDevice,
+  initialZoneFilter = null,
+  initialDeviceFilter = null,
 }: {
   board: Board;
   onOpenDevice: (id: number) => void;
+  /** From `?zone=` on this page's own address. */
+  initialZoneFilter?: string | null;
+  /** From `?onlyDevice=` — the device card links here to show the rows it
+   *  used to draw itself. */
+  initialDeviceFilter?: string | null;
 }) {
-  const rows = flatten(board);
-  if (rows.length === 0) {
+  const client = useQueryClient();
+  /** Delete asks first. The board is the landing page, the icon is a 16px
+   *  target beside two others, and deleting a device destroys every
+   *  hostname assignment pointing at it — the same reasoning `DeviceList`
+   *  records for its own row, applied to the surface that now carries the
+   *  same control. */
+  const [confirmDelete, setConfirmDelete] = useState<BoardDevice | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const remove = useMutation({
+    mutationFn: deleteDevice,
+    onSuccess: () => {
+      setConfirmDelete(null);
+      setError(null);
+      // Both: the board is what this page draws, and the devices list is
+      // what every other surface reads. Invalidating one leaves the other
+      // showing a device that no longer exists.
+      void client.invalidateQueries({ queryKey: BOARD_QUERY_KEY });
+      void client.invalidateQueries({ queryKey: DEVICES_QUERY_KEY });
+    },
+    onError: (err: Error) => setError(err.message),
+  });
+
+  /** Two view filters over the rows already on screen.
+   *
+   *  Deliberately client-side and deliberately not in the URL. The board
+   *  is one request that already carries every device and name this
+   *  tenant has; filtering it is a question about what is in front of you,
+   *  not a different query. And unlike a zone or a name, "I was looking at
+   *  one device" is not a thing anyone pastes into a ticket — the log
+   *  search is where a shareable filtered view lives, and each row links
+   *  straight into it. */
+  const [deviceFilter, setDeviceFilter] = useState<string | null>(
+    initialDeviceFilter,
+  );
+  const [nameFilter, setNameFilter] = useState<string | null>(null);
+  /** Seeded from `?zone=` so the zone list can link here focused on one
+   *  zone — it used to link to `/atrium-ddns/names?zone=`, a page that is
+   *  going away. Held in state after that, because it is a view filter
+   *  like the other two and changing it should not push history. */
+  const [zoneFilter, setZoneFilter] = useState<string | null>(
+    initialZoneFilter,
+  );
+
+  const allRows = flatten(board);
+  const rows = allRows.filter(
+    (row) =>
+      (deviceFilter === null || String(row.device?.id) === deviceFilter) &&
+      (nameFilter === null || String(row.hostname?.id) === nameFilter) &&
+      (zoneFilter === null || row.hostname?.domain_name === zoneFilter),
+  );
+
+  /** Options come from the board payload, so they can only offer things
+   *  the table can actually show — a filter that selects nothing is a
+   *  filter that should not have been offered. Sorted by name because the
+   *  payload's order is publish order, which is meaningless in a picker. */
+  const deviceOptions = board.devices
+    .map((d) => ({ value: String(d.id), label: d.name }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+  const nameOptions = [
+    ...board.devices.flatMap((d) => d.hostnames),
+    ...board.unassigned_hostnames,
+  ]
+    .map((h) => ({ value: String(h.id), label: h.name }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+  const zoneOptions = Array.from(
+    new Set(
+      [
+        ...board.devices.flatMap((d) => d.hostnames),
+        ...board.unassigned_hostnames,
+      ]
+        .map((h) => h.domain_name)
+        .filter((n): n is string => Boolean(n)),
+    ),
+  )
+    .sort((a, b) => a.localeCompare(b))
+    .map((name) => ({ value: name, label: name }));
+  const filtered =
+    deviceFilter !== null || nameFilter !== null || zoneFilter !== null;
+  /** The account is empty — a fact about the tenant.
+   *
+   *  Keyed on `allRows`, **not** on the filtered `rows`. Keying it on the
+   *  filtered set made a filter that matched nothing render *"You have no
+   *  devices yet"* over an account with twelve of them: two different
+   *  facts in one string, and the more alarming one shown for the more
+   *  ordinary cause. It also hid the filter controls, so the only way out
+   *  was to reload. A filtered-empty result is a *measurement*, and it
+   *  says so below, with the controls still on screen. */
+  if (allRows.length === 0) {
     return (
       <span className="ddns-note" data-testid="board-empty">
         You have no devices yet. Add one to get a DDNS username and password,
@@ -128,6 +239,68 @@ export function BoardTable({
           {board.health_check_interval_minutes} minutes.
         </p>
       ) : null}
+      {/* Pick a device or a name and the table narrows to it. Searchable
+          because a tenant with forty names should type rather than scroll,
+          clearable because removing a filter must be as easy as adding one. */}
+      <Group gap="sm" align="flex-end" wrap="wrap" data-testid="board-filters">
+        <Select
+          label="Device"
+          placeholder="any device"
+          data={deviceOptions}
+          value={deviceFilter}
+          onChange={setDeviceFilter}
+          searchable
+          clearable
+          size="xs"
+          w={200}
+          data-testid="board-filter-device"
+        />
+        <Select
+          label="Name"
+          placeholder="any name"
+          data={nameOptions}
+          value={nameFilter}
+          onChange={setNameFilter}
+          searchable
+          clearable
+          size="xs"
+          w={240}
+          data-testid="board-filter-name"
+        />
+        <Select
+          label="Zone"
+          placeholder="any zone"
+          data={zoneOptions}
+          value={zoneFilter}
+          onChange={setZoneFilter}
+          searchable
+          clearable
+          size="xs"
+          w={200}
+          data-testid="board-filter-zone"
+        />
+        {filtered ? (
+          <Button
+            variant="subtle"
+            size="compact-xs"
+            onClick={() => {
+              setDeviceFilter(null);
+              setNameFilter(null);
+            }}
+            data-testid="board-filter-clear"
+          >
+            clear
+          </Button>
+        ) : null}
+        {/* The denominator, so a narrow result is a measurement rather than
+            a board that looks broken. `0 of 12` is a statement; an empty
+            table under an unremarked filter is not. */}
+        {filtered ? (
+          <span className="ddns-note" data-testid="board-filter-count">
+            showing {rows.length} of {allRows.length}
+          </span>
+        ) : null}
+      </Group>
       <div className="ddns-boardtable" data-testid="board-table">
         <div className="ddns-boardtable__head">
           <span className="ddns-th" />
@@ -148,6 +321,12 @@ export function BoardTable({
           </span>
           <span className="ddns-th" />
         </div>
+        {rows.length === 0 ? (
+          <span className="ddns-note" data-testid="board-no-match">
+            No row matches that filter. {allRows.length} in total — clear the
+            filter to see them.
+          </span>
+        ) : null}
         {rows.map((row, index) => {
           const tone = toneOf(row.strip);
           const family = row.strip?.family ?? "none";
@@ -172,30 +351,80 @@ export function BoardTable({
                 {tone === "diverged" ? "!" : ""}
               </span>
               {row.device ? (
-                <button
-                  type="button"
-                  className="ddns-data ddns-boardtable__device"
-                  onClick={() => onOpenDevice(row.device!.id)}
-                  data-testid={`board-open-${row.device.name}`}
-                >
-                  {row.device.name}
-                </button>
+                <Group gap={4} wrap="nowrap" align="center">
+                  <button
+                    type="button"
+                    className="ddns-data ddns-boardtable__device"
+                    onClick={() => onOpenDevice(row.device!.id)}
+                    data-testid={`board-open-${row.device.name}`}
+                  >
+                    {row.device.name}
+                  </button>
+                  <Tooltip label="Delete this device" withArrow>
+                    <ActionIcon
+                      variant="subtle"
+                      color="gray"
+                      size="sm"
+                      aria-label={`Delete ${row.device.name}`}
+                      onClick={() => setConfirmDelete(row.device)}
+                      data-testid={`board-delete-${row.device.name}`}
+                    >
+                      <IconTrash size={15} />
+                    </ActionIcon>
+                  </Tooltip>
+                </Group>
               ) : (
                 <span className="ddns-cell" data-tone="quiet">
                   no device
                 </span>
               )}
               {row.hostname ? (
-                <a
-                  className="ddns-data"
-                  href={namesHrefForName(row.hostname.id)}
-                >
-                  {row.hostname.name}
-                </a>
+                <Group gap={4} wrap="nowrap" align="center">
+                  <a className="ddns-data" href={boardNameHref(row.hostname.id)}>
+                    {row.hostname.name}
+                  </a>
+                  {/* Adding a name is the other thing you come to this row for,
+                      and it was reachable only from the header. Carries the return
+                      address so finishing lands back here rather than stranding
+                      you on the names page, which has no nav entry. */}
+                  <Tooltip label="Add a name" withArrow>
+                    <ActionIcon
+                      component="a"
+                      href={boardNameNewHref(row.device?.id)}
+                      variant="subtle"
+                      color="gray"
+                      size="sm"
+                      aria-label="Add a name"
+                      data-testid={`board-add-name-${row.hostname.name}`}
+                    >
+                      <IconPlus size={15} />
+                    </ActionIcon>
+                  </Tooltip>
+                </Group>
               ) : (
-                <span className="ddns-cell" data-tone="quiet">
-                  no names yet
-                </span>
+                <Group gap={4} wrap="nowrap" align="center">
+                  <span className="ddns-cell" data-tone="quiet">
+                    no names yet
+                  </span>
+                  {/* The row the `+` matters most on. A device with no names is the
+                      state the board's own empty text tells you to fix — "register a
+                      name for it to update" — and it was the one row with no way to
+                      act on it. The device is preselected because this row knows
+                      which one it is. */}
+                  <Tooltip label="Add a name for this device" withArrow>
+                    <ActionIcon
+                      component="a"
+                      href={boardNameNewHref(row.device?.id)}
+                      variant="subtle"
+                      color="gray"
+                      size="sm"
+                      aria-label={`Add a name for ${row.device?.name ?? "this device"}`}
+                      data-testid={`board-add-name-for-${row.device?.name}`}
+                    >
+                      <IconPlus size={15} />
+                    </ActionIcon>
+                  </Tooltip>
+                </Group>
               )}
               <span className="ddns-cell">{row.strip?.family ?? "—"}</span>
               <span className="ddns-cell">{answeredText(row.strip)}</span>
@@ -233,12 +462,15 @@ export function BoardTable({
                 {row.device ? row.device.updates_display : "—"}
               </span>
               {row.hostname ? (
-                <LogLink
-                  params={{ hostname_id: row.hostname.id }}
-                  data-testid={`board-log-${row.hostname.name}`}
-                >
-                  log
-                </LogLink>
+                <Tooltip label="Show this name in the log" withArrow>
+                  <LogLink
+                    params={{ hostname_id: row.hostname.id }}
+                    aria-label={`Log for ${row.hostname.name}`}
+                    data-testid={`board-log-${row.hostname.name}`}
+                  >
+                    <IconListSearch size={15} />
+                  </LogLink>
+                </Tooltip>
               ) : (
                 <span />
               )}
@@ -246,6 +478,55 @@ export function BoardTable({
           );
         })}
       </div>
+      {/* Delete asks first, and names what goes with the device.
+          `DeviceList` records why: delete used to fire straight from the
+          row with no dialog and no undo, and one misplaced click destroyed
+          a device and every hostname assignment pointing at it. The icon
+          that triggers it here is a 16px target beside another. */}
+      <Modal
+        opened={confirmDelete !== null}
+        onClose={() => setConfirmDelete(null)}
+        title="Delete this device?"
+        data-testid="board-delete-confirm"
+      >
+        <DdnsPortalScope>
+          <Stack gap="sm">
+            <Text size="sm">
+              <strong>{confirmDelete?.name}</strong> is deleted, along with
+              its DDNS credential. Any name it updates is left with no
+              device, so nothing will update it until you assign another.
+              This cannot be undone.
+            </Text>
+            {error ? (
+              <Alert color="gray" variant="light" data-testid="board-delete-error">
+                <Text size="sm" ff="monospace">
+                  {error}
+                </Text>
+              </Alert>
+            ) : null}
+            <Group justify="flex-end">
+              <Button
+                size="xs"
+                variant="default"
+                disabled={remove.isPending}
+                onClick={() => setConfirmDelete(null)}
+                data-testid="board-delete-cancel"
+              >
+                Cancel
+              </Button>
+              <Button
+                size="xs"
+                color="red"
+                disabled={remove.isPending}
+                onClick={() => confirmDelete && remove.mutate(confirmDelete.id)}
+                data-testid="board-delete-confirmed"
+              >
+                Delete {confirmDelete?.name}
+              </Button>
+            </Group>
+          </Stack>
+        </DdnsPortalScope>
+      </Modal>
     </>
   );
 }

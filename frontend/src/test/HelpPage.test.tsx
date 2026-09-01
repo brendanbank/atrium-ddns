@@ -108,10 +108,11 @@ test('every route this bundle registers is listed on the help page', async () =>
   // route, silently and forever, which is the shape this file was
   // written against in the first place.
   const linked = new Set(SURFACES.map((s) => s.to));
-  const named = new Set(
-    SURFACES.flatMap((s) => (s.within ?? []).map((n) => n.path)),
-  );
-  const covered = new Set([...linked, ...named]);
+  // There is no longer a second channel: `within` carried routes whose
+  // path had a parameter — nameable, not linkable — and those routes
+  // are gone. The device card and the name modal are query parameters
+  // on the board, so every registered surface has a real address again.
+  const covered = new Set(linked);
   // The scaffold's demo page and the help page itself are the two
   // registrations that are deliberately not in the list: one is the
   // template's placeholder and the other is this page.
@@ -137,13 +138,18 @@ test('every route this bundle registers is listed on the help page', async () =>
       true,
     );
   }
-  // …and the second channel is not vacuously satisfied. If `within` ever
-  // empties, this fails rather than the sweep quietly reverting to
-  // link-only coverage — and every entry in it must be a parameterised
-  // path, because a route that *could* be linked should be.
-  expect(named.size).toBeGreaterThan(0);
-  for (const path of named) {
-    expect(path, 'a named entry that could have been a link').toContain(':');
+  // Link-only coverage is now correct rather than a regression, and this
+  // is what holds it that way: if a parameterised route is ever
+  // registered again it has no address to link to, `covered` cannot
+  // contain it, and the sweep above would fail with a confusing message
+  // about a missing help entry. Failing here instead says what actually
+  // changed.
+  for (const route of handles.routes) {
+    expect(
+      route.path,
+      `${route.path} carries a parameter — the help page can only link ` +
+        'addresses, so a nested "named" entry would be needed again',
+    ).not.toContain(':');
   }
 });
 

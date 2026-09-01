@@ -9,11 +9,10 @@ const DEMO_CREDENTIAL: Record<string, string> = {
 };
 
 import {
+  BOARD_PATH,
   API_URL,
-  DEVICES_PATH,
   DOC_ADDRESS_V4,
   DOMAINS_PATH,
-  NAMES_PATH,
   bindScriptedBackend,
   chooseFromSelect,
   deviceCallsIn,
@@ -149,8 +148,12 @@ test.describe('the §3.3.1 walk, through the UI', () => {
 
     await stillAlive('while creating the zone and its provider');
     // --- 3. the device ------------------------------------------------
-    await page.goto(DEVICES_PATH);
-    await page.getByTestId('add-device').click();
+    // Both the device and the name are created *on the board* now.
+    // `/atrium-ddns/devices` and `/atrium-ddns/names` are gone — the board
+    // is the only tenant surface, and each modal is a query parameter on
+    // it, so this walk no longer leaves the page it started on.
+    await page.goto(BOARD_PATH);
+    await page.getByTestId('board-add-device').click();
     const deviceModal = page.getByRole('dialog');
     await deviceModal.getByTestId('device-name').fill(deviceName);
     await deviceModal.getByTestId('device-submit').click();
@@ -164,8 +167,8 @@ test.describe('the §3.3.1 walk, through the UI', () => {
 
     await stillAlive('while creating the device');
     // --- 4. the name --------------------------------------------------
-    await page.goto(NAMES_PATH);
-    await page.getByTestId('add-hostname').click();
+    await page.goto(BOARD_PATH);
+    await page.getByTestId('board-add-name').click();
     const nameModal = page.getByRole('dialog');
     await expect(nameModal).toBeVisible();
     await chooseFromSelect(page, 'hostname-zone', zone);
@@ -175,7 +178,8 @@ test.describe('the §3.3.1 walk, through the UI', () => {
     );
     await chooseFromSelect(page, 'hostname-device', deviceName);
     await nameModal.getByTestId('name-submit').click();
-    await expect(page.getByTestId(`hostname-${hostname}`)).toBeVisible({
+    // The board is what shows it now, as a row rather than a list entry.
+    await expect(page.getByTestId(`board-row-${hostname}-none`)).toBeVisible({
       timeout: 8_000,
     });
 
@@ -203,24 +207,24 @@ test.describe('the §3.3.1 walk, through the UI', () => {
 
     await stillAlive('while rendering the board');
     // --- 7. the strip, where it still lives ---------------------------
-    await row.getByTestId(`board-open-${deviceName}`).click();
-    const card = page.getByTestId('device-detail');
-    await expect(card).toBeVisible({ timeout: 8_000 });
-    // Either rendering counts. §3.4 collapses a strip whose joints all
-    // agree, and which one you get depends on whether the health check
-    // has run — so pinning one testid makes this pass or fail on a
-    // scheduler, not on whether a strip was drawn.
-    const strip = page.locator(
-      `[data-testid="strip-${hostname}-A"], ` +
-        `[data-testid="strip-collapsed-${hostname}-A"]`,
-    );
-    await expect(strip).toBeVisible({ timeout: 8_000 });
-    // The three stations, and the published address among them. A strip
-    // that rendered its frame and no values would satisfy `toBeVisible`.
-    await expect(strip).toContainText(DOC_ADDRESS_V4);
+    //
+    // **On the board row, not inside the device card.** The card used to
+    // draw each name's strip; it links to the board instead, because the
+    // same rows rendered twice went out of step. So the row *is* the
+    // strip's rendering: the published address, the answered address and
+    // the family, on one line.
+    await expect(row).toContainText(DOC_ADDRESS_V4);
+    await expect(row).toContainText('A');
+    // A row that rendered its frame and no values would satisfy
+    // `toBeVisible`, so the address above is the check that has teeth.
+    // And this is a *measured* row rather than the never-published state:
+    await expect(row).not.toContainText('nothing published');
 
     await testInfo.attach('resolution-strip.png', {
-      body: await card.screenshot({ animations: 'disabled' }),
+      // The board table, which is where the strip is drawn now.
+      body: await page
+        .getByTestId('board-table')
+        .screenshot({ animations: 'disabled' }),
       contentType: 'image/png',
     });
 

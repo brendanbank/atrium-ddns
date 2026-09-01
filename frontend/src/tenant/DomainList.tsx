@@ -78,7 +78,7 @@ function ZoneRow({
           {provider ?? '—'}
         </span>
         <Anchor
-          href={namesHrefForZone(domain.id)}
+          href={namesHrefForZone(domain.name)}
           size="sm"
           data-testid={`names-${domain.name}`}
         >

@@ -33,7 +33,22 @@
  */
 import type { BoardHostname } from '../api/board';
 import { LogLink } from '../LogSearchPage';
-import { namesHrefForName } from '../paths';
+import { boardDeviceHref, boardNameHref, withReturn } from '../paths';
+
+/** A name's address, carrying the way back to the card you clicked it in.
+ *
+ * `HostnameBlock` is rendered inside the *device card*. Opening a name
+ * from there and closing it used to land on the bare board, losing the
+ * device you were reading — so the link says where to return to, and
+ * `DeviceBoardPage` sends you there on close. It is in the URL rather
+ * than in a component-held stack so it survives a reload and a pasted
+ * link, which a stack would not. */
+function nameHrefFrom(hostname: { id: number; device_id: number | null }) {
+  const href = boardNameHref(hostname.id);
+  return hostname.device_id === null
+    ? href
+    : withReturn(href, boardDeviceHref(hostname.device_id));
+}
 import { ResolutionStrip, StripSkeleton } from './ResolutionStrip';
 
 /* The board answers *which* device stopped talking. The next question is
@@ -66,7 +81,7 @@ export function HostnameBlock({ hostname }: { hostname: BoardHostname }) {
       <div className="ddns-hostname__strips" data-testid={`hostname-${hostname.name}`}>
         <a
             className="ddns-data"
-            href={namesHrefForName(hostname.id)}
+            href={nameHrefFrom(hostname)}
             data-testid={`hostname-${hostname.name}-link`}
           >
             {hostname.name}
@@ -87,7 +102,7 @@ export function HostnameBlock({ hostname }: { hostname: BoardHostname }) {
         <ResolutionStrip
           key={`${hostname.id}-${strip.family}`}
           hostname={hostname.name}
-          hostnameHref={namesHrefForName(hostname.id)}
+          hostnameHref={nameHrefFrom(hostname)}
           strip={strip}
         />
       ))}

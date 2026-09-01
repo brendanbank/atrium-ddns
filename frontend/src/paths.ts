@@ -21,7 +21,6 @@ export const BOARD_PATH = '/atrium-ddns/board';
 
 /** #45's two tenant surfaces, same rule. */
 export const DOMAINS_PATH = '/atrium-ddns/domains';
-export const DEVICES_PATH = '/atrium-ddns/devices';
 
 /** The names surface, filtered to one zone.
  *
@@ -44,16 +43,19 @@ export const DEVICES_PATH = '/atrium-ddns/devices';
 export const NAME_ZONE_PARAM = 'zone';
 export const NAME_ID_PARAM = 'name';
 
-export function namesHrefForZone(zoneId: number): string {
-  return `/atrium-ddns/names?${NAME_ZONE_PARAM}=${zoneId}`;
+/** The board, filtered to one zone.
+ *
+ * Takes the zone's **name**, not its id: the board payload carries
+ * `domain_name` on each hostname and no `domain_id`, so the name is what
+ * the filter can actually compare against — and it is what the dropdown
+ * shows, so the address matches the control. A renamed zone breaks a
+ * stale link, which for a view filter is the right trade against a
+ * backend change to carry an id nothing else needs. */
+export function namesHrefForZone(zoneName: string): string {
+  return `/atrium-ddns?${NAME_ZONE_PARAM}=${encodeURIComponent(zoneName)}`;
 }
 
-/** The names surface, focused on one name. Same query-parameter shape:
- *  the names list is a list with filters, and "the name with id 7" is
- *  one of those rather than a page of its own. */
-export function namesHrefForName(hostnameId: number): string {
-  return `/atrium-ddns/names?${NAME_ID_PARAM}=${hostnameId}`;
-}
+
 
 /** The zone list, which is also where a zone modal is drawn over. */
 export const ZONES_LIST_PATH = DOMAINS_PATH;
@@ -96,6 +98,43 @@ export type ModalTarget = { open: false } | { open: true; id: number | null };
  *  cannot be confused for one another. */
 export const NEW_VALUE = 'new';
 
+/** Where to go back to when a create flow finishes.
+ *
+ * The board is the landing surface and the only nav entry, but creating a
+ * device or a name happens on `/atrium-ddns/devices` and
+ * `/atrium-ddns/names` — pages that no longer have one. So a create started
+ * from the board used to end on a page you could not navigate away from,
+ * which reads as being dumped somewhere rather than as having finished.
+ *
+ * The alternative was hosting both create modals on the board. That is the
+ * better shape and is not this change: the device form shares state with the
+ * secret modal that follows it, and pulling them apart while the surface is
+ * being tested is more churn than the problem is worth. Worth revisiting.
+ */
+export const RETURN_PARAM = 'from';
+
+/** Adds a return address to a create href. */
+export function withReturn(href: string, from: string): string {
+  const sep = href.includes('?') ? '&' : '?';
+  return `${href}${sep}${RETURN_PARAM}=${encodeURIComponent(from)}`;
+}
+
+/** The return address, or `null`.
+ *
+ * **Refuses anything not inside this bundle.** A return address is a
+ * redirect target read from the URL, so an unchecked one sends a user
+ * wherever a pasted link says — including off-site. It must start with
+ * `/atrium-ddns`, and `//evil.example` is rejected because a protocol-
+ * relative URL is not a path however much it looks like one.
+ */
+export function returnFromSearch(search: string): string | null {
+  const raw = new URLSearchParams(search).get(RETURN_PARAM);
+  if (raw === null) return null;
+  if (raw.startsWith('//')) return null;
+  if (!raw.startsWith('/atrium-ddns')) return null;
+  return raw;
+}
+
 /** What `?<param>=` means, in three states.
  *
  * Absent — no modal. `new` — the create form. A number — that row.
@@ -123,6 +162,54 @@ export function hrefWithTarget(
 export const ZONE_PARAM = 'zone';
 export const DEVICE_PARAM = 'device';
 
+/** Which device a *new* name starts attached to.
+ *
+ * A separate key from `DEVICE_PARAM` on purpose. On the board `?device=`
+ * opens that device's card, so reusing it for the preset would ask one
+ * address to mean two things — open a card, and pre-fill a field in a
+ * different modal — and `?name=new&device=7` would open both. */
+export const NAME_FOR_PARAM = 'for';
+
+/** The board — the only tenant surface — with one modal open over it.
+ *
+ * These replace `namesHrefForName` / `deviceHrefParam`, which pointed at
+ * `/atrium-ddns/names` and `/atrium-ddns/devices`. The board hosts both
+ * modals now, so opening one is a query on the page you are already on
+ * rather than a trip to a page with no way back. */
+export const BOARD_PATH_HOME = '/atrium-ddns';
+
+export function boardNameHref(hostnameId: number): string {
+  return `${BOARD_PATH_HOME}?${NAME_ID_PARAM}=${hostnameId}`;
+}
+
+export function boardNameNewHref(deviceId?: number): string {
+  const base = `${BOARD_PATH_HOME}?${NAME_ID_PARAM}=${NEW_VALUE}`;
+  return deviceId === undefined
+    ? base
+    : `${base}&${NAME_FOR_PARAM}=${deviceId}`;
+}
+
+/** The board, *filtered* to one device — not the device's card open.
+ *
+ * A separate key from `DEVICE_PARAM` because on the board `?device=`
+ * opens the card, and this is the opposite move: close the card and show
+ * the rows it was describing. One key cannot mean both, and
+ * `?device=7&device=7` is not a design.
+ *
+ * It exists because the card used to list the device's names itself,
+ * which is the board's job — the same rows, drawn a second way, in a
+ * modal you opened to change a rate limit. The card links to the real
+ * list instead of carrying a copy of it. */
+export const BOARD_ONLY_DEVICE_PARAM = 'onlyDevice';
+
+export function boardForDeviceHref(deviceId: number): string {
+  return `${BOARD_PATH_HOME}?${BOARD_ONLY_DEVICE_PARAM}=${deviceId}`;
+}
+
+export function boardDeviceHref(deviceId: number): string {
+  return `${BOARD_PATH_HOME}?${DEVICE_PARAM}=${deviceId}`;
+}
+
 export function zoneFromSearch(search: string): ModalTarget {
   return targetFromSearch(search, ZONE_PARAM);
 }
@@ -135,74 +222,8 @@ export function zoneNewHref(): string {
   return hrefWithTarget(DOMAINS_PATH, ZONE_PARAM, NEW_VALUE);
 }
 
-export function deviceFromSearch(search: string): ModalTarget {
-  return targetFromSearch(search, DEVICE_PARAM);
-}
 
-export function deviceHrefParam(id: number): string {
-  return hrefWithTarget(DEVICES_PATH, DEVICE_PARAM, id);
-}
 
-/** #89's device detail — `ui-design.md` §11.2.
- *
- * A **route**, and §12 decides that on the width budget rather than on
- * preference: one resolution strip needs ≈592px (§3.1), atrium's shell
- * gives 1168px at a 1440px viewport (§3.6), a 360/800 master-detail
- * split leaves ~790px, and Mantine's `lg` drawer is 620px — *below the
- * one-strip minimum*, so the signature element would wrap inside its
- * own detail view. A route keeps the full 1168px, is linkable into a
- * ticket, and leaves the back button working.
- *
- * The `:id` segment is react-router's, because atrium's `App.tsx`
- * hands every registered `path` straight to `<Route path=…>`. The page
- * itself cannot call `useParams` — the host bundle mounts its own React
- * tree, so react-router's context does not cross the boundary (the same
- * reason `useLogQuery` reads `window.location`) — so it parses the id
- * out of the pathname with `deviceIdFromPath` below. One string, two
- * readings, and they are kept in one module so they cannot drift.
- *
- * `deviceIdFromPath` is now the only pathname parser here. #88 added a
- * second for zones, and the note that lived here argued against merging
- * them; that argument expired when the zone route did — the zone modal
- * reads `?zone=` through the generic `targetFromSearch`, which is where
- * a third surface should go too.
- */
-export const DEVICE_DETAIL_PATH = '/atrium-ddns/devices/:id';
 
-/** The href for one device. The inverse of `deviceIdFromPath`, and the
- *  only place a detail URL is composed. */
-export function deviceHref(id: number): string {
-  return `${DEVICES_PATH}/${id}`;
-}
 
-/** The id in a detail URL, or `null` when the path is not one.
- *
- * Derived from `DEVICE_DETAIL_PATH` rather than from a second literal:
- * the pattern is split on `/`, the `:id` segment is located by name,
- * and the same index is read out of the real path. A route renamed to
- * `/atrium-ddns/routers/:id` therefore keeps working without this
- * function being edited, which is the difference between deriving and
- * restating.
- *
- * Returns `null` — not `0`, and not `NaN` — for anything that is not a
- * positive integer id. The three states the caller has to tell apart
- * are *no id in the URL*, *an id that names nothing* and *a device*;
- * rendering the first as `0` would send a request for device zero.
- */
-export function deviceIdFromPath(pathname: string): number | null {
-  const pattern = DEVICE_DETAIL_PATH.split('/');
-  const actual = pathname.replace(/\/+$/, '').split('/');
-  if (actual.length !== pattern.length) return null;
-  let id: number | null = null;
-  for (let i = 0; i < pattern.length; i += 1) {
-    if (pattern[i].startsWith(':')) {
-      if (!/^[0-9]+$/.test(actual[i])) return null;
-      const parsed = Number(actual[i]);
-      if (!Number.isSafeInteger(parsed) || parsed <= 0) return null;
-      id = parsed;
-    } else if (pattern[i] !== actual[i]) {
-      return null;
-    }
-  }
-  return id;
-}
+

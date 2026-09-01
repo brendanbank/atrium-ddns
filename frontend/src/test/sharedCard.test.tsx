@@ -25,8 +25,10 @@
  *
  * ## The three entrances
  *
- * - `DeviceCard`: the route (`DeviceDetailPage`), the device list's row
- *   (`DevicesPage` → `DeviceList`), and the board's row
+ * - `DeviceCard`: the board's row. It had three call sites — the
+ *   `/atrium-ddns/devices/:id` route and the device list's row as well —
+ *   and both went with the pages they lived on when the board became the
+ *   only tenant surface
  *   (`DeviceBoardPage` → `DeviceBoard`).
  * - `ZoneModal`: `DomainsPage` renders it, and both zone addresses
  *   (`/atrium-ddns/zones/:id` and `/atrium-ddns/zones/new`) route to that
@@ -109,8 +111,6 @@ vi.mock('../tenant/ZoneModal', async () => {
 });
 
 const { DeviceBoardPage } = await import('../DeviceBoardPage');
-const { DeviceDetailPage } = await import('../DeviceDetailPage');
-const { DevicesPage } = await import('../DevicesPage');
 const { DomainsPage } = await import('../DomainsPage');
 
 const TENANT: UserContext = {
@@ -193,31 +193,41 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe('DeviceCard has one definition and three call sites', () => {
-  test('the route renders it', async () => {
-    window.history.pushState({}, '', `/atrium-ddns/devices/${DEVICE_ROW.id}`);
-    renderWithAtrium(<DeviceDetailPage />);
-    const found = await screen.findByTestId('device-card-substitute');
-    expect(found).toHaveTextContent(`${DEVICE_SENTINEL} ${DEVICE_ROW.id}`);
-  });
-
-  test('the device list opens it in a modal, and the id travels with it', async () => {
-    renderWithAtrium(<DevicesPage />);
-    const name = await screen.findByTestId(`open-${DEVICE_ROW.name}`);
-    // The id is asserted, not just the presence of the card: a modal
-    // that opened the *first* device regardless of the row clicked
-    // would render the sentinel and be wrong.
-    fireEvent.click(name);
-    const found = await screen.findByTestId('device-card-substitute');
-    expect(found).toHaveTextContent(`${DEVICE_SENTINEL} ${DEVICE_ROW.id}`);
-  });
-
+describe('DeviceCard has one definition and one call site', () => {
+  /* It had three: the `/atrium-ddns/devices/:id` route, the device
+     list's row, and the board's row. Two of them went with the pages
+     they lived on when the board became the only tenant surface, so the
+     guard is narrower — but it is the *same* guard, and the thing it
+     defends is unchanged: the board must render the shared card rather
+     than grow a copy of it. A second copy is what this file exists to
+     catch, and one call site is where a copy is easiest to add without
+     anyone noticing. */
   test('the board opens it from the device name', async () => {
     renderWithAtrium(<DeviceBoardPage />);
     await screen.findByTestId('board-table');
     fireEvent.click(screen.getByTestId(`board-open-${DEVICE_ROW.name}`));
     const found = await screen.findByTestId('device-card-substitute');
+    // The id is asserted, not just the card's presence: a modal that
+    // opened the *first* device regardless of the row clicked would
+    // render the sentinel and still be wrong.
     expect(found).toHaveTextContent(`${DEVICE_SENTINEL} ${DEVICE_ROW.id}`);
+  });
+
+  test('and nothing renders the real card beside it', async () => {
+    // The mock is load-bearing in one direction only. If it failed to
+    // apply, the sentinel would be absent and the test above would fail
+    // loudly. This one fails in the other direction: a substitution that
+    // took effect while a *second*, unmocked copy rendered alongside —
+    // which is exactly what an inlined duplicate looks like from here.
+    renderWithAtrium(<DeviceBoardPage />);
+    await screen.findByTestId('board-table');
+    fireEvent.click(screen.getByTestId(`board-open-${DEVICE_ROW.name}`));
+    await screen.findByTestId('device-card-substitute');
+    await waitFor(() => {
+      // `device-detail` is the real `DeviceCard`'s own root testid, and
+      // the substitute does not render it.
+      expect(screen.queryByTestId('device-detail')).not.toBeInTheDocument();
+    });
   });
 });
 
@@ -260,8 +270,9 @@ describe('the substitution is what makes the guard able to fail', () => {
     // catches a substitution that took effect but left the real card
     // rendering beside it, which is what a second copy at a call site
     // looks like from here.
-    renderWithAtrium(<DevicesPage />);
-    fireEvent.click(await screen.findByTestId(`open-${DEVICE_ROW.name}`));
+    renderWithAtrium(<DeviceBoardPage />);
+    await screen.findByTestId('board-table');
+    fireEvent.click(screen.getByTestId(`board-open-${DEVICE_ROW.name}`));
     await screen.findByTestId('device-card-substitute');
     await waitFor(() => {
       expect(screen.queryByTestId('device-detail')).not.toBeInTheDocument();

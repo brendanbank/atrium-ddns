@@ -105,7 +105,14 @@ test('every registered surface still mounts through the wrapper element', async 
   // already refreshed. `?zone=` on the list route never changes the
   // route. Subtracting a surface is exactly the edit this count is here
   // to make someone justify, so the justification is here.
-  expect(rendered.length).toBe(14);
+  //
+  // **Eleven, down from fourteen.** `/atrium-ddns/devices`,
+  // `/atrium-ddns/names` and `/atrium-ddns/devices/:id` were removed, not
+  // forgotten: the board is the only tenant surface now, and the device
+  // card, the device create form and the name modal are query parameters
+  // on it. Subtracting a surface is exactly the edit this count exists to
+  // make someone justify, so the justification is here.
+  expect(rendered.length).toBe(11);
   // Keys are the registry's primary key: two registrations sharing one
   // silently replace each other, so the count above would still read 15
   // while one surface never mounts. Added by #46 because three issues
@@ -121,7 +128,6 @@ test('every registered surface still mounts through the wrapper element', async 
     'atrium-ddns-settings-rate-limits',
     'atrium-ddns-settings-health-checks',
     'atrium-ddns-settings-retention',
-    'atrium-ddns-device-detail',
   ]) {
     expect(
       rendered.find((entry) => entry.key === key),
@@ -165,30 +171,23 @@ test('the zone modal is a query parameter, and not a second route', async () => 
   ).toEqual([]);
 });
 
-test('the device detail route is registered at the path the list links to', async () => {
-  const main = await import('../main');
-  const paths = await import('../paths');
+test('no tenant surface is a route of its own any more', async () => {
+  await import('../main');
 
-  const route = handles.routes.find(
-    (entry) => entry.key === 'atrium-ddns-device-detail',
-  );
-  expect(route, 'the device detail route was never registered').toBeDefined();
-  expect(route!.path).toBe(main.DEVICE_DETAIL_PATH);
-
-  // The two halves of one string, checked against each other rather
-  // than against a literal typed twice: the pattern registered with
-  // atrium, and the href the device list composes. A route registered
-  // at a path nothing produces is #75's defect — a surface that exists
-  // and nothing names — and no component test can see it.
-  const href = paths.deviceHref(42);
-  expect(paths.deviceIdFromPath(href)).toBe(42);
-  expect(href.startsWith(`${main.DEVICES_PATH}/`)).toBe(true);
-
-  // …and it deliberately has no nav item. A sidebar entry pointing at a
-  // literal `:id` is a dead link.
-  expect(
-    handles.navItems.find((entry) => entry.to === main.DEVICE_DETAIL_PATH),
-  ).toBeUndefined();
+  // `/atrium-ddns/devices`, `/atrium-ddns/names` and
+  // `/atrium-ddns/devices/:id` are gone. Asserted as an absence so
+  // re-registering one has to come past this test and read why: each was
+  // a page with no nav entry, reachable only by being sent there, so
+  // finishing anything on one left you somewhere you could not navigate
+  // away from. They are query parameters on the board instead.
+  const paths = handles.routes
+    .map((route) => route.path)
+    .filter((p): p is string => typeof p === 'string');
+  expect(paths.filter((p) => p.startsWith('/atrium-ddns/devices'))).toEqual([]);
+  expect(paths.filter((p) => p.startsWith('/atrium-ddns/names'))).toEqual([]);
+  // …and nothing parameterised is left at all, which is what let the help
+  // page drop its "named but not linkable" second channel.
+  expect(paths.filter((p) => p.includes(':'))).toEqual([]);
 });
 
 test('the nav item for the board is not permission-gated away', async () => {
