@@ -18,30 +18,57 @@ the four where they belong. A ``nsupdate_secret`` found in ``config`` is
 treating it as a place a TSIG secret may live would quietly undo the
 encryption.
 
-**The response rcode is not read, and a refused update is reported as
-``good``.** Both ``dns.query.tcp`` calls below discard what they return.
-A nameserver that answers ``REFUSED`` — the ordinary shape of an
-``update-policy`` denying a key — sends a well-formed, correctly
-TSIG-signed message, so dnspython raises nothing and the tenant is told
-the write succeeded over an unchanged zone. Same for ``SERVFAIL``.
+**The response rcode IS read, and that is a deliberate divergence from
+the legacy adapter. Do not "fix" this back to match it.** #142, settled
+by the milestone owner on 2026-09-01.
 
-Recorded here rather than fixed, for three reasons and none of them is
-that it is acceptable. The legacy adapter does the same
-(``lib/account/nsupdate.py:61`` binds ``response`` and never reads it),
-so this is a ported divergence and not a rewrite regression; the frozen
-wire table cannot adjudicate it, because every backend it declares is a
-scripted stub and no case in it reaches this module; and correcting it
-changes what a live tenant sees on ``/nic/update``, which is a product
-decision rather than a tidy-up. Measured over a real socket and pinned
-by ``backend/tests/test_nsupdate_receiver.py::TestTheRcodeIsNotRead``,
-which goes red when it is fixed — deliberately, so the fix is a visible
-edit rather than a silent drift. Tracked as #142.
+``dns.query.tcp`` returns the nameserver's answer, and a non-zero rcode
+in it means the zone was not written. Nothing raises: a ``REFUSED`` from
+BIND — the ordinary shape of an ``update-policy`` denying a key, a zone
+that is not a primary here, or an ACL the operator tightened — is a
+well-formed, correctly TSIG-signed message, and dnspython hands it back
+exactly as it hands back a ``NOERROR``. So the check has to be written
+or it does not happen.
+
+Legacy does not write it. ``dyndns-route53``'s
+``lib/account/nsupdate.py:61`` binds ``response``, logs it at debug on
+line 67, and never reads it — so every non-zero rcode reaches the tenant
+as ``good``, the client does not retry, and the zone stays stale for as
+long as it keeps sending the same address. ``base.py``'s own comment on
+``check_hostnameon_server`` names that direction as the unsafe one.
+
+Two things make this the right divergence rather than a rewrite
+regression pointing the other way:
+
+* **Legacy already reads rcodes — in the other adapter half.**
+  ``lib/accounts.py:229`` reads ``response.rcode()``, compares it to
+  ``dns.rcode.NOERROR`` and renders it with ``dns.rcode.to_text`` in the
+  log, in ``get_authoritative_nameserver``. So this is not a new idiom
+  imported into a codebase that had none; it is legacy's *own* idiom
+  applied to the one call site legacy forgot.
+* **The frozen wire table has no opinion to overrule.** Every backend
+  ``tests/compat/protocol_cases.yaml`` declares is ``service: stub`` or
+  ``service: no-such-service``, so no case in it reaches this module —
+  asserted, not assumed, by
+  ``test_nsupdate_receiver.py::test_the_wire_table_cannot_reach_this_adapter``.
+
+Every non-zero rcode is covered, not just ``REFUSED``: a fix keyed on
+one rcode is the same defect with a smaller blast radius. The evidence
+is ``backend/tests/test_nsupdate_receiver.py::TestTheRcodeIsReadNow``
+— formerly ``TestTheRcodeIsNotRead``, which pinned the old answer —
+driving each header rcode through a receiver that really signs and
+really refuses. ``test_providers.py``'s ``FakeNsUpdate`` returns the
+*request* from ``tcp()`` and a ``dns.update.Update`` reads as
+``NOERROR``, so the mocked suite passes either way and is not evidence
+about this at all.
 """
 from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
+import dns.message
 import dns.query
+import dns.rcode
 import dns.tsig
 import dns.tsigkeyring
 import dns.update
@@ -72,6 +99,42 @@ REQUIRED_SETTINGS: tuple[str, ...] = (
 
 #: The one setting that may only ever come from the encrypted column.
 SECRET_SETTINGS: frozenset[str] = frozenset({"nsupdate_secret"})
+
+
+class UpdateRefused(Exception):
+    """The nameserver answered a well-formed refusal.
+
+    Not an error dnspython raises — it is a message that parsed, that
+    authenticated, and that says the zone was not written. Raised inside
+    the same ``try`` as ``dns.query.tcp`` so a refusal and a transport
+    fault take one path to ``dnserr``, and carrying the rcode by name so
+    the diagnosis is one grep rather than three deploys.
+    """
+
+    def __init__(self, rcode: int) -> None:
+        self.rcode = rcode
+        #: ``REFUSED``, ``SERVFAIL``, ``NOTZONE`` … The text, not the
+        #: integer: a log line reading ``rcode=5`` is a lookup, and #142
+        #: exists because a diagnosis that costs a lookup does not get
+        #: made.
+        self.rcode_text = dns.rcode.to_text(rcode)
+        super().__init__(f"nameserver answered {self.rcode_text}")
+
+
+def _raise_for_rcode(response: dns.message.Message) -> None:
+    """Refuse anything that is not ``NOERROR``.
+
+    Deliberately not a list of the rcodes RFC 2136 §2.2 names.
+    ``NOTZONE``, ``NXRRSET``, ``YXRRSET``, ``NOTAUTH``, ``SERVFAIL`` and
+    ``REFUSED`` are the ones seen in practice, but a fix keyed on an
+    enumeration is the same defect with a smaller blast radius: a rcode
+    left off the list is reported to the tenant as ``good``. The only
+    rcode that means the zone was written is ``NOERROR``, so that is the
+    one this tests for.
+    """
+    rcode = response.rcode()
+    if rcode != dns.rcode.NOERROR:
+        raise UpdateRefused(rcode)
 
 
 #: The TSIG algorithms dnspython will actually accept, read off
@@ -210,13 +273,21 @@ class NsUpdateProvider(BaseProvider):
                     # in `test_providers.py` by reading the message this
                     # call produces.
                     update.replace(hostname + ".", ttl, rtype, ip)
-                    dns.query.tcp(update, nameserver, timeout=QUERY_TIMEOUT)
+                    response = dns.query.tcp(
+                        update, nameserver, timeout=QUERY_TIMEOUT
+                    )
+                    _raise_for_rcode(response)
                 except Exception as exc:  # noqa: BLE001
                     log.error(
                         "provider.create_failed",
                         service=self.SERVICE,
                         hostname=hostname,
                         rtype=rtype,
+                        # ``None`` for a transport fault, the rcode name
+                        # for a refusal. Two states, two renderings: a
+                        # transport fault and a REFUSED are different
+                        # things to go and look at.
+                        rcode=getattr(exc, "rcode_text", None),
                         error=str(exc),
                     )
                     results[hostname] = STATUS_DNSERR
@@ -270,12 +341,16 @@ class NsUpdateProvider(BaseProvider):
                     # or does not.
                     for record_type in rtypes:
                         update.delete(hostname + ".", record_type)
-                    dns.query.tcp(update, nameserver, timeout=QUERY_TIMEOUT)
+                    response = dns.query.tcp(
+                        update, nameserver, timeout=QUERY_TIMEOUT
+                    )
+                    _raise_for_rcode(response)
                 except Exception as exc:  # noqa: BLE001
                     log.error(
                         "provider.delete_failed",
                         service=self.SERVICE,
                         hostname=hostname,
+                        rcode=getattr(exc, "rcode_text", None),
                         error=str(exc),
                     )
                     results[hostname] = STATUS_DNSERR
@@ -297,4 +372,5 @@ __all__ = [
     "REQUIRED_SETTINGS",
     "SECRET_SETTINGS",
     "NsUpdateProvider",
+    "UpdateRefused",
 ]

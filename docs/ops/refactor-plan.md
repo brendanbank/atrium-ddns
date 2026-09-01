@@ -1424,6 +1424,56 @@ than letting it size itself against the whole box.
 Settled by the operator 2026-08-15. Each is a deliberate difference from the old
 service, approved rather than inherited.
 
+**The nsupdate adapter reads the response rcode. Legacy does not — do not
+"fix" this back to match it.** Settled by the operator 2026-09-01, #142. The
+old `lib/account/nsupdate.py` binds the return of `dns.query.tcp` on line 61,
+debug-logs it on line 67, and never reads it, so a nameserver answering
+`REFUSED` — an `update-policy` denying the key, a zone that is not a primary
+here, an ACL someone tightened — sends a well-formed, correctly TSIG-signed
+message, dnspython raises nothing, and the tenant is told `good` over an
+unchanged zone. The client then does not retry and the zone stays stale for as
+long as it keeps sending the same address; `base.py`'s comment on
+`check_hostnameon_server` names that as the unsafe direction. Every non-zero
+rcode behaves the same way — `SERVFAIL`, `NOTZONE`, `NXRRSET`, `YXRRSET`,
+`NOTAUTH` all mean the update did not happen.
+
+Three things make this the right divergence rather than a rewrite regression
+pointed the other way:
+
+- **It is legacy's own idiom, not a new one.** `lib/accounts.py:229`, in
+  `get_authoritative_nameserver`, already reads `response.rcode()`, compares it
+  against `dns.rcode.NOERROR` and renders it with `dns.rcode.to_text` in the
+  log line. The old service is not rcode-blind by design; it is rcode-blind at
+  exactly one call site. This applies the pattern legacy wrote to the place
+  legacy forgot.
+- **The frozen table has no opinion to overrule.** Every backend
+  `tests/compat/protocol_cases.yaml` declares is `service: stub` or
+  `service: no-such-service`, so no case in it reaches `providers/nsupdate.py`.
+  Asserted from the table's own data by
+  `test_nsupdate_receiver.py::test_the_wire_table_cannot_reach_this_adapter`,
+  not left as prose — if an nsupdate case is ever added, that goes red rather
+  than quietly becoming false. Re-verified at 124 of 124 executable cases for
+  `TARGET=host` when the fix landed: unchanged, as predicted.
+- **Every non-zero rcode is covered, not just `REFUSED`.** A fix keyed on one
+  rcode is the same defect with a smaller blast radius, so the adapter tests
+  for `NOERROR` and refuses everything else, and the evidence is parametrised
+  over a set *derived* from `dns.rcode` rather than typed out.
+
+What a tenant sees changes the day this ships: a backend that has been quietly
+refusing writes starts answering `dnserr` on `/nic/update` instead of `good`.
+That is the point — the client retries — but it is a visible change and it is
+recorded here rather than discovered. The refusal names the rcode in its own
+structlog field (`rcode="REFUSED"`, the text and not the integer) so the
+diagnosis is one grep; a transport fault carries `rcode=None`, because *no
+rcode* and *rcode zero* are different states.
+
+Evidenced by `backend/tests/test_nsupdate_receiver.py::TestTheRcodeIsReadNow`
+— formerly `TestTheRcodeIsNotRead`, which #131 wrote to pin the old answer, and
+which was inverted rather than deleted. `test_providers.py`'s `FakeNsUpdate`
+returns the *request* from `tcp()` and a `dns.update.Update` reads as
+`NOERROR`, so the mocked suite passes either way and is not evidence about this
+at all; the reading has to come from the real TSIG receiver.
+
 **The three Route 53 defects #15 fixed stay fixed.** The old adapter mapped
 *every* zone in the AWS account rather than only the tenant's; its zone listing
 ignored `IsTruncated`, so anything past the first page was invisible; and both
