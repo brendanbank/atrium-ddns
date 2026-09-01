@@ -250,6 +250,18 @@ def unusable_password_hash() -> str:
     return PasswordHelper().hash("unusable-" + "x" * 24)
 
 
+def _needs_advisory_lock() -> bool:
+    """True only on MySQL.
+
+    ``GET_LOCK`` exists here to serialise xdist workers that share one
+    MySQL. On a per-worker in-memory SQLite there is nothing shared to
+    serialise, and the function does not exist — so the guard is not
+    "skipped for convenience", it is inapplicable. That distinction is
+    why this is a dialect test and not a flag.
+    """
+    return get_engine().dialect.name == "mysql"
+
+
 @asynccontextmanager
 async def fixture_writes(owner: str = "?") -> AsyncIterator[AsyncSession]:
     """A session whose transaction no other xdist worker overlaps.
@@ -277,6 +289,16 @@ async def fixture_writes(owner: str = "?") -> AsyncIterator[AsyncSession]:
         )
 
     engine = get_engine()
+    if not _needs_advisory_lock():
+        _HELD_BY = owner
+        try:
+            factory = get_session_factory()
+            async with factory() as session:
+                yield session
+                await session.commit()
+        finally:
+            _HELD_BY = None
+        return
     async with engine.connect() as guard:
         got = (
             await guard.execute(
@@ -704,6 +726,13 @@ async def ddns_config_lock(owner: str = "?") -> AsyncIterator[None]:
         )
 
     engine = get_engine()
+    if not _needs_advisory_lock():
+        _CONFIG_HELD_BY = owner
+        try:
+            yield
+        finally:
+            _CONFIG_HELD_BY = None
+        return
     async with engine.connect() as guard:
         got = (
             await guard.execute(
