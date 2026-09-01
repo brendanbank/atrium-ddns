@@ -4,7 +4,7 @@ import { expect } from '@playwright/test';
 import type { APIRequestContext, Page } from '@playwright/test';
 import { generate as generateTOTP } from 'otplib';
 
-import { BOARD_PATH, DEVICES_PATH, DOMAINS_PATH } from '../src/paths';
+import { BOARD_PATH, DOMAINS_PATH } from '../src/paths';
 
 /**
  * Shared vocabulary for the atrium-ddns e2e specs.
@@ -223,14 +223,13 @@ export async function loginAsUser(page: Page): Promise<ProvisionedUser> {
 
 // --- atrium-ddns specifics ---------------------------------------- //
 
-/** The paths the bundle registers, imported from the module the
- *  registrations themselves read (`src/paths.ts`) rather than typed a
- *  second time here. `NAMES_PATH` and `LOG_PATH` live in their own
- *  page modules — `.tsx`, so importing them would pull Mantine and
- *  React into the test process — and are the two literals below. */
-export const NAMES_PATH = '/atrium-ddns/names';
+/** `/atrium-ddns/names` is gone: the board is the only tenant surface
+ *  and the name modal is `?name=` on it. Nothing here needs the path
+ *  any more, so it is not re-declared — a constant naming a route that
+ *  no longer exists is the kind of thing a spec is later written
+ *  against. `LOG_PATH` still lives in its own module. */
 export const LOG_PATH = '/atrium-ddns/logs';
-export { BOARD_PATH, DEVICES_PATH, DOMAINS_PATH };
+export { BOARD_PATH, DOMAINS_PATH };
 
 /** Every nav item the bundle registers, label and destination.
  *  `ui-parity.md` §3.2 reads the same seven out of the served bundle. */

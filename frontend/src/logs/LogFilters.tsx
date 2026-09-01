@@ -60,6 +60,30 @@ export interface LogFiltersProps {
    *  shown only then — and the decision arrives from the server rather
    *  than being re-derived from a permission list in the browser. */
   crossTenant: boolean;
+  /** The things the id filters are *about*.
+   *
+   *  `device_id`, `hostname_id` and `domain_id` were filterable and
+   *  labelled but had no control at all — reachable only by following a
+   *  link that already knew the id. So the log could be filtered to a name
+   *  and never *by* one, and the chip it produced read `hostname: 1`,
+   *  which is the id rendered as if it were the answer.
+   *
+   *  One list feeds both the select and the chip, so a filter and its own
+   *  description cannot disagree about what id 1 is called. */
+  devices: { id: number; name: string }[];
+  hostnames: { id: number; name: string }[];
+  domains: { id: number; name: string }[];
+  /** The users seen in the rows currently loaded, `{id, email}`.
+   *
+   *  Derived from the result rather than fetched: this bundle owns no
+   *  user directory — atrium does — and the rows already carry
+   *  `user_email` beside `user_id`, which is what the ledger renders. It
+   *  is enough for the two jobs here. Resolving the *chip* is exact: a
+   *  result filtered to one user contains that user on every row. The
+   *  dropdown is necessarily partial — it can only offer users who appear
+   *  in what is loaded — and that is stated in its placeholder rather
+   *  than left to be discovered. */
+  users: { id: number; email: string }[];
   onChange: (key: keyof LogQuery, value: string) => void;
   onClear: () => void;
 }
@@ -74,6 +98,10 @@ function cleared(value: string | null): string {
 export function LogFilters({
   query,
   vocabulary,
+  devices,
+  hostnames,
+  domains,
+  users,
   applied,
   crossTenant,
   onChange,
@@ -84,25 +112,68 @@ export function LogFilters({
   // Driven off the server's echo, keyed by the same `QUERY_KEYS` the URL
   // reader and writer walk. A filter added to `EMPTY_QUERY` appears here
   // with nothing edited.
+  /** The name behind an id filter, or the id when nothing matches it.
+   *
+   *  Falling back to the id rather than to `—` or a blank: an id the
+   *  current lists do not contain is a real state — a deleted device, a
+   *  cross-tenant read, a link pasted from someone else's account — and
+   *  `hostname: 1` is at least true, where `hostname: —` would claim the
+   *  filter is empty when the rows below are filtered by it. */
+  /** Whatever arrived, as something safe to `.map`.
+   *
+   *  `?? []` was not enough and the difference took the whole page down.
+   *  It guards `null` and `undefined`; a lookup that answers `{}` — an
+   *  error body, an endpoint that moved, a stub that returns a bare
+   *  object — is neither, so `rows.map` threw during render and, with no
+   *  error boundary over the host root, React unmounted everything. The
+   *  log rendered nothing because a *filter option list* was the wrong
+   *  shape. Refuse the shape here instead: the selects go empty and the
+   *  log still reads, which is what the fallback was always meant to do. */
+  const list = (rows: unknown): { id: number; name: string }[] =>
+    Array.isArray(rows) ? (rows as { id: number; name: string }[]) : [];
+
+  const nameFor = (key: string, id: string): string => {
+    const rows =
+      key === 'device_id'
+        ? list(devices)
+        : key === 'hostname_id'
+          ? list(hostnames)
+          : key === 'domain_id'
+            ? list(domains)
+            : key === 'user_id'
+              ? list(users.map((u) => ({ id: u.id, name: u.email })))
+              : null;
+    if (rows === null) return id;
+    return rows.find((row) => String(row.id) === id)?.name ?? id;
+  };
+
   const chips = QUERY_KEYS.map((key) => {
     const value = (applied as unknown as Record<string, unknown>)[key];
     if (value === null || value === undefined || value === '') return null;
-    return { key, value: String(value) };
+    return { key, value: nameFor(key, String(value)) };
   }).filter((chip): chip is { key: keyof LogQuery; value: string } =>
     chip !== null,
   );
+
+  /** Mantine wants `{value,label}` with a string value; ids are numbers. */
+  const options = (rows: unknown) =>
+    list(rows).map((row) => ({ value: String(row.id), label: row.name }));
 
   return (
     <Stack gap="xs" data-testid="log-filters">
       <Group gap="sm" align="flex-end" wrap="wrap">
         {crossTenant ? (
-          <TextInput
-            label="User id"
+          <Select
+            label="User"
+            placeholder="anyone in these rows"
             description="Everyone's rows are visible to you"
-            value={query.user_id}
-            onChange={(event) => onChange('user_id', event.currentTarget.value)}
+            data={options(users.map((u) => ({ id: u.id, name: u.email })))}
+            value={query.user_id || null}
+            onChange={(value) => onChange('user_id', cleared(value))}
+            searchable
+            clearable
             data-testid="filter-user-id"
-            w={140}
+            w={240}
           />
         ) : null}
         <Select
@@ -145,6 +216,45 @@ export function LogFilters({
           onChange={(value) => onChange('backend_type', cleared(value))}
           data-testid="filter-backend-type"
           w={170}
+        />
+        {/* The three id filters, as things you can pick by name.
+            `searchable` because a tenant with forty names should type, not
+            scroll; `clearable` because removing a filter has to be as easy
+            as adding one, and the chip's remove button is the other way.
+            They sit before `Called from` so the two questions a log is
+            usually asked — *which device* and *which name* — come first. */}
+        <Select
+          label="Device"
+          placeholder="any device"
+          data={options(devices)}
+          value={query.device_id || null}
+          onChange={(value) => onChange('device_id', cleared(value))}
+          searchable
+          clearable
+          data-testid="filter-device-id"
+          w={190}
+        />
+        <Select
+          label="Name"
+          placeholder="any name"
+          data={options(hostnames)}
+          value={query.hostname_id || null}
+          onChange={(value) => onChange('hostname_id', cleared(value))}
+          searchable
+          clearable
+          data-testid="filter-hostname-id"
+          w={220}
+        />
+        <Select
+          label="Zone"
+          placeholder="any zone"
+          data={options(domains)}
+          value={query.domain_id || null}
+          onChange={(value) => onChange('domain_id', cleared(value))}
+          searchable
+          clearable
+          data-testid="filter-domain-id"
+          w={200}
         />
         <TextInput
           label="Called from"

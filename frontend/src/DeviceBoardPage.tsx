@@ -20,49 +20,130 @@
  * the permission — so a user without it does not generate a 403 on every
  * page load.
  */
-import { useState } from 'react';
-import { Alert, Anchor, Group, Stack, Text, Title } from '@mantine/core';
+import { Alert, Button, Group, Stack, Text, Title } from '@mantine/core';
 import { useQuery } from '@tanstack/react-query';
-import { usePerm } from '@brendanbank/atrium-host-bundle-utils/react';
+import {
+  useAtriumLocation,
+  useAtriumNavigate,
+  usePerm,
+} from '@brendanbank/atrium-host-bundle-utils/react';
 
 import { BOARD_PERMISSION, boardQuery } from './api/board';
+import { DEVICE_PERMISSION } from './api/devices';
 import { HOSTNAME_PERMISSION } from './api/hostnames';
+import {
+  BOARD_ONLY_DEVICE_PARAM,
+  BOARD_PATH_HOME,
+  DEVICE_PARAM,
+  NAME_FOR_PARAM,
+  NAME_ID_PARAM,
+  NAME_ZONE_PARAM,
+  NEW_VALUE,
+  boardDeviceHref,
+  boardNameNewHref,
+  returnFromSearch,
+} from './paths';
 import { BoardSkeleton } from './board/DeviceBoard';
 import { BoardTable } from './board/BoardTable';
 import { HealthCheckActions } from './board/HealthCheckActions';
-import { NAMES_PATH } from './HostnamesPage';
 import { DdnsRoot } from './host/DdnsRoot';
 import { DeviceCardModal } from './tenant/DeviceCard';
+import { DeviceCreateModal } from './tenant/DeviceCreateModal';
+import { NameModal } from './tenant/NameModal';
+
 
 export function DeviceBoardInner() {
   const hasPerm = usePerm();
+  const { search } = useAtriumLocation();
+  const navigate = useAtriumNavigate();
   const canRead = hasPerm(BOARD_PERMISSION);
   const { data, isLoading, error } = useQuery(boardQuery({ enabled: canRead }));
-  /** Which device's card is open. Held here rather than in
-   *  `DeviceBoard` because `DeviceCard` imports `HostnameBlock` from
-   *  that module, and importing the card there would close a cycle. */
-  const [openDevice, setOpenDevice] = useState<number | null>(null);
+  /** Both modals are the address bar, the way the zone modal already is.
+   *
+   *  They were `useState`, so a reload or a pasted link landed on the bare
+   *  board — and the name link went to `/atrium-ddns/names`, a whole page
+   *  away, because the board could not show a name itself.
+   *
+   *  Reading them from the URL also buys the return behaviour without a
+   *  stack: opening a name *from* a device card carries `?from=` naming
+   *  the card's own address, so closing the name goes back to the device.
+   *  It survives a reload, which a component-held stack would not. */
+  const params = new URLSearchParams(search);
+  const rawDevice = params.get(DEVICE_PARAM);
+  const openDevice =
+    rawDevice !== null && /^\d+$/.test(rawDevice) ? Number(rawDevice) : null;
+  /** `?device=new` is the create form, not a card with no device. */
+  const creatingDevice = rawDevice === NEW_VALUE;
+  const rawName = params.get(NAME_ID_PARAM);
+  const nameOpen = rawName !== null;
+  const nameId =
+    rawName === null || rawName === NEW_VALUE ? null : Number(rawName) || null;
+  const rawFor = params.get(NAME_FOR_PARAM);
+  const presetDeviceId =
+    rawFor !== null && /^\d+$/.test(rawFor) ? Number(rawFor) : null;
+  /** Where closing a modal goes. `?from=` when one modal opened another,
+   *  otherwise the bare board. */
+  const closeTo = returnFromSearch(search) ?? BOARD_PATH_HOME;
+  /** `?zone=<name>` focuses the board on one zone. The zones page links
+   *  here that way now: it used to send you to `/atrium-ddns/names`, a
+   *  surface that is going away. Read once, into the table's own filter
+   *  state — after that it is a control, not an address. */
+  const zoneFromUrl = params.get(NAME_ZONE_PARAM);
+  /** `?onlyDevice=` narrows the table to one device. Distinct from
+   *  `?device=`, which opens that device's card — the card links here to
+   *  show the rows it no longer draws itself. */
+  const onlyDeviceFromUrl = params.get(BOARD_ONLY_DEVICE_PARAM);
 
   return (
     <Stack gap="md">
       <Group justify="space-between" align="baseline">
         <Title order={3}>Devices and names</Title>
-        {/* The way out of an empty board. #69 found that the board, the
-            zones page and the log all *describe* hostnames and none of
-            them could create one — so the object this page renders was
-            unreachable from the page that renders it. Gated on the
-            hostname permission rather than the board's: a link to a page
-            that answers a refusal is worse than no link.
+        {/* The two things you come here to *do*, and the reason they are
+            buttons rather than a link in the corner.
 
-            A plain anchor for the reason `LogLink` gives — this tree is
-            mounted inside atrium's React, so react-router's `Link` is
-            not reachable and a bare `pushState` would move the address
-            bar without telling the router. */}
-        {hasPerm(HOSTNAME_PERMISSION) ? (
-          <Anchor href={NAMES_PATH} size="sm" data-testid="board-names-link">
-            Manage names
-          </Anchor>
-        ) : null}
+            #69 found that the board, the zones page and the log all
+            *describe* hostnames while none of them could create one, so
+            the object this page renders was unreachable from the page
+            that renders it. The separate Devices and Names nav items were
+            then removed, on the grounds that this board is both of those
+            lists joined — true for reading them, and false for making
+            one. What was left said *"You have no devices yet. Add one to
+            get a DDNS username and password"* over a page with no way to
+            add one: an instruction the surface carrying it cannot follow.
+
+            Each is gated on the permission for the thing it creates, not
+            on the board's: an action that answers a refusal is worse than
+            no action. `Manage names` stays as the way to the list, since
+            browsing names and adding one are different errands.
+
+            Plain anchors for the reason `LogLink` gives — this tree is
+            mounted inside atrium's React, so react-router's `Link` is not
+            reachable and a bare `pushState` would move the address bar
+            without telling the router. `component="a"` keeps that while
+            still rendering as a button. */}
+        <Group gap="sm" align="center">
+          {hasPerm(DEVICE_PERMISSION) ? (
+            <Button
+              component="a"
+              href={`${BOARD_PATH_HOME}?${DEVICE_PARAM}=${NEW_VALUE}`}
+              size="xs"
+              data-testid="board-add-device"
+            >
+              Add a device
+            </Button>
+          ) : null}
+          {hasPerm(HOSTNAME_PERMISSION) ? (
+            <Button
+              component="a"
+              href={boardNameNewHref()}
+              size="xs"
+              variant="default"
+              data-testid="board-add-name"
+            >
+              Add a name
+            </Button>
+          ) : null}
+        </Group>
       </Group>
       {!canRead ? (
         <Alert
@@ -100,14 +181,29 @@ export function DeviceBoardInner() {
           <HealthCheckActions
             intervalMinutes={data.health_check_interval_minutes}
           />
-          <BoardTable board={data} onOpenDevice={setOpenDevice} />
+          <BoardTable
+            board={data}
+            onOpenDevice={(id) => navigate(boardDeviceHref(id))}
+            initialZoneFilter={zoneFromUrl}
+            initialDeviceFilter={onlyDeviceFromUrl}
+          />
           {/* §18.2 — the board's device name is now a way in, and this
               is where it goes. The same `DeviceCard` the route renders
               and the device list opens: one definition, asserted by
               module identity in `src/test/sharedCard.test.tsx`. */}
           <DeviceCardModal
             deviceId={openDevice}
-            onClose={() => setOpenDevice(null)}
+            onClose={() => navigate(closeTo, { replace: true })}
+          />
+          <DeviceCreateModal
+            opened={creatingDevice}
+            onClose={() => navigate(closeTo, { replace: true })}
+          />
+          <NameModal
+            nameId={nameId}
+            opened={nameOpen}
+            presetDeviceId={presetDeviceId}
+            onClose={() => navigate(closeTo, { replace: true })}
           />
         </>
       ) : null}

@@ -37,9 +37,22 @@
  * matters because the two states want opposite actions — one is a bug
  * report, the other is a decision about whether to reconfigure a router.
  */
-import { Alert, Button, Code, Group, Stack, Text } from '@mantine/core';
+import {
+  ActionIcon,
+  Alert,
+  Button,
+  Code,
+  CopyButton,
+  Group,
+  Modal,
+  Stack,
+  Text,
+  Tooltip,
+} from '@mantine/core';
+import { IconCheck, IconCopy } from '@tabler/icons-react';
 
 import type { CredentialOrigin, DeviceSecret } from '../api/devices';
+import { DdnsPortalScope } from '../host/DdnsRoot';
 
 /** What the interface says about a stored secret, by origin.
  *
@@ -88,6 +101,33 @@ export function MigratedNotice({ origin }: { origin: CredentialOrigin }) {
  * a secret whose username the user then has to go and find is a
  * two-screen operation for a one-screen fact.
  */
+/** A copy button that says whether it worked.
+ *
+ * `CopyButton`'s `copied` flag is the whole point: a click with no
+ * feedback is indistinguishable from a click that missed, and on a value
+ * shown exactly once that ambiguity is expensive — you cannot check by
+ * pasting somewhere and coming back, because coming back is not
+ * available. The tick is the acknowledgement. */
+function CopyValue({ value, what }: { value: string; what: string }) {
+  return (
+    <CopyButton value={value} timeout={2000}>
+      {({ copied, copy }) => (
+        <Tooltip label={copied ? 'Copied' : `Copy the ${what}`} withArrow>
+          <ActionIcon
+            variant="subtle"
+            color={copied ? 'teal' : 'gray'}
+            onClick={copy}
+            aria-label={`Copy the ${what}`}
+            data-testid={`copy-${what}`}
+          >
+            {copied ? <IconCheck size={16} /> : <IconCopy size={16} />}
+          </ActionIcon>
+        </Tooltip>
+      )}
+    </CopyButton>
+  );
+}
+
 export function SecretOnce({
   issued,
   onDismiss,
@@ -108,18 +148,41 @@ export function SecretOnce({
           hash, so it cannot be recovered — if you lose it you must rotate, which
           issues a new one and stops the old one working.
         </Text>
-        <div className="ddns-strip__stations">
-          <span className="ddns-th">Username</span>
-          <span className="ddns-data" data-testid="issued-username">
-            {issued.device.username}
-          </span>
-          <span />
-          <span className="ddns-th">Secret</span>
-          <Code className="ddns-data" data-testid="issued-secret">
-            {issued.secret}
-          </Code>
-          <span />
-        </div>
+        {/* Both values get a copy button, and the secret is the reason.
+            It is a long opaque run that has to be transcribed *exactly*
+            into a router, is shown once, and cannot be recovered — so a
+            selection that clips a character produces a device that
+            authenticates today and fails whenever the router next
+            re-reads its config. Selecting by hand is the step most likely
+            to go wrong at the one moment that cannot be repeated.
+
+            The username gets one too, because it is copied in the same
+            sitting into the same form, and offering the button on only
+            one of the pair invites hand-selecting the other. */}
+        <Stack gap="xs">
+          <Group gap="sm" align="center" wrap="nowrap">
+            <span className="ddns-th" style={{ minWidth: '5rem' }}>
+              Username
+            </span>
+            <span className="ddns-data" data-testid="issued-username">
+              {issued.device.username}
+            </span>
+            <CopyValue value={issued.device.username} what="username" />
+          </Group>
+          <Group gap="sm" align="center" wrap="nowrap">
+            <span className="ddns-th" style={{ minWidth: '5rem' }}>
+              Secret
+            </span>
+            <Code
+              className="ddns-data"
+              data-testid="issued-secret"
+              style={{ wordBreak: 'break-all' }}
+            >
+              {issued.secret}
+            </Code>
+            <CopyValue value={issued.secret} what="secret" />
+          </Group>
+        </Stack>
         <Group justify="flex-end">
           <Button
             size="xs"
@@ -132,5 +195,60 @@ export function SecretOnce({
         </Group>
       </Stack>
     </Alert>
+  );
+}
+
+/** `SecretOnce`, in the modal it is always shown in.
+ *
+ * Both places that issue a credential — creating a device, and rotating an
+ * existing one — show the same thing and must show it the same way. They did
+ * not: creation opened a modal, rotation printed the secret **inline inside
+ * the device card**, where it competes with the form around it and scrolls
+ * away like ordinary content. A credential shown once should be the only
+ * thing on screen while it is on screen.
+ *
+ * `zIndex` is explicit, and that is the whole reason this is one component
+ * rather than two similar ones. Mantine gives every modal the same z-index,
+ * so siblings stack by mount order — fine until a re-render changes the
+ * order and the secret ends up behind the form that produced it. Rotation
+ * makes that concrete: the card is itself a modal, so the secret has to
+ * outrank a modal that is already open, not merely appear.
+ */
+export function SecretOnceModal({
+  issued,
+  onDismiss,
+  title = 'Device created',
+}: {
+  /** `null` closes it. The caller holds the secret in component state and
+   *  nowhere else — not the query cache, not storage, not a ref that
+   *  survives a remount. */
+  issued: DeviceSecret | null;
+  onDismiss: () => void;
+  /** What produced the credential. The two callers say different things,
+   *  and "Device created" over a rotation would be wrong about the one
+   *  fact the reader needs. */
+  title?: string;
+}) {
+  return (
+    <Modal
+      opened={issued !== null}
+      onClose={onDismiss}
+      title={title}
+      /* Wide enough for the secret to sit on one line. At the default
+         width it wrapped mid-token, which makes a value that must be
+         transcribed exactly look like two values — and hand-selection
+         across a wrap is where a character goes missing. */
+      size="lg"
+      zIndex={400}
+      data-testid="device-secret-modal"
+    >
+      {/* Portalled to `document.body`, outside `[data-ddns-root]`, so
+          without this the secret renders with none of `ddns.css` — and
+          `.ddns-data` is what makes it selectable as one monospaced run
+          rather than reflowing prose. */}
+      <DdnsPortalScope>
+        {issued ? <SecretOnce issued={issued} onDismiss={onDismiss} /> : null}
+      </DdnsPortalScope>
+    </Modal>
   );
 }

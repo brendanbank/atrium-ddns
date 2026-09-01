@@ -45,10 +45,9 @@ import {
 } from '@brendanbank/atrium-test-utils';
 
 import { DeviceBoardPage } from '../DeviceBoardPage';
-import { DevicesPage } from '../DevicesPage';
 import { DomainsPage } from '../DomainsPage';
 import { DDNS_ROOT_ATTRIBUTE } from '../host/DdnsRoot';
-import { deviceHrefParam, zoneHrefParam } from '../paths';
+import { zoneHrefParam } from '../paths';
 import { queryClient } from '../queryClient';
 import { board, device as boardDevice } from './fixtures';
 
@@ -126,6 +125,12 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   handles?.cleanup();
+  // Reset the address. Surfaces here read the URL — the zones list opens
+  // its modal from `?zone=`, and the board now takes its zone filter from
+  // the same key — so a test that navigates leaves the next one on a
+  // filtered board with no rows. That failed as "the table did not
+  // render" three tests later, which is the wrong diagnosis entirely.
+  window.history.pushState({}, '', '/');
   vi.unstubAllGlobals();
 });
 
@@ -174,15 +179,19 @@ describe('the card modal keeps the host’s CSS scope', () => {
   });
 });
 
-describe('the devices list — §16, row 3', () => {
-  test('the device name is an anchor with a real href, and it keeps the data face', async () => {
-    renderWithAtrium(<DevicesPage />);
-    const name = await screen.findByTestId(`open-${DEVICE_ROW.name}`);
-    expect(name.tagName).toBe('A');
-    expect(name).toHaveAttribute('href', deviceHrefParam(DEVICE_ROW.id));
-    expect(name.className.split(/\s+/)).toContain('ddns-data');
-  });
-});
+/* §16 row 3 — the devices list — is gone with the page.
+ *
+ * `/atrium-ddns/devices` was removed when the board became the only
+ * tenant surface: the device card, the create form and the name modal are
+ * all query parameters on the board now. The affordance that row asserted
+ * — a device name is an anchor with a real href, not a span — is still
+ * asserted, on the surface that still exists: see "the board — §16, row
+ * 1" above, which checks the board's own device control.
+ *
+ * Deleted rather than pointed at a page that no longer exists, and
+ * recorded here rather than silently dropped, because a row of §16
+ * vanishing from this file with no explanation is how a guard stops
+ * covering something without anyone deciding to stop. */
 
 describe('the board — §16, row 1: it was not a link at all', () => {
   test('the device name is a control, not a span', async () => {
@@ -219,6 +228,14 @@ describe('the board — §16, row 1: it was not a link at all', () => {
     expect(
       screen.queryByTestId(`device-${DEVICE_ROW.name}-expand`),
     ).not.toBeInTheDocument();
-    expect(document.querySelectorAll('[aria-expanded]')).toHaveLength(0);
+    // Scoped to the rows, not the document. The board grew a device and
+    // a name filter, and a Mantine `Select` is a combobox — it carries
+    // `aria-expanded` legitimately, on a control that is not in a row and
+    // does not disclose anything about a device. A document-wide sweep
+    // failed on that, which is the guard being wider than the property it
+    // is defending: the defect was a *row* announcing "collapsed" to a
+    // screen reader user trying to open a device.
+    const table = screen.getByTestId('board-table');
+    expect(table.querySelectorAll('[aria-expanded]')).toHaveLength(0);
   });
 });

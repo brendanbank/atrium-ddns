@@ -36,11 +36,8 @@ import { Anchor, List, Stack, Text, Title } from '@mantine/core';
 
 import {
   BOARD_PATH,
-  DEVICES_PATH,
-  DEVICE_DETAIL_PATH,
   DOMAINS_PATH,
 } from './paths';
-import { NAMES_PATH } from './HostnamesPage';
 import { LOG_PATH } from './LogSearchPage';
 import { SETTINGS_ROUTES } from './settings/settingsRoutes';
 import { DdnsRoot } from './host/DdnsRoot';
@@ -95,33 +92,25 @@ export const DOCUMENTS: { path: string; title: string; blurb: string }[] = [
   },
 ];
 
-/** A route this bundle registers that **has no address to link to**,
- *  because its path carries a parameter.
+/** Every surface this bundle registers, one row each.
  *
- *  `/atrium-ddns/devices/:id` is a real, registered, reachable surface,
- *  and a `<a href="/atrium-ddns/devices/:id">` is a link to a literal
- *  colon. So it is described rather than linked, under the surface it is
- *  reached from — and it is still inside the sweep in
- *  `HelpPage.test.tsx`, which requires every registered route to be
- *  either linked here or named here. A route quietly exempted from that
- *  guard is the *"a writer nothing calls"* shape one indirection along:
- *  a surface that exists, that the help page does not mention, and that
- *  nothing fails on.
+ * There is no longer a *nested* kind. `NestedSurface` existed for routes
+ * whose path carried a parameter — `/atrium-ddns/devices/:id` — which
+ * could be named but not linked, because an `<a href>` to a literal colon
+ * is not an address. Those routes are gone: the device card and the name
+ * modal are query parameters on the board, so every surface has a real
+ * address again and the second channel had nothing left to carry.
+ *
+ * It is deleted rather than kept empty. An unused mechanism with one
+ * remaining consumer is the *"a writer nothing calls"* shape, and the
+ * sweep in `HelpPage.test.tsx` now asserts the absence directly.
  */
-export interface NestedSurface {
-  /** The registered path, parameter and all. Never rendered as an href. */
-  path: string;
-  label: string;
-  blurb: string;
-}
-
 /** One row per surface this bundle registers. The path comes from the
  *  registration's own constant — see the module docstring. */
 export const SURFACES: {
   to: string;
   label: string;
   blurb: string;
-  within?: NestedSurface[];
 }[] = [
   {
     to: BOARD_PATH,
@@ -130,30 +119,10 @@ export const SURFACES: {
       'The board. Which router has gone quiet, and whether what DNS answers matches what we last published. “Check now” re-resolves everything you can see instead of waiting for the scheduled check.',
   },
   {
-    to: NAMES_PATH,
-    label: 'Names',
-    blurb:
-      'Register a hostname under one of your zones and assign it to a device. A name is refused here if the wire protocol could never update it. “Publishing” on each row chooses which of the zone’s providers that name is published to, overrides its TTL, and publishes an address immediately instead of waiting for the router — leaving the provider list untouched means the name follows the zone, including providers you bind to it later.',
-  },
-  {
     to: DOMAINS_PATH,
     label: 'Zones and providers',
     blurb:
       'Claim a zone and bind its first DNS provider, in one step. A zone with no provider publishes nowhere — every update for a name in it answers 911 — so the list marks one, and creating one is a deliberate choice rather than the default. Clicking a zone opens it in place, at ?zone=<id> — one modal for creating and for editing, and the address is what holds it open, so a reload or a pasted link brings it back.',
-  },
-  {
-    to: DEVICES_PATH,
-    label: 'Devices',
-    blurb:
-      'The credential a router authenticates with. The secret is shown once, at creation and at rotation, and cannot be displayed again.',
-    within: [
-      {
-        path: DEVICE_DETAIL_PATH,
-        label: 'One device',
-        blurb:
-          'Opened by clicking a device. Rename it in place, change its rate limit (or return it to the installation default), see the names it updates at full width, and rotate its secret. A rename is refused if you already have a device by that name — another account having one does not matter — and it never touches the credential, so the router keeps working.',
-      },
-    ],
   },
   {
     to: LOG_PATH,
@@ -214,20 +183,6 @@ export function HelpInner() {
               {surface.label}
             </Anchor>{' '}
             — {surface.blurb}
-            {surface.within ? (
-              <List spacing="xs" size="sm" withPadding>
-                {surface.within.map((nested) => (
-                  <List.Item
-                    key={nested.path}
-                    data-testid={`help-within-${nested.path}`}
-                  >
-                    {/* Named, not linked. The path carries a parameter,
-                        so there is no address to send anyone to. */}
-                    <strong>{nested.label}</strong> — {nested.blurb}
-                  </List.Item>
-                ))}
-              </List>
-            ) : null}
           </List.Item>
         ))}
       </List>

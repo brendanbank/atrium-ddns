@@ -62,7 +62,10 @@ import { expect, test, type Page } from '@playwright/test';
 
 import { API_URL, loginAsUser } from './helpers';
 
-const DEVICES_PATH = '/atrium-ddns/devices';
+/** The board. `/atrium-ddns/devices` is gone — the device card, the
+ *  create form and the name modal are query parameters on the board now,
+ *  so the address a card opens at is `/atrium-ddns?device=<id>`. */
+const DEVICES_PATH = '/atrium-ddns';
 
 /** §3.1's measured minimum for one resolution strip. §12 rejects a
  *  Mantine `lg` drawer (620px) because it is below this. */
@@ -86,7 +89,7 @@ async function createDevice(
   name: string,
 ): Promise<{ name: string; username: string; secret: string }> {
   await page.goto(DEVICES_PATH);
-  await page.getByTestId('add-device').click();
+  await page.getByTestId('board-add-device').click();
   await page.getByTestId('device-name').fill(name);
   await page.getByTestId('device-submit').click();
   await expect(page.getByTestId('device-secret-once')).toBeVisible();
@@ -97,7 +100,7 @@ async function createDevice(
   return { name, username: username.trim(), secret: secret.trim() };
 }
 
-test.describe('the device detail route', () => {
+test.describe('the device card, on the board', () => {
   test('a tenant reaches it from the list and renames in place', async ({
     page,
   }) => {
@@ -106,7 +109,7 @@ test.describe('the device detail route', () => {
     // The nav items render at all. #91's first spec asserts this; it is
     // repeated here because everything below is vacuous without it.
     await page.goto(DEVICES_PATH);
-    await expect(page.getByTestId('add-device')).toBeVisible();
+    await expect(page.getByTestId('board-add-device')).toBeVisible();
 
     const suffix = unique();
     const original = `router-${suffix}`;
@@ -121,12 +124,16 @@ test.describe('the device detail route', () => {
     // which are properties of the URL, so this test reads the row's own
     // `href` and goes there — it is about the *route*, and the modal
     // has its own spec.
-    const detailHref = (await page
-      .getByTestId(`open-${original}`)
-      .getAttribute('href')) as string;
-    expect(detailHref).toMatch(new RegExp(`${DEVICES_PATH}\\?device=\\d+$`));
-    await page.goto(detailHref);
-    await expect(page).toHaveURL(new RegExp(`${DEVICES_PATH}\\?device=\\d+$`));
+    // The row's own name opens the card, and doing so puts the card in
+    // the address — which is what makes it reloadable and Back-able. The
+    // device list this used to read an `href` from is gone; the board's
+    // control is a button that navigates, so the URL is read after the
+    // click rather than off the element.
+    await page.getByTestId(`board-open-${original}`).click();
+    await expect(page).toHaveURL(new RegExp(`\\?device=\\d+$`));
+    // Kept so the card can be reopened *by address* below — the point of
+    // the URL carrying it.
+    const deviceIdFromRow = new URL(page.url()).searchParams.get('device');
     await expect(page.getByTestId('device-name-input')).toHaveValue(original);
     // The cell carries a "Username:" prefix now — on a line that also
     // says "seen" and "created", the bare `ddns-…` string was the one
@@ -149,17 +156,21 @@ test.describe('the device detail route', () => {
 
     const renamed = `renamed-${suffix}`;
     await page.getByTestId('device-name-input').fill(renamed);
-    await page.getByTestId('device-name-save').click();
-    await expect(page.getByTestId('device-name-input')).toHaveValue(renamed);
+    // **Saving closes the card.** One Save for the whole card, and it is
+    // an exit like Cancel — so the reading that proves the rename landed
+    // is the board's own row, not a field still on screen.
+    await page.getByTestId('device-save').click();
+    await expect(page.getByTestId(`board-open-${renamed}`)).toBeVisible({
+      timeout: 8_000,
+    });
 
     // Linkable, and it survives a reload — the first of §12's three
-    // things a drawer cannot do.
+    // things a drawer cannot do. Reopened by address, not by clicking.
+    const cardUrl = `${DEVICES_PATH}?device=${deviceIdFromRow}`;
+    await page.goto(cardUrl);
+    await expect(page.getByTestId('device-name-input')).toHaveValue(renamed);
     await page.reload();
     await expect(page.getByTestId('device-name-input')).toHaveValue(renamed);
-
-    // Back works — the second.
-    await page.goBack();
-    await expect(page).toHaveURL(new RegExp(`${DEVICES_PATH}$`));
 
     // **The rename did not rotate the credential.** The secret captured
     // at creation, driven at `/nic/update` over HTTP Basic. `badauth`
@@ -209,15 +220,15 @@ test.describe('the device detail route', () => {
     await createDevice(page, mover);
 
     await page.goto(DEVICES_PATH);
-    await page.getByTestId(`open-${mover}`).click();
+    await page.getByTestId(`board-open-${mover}`).click();
     await page.getByTestId('device-name-input').fill(taken);
-    await page.getByTestId('device-name-save').click();
+    await page.getByTestId('device-save').click();
 
     // Verbatim, including the offending name. Not "that name is in
     // use", which would be the browser's words about the server's
     // answer — and not a silently generated `occupied (2)`, which is the
     // implementation this assertion exists to fail.
-    await expect(page.getByTestId('device-name-refusal')).toContainText(
+    await expect(page.getByTestId('device-save-refusal')).toContainText(
       `you already have a device called '${taken}'`,
     );
     await expect(page.getByTestId('device-name-input')).toHaveValue(taken);
@@ -225,8 +236,8 @@ test.describe('the device detail route', () => {
     // Nothing was written: the list still has one of each name and no
     // suffixed variant.
     await page.goto(DEVICES_PATH);
-    await expect(page.getByTestId(`open-${taken}`)).toHaveCount(1);
-    await expect(page.getByTestId(`open-${mover}`)).toHaveCount(1);
+    await expect(page.getByTestId(`board-open-${taken}`)).toHaveCount(1);
+    await expect(page.getByTestId(`board-open-${mover}`)).toHaveCount(1);
   });
 
   test('a name another tenant uses is accepted — the constraint is per user', async ({
@@ -246,15 +257,15 @@ test.describe('the device detail route', () => {
     await createDevice(secondPage, mine);
 
     await secondPage.goto(DEVICES_PATH);
-    await secondPage.getByTestId(`open-${mine}`).click();
+    await secondPage.getByTestId(`board-open-${mine}`).click();
     await secondPage.getByTestId('device-name-input').fill(shared);
-    await secondPage.getByTestId('device-name-save').click();
+    await secondPage.getByTestId('device-save').click();
 
     // Succeeds. A test that only checked "a duplicate is a 409" would
     // pass identically against an installation-wide constraint, which
     // would let one tenant's naming choices refuse another's.
     await expect(secondPage.getByTestId('device-name-input')).toHaveValue(shared);
-    await expect(secondPage.getByTestId('device-name-refusal')).toHaveCount(0);
+    await expect(secondPage.getByTestId('device-save-refusal')).toHaveCount(0);
 
     await first.close();
     await second.close();
@@ -268,10 +279,16 @@ test.describe('the device detail route', () => {
     await loginAsUser(firstPage);
     await createDevice(firstPage, `victim-${unique()}`);
     await firstPage.goto(DEVICES_PATH);
-    const href = await firstPage
-      .getByTestId(/^open-victim-/)
+    // The board's control is a button that navigates, not an anchor, so
+    // the card's address is read off the URL after opening it rather than
+    // off an `href`. Same property being set up: one tenant's card, by
+    // address, handed to another tenant.
+    await firstPage
+      .getByTestId(/^board-open-victim-/)
       .first()
-      .getAttribute('href');
+      .click();
+    await expect(firstPage).toHaveURL(/\?device=\d+$/);
+    const href = new URL(firstPage.url()).pathname + new URL(firstPage.url()).search;
     expect(href).toBeTruthy();
 
     const second = await browser.newContext();
@@ -290,7 +307,7 @@ test.describe('the device detail route', () => {
     await second.close();
   });
 
-  test('the device’s names reach the route at the width one strip needs', async ({
+  test('the card links to its names rather than drawing them again', async ({
     page,
   }) => {
     const tenant = await loginAsUser(page);
@@ -305,31 +322,40 @@ test.describe('the device detail route', () => {
     await page.goto(`${DEVICES_PATH}?device=${deviceId}`);
     await expect(page.getByTestId('device-name-input')).toHaveValue(deviceName);
 
-    // The name block reaches the route. This zone has no provider, so
-    // §10.1's state applies and the block says *nothing published yet —
-    // no strip to draw* rather than drawing two empty rails. That is a
-    // real rendering, and it is deliberately **not** called a strip: the
-    // strip itself is the next test, which fails rather than passes if
-    // nothing published.
-    const block = page.getByTestId(`hostname-home.${zone}`);
-    await expect(block).toBeVisible();
-    await expect(block).toContainText('no strip to draw');
+    // **The card no longer draws the device's names.** It listed them —
+    // the same rows the board draws, rendered a second way inside a modal
+    // opened to change a rate limit — and the two went out of step: the
+    // board grew filters, a per-row `+` and a per-row log link, and none
+    // of it reached the copy in here.
+    //
+    // So the card states the count and links to the real list, filtered
+    // to this device. That link is what this test asserts now.
+    const link = page.getByTestId('detail-names-link');
+    await expect(link).toBeVisible();
+    await expect(link).toContainText('1 name');
+    await link.click();
 
-    // §12's measurement, taken rather than restated from the document:
-    // the container the strip is laid out in is at least as wide as one
-    // strip needs. A Mantine `lg` drawer would be 620px of chrome and
-    // less than this of content, which is the whole argument for a
-    // route.
-    const box = await block.boundingBox();
+    // …and it lands on the board, narrowed to this device, with the name
+    // present. `?onlyDevice=` is the *filter*; `?device=` opens the card,
+    // and one key cannot mean both.
+    await expect(page).toHaveURL(new RegExp(`onlyDevice=${deviceId}$`));
+    await expect(
+      page.getByTestId(`board-row-home.${zone}-none`),
+    ).toBeVisible({ timeout: 8_000 });
+
+    // §12's width measurement moves to where the strip is actually laid
+    // out. The board is full width, so the one-strip minimum is met with
+    // room to spare — which is the argument the route was carrying.
+    const table = page.getByTestId('board-table');
+    const box = await table.boundingBox();
     expect(box).not.toBeNull();
     expect(
       (box as { width: number }).width,
-      'the name block is below §3.1’s one-strip minimum — the ' +
-        'signature element would wrap inside its own detail view',
+      'the board is below §3.1’s one-strip minimum',
     ).toBeGreaterThanOrEqual(ONE_STRIP_MIN_PX);
   });
 
-  test('a published name draws its resolution strip on the route', async ({
+  test('a published name draws its resolution strip on the board', async ({
     page,
   }) => {
     await loginAsUser(page);
@@ -389,25 +415,21 @@ test.describe('the device detail route', () => {
     expect((await published.text()).trim()).toMatch(/^(good|nochg)\b/);
 
     await page.setViewportSize({ width: 1440, height: 1000 });
-    await page.goto(`${DEVICES_PATH}?device=${deviceId}`);
-    await expect(page.getByTestId('device-name-input')).toHaveValue(deviceName);
+    // The board, narrowed to this device. The card used to draw the strip
+    // itself; it links here instead, so this is where the signature
+    // element is now rendered — and the row is the strip.
+    await page.goto(`${DEVICES_PATH}?onlyDevice=${deviceId}`);
 
-    // The signature element, on the detail route, for the first time in
-    // this repository's history in a browser. Either shape counts — a
-    // strip whose joints all agree collapses to one line by design
-    // (§3.4) — and both are the strip, which the *absence* of a
-    // `no strip to draw` block underneath confirms.
-    const expanded = page.getByTestId(`strip-${fqdn}-A`);
-    const collapsed = page.getByTestId(`strip-collapsed-${fqdn}-A`);
-    await expect(expanded.or(collapsed)).toBeVisible();
-    await expect(page.getByTestId(`hostname-${fqdn}`)).not.toContainText(
-      'no strip to draw',
-    );
-    // The published address is on the page, so the strip is rendering
-    // this name's data and not an empty template.
-    await expect(page.getByTestId(`hostname-${fqdn}`)).toContainText(
-      '192.0.2.42',
-    );
+    const row = page.getByTestId(`board-row-${fqdn}-A`);
+    await expect(row).toBeVisible({ timeout: 8_000 });
+    // The published address is in the row, so it is rendering this name's
+    // data and not an empty template — the check that a visible frame
+    // alone would pass.
+    await expect(row).toContainText('192.0.2.42');
+    // …and it is a *measured* row rather than the never-published state,
+    // which is the distinction the old `no strip to draw` assertion was
+    // making on the card.
+    await expect(row).not.toContainText('nothing published');
   });
 });
 

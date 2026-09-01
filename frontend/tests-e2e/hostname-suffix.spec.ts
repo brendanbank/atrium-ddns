@@ -59,11 +59,12 @@ test.describe('the name field composes, and the server validates', () => {
       [201, 409],
       `zone claim failed: ${created.status()} ${await created.text()}`,
     ).toContain(created.status());
-    // `NAMES_PATH` in `src/HostnamesPage.tsx`. Written out rather than
-    // imported: `tsconfig.json` scopes type checking to `src`, so a
-    // spec importing from it would be the one file in the tree the gate
-    // does not check.
-    await page.goto('/atrium-ddns/names');
+    // The board. `/atrium-ddns/names` is gone — the name modal is
+    // `?name=` on the only tenant surface there is. Written out rather
+    // than imported: `tsconfig.json` scopes type checking to `src`, so a
+    // spec importing a constant from it would be the one file in the tree
+    // the gate does not check.
+    await page.goto('/atrium-ddns');
   });
 
   /** Open the modal and select the zone. Mantine's `Select` is not a
@@ -71,7 +72,7 @@ test.describe('the name field composes, and the server validates', () => {
    *  matches the visible input, not an option list. Click it open, then
    *  click the option by role. */
   async function openFormAndPickZone(page: import('@playwright/test').Page) {
-    await page.getByTestId('add-hostname').click();
+    await page.getByTestId('board-add-name').click();
     await expect(page.getByTestId('hostname-name')).toBeVisible();
     await page.getByTestId('hostname-zone').click();
     await page.getByRole('option', { name: ZONE, exact: true }).click();
@@ -101,7 +102,9 @@ test.describe('the name field composes, and the server validates', () => {
     // The row the list draws carries the composed name, which is the
     // only reading that proves the composition survived the round trip
     // rather than merely being rendered.
-    await expect(page.getByTestId(`hostname-home.${ZONE}`)).toBeVisible();
+    await expect(
+        page.getByTestId(`board-row-home.${ZONE}-none`),
+      ).toBeVisible();
   });
 
   test('a pasted FQDN is not suffixed twice', async ({ page }) => {
@@ -112,7 +115,9 @@ test.describe('the name field composes, and the server validates', () => {
       `attic.${ZONE}`,
     );
     await page.getByTestId('name-submit').click();
-    await expect(page.getByTestId(`hostname-attic.${ZONE}`)).toBeVisible();
+    await expect(
+        page.getByTestId(`board-row-attic.${ZONE}-none`),
+      ).toBeVisible();
     // …and the doubled form is not what was stored. Named explicitly
     // rather than left to the positive assertion, because "the right
     // row exists" and "the wrong row does not" are two facts.

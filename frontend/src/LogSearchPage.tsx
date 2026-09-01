@@ -41,6 +41,9 @@ import type { EventRow } from './api/events';
 import { LogDetail } from './logs/LogDetail';
 import { LogLedger, LogSkeleton } from './logs/LogLedger';
 import { LogUnattributable } from './logs/LogUnattributable';
+import { devicesQuery } from './api/devices';
+import { hostnamesQuery } from './api/hostnames';
+import { domainsQuery } from './api/domains';
 import { useLogQuery } from './logs/useLogQuery';
 
 export function LogSearchInner() {
@@ -55,6 +58,15 @@ export function LogSearchInner() {
   // the shareable thing; the page you happened to be on is not.
   const [cursor, setCursor] = useState<string | null>(null);
   const { data, isLoading, error } = useQuery(eventsQuery(query, cursor));
+
+  /** The named things the id filters are about. Any authenticated caller
+   *  may read their own log, so these are fetched unconditionally — but a
+   *  failure is not fatal: `?? []` leaves the selects empty and every
+   *  other filter working, because a log you cannot filter by name is far
+   *  better than a log that will not render. */
+  const devices = useQuery(devicesQuery({ enabled: true }));
+  const hostnames = useQuery(hostnamesQuery({ enabled: true }));
+  const domains = useQuery(domainsQuery({ enabled: true }));
 
   const active = activeFilterCount(query);
 
@@ -76,6 +88,25 @@ export function LogSearchInner() {
           vocabulary={data.vocabulary}
           applied={data.filters}
           crossTenant={data.cross_tenant}
+          devices={devices.data ?? []}
+          hostnames={hostnames.data ?? []}
+          domains={domains.data ?? []}
+          /* Derived from the rows on screen, deduped. This bundle owns no
+             user directory — atrium does — and the rows already carry
+             `user_email` beside `user_id`, which is what the ledger
+             renders. Exact for the chip (a result filtered to one user
+             carries that user on every row); necessarily partial for the
+             dropdown, which its placeholder says. */
+          users={Array.from(
+            new Map(
+              (data.rows ?? [])
+                .filter((row) => row.user_id !== null && row.user_email)
+                .map((row) => [
+                  row.user_id as number,
+                  { id: row.user_id as number, email: row.user_email as string },
+                ]),
+            ).values(),
+          )}
           onChange={onFilter}
           onClear={() => {
             setCursor(null);
