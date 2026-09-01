@@ -162,31 +162,70 @@ dev-bootstrap: build up migrate  ## build, start, migrate; run me first
 # stack is the wrong place to learn that a file was written for you. It refuses
 # and names `make env`.
 env:  ## create .env from .env.example with freshly generated secrets
-	@if [ -f .env ]; then \
+	@# ONE shell, deliberately. This was five separate recipe lines, and make
+	@# runs each in its own shell — so the `exit $$?` that follows "already
+	@# exists" ended only *that* shell, and make went straight on to
+	@# `cp .env.example .env`. The target printed "left untouched" and
+	@# overwrote the file in the same breath.
+	@#
+	@# It cost real data before it was found: a developer .env holding the
+	@# credentials a running MySQL volume had been initialised with was
+	@# replaced by the example's defaults, leaving a database nothing could
+	@# authenticate to, and CI's e2e .env was replaced mid-run — which moved
+	@# API_HOST_PORT from 8000 to 8053 while make had already expanded
+	@# E2E_BASE_URL from the old value, so the readiness probe polled a port
+	@# nothing was listening on and timed out after 120s naming neither cause.
+	@#
+	@# Guarded by `make check-env-idempotent`, which asserts the file is
+	@# byte-identical after a second run.
+	@set -e; \
+	if [ -f .env ]; then \
 		echo "make env: .env already exists — left untouched"; \
-		./scripts/check-env.sh; \
-		exit $$?; \
-	fi
-	@cp .env.example .env
-	@# Per key, not one sed: APP_SECRET_KEY and JWT_SECRET carry the same
-	@# placeholder string and must not end up with the same value. Written
-	@# with @ so make does not echo the recipe — the values are secrets from
-	@# the moment they exist.
-	@for spec in "APP_SECRET_KEY 48" "JWT_SECRET 48" "SECRET_ENCRYPTION_KEY 32"; do \
+		exec ./scripts/check-env.sh; \
+	fi; \
+	cp .env.example .env; \
+	for spec in "APP_SECRET_KEY 48" "JWT_SECRET 48" "SECRET_ENCRYPTION_KEY 32"; do \
 		set -- $$spec; key=$$1; bytes=$$2; \
 		val=$$(openssl rand -hex $$bytes); \
 		tmp=$$(mktemp); \
 		awk -v k="$$key" -v v="$$val" '$$0 ~ "^" k "=" && !seen { print k "=" v; seen=1; next } { print }' \
 			.env > $$tmp && mv $$tmp .env; \
-	done
-	@chmod 600 .env
-	@echo "make env: wrote .env from .env.example, with fresh values for"
-	@echo "          APP_SECRET_KEY, JWT_SECRET and SECRET_ENCRYPTION_KEY."
-	@echo "          Back SECRET_ENCRYPTION_KEY up: lose it and every stored"
-	@echo "          provider credential is unrecoverable."
-	@echo "          Ports are still the .env.example defaults — change"
-	@echo "          API_HOST_PORT / MYSQL_HOST_PORT if they collide."
-	@./scripts/check-env.sh
+	done; \
+	chmod 600 .env; \
+	echo "make env: wrote .env from .env.example, with fresh values for"; \
+	echo "          APP_SECRET_KEY, JWT_SECRET and SECRET_ENCRYPTION_KEY."; \
+	echo "          Back SECRET_ENCRYPTION_KEY up: lose it and every stored"; \
+	echo "          provider credential is unrecoverable."; \
+	echo "          Ports are still the .env.example defaults — change"; \
+	echo "          API_HOST_PORT / MYSQL_HOST_PORT if they collide."; \
+	./scripts/check-env.sh
+
+check-env-idempotent:  ## `make env` must never modify an existing .env
+	@# Runs the REAL recipe in the REAL directory, against a valid .env, and
+	@# compares the file's digest. The first version of this guard ran make
+	@# from a temp dir with no scripts/, so check-env.sh was not found and
+	@# `set -e` aborted before the cp — in BOTH the fixed and broken recipes.
+	@# It printed PASS against a deliberately reintroduced defect: a probe
+	@# that could not fail, written while guarding against that very family.
+	@#
+	@# Two conditions are load-bearing. The .env must be VALID, because the
+	@# broken recipe only reached its `cp` when check-env.sh exited 0. And the
+	@# assertion is on the file, not the output: the broken version printed
+	@# "left untouched" and overwrote it in the same breath.
+	@set -e; \
+	had=0; bak=""; \
+	if [ -f .env ]; then had=1; bak=$$(mktemp); cp .env $$bak; else $(MAKE) --no-print-directory env >/dev/null; fi; \
+	before=$$(md5 -q .env 2>/dev/null || md5sum .env | cut -d" " -f1); \
+	set +e; $(MAKE) --no-print-directory env >/dev/null 2>&1; set -e; \
+	after=$$(md5 -q .env 2>/dev/null || md5sum .env | cut -d" " -f1); \
+	if [ "$$had" = 1 ]; then cp $$bak .env; rm -f $$bak; else rm -f .env; fi; \
+	if [ "$$before" != "$$after" ]; then \
+		echo "check-env-idempotent: FAIL — make env modified an existing .env"; \
+		echo "  before $$before"; \
+		echo "  after  $$after"; \
+		exit 1; \
+	fi; \
+	echo "check-env-idempotent: PASS — an existing .env is byte-identical after make env"
 
 check-env:  ## refuse to start a stack whose .env cannot produce a living api
 	@./scripts/check-env.sh
@@ -656,6 +695,7 @@ gate:  ## run exactly the checks this diff can reach (auto-scoped; GATE_BASE=...
 	if [ "$$sw" -gt 0 ]; then \
 		echo "gate: stack wiring touched ($$sw file(s)) -> .env guard self-test"; \
 		$(MAKE) --no-print-directory check-env-self-test; \
+		$(MAKE) --no-print-directory check-env-idempotent; \
 	else \
 		echo "gate: SKIP .env guard self-test — no Makefile, compose.yaml, .env.example or shell script changed"; \
 	fi; \
