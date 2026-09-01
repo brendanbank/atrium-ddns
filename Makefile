@@ -130,7 +130,13 @@ endef
 	atrium-bump
 
 help:  ## show this help
-	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-21s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@# The character class includes 0-9 deliberately. Without it every
+	@# target with a digit in its name was filtered out of this listing —
+	@# which was exactly `e2e-up`, `e2e-deps`, `test-e2e` and `e2e-down`,
+	@# and nothing else. They worked; they were just undiscoverable, so the
+	@# command you reach for before a milestone merge could only be learned
+	@# by asking someone. Present since the 2026-08-15 scaffold.
+	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_-]+:.*?## / {printf "  %-21s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 dev-bootstrap: build up migrate  ## build, start, migrate; run me first
 	@echo
