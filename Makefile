@@ -137,7 +137,64 @@ dev-bootstrap: build up migrate  ## build, start, migrate; run me first
 	@echo "Stack is up. Next: make seed-admin EMAIL=you@example.com PASSWORD=..."
 	@echo "Then: make seed-bundle && open http://localhost:8000"
 
-up:  ## start the stack
+# --- .env, and refusing to start a stack that cannot live (#137) ------------
+#
+# `.env.example` ships `replace-me-with-openssl-rand-hex-32` for
+# SECRET_ENCRYPTION_KEY. atrium checks that key's SHAPE in every environment,
+# so a `.env` that is a straight copy of the example boots an api that raises
+# ValidationError, is restarted by `restart: unless-stopped`, and raises it
+# again — while `make up` prints "Started" and exits 0. Measured here on
+# 2026-09-01: exit 0, RestartCount climbing 5→8, curl on the published port
+# refused. The defect is the successful report over something already dead.
+#
+# Two answers, and they are not exclusive:
+#
+#   `make env`   mints a working `.env` — the targets that already created one
+#                behind your back (dev-up, e2e-up) now create a live one
+#                instead of a dead one.
+#   `check-env`  refuses before compose is called, naming the key and the fix.
+#
+# The guard is the one that generalises, so it is a prerequisite of `up` rather
+# than a step inside it: it runs on every path that reaches `up`, including
+# `dev-bootstrap` and `make gate`'s own `$(MAKE) up migrate`.
+#
+# Note `up` does NOT create `.env`. It never did, and a target that starts a
+# stack is the wrong place to learn that a file was written for you. It refuses
+# and names `make env`.
+env:  ## create .env from .env.example with freshly generated secrets
+	@if [ -f .env ]; then \
+		echo "make env: .env already exists — left untouched"; \
+		./scripts/check-env.sh; \
+		exit $$?; \
+	fi
+	@cp .env.example .env
+	@# Per key, not one sed: APP_SECRET_KEY and JWT_SECRET carry the same
+	@# placeholder string and must not end up with the same value. Written
+	@# with @ so make does not echo the recipe — the values are secrets from
+	@# the moment they exist.
+	@for spec in "APP_SECRET_KEY 48" "JWT_SECRET 48" "SECRET_ENCRYPTION_KEY 32"; do \
+		set -- $$spec; key=$$1; bytes=$$2; \
+		val=$$(openssl rand -hex $$bytes); \
+		tmp=$$(mktemp); \
+		awk -v k="$$key" -v v="$$val" '$$0 ~ "^" k "=" && !seen { print k "=" v; seen=1; next } { print }' \
+			.env > $$tmp && mv $$tmp .env; \
+	done
+	@chmod 600 .env
+	@echo "make env: wrote .env from .env.example, with fresh values for"
+	@echo "          APP_SECRET_KEY, JWT_SECRET and SECRET_ENCRYPTION_KEY."
+	@echo "          Back SECRET_ENCRYPTION_KEY up: lose it and every stored"
+	@echo "          provider credential is unrecoverable."
+	@echo "          Ports are still the .env.example defaults — change"
+	@echo "          API_HOST_PORT / MYSQL_HOST_PORT if they collide."
+	@./scripts/check-env.sh
+
+check-env:  ## refuse to start a stack whose .env cannot produce a living api
+	@./scripts/check-env.sh
+
+check-env-self-test:  ## show the .env guard refusing, against synthetic files
+	@./scripts/check-env.sh --self-test
+
+up: check-env  ## start the stack
 	$(COMPOSE) up -d
 
 down:  ## stop the stack (keeps data volume)
@@ -188,7 +245,12 @@ DEV_MYSQL_HOST_PORT := $(shell sed -n 's/^MYSQL_HOST_PORT=//p' .env 2>/dev/null 
 DEV_BASE_URL ?= http://localhost:$(or $(DEV_API_HOST_PORT),8053)
 
 dev-up:  ## raise the stack + seed YOUR admin from 1Password (see scripts/dev-admin.sh)
-	@if [ ! -f .env ]; then echo "creating .env from .env.example"; cp .env.example .env; fi
+	@# Was `cp .env.example .env`, which produced a file whose
+	@# SECRET_ENCRYPTION_KEY atrium refuses — a dead api behind a green start.
+	@# `make env` copies the same file and mints real values into it, and ends
+	@# in the guard, so an existing hand-edited `.env` is checked rather than
+	@# overwritten. See the block above `up` (#137).
+	@$(MAKE) --no-print-directory env
 	@# Refuse before building anything. A five-minute image build that ends
 	@# in "the 1Password CLI is not signed in" is a worse way to learn it.
 	./scripts/dev-admin.sh --check
@@ -559,6 +621,11 @@ test-backend-file:  ## one file, verbose — the way to diagnose a hang (FILE=te
 GATE_CONF_BRANCH := $(shell sed -n 's/^OVERNIGHT_MILESTONE_BRANCH=//p' .overnight.conf 2>/dev/null | tail -n1)
 GATE_BASE ?= $(or $(OVERNIGHT_MILESTONE_BRANCH),$(GATE_CONF_BRANCH),$(OVERNIGHT_TRUNK),master)
 
+# A third scope, added by #137: a guard nothing invokes is a guard that passes
+# because it never ran. `Makefile`, `compose.yaml`, `.env.example` and the
+# shell scripts reach no pytest and no vitest, so a diff confined to them used
+# to print "this diff reaches no test" and that was the whole reading. The
+# `.env` guard's own `--self-test` is the test they reach.
 gate:  ## run exactly the checks this diff can reach (auto-scoped; GATE_BASE=...)
 	@set -e; \
 	base="$(GATE_BASE)"; \
@@ -567,6 +634,7 @@ gate:  ## run exactly the checks this diff can reach (auto-scoped; GATE_BASE=...
 	if [ -z "$$changed" ]; then echo "gate: no changes against $$base — nothing to check"; exit 0; fi; \
 	fe=$$(printf '%s\n' "$$changed" | grep -cE '^frontend/(src/|tests-e2e/|[^/]+\.(json|ts|cts|mts))' || true); \
 	be=$$(printf '%s\n' "$$changed" | grep -cE '^(backend/|tests/|scripts/.*\.py)' || true); \
+	sw=$$(printf '%s\n' "$$changed" | grep -cE '^(Makefile|compose\.yaml|\.env\.example|scripts/.*\.sh)$$' || true); \
 	echo "gate: $$(printf '%s\n' "$$changed" | wc -l | tr -d ' ') file(s) changed against $$base"; \
 	printf '%s\n' "$$changed" | sed 's/^/  /'; \
 	echo; \
@@ -585,7 +653,14 @@ gate:  ## run exactly the checks this diff can reach (auto-scoped; GATE_BASE=...
 		echo "gate: SKIP stack + backend unit tests — no backend/, tests/ or python script changed"; \
 	fi; \
 	echo; \
-	if [ "$$fe" -eq 0 ] && [ "$$be" -eq 0 ]; then \
+	if [ "$$sw" -gt 0 ]; then \
+		echo "gate: stack wiring touched ($$sw file(s)) -> .env guard self-test"; \
+		$(MAKE) --no-print-directory check-env-self-test; \
+	else \
+		echo "gate: SKIP .env guard self-test — no Makefile, compose.yaml, .env.example or shell script changed"; \
+	fi; \
+	echo; \
+	if [ "$$fe" -eq 0 ] && [ "$$be" -eq 0 ] && [ "$$sw" -eq 0 ]; then \
 		echo "gate: this diff reaches no test. That is the result, not a skipped step."; \
 		echo "gate: evidence for such a change is the diff itself plus a direct"; \
 		echo "gate: demonstration of the behaviour it changes."; \
@@ -657,7 +732,10 @@ E2E_IMAGE := $(shell $(COMPOSE) config --images 2>/dev/null | grep -v '^mysql' |
 # served bundle was 801,320 bytes where the freshly built image held 815,012.
 # The containers are cheap to replace and the confusion is not.
 e2e-up:  ## raise + migrate + seed the stack the e2e specs run against
-	@if [ ! -f .env ]; then echo "creating .env from .env.example"; cp .env.example .env; fi
+	@# Same substitution as dev-up, and this is the line issue #137 was
+	@# written from: it was the first thing a fresh worktree ran, and it wrote
+	@# a `.env` whose SECRET_ENCRYPTION_KEY the api refuses.
+	@$(MAKE) --no-print-directory env
 	ATRIUM_DDNS_COMPAT_STUB=1 $(COMPOSE) up -d --build
 	ATRIUM_DDNS_COMPAT_STUB=1 $(COMPOSE) up -d --force-recreate --no-deps api worker
 	@ready=0; for i in $$(seq 1 40); do \
