@@ -36,7 +36,7 @@ function markerLabel(upper: Joint, lower: Joint): string {
   });
   const { unmount } = render(
     <DdnsRoot>
-      <BoardTable board={b} />
+      <BoardTable board={b} onOpenDevice={() => {}} />
     </DdnsRoot>,
   );
   const label = screen.getByTestId('board-mark-a.example.test').getAttribute('aria-label') ?? '';
