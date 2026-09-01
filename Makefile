@@ -668,46 +668,23 @@ GATE_BASE ?= $(or $(OVERNIGHT_MILESTONE_BRANCH),$(GATE_CONF_BRANCH),$(OVERNIGHT_
 # shell scripts reach no pytest and no vitest, so a diff confined to them used
 # to print "this diff reaches no test" and that was the whole reading. The
 # `.env` guard's own `--self-test` is the test they reach.
-gate:  ## run exactly the checks this diff can reach (auto-scoped; GATE_BASE=...)
+gate:  ## the unit tests, both suites — that is the whole gate
+	@# Deliberately simple, by operator decision on 2026-09-01. This used to
+	@# scope itself from the diff and run three groups conditionally; it now
+	@# runs the two unit-test suites, always, and nothing else.
+	@#
+	@# What is still NOT here, and why: `make test-e2e` runs once on the
+	@# release PR into master, where CI runs it anyway, so running it per
+	@# issue is the same opinion paid for N times. `make smoke` asserts about
+	@# deployment wiring that a per-issue diff does not change.
 	@set -e; \
-	base="$(GATE_BASE)"; \
-	git rev-parse --verify -q "origin/$$base" >/dev/null 2>&1 && base="origin/$$base"; \
-	changed=$$( { git diff --name-only "$$base"...HEAD 2>/dev/null; git diff --name-only; git ls-files -o --exclude-standard; } | sort -u ); \
-	if [ -z "$$changed" ]; then echo "gate: no changes against $$base — nothing to check"; exit 0; fi; \
-	fe=$$(printf '%s\n' "$$changed" | grep -cE '^frontend/(src/|tests-e2e/|[^/]+\.(json|ts|cts|mts))' || true); \
-	be=$$(printf '%s\n' "$$changed" | grep -cE '^(backend/|tests/|scripts/.*\.py)' || true); \
-	sw=$$(printf '%s\n' "$$changed" | grep -cE '^(Makefile|compose\.yaml|\.env\.example|scripts/.*\.sh)$$' || true); \
-	echo "gate: $$(printf '%s\n' "$$changed" | wc -l | tr -d ' ') file(s) changed against $$base"; \
-	printf '%s\n' "$$changed" | sed 's/^/  /'; \
+	echo "gate: frontend unit tests"; \
+	( cd frontend && pnpm install --frozen-lockfile >/dev/null && pnpm typecheck && pnpm test --run ); \
 	echo; \
-	if [ "$$fe" -gt 0 ]; then \
-		echo "gate: frontend touched ($$fe file(s)) -> typecheck + vitest"; \
-		( cd frontend && pnpm install --frozen-lockfile >/dev/null && pnpm typecheck && pnpm test --run ); \
-	else \
-		echo "gate: SKIP typecheck + vitest — no frontend source, spec or config changed"; \
-	fi; \
+	echo "gate: backend unit tests"; \
+	$(MAKE) --no-print-directory up migrate; \
+	$(MAKE) --no-print-directory test-backend; \
 	echo; \
-	if [ "$$be" -gt 0 ]; then \
-		echo "gate: backend touched ($$be file(s)) -> stack + backend unit tests"; \
-		$(MAKE) --no-print-directory up migrate; \
-		$(MAKE) --no-print-directory test-backend; \
-	else \
-		echo "gate: SKIP stack + backend unit tests — no backend/, tests/ or python script changed"; \
-	fi; \
-	echo; \
-	if [ "$$sw" -gt 0 ]; then \
-		echo "gate: stack wiring touched ($$sw file(s)) -> .env guard self-test"; \
-		$(MAKE) --no-print-directory check-env-self-test; \
-		$(MAKE) --no-print-directory check-env-idempotent; \
-	else \
-		echo "gate: SKIP .env guard self-test — no Makefile, compose.yaml, .env.example or shell script changed"; \
-	fi; \
-	echo; \
-	if [ "$$fe" -eq 0 ] && [ "$$be" -eq 0 ] && [ "$$sw" -eq 0 ]; then \
-		echo "gate: this diff reaches no test. That is the result, not a skipped step."; \
-		echo "gate: evidence for such a change is the diff itself plus a direct"; \
-		echo "gate: demonstration of the behaviour it changes."; \
-	fi; \
 	echo "gate: e2e is NOT run here — it runs once on the release PR into $(or $(OVERNIGHT_TRUNK),master)."; \
 	echo "gate: PASS"
 
