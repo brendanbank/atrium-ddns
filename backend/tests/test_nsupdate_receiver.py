@@ -22,8 +22,10 @@ what this file is:
 1. **the signature** — a keyring built from the wrong secret, or naming
    a key the server does not hold, is indistinguishable from a correct
    one to a double that records whatever it is handed;
-2. **the refusals** — ``REFUSED``, ``SERVFAIL``, a dropped connection,
-   in the well-formed signed responses a nameserver actually sends;
+2. **the refusals** — every non-zero header rcode, plus a dropped
+   connection, in the well-formed signed responses a nameserver actually
+   sends. This is where #142 was found and where its fix is evidenced:
+   see :class:`TestTheRcodeIsReadNow`, formerly ``TestTheRcodeIsNotRead``;
 3. **the timeout** — ``QUERY_TIMEOUT`` is passed to ``dns.query.tcp``
    and nothing has ever held a socket open long enough to reach it.
 
@@ -74,6 +76,8 @@ import dns.rdatatype
 import dns.tsig
 import dns.update
 import pytest
+import structlog
+import structlog.testing
 
 from atrium_ddns.providers import (
     STATUS_DNSERR,
@@ -84,7 +88,13 @@ from atrium_ddns.providers import (
 )
 from atrium_ddns.providers import nsupdate as nsupdate_mod
 
-from tsig_receiver import HANG_SECONDS, TsigReceiver, can_bind
+from tsig_receiver import (
+    HANG_SECONDS,
+    RCODE_BEHAVIOURS,
+    REFUSAL_BEHAVIOURS,
+    TsigReceiver,
+    can_bind,
+)
 
 #: The key the receiver holds. 32 bytes of base64 —
 #: ``dns.tsigkeyring.from_text`` really parses it and
@@ -445,9 +455,12 @@ class TestTheSignatureIsVerified:
         implementation — answer a bare ``NOTAUTH`` and let the client
         notice — does not work: dnspython does not require a signed
         request to get a signed response, so an unsigned refusal comes
-        back as an ordinary message with no exception raised. Combined
-        with ``TestTheRcodeIsNotRead`` below, that would have made a
-        rejected update report ``good``.
+        back as an ordinary message with no exception raised. Before
+        #142 that was compounded — the adapter did not read the rcode
+        either — and a rejected update reported ``good``. The rcode is
+        read now (:class:`TestTheRcodeIsReadNow`), but this half still
+        has to hold on its own: a refusal the client accepts silently is
+        a refusal whose rcode never reaches the code that reads it.
 
         This sends the raw message itself rather than going through the
         adapter: it is a statement about dnspython's client, not about
@@ -555,60 +568,124 @@ class TestTheRefusalPaths:
         assert nsupdate_mod.QUERY_TIMEOUT == 10.0
 
 
-class TestTheRcodeIsNotRead:
-    """**A refused UPDATE is reported to the tenant as ``good``.**
+class TestTheRcodeIsReadNow:
+    """**A refused UPDATE reaches the tenant as ``dnserr``.** #142.
 
-    Found by this file, on a real socket, and it is a defect rather than
-    a quirk: the client is told the update succeeded, so it does not
-    retry, and the zone stays stale for as long as it keeps sending the
-    same address. ``base.py``'s own comment on ``check_hostnameon_server``
-    names that direction as the unsafe one.
+    Inverted, not deleted. This class was ``TestTheRcodeIsNotRead`` and
+    it pinned the opposite answer: #131 found, on this socket, that
+    ``dns.query.tcp`` returns the response and neither ``createrecords``
+    nor ``deleterecords`` looked at ``response.rcode()``, so every
+    non-zero rcode reached the tenant as ``good``. The client is then
+    told the update succeeded, does not retry, and the zone stays stale
+    for as long as it keeps sending the same address —
+    ``base.py``'s own comment on ``check_hostnameon_server`` names that
+    direction as the unsafe one.
 
-    The mechanism is that ``dns.query.tcp`` returns the response and
-    neither ``createrecords`` nor ``deleterecords`` looks at
-    ``response.rcode()``. Nothing raises: a ``REFUSED`` from BIND is a
-    well-formed, correctly TSIG-signed message, and dnspython hands it
-    back exactly as it hands back a ``NOERROR``.
+    #131 pinned rather than fixed it because it changes what a live
+    tenant sees on ``/nic/update``, which is the milestone owner's call.
+    That call was taken on 2026-09-01: **fix it.** The assertions below
+    therefore flipped from ``good`` to ``dnserr`` — a visible edit to an
+    assertion that says what it is, which is exactly what the pin was
+    for. The old name is kept in this paragraph so ``git log -S`` and a
+    grep both still land here.
 
-    **Not fixed here, deliberately.** The legacy adapter has the same
-    behaviour — ``lib/account/nsupdate.py:61`` binds ``response`` and
-    never reads it — so this is a faithfully ported divergence and not a
-    rewrite regression, and correcting it changes what a live tenant
-    sees on ``/nic/update``. The frozen table cannot adjudicate it (see
-    :func:`test_the_wire_table_cannot_reach_this_adapter`), so there is
-    no compat answer to appeal to. That makes it a product decision for
-    the milestone owner, raised as #142.
+    **This is a deliberate divergence from ``dyndns-route53``, and it
+    must not be "fixed" back.** Legacy's ``lib/account/nsupdate.py:61``
+    binds ``response``, debug-logs it on line 67, and never reads it. It
+    is not, however, a new idiom: legacy's own ``lib/accounts.py:229``
+    reads ``response.rcode()``, compares it against ``dns.rcode.NOERROR``
+    and renders it with ``dns.rcode.to_text`` — so this change applies
+    legacy's pattern to the one call site legacy forgot. Recorded in
+    ``docs/ops/refactor-plan.md`` § 5c beside the other accepted
+    behaviour changes, and in ``providers/nsupdate.py``'s own docstring.
 
-    These tests therefore pin the behaviour that exists, named so nobody
-    reads them as approval. When the fix lands they go red, which is the
-    point: the change is then a visible edit to an assertion that says
-    what it is, not a silent drift.
+    The frozen wire table has no opinion to overrule; see
+    :func:`test_the_wire_table_cannot_reach_this_adapter`, which asserts
+    that from the table's own data rather than taking it on trust.
     """
 
-    @pytest.mark.parametrize("behaviour", ["refused", "servfail"])
-    def test_a_refused_update_is_reported_as_good_which_is_wrong(
+    @pytest.mark.parametrize("behaviour", REFUSAL_BEHAVIOURS)
+    def test_every_non_zero_rcode_is_dnserr_on_create(
         self, receiver: TsigReceiver, behaviour: str
     ) -> None:
+        """Every one, not just ``REFUSED``.
+
+        A fix keyed on one rcode is the same defect with a smaller blast
+        radius, so the parametrisation is *derived* from ``dns.rcode``
+        (see ``tsig_receiver.REFUSAL_BEHAVIOURS``) rather than typed out:
+        a hand-written list is the same defect one release later.
+        """
         receiver.behaviour = behaviour
         results = get_provider(account()).createrecords(V4, ZONES)
 
-        assert results == {HOSTNAME: STATUS_GOOD}, (
-            "if this is now dnserr, the rcode is being read and this test "
-            "should be deleted along with the issue it was pinned for"
+        assert results == {HOSTNAME: STATUS_DNSERR}, (
+            f"a {behaviour.upper()} answer to the UPDATE was reported as "
+            f"{results[HOSTNAME]!r}. If this reads 'good', the rcode has "
+            "stopped being read and #142 is back."
         )
         assert len(receiver.updates) == 1
+        assert receiver.rejections == [], (
+            "the receiver refused the *signature*, so this says nothing "
+            "about the rcode path"
+        )
 
-    def test_the_receiver_really_did_refuse(
+    @pytest.mark.parametrize("behaviour", REFUSAL_BEHAVIOURS)
+    def test_every_non_zero_rcode_is_dnserr_on_delete(
+        self, receiver: TsigReceiver, behaviour: str
+    ) -> None:
+        """The second ``dns.query.tcp`` call site, over the same socket.
+
+        Both sites are covered because a fix applied to one is the more
+        likely half of this defect's return: ``deleterecords`` sends no
+        resolver query, so nothing else in this file would notice.
+        """
+        receiver.behaviour = behaviour
+        results = get_provider(account()).deleterecords(ZONES)
+
+        assert results == {HOSTNAME: STATUS_DNSERR}, (
+            f"a {behaviour.upper()} answer to the delete was reported as "
+            f"{results[HOSTNAME]!r}"
+        )
+        assert len(receiver.updates) == 1
+        assert receiver.rejections == []
+
+    def test_noerror_is_still_good_so_the_check_is_not_a_blanket_refusal(
         self, receiver: TsigReceiver
     ) -> None:
-        """Vacuity for the pair above, from the client's own reading.
+        """The other side of the branch, or the pair above is vacuous.
 
-        The adapter discards the response, so the test above cannot show
-        what the rcode was. This sends the same message by hand and
-        reads it, which is the only way to tell "the adapter ignored a
-        REFUSED" from "the receiver never sent one".
+        An adapter that answered ``dnserr`` unconditionally would pass
+        every parametrised case above and break every real tenant. This
+        is the reading that separates *the rcode is read* from *the
+        write path is broken*.
         """
-        receiver.behaviour = "refused"
+        receiver.behaviour = "noerror"
+        results = get_provider(account()).createrecords(V4, ZONES)
+
+        assert results == {HOSTNAME: STATUS_GOOD}
+        assert len(receiver.updates) == 1
+
+    @pytest.mark.parametrize("behaviour", REFUSAL_BEHAVIOURS)
+    def test_the_receiver_really_did_refuse(
+        self, receiver: TsigReceiver, behaviour: str
+    ) -> None:
+        """Vacuity for the parametrised cases, from a second reading.
+
+        #131 wrote this guard because the adapter discarded the
+        response, so nothing else could tell "the adapter ignored a
+        REFUSED" from "the receiver never sent one". **It is still
+        needed, for the mirror reason**: the adapter now converts the
+        rcode into a status and still does not report which rcode it
+        saw, so a receiver that answered ``SERVFAIL`` to every
+        ``behaviour`` would satisfy every assertion above. This sends the
+        same message by hand and reads the rcode back off the wire.
+
+        Extended to every behaviour rather than left on ``refused``,
+        because a one-rcode vacuity guard under an eleven-rcode
+        parametrisation is a guard covering one twelfth of what it
+        appears to.
+        """
+        receiver.behaviour = behaviour
         update = dns.update.Update(
             f"{ZONE}.", keyring=receiver.keyring, keyalgorithm="hmac-sha256"
         )
@@ -616,8 +693,87 @@ class TestTheRcodeIsNotRead:
 
         response = dns.query.tcp(update, LOOPBACK, timeout=5.0)
 
-        assert response.rcode() == dns.rcode.REFUSED
+        assert response.rcode() == RCODE_BEHAVIOURS[behaviour], (
+            f"asked the receiver for {behaviour!r} and it answered "
+            f"{dns.rcode.to_text(response.rcode())} — the cases above are "
+            "not measuring the rcode they name"
+        )
+        assert response.rcode() != dns.rcode.NOERROR
         assert receiver.rejections == []
+
+    def test_the_log_line_names_the_rcode(
+        self, receiver: TsigReceiver
+    ) -> None:
+        """A refusal must be one grep, not three deploys.
+
+        #142's whole cost was a diagnosis nobody could make from the
+        outside, and ``dnserr`` alone does not distinguish a REFUSED
+        from a timeout from a dropped connection. The rcode is carried
+        as its own structlog key *and* in the message, and the name is
+        asserted rather than the integer: ``rcode=5`` is a lookup, and a
+        diagnosis that costs a lookup does not get made.
+
+        Asserted on the captured event dict rather than on rendered
+        text, because a formatter change must not silently delete the
+        field.
+        """
+        receiver.behaviour = "notzone"
+        with structlog.testing.capture_logs() as captured:
+            results = get_provider(account()).createrecords(V4, ZONES)
+
+        assert results == {HOSTNAME: STATUS_DNSERR}
+        failures = [e for e in captured if e.get("event") == "provider.create_failed"]
+        assert len(failures) == 1, (
+            f"expected one provider.create_failed, got "
+            f"{[e.get('event') for e in captured]}"
+        )
+        assert failures[0]["rcode"] == "NOTZONE", failures[0]
+        assert "NOTZONE" in str(failures[0]["error"]), failures[0]
+
+    def test_a_transport_fault_carries_no_rcode(
+        self, receiver: TsigReceiver
+    ) -> None:
+        """``n/a`` is never a value — the other half of the field above.
+
+        A dropped connection has no rcode at all. Rendering that as
+        ``NOERROR``, or as ``0``, would fold *not measured* into
+        *measured as zero* and send the reader to the wrong file. The
+        field is ``None``.
+        """
+        receiver.behaviour = "drop"
+        with structlog.testing.capture_logs() as captured:
+            results = get_provider(account()).createrecords(V4, ZONES)
+
+        assert results == {HOSTNAME: STATUS_DNSERR}
+        failures = [e for e in captured if e.get("event") == "provider.create_failed"]
+        assert len(failures) == 1
+        assert failures[0]["rcode"] is None, failures[0]
+
+    def test_the_refusal_set_is_derived_and_covers_rfc_2136(self) -> None:
+        """The parametrisation is not a hand-kept list — asserted.
+
+        Two instruments on the same question. The first is that
+        ``REFUSAL_BEHAVIOURS`` is computed from ``dns.rcode.Rcode``, so a
+        rcode dnspython adds is covered with no edit here. The second is
+        this: the six rcodes RFC 2136 §2.2 actually names for an UPDATE
+        are checked to be *in* it, by name, so a derivation that quietly
+        started returning an empty tuple — which would make every
+        parametrised case above disappear rather than fail — is caught.
+        A vanished parametrisation is a green suite.
+        """
+        assert set(REFUSAL_BEHAVIOURS) >= {
+            "formerr",
+            "servfail",
+            "refused",
+            "yxrrset",
+            "nxrrset",
+            "notauth",
+            "notzone",
+        }, sorted(REFUSAL_BEHAVIOURS)
+        assert "noerror" not in REFUSAL_BEHAVIOURS
+        assert all(
+            RCODE_BEHAVIOURS[name] != dns.rcode.NOERROR for name in REFUSAL_BEHAVIOURS
+        )
 
 
 # --------------------------------------------------------------------------

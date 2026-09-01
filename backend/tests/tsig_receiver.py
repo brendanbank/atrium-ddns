@@ -17,10 +17,12 @@ boundary and no mock can reach them:
   key the server does not hold, produces a message the double swallows
   and a real nameserver refuses.
 * **the refusals.** A double raises what a test tells it to. A
-  nameserver answers ``REFUSED`` or ``SERVFAIL`` *in a well-formed,
-  correctly signed response*, which is a different thing entirely — and
-  the adapter sees it differently too. See
-  ``test_nsupdate_receiver.py``'s ``TestTheRcodeIsNotRead``.
+  nameserver answers ``REFUSED``, ``SERVFAIL``, ``NOTZONE`` — any of
+  eleven non-zero header rcodes — *in a well-formed, correctly signed
+  response*, which is a different thing entirely. Nothing raises and
+  nothing is malformed; only reading ``response.rcode()`` tells the two
+  apart. That is #142, and ``test_nsupdate_receiver.py``'s
+  ``TestTheRcodeIsReadNow`` drives every one of the eleven through here.
 * **the timeout.** ``QUERY_TIMEOUT`` is passed to ``dns.query.tcp`` and
   nothing has ever made a socket sit still long enough to reach it.
 
@@ -75,12 +77,44 @@ import dns.tsig
 import dns.tsigkeyring
 import dns.update
 
-#: What the receiver may be told to do with a *well-signed* UPDATE.
-#: ``hang`` holds the connection open past the client's timeout without
-#: answering; ``drop`` closes it without a response. They are different
-#: faults and the adapter is entitled to treat them differently, so they
-#: are separate rather than one "failure" knob.
-BEHAVIOURS: tuple[str, ...] = ("noerror", "refused", "servfail", "hang", "drop")
+#: Every rcode a nameserver can put in a response *header*, keyed by its
+#: lowercase name, **derived from ``dns.rcode`` rather than typed out**.
+#:
+#: Typed out, this was ``noerror``/``refused``/``servfail``, and the
+#: adapter check it now drives would have been evidenced against three
+#: of twelve — which is #142's own warning (*a fix keyed on one rcode is
+#: the same defect with a smaller blast radius*) reappearing in the
+#: instrument instead of in the code. Derived, an rcode dnspython learns
+#: about is covered here with no edit, and one it drops takes its own
+#: coverage with it.
+#:
+#: ``value < 16`` is the whole filter and it is not arbitrary: the DNS
+#: header carries four bits, so 0–15 is exactly what a response can say
+#: without an OPT or TSIG record. ``BADVERS``/``BADSIG`` (16) and up are
+#: extended rcodes belonging to EDNS0 and TSIG rather than answers to an
+#: UPDATE, and ``dns.message.Message.set_rcode`` would have to invent an
+#: OPT record to express them.
+RCODE_BEHAVIOURS: dict[str, int] = {
+    name.lower(): member.value
+    for name, member in dns.rcode.Rcode.__members__.items()
+    if member.value < 16
+}
+
+#: What the receiver may be told to do with a *well-signed* UPDATE:
+#: every header rcode above, plus the two faults that are not an rcode
+#: at all. ``hang`` holds the connection open past the client's timeout
+#: without answering; ``drop`` closes it without a response. They are
+#: different faults and the adapter is entitled to treat them
+#: differently, so they are separate rather than one "failure" knob.
+BEHAVIOURS: tuple[str, ...] = tuple(RCODE_BEHAVIOURS) + ("hang", "drop")
+
+#: The subset that means *the zone was not written* — everything the
+#: adapter must turn into ``dnserr``. The complement is exactly
+#: ``noerror``, which is the point: the adapter tests for the one, not
+#: for a list of the others.
+REFUSAL_BEHAVIOURS: tuple[str, ...] = tuple(
+    name for name in RCODE_BEHAVIOURS if name != "noerror"
+)
 
 #: Seconds the ``hang`` behaviour sits on a connection. Longer than the
 #: timeouts the tests set, shorter than anyone's patience.
@@ -282,13 +316,14 @@ class TsigReceiver:
             return
 
         response = dns.message.make_response(request)
-        response.set_rcode(
-            {
-                "noerror": dns.rcode.NOERROR,
-                "refused": dns.rcode.REFUSED,
-                "servfail": dns.rcode.SERVFAIL,
-            }[self.behaviour]
-        )
+        # ``make_response`` carries the request's keyring and key name
+        # over, so this answer is really TSIG-signed, with ``error=0``.
+        # That matters: an *unsigned* refusal is a different fault, and
+        # one dnspython's client accepts without complaint — measured by
+        # ``test_an_unsigned_refusal_would_be_accepted_by_the_client``.
+        # The refusal the adapter is shown here is the one a nameserver
+        # actually sends.
+        response.set_rcode(RCODE_BEHAVIOURS[self.behaviour])
         _send_tcp(conn, response.to_wire())
 
     def _serve_udp(self) -> None:
@@ -373,4 +408,11 @@ def can_bind(host: str = "127.0.0.1", port: int = 53) -> tuple[bool, str]:
     return True, ""
 
 
-__all__ = ["BEHAVIOURS", "HANG_SECONDS", "TsigReceiver", "can_bind"]
+__all__ = [
+    "BEHAVIOURS",
+    "HANG_SECONDS",
+    "RCODE_BEHAVIOURS",
+    "REFUSAL_BEHAVIOURS",
+    "TsigReceiver",
+    "can_bind",
+]
