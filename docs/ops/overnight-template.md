@@ -1490,3 +1490,24 @@ Three things the fix taught that a `.gitignore` line alone would not have:
   `users.totp_secret`. **The defect the issue described on the deploy host was
   also sitting on the workstation, in a different file family.** An accidental
   find is not a sampling method; sweep a population you did not write.
+
+**`make test-backend-file` does not run `check-fresh`, and a stale green
+names the file you just edited.** #132: an agent ran its six new tests
+through `make test-backend-file FILE=…` and got **111 passed** — the
+pre-change count, from the *old* copy of that file inside the image,
+because `make up` does not rebuild and `test-backend-file`
+(`Makefile:437`) has no `check-fresh` prerequisite where `test-backend`
+does. The run was green, fast, and reported the filename that had been
+edited, about a copy that did not contain the edit.
+
+It was caught only because 111 was recognisably the baseline and the new
+test names were absent from `--collect-only`; `make check-fresh` then said
+so loudly. The guard is not broken — the shortcut simply does not call it,
+and the shortcut is the one reached for under time pressure, when a
+suite is suspected of hanging.
+
+The same shape as the bundle-freshness incident and as #36's bind mount:
+**an assertion about an artefact chosen by convention rather than
+resolved.** Use `make test-backend` when the answer matters, and treat
+`test-backend-file`'s output as a diagnostic aid rather than a reading,
+unless you ran `make check-fresh` yourself first.
