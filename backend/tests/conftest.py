@@ -412,6 +412,65 @@ async def purge_tenants(
                 ),
                 {"ids": user_ids},
             )
+            # The host tables, explicitly, before the users they hang off.
+            #
+            # `DELETE FROM users` cleans these up on a *migrated* schema,
+            # because alembic emits the `ON DELETE CASCADE` that
+            # `HostForeignKey` only records as a marker — it registers no
+            # ForeignKey against the metadata, so anything built by
+            # `create_all` has no constraint and no cascade at all.
+            #
+            # Relying on the cascade made this cleanup silently dependent on
+            # DDL that only one of the two schemas has. It presented as ~196
+            # unrelated-looking UNIQUE failures the first time the suite was
+            # pointed at SQLite: the user went, its devices and domains
+            # stayed, and the next test collided.
+            #
+            # EVERY delete below is scoped to `user_ids`, including the
+            # tables that have no `user_id` of their own — they are reached
+            # through the device or domain that does. An unscoped
+            # `DELETE FROM ddns_hostname` would pass on SQLite, where each
+            # worker owns its database, and delete nine other workers' rows
+            # on the shared MySQL. That is the #117 / #149 failure exactly,
+            # reintroduced by a cleanup written to fix it.
+            await s.execute(
+                sa.text(
+                    "DELETE FROM ddns_hostname_backend WHERE hostname_id IN ("
+                    "  SELECT id FROM ddns_hostname WHERE device_id IN ("
+                    "    SELECT id FROM ddns_device WHERE user_id IN :ids)"
+                    "  OR domain_id IN (SELECT id FROM ddns_domain WHERE user_id IN :ids))"
+                ).bindparams(sa.bindparam("ids", expanding=True)),
+                {"ids": user_ids},
+            )
+            await s.execute(
+                sa.text(
+                    "DELETE FROM ddns_hostname WHERE device_id IN ("
+                    "  SELECT id FROM ddns_device WHERE user_id IN :ids)"
+                    " OR domain_id IN (SELECT id FROM ddns_domain WHERE user_id IN :ids)"
+                ).bindparams(sa.bindparam("ids", expanding=True)),
+                {"ids": user_ids},
+            )
+            await s.execute(
+                sa.text(
+                    "DELETE FROM ddns_domain_backend WHERE domain_id IN ("
+                    "  SELECT id FROM ddns_domain WHERE user_id IN :ids)"
+                ).bindparams(sa.bindparam("ids", expanding=True)),
+                {"ids": user_ids},
+            )
+            await s.execute(
+                sa.text(
+                    "DELETE FROM ddns_rate_limit_event WHERE device_id IN ("
+                    "  SELECT id FROM ddns_device WHERE user_id IN :ids)"
+                ).bindparams(sa.bindparam("ids", expanding=True)),
+                {"ids": user_ids},
+            )
+            for _t in ("ddns_domain", "ddns_device"):
+                await s.execute(
+                    sa.text(f"DELETE FROM {_t} WHERE user_id IN :ids").bindparams(
+                        sa.bindparam("ids", expanding=True)
+                    ),
+                    {"ids": user_ids},
+                )
             await s.execute(
                 sa.text(
                     "DELETE FROM user_secret_keys WHERE user_id IN :ids"
