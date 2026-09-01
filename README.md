@@ -8,15 +8,25 @@ models, and UI.
 ## Quick start
 
 ```bash
-cp .env.example .env
-# Edit .env: set APP_SECRET_KEY, JWT_SECRET (openssl rand -hex 48 each),
-# MYSQL_PASSWORD, MYSQL_ROOT_PASSWORD.
+make env      # copies .env.example and mints APP_SECRET_KEY, JWT_SECRET
+              # and SECRET_ENCRYPTION_KEY into it with `openssl rand -hex`
+# Optionally edit .env: MYSQL_PASSWORD / MYSQL_ROOT_PASSWORD are still the
+# shipped defaults, and API_HOST_PORT / MYSQL_HOST_PORT are 8053 / 13353.
 
 make dev-bootstrap
 make seed-admin EMAIL=you@example.com PASSWORD='a-good-password'
 make seed-bundle
 open http://localhost:8053   # API_HOST_PORT in .env; MySQL is on MYSQL_HOST_PORT (13353)
 ```
+
+`cp .env.example .env` used to be the first line here, and it produced a
+stack that could not run: the example's `SECRET_ENCRYPTION_KEY` is the
+literal string `replace-me-with-openssl-rand-hex-32`, atrium checks that key's
+shape in **every** environment, and the api crash-looped behind a `make up`
+that printed "Started" and exited 0. `make env` mints real values instead, and
+`make up` now refuses — naming the key and the fix — rather than starting a
+container that cannot live. `make check-env-self-test` shows the guard
+refusing, one damaged key at a time.
 
 Sign in with the seeded admin and the **Atrium Ddns** card appears on
 the home page, with a sidebar link to `/atrium-ddns`, an admin tab,

@@ -1511,3 +1511,45 @@ The same shape as the bundle-freshness incident and as #36's bind mount:
 resolved.** Use `make test-backend` when the answer matters, and treat
 `test-backend-file`'s output as a diagnostic aid rather than a reading,
 unless you ran `make check-fresh` yourself first.
+
+**`make up` exits 0 over an api that is already dead, and `.env.example` is
+how you get there.** #137: the example ships
+`SECRET_ENCRYPTION_KEY=replace-me-with-openssl-rand-hex-32`, atrium checks
+that key's *shape* in every environment, and `restart: unless-stopped` turns
+the resulting ValidationError into a loop. Measured on a fresh worktree with a
+straight `cp .env.example .env`: `make up` printed *"Container …-api-1
+Started"* and exited **0**, while `docker inspect` showed
+`Status=restarting` with `RestartCount` climbing 5→8 and `curl` on the
+published port failed with exit 7. The first symptom an agent sees is not
+"your key is invalid" — it is something unrelated failing ten minutes later.
+
+Three states that look like one, and only one of them is survivable —
+measured under the image's own interpreter against
+`ghcr.io/brendanbank/atrium:0.29.0`:
+
+* `SECRET_ENCRYPTION_KEY` **unset** → *accepted*, silently falling back to the
+  all-zeros dev default.
+* `SECRET_ENCRYPTION_KEY=` **empty** → refused, *"decodes to 0 bytes"*.
+* `SECRET_ENCRYPTION_KEY=replace-me-…` **placeholder** → refused, *"must be
+  hex-encoded"*.
+
+And the state a missing `.env` produces is **not** the first one.
+`compose.yaml` names the variable in the api's `environment:` block, so an
+absent key is interpolated to `""` rather than omitted — `docker compose
+config` renders `SECRET_ENCRYPTION_KEY: ""`. A guard that collapses *unset*
+into *empty* into *placeholder* sends its reader to the wrong file; `n/a` is
+never `0`.
+
+`make env` mints a working `.env`; `make up` refuses on one that cannot live,
+naming the key and the command. `make check-env-self-test` shows the guard
+refusing on each state in turn, one damaged line at a time against a `.env`
+that otherwise passes — including the shipped `.env.example` itself, which
+must never pass, so a future edit that quietly commits a working key turns the
+self-test red.
+
+The reverse trap was live in this repo while the guard was being written: the
+gate scopes off `frontend/`, `backend/`, `tests/` and `scripts/*.py`, so a
+change confined to `Makefile`, `compose.yaml`, `.env.example` and
+`scripts/*.sh` reached **no test at all** and printed *"this diff reaches no
+test"* as its whole reading. A guard that never runs passes. `make gate` now
+carries a third scope for exactly those paths.
