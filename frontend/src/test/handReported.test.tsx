@@ -34,7 +34,13 @@
  * says which reading it is.
  */
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
-import { act, cleanup, screen, waitFor } from '@testing-library/react';
+import {
+  act,
+  cleanup,
+  fireEvent,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 
 import {
   mockAtriumRegistry,
@@ -205,6 +211,99 @@ describe('a filter that matches nothing is a measurement, not an empty account �
     expect(screen.getByTestId('board-filter-count').textContent).toContain(
       'showing 1 of 2',
     );
+  });
+});
+
+describe('clear clears every filter, including the one it forgot — #141', () => {
+  beforeEach(() => {
+    queryClient.clear();
+    stubBoard(TWO_DEVICE_BOARD);
+  });
+
+  /** A zone with no names in it — not on the board's payload at all. So
+   *  `?zone=` reaches zero rows the way a tenant reaches them: by
+   *  following the zones list's link to an empty zone, rather than by
+   *  composing two filters that disagree, which is how the tests above
+   *  get there. Both arrivals render the same sentence; only this one is
+   *  a single filter, which is what makes the defect legible. */
+  const EMPTY_ZONE = 'example.com';
+
+  test('a zone filter from ?zone= is cleared, so the empty state is escapable', async () => {
+    // The reported defect. `board-no-match` tells the tenant to "clear
+    // the filter to see them", and the control beside it reset the
+    // device and name filters only — so the one arrival that reliably
+    // produces this screen is the one arrival its instruction cannot
+    // answer, and the row count stayed at `showing 0 of 2` with no way
+    // back short of editing the address bar.
+    await openBoard(`?zone=${EMPTY_ZONE}`);
+    expect(screen.getByTestId('board-no-match')).toBeInTheDocument();
+    expect(screen.getByTestId('board-filter-count').textContent).toContain(
+      'showing 0 of 2',
+    );
+
+    fireEvent.click(screen.getByTestId('board-filter-clear'));
+
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId('board-no-match'),
+        'clear left the zone filter set. The board still matches no rows ' +
+          'and the only way out is the address bar — #141.',
+      ).toBeNull(),
+    );
+    // …and the rows it was hiding are the rows that come back. Asserting
+    // only that the sentence went would pass for a clear that emptied
+    // the table rather than unfiltering it. Counted against the same
+    // denominator the sentence quoted — `2 in total` — rather than
+    // against two written-out testids, which would pin the address
+    // family into an assertion that is not about families.
+    //
+    // Read off the rows' own testids rather than by text: every name is
+    // also an option in the Name picker, so `getByText` finds two of
+    // each and fails for a reason that has nothing to do with #141.
+    const rowIds = screen
+      .getAllByTestId(/^board-row-/)
+      .map((el) => el.getAttribute('data-testid') ?? '');
+    expect(rowIds).toHaveLength(2);
+    expect(
+      rowIds.filter((id) => id.includes(`host-a.${ROUTER.zone}`)),
+    ).toHaveLength(1);
+    expect(
+      rowIds.filter((id) => id.includes(`host-b.${GARAGE.zone}`)),
+    ).toHaveLength(1);
+  });
+
+  test('the clear control removes itself, which is the predicate that summoned it', async () => {
+    // The assertion that does not enumerate filters, and the reason a
+    // fourth filter does not need a fourth test here. `board-filter-clear`
+    // and `board-filter-count` are rendered behind the *same* `filtered`
+    // predicate the clear handler exists to falsify, so "the button is
+    // still on screen after being pressed" is exactly "some filter
+    // survived" — whichever one it is, named or not.
+    await openBoard(`?onlyDevice=${ROUTER.id}&zone=${EMPTY_ZONE}`);
+    expect(screen.getByTestId('board-filter-clear')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('board-filter-clear'));
+
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId('board-filter-clear'),
+        'the clear control survived its own click, so at least one filter ' +
+          'it does not know about is still set — #141.',
+      ).toBeNull(),
+    );
+    expect(screen.queryByTestId('board-filter-count')).toBeNull();
+    // The controls themselves stay. Clearing a filter is not hiding the
+    // means to set another one — PR #127's half of this screen.
+    expect(screen.getByTestId('board-filters')).toBeInTheDocument();
+  });
+
+  test('the control is absent on an unfiltered board — the control', async () => {
+    // Without this, a clear button that never rendered at all would
+    // satisfy the assertion above by never being found in the first
+    // place.
+    await openBoard();
+    expect(screen.queryByTestId('board-filter-clear')).toBeNull();
+    expect(screen.queryByTestId('board-filter-count')).toBeNull();
   });
 });
 

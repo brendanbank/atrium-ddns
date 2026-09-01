@@ -122,6 +122,25 @@ function nothingChecked(board: Board): boolean {
   );
 }
 
+/** The board's view filters, as one value. Each is the selected option or
+ *  `null` for "any" — the shape Mantine's clearable `Select` already
+ *  speaks, so no filter needs a sentinel of its own.
+ *
+ *  Adding one here is a compile error at `NO_FILTERS` until it is given a
+ *  default, which is the point: `filtered` and the clear control are both
+ *  derived from this record, and a filter that exists in only one of them
+ *  is #141. */
+interface ViewFilters {
+  device: string | null;
+  name: string | null;
+  zone: string | null;
+}
+
+/** Every filter off. Both the initial state's base and what the clear
+ *  control resets to — deliberately one value, so "cleared" cannot come
+ *  to mean two different things. */
+const NO_FILTERS: ViewFilters = { device: null, name: null, zone: null };
+
 export function BoardTable({
   board,
   onOpenDevice,
@@ -158,33 +177,49 @@ export function BoardTable({
     onError: (err: Error) => setError(err.message),
   });
 
-  /** Two view filters over the rows already on screen.
+  /** The view filters over the rows already on screen. `zone` is seeded
+   *  from `?zone=` so the zone list can link here focused on one zone —
+   *  it used to link to `/atrium-ddns/names?zone=`, a page that is going
+   *  away — and `device` from `?onlyDevice=` for the device card. Both
+   *  are read once, as initial state; changing a filter afterwards does
+   *  not push history, because it is a question about what is in front of
+   *  you rather than a different query.
    *
-   *  Deliberately client-side and deliberately not in the URL. The board
-   *  is one request that already carries every device and name this
-   *  tenant has; filtering it is a question about what is in front of you,
-   *  not a different query. And unlike a zone or a name, "I was looking at
-   *  one device" is not a thing anyone pastes into a ticket — the log
-   *  search is where a shareable filtered view lives, and each row links
-   *  straight into it. */
-  const [deviceFilter, setDeviceFilter] = useState<string | null>(
-    initialDeviceFilter,
-  );
-  const [nameFilter, setNameFilter] = useState<string | null>(null);
-  /** Seeded from `?zone=` so the zone list can link here focused on one
-   *  zone — it used to link to `/atrium-ddns/names?zone=`, a page that is
-   *  going away. Held in state after that, because it is a view filter
-   *  like the other two and changing it should not push history. */
-  const [zoneFilter, setZoneFilter] = useState<string | null>(
-    initialZoneFilter,
-  );
+   *  Deliberately client-side. The board is one request that already
+   *  carries every device and name this tenant has. And unlike a zone or
+   *  a name, "I was looking at one device" is not a thing anyone pastes
+   *  into a ticket — the log search is where a shareable filtered view
+   *  lives, and each row links straight into it.
+   *
+   *  **One record rather than one `useState` per filter, and that is the
+   *  fix for #141.** As three separate hooks, `filtered` was computed
+   *  over all three and `clear` reset two of them, so the zone filter —
+   *  the one a zones-list link seeds, and therefore the one most likely
+   *  to be the only filter set — survived its own clear button. A tenant
+   *  arriving at a zone with no names read *"clear the filter to see
+   *  them"*, pressed clear, and nothing happened: the empty-state fix's
+   *  instruction was the one instruction the surface could not follow.
+   *
+   *  Here `filtered` and `clearFilters` are both derived from the keys of
+   *  the same record, and `NO_FILTERS` is typed as a whole `ViewFilters`,
+   *  so a fourth filter is a type error until it is added to both. The
+   *  invariant is checked by `tsc` rather than kept by hand, which is
+   *  what stops this defect regrowing. */
+  const [filters, setFilters] = useState<ViewFilters>({
+    ...NO_FILTERS,
+    device: initialDeviceFilter,
+    zone: initialZoneFilter,
+  });
+  const setFilter = (key: keyof ViewFilters) => (value: string | null) =>
+    setFilters((current) => ({ ...current, [key]: value }));
+  const clearFilters = () => setFilters(NO_FILTERS);
 
   const allRows = flatten(board);
   const rows = allRows.filter(
     (row) =>
-      (deviceFilter === null || String(row.device?.id) === deviceFilter) &&
-      (nameFilter === null || String(row.hostname?.id) === nameFilter) &&
-      (zoneFilter === null || row.hostname?.domain_name === zoneFilter),
+      (filters.device === null || String(row.device?.id) === filters.device) &&
+      (filters.name === null || String(row.hostname?.id) === filters.name) &&
+      (filters.zone === null || row.hostname?.domain_name === filters.zone),
   );
 
   /** Options come from the board payload, so they can only offer things
@@ -212,8 +247,10 @@ export function BoardTable({
   )
     .sort((a, b) => a.localeCompare(b))
     .map((name) => ({ value: name, label: name }));
-  const filtered =
-    deviceFilter !== null || nameFilter !== null || zoneFilter !== null;
+  /** Over the record's own values, not over a list of names written out
+   *  again here. This predicate and `clearFilters` are the pair that
+   *  disagreed in #141; neither enumerates a filter now. */
+  const filtered = Object.values(filters).some((value) => value !== null);
   /** The account is empty — a fact about the tenant.
    *
    *  Keyed on `allRows`, **not** on the filtered `rows`. Keying it on the
@@ -239,16 +276,17 @@ export function BoardTable({
           {board.health_check_interval_minutes} minutes.
         </p>
       ) : null}
-      {/* Pick a device or a name and the table narrows to it. Searchable
-          because a tenant with forty names should type rather than scroll,
-          clearable because removing a filter must be as easy as adding one. */}
+      {/* Pick any of these and the table narrows to it. Searchable because
+          a tenant with forty names should type rather than scroll, and
+          clearable — individually here, all at once below — because
+          removing a filter must be as easy as adding one. */}
       <Group gap="sm" align="flex-end" wrap="wrap" data-testid="board-filters">
         <Select
           label="Device"
           placeholder="any device"
           data={deviceOptions}
-          value={deviceFilter}
-          onChange={setDeviceFilter}
+          value={filters.device}
+          onChange={setFilter("device")}
           searchable
           clearable
           size="xs"
@@ -259,8 +297,8 @@ export function BoardTable({
           label="Name"
           placeholder="any name"
           data={nameOptions}
-          value={nameFilter}
-          onChange={setNameFilter}
+          value={filters.name}
+          onChange={setFilter("name")}
           searchable
           clearable
           size="xs"
@@ -271,8 +309,8 @@ export function BoardTable({
           label="Zone"
           placeholder="any zone"
           data={zoneOptions}
-          value={zoneFilter}
-          onChange={setZoneFilter}
+          value={filters.zone}
+          onChange={setFilter("zone")}
           searchable
           clearable
           size="xs"
@@ -283,10 +321,7 @@ export function BoardTable({
           <Button
             variant="subtle"
             size="compact-xs"
-            onClick={() => {
-              setDeviceFilter(null);
-              setNameFilter(null);
-            }}
+            onClick={clearFilters}
             data-testid="board-filter-clear"
           >
             clear
