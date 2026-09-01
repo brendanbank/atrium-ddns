@@ -451,6 +451,32 @@ test-frontend:  ## frontend unit tests via vitest
 # `--target`, and the wire table is reported as NOT RUN rather than as nought
 # failures. The table itself is `make test-compat`, which is not in the gate
 # because it needs a live service named on the command line.
+ATRIUM_SRC ?= /Users/brendan/src/atrium/backend
+TEST_VENV  ?= .test-venv
+
+$(TEST_VENV)/bin/python:  ## the unit lane's venv — atrium's deps, no container
+	@echo "creating $(TEST_VENV) (one time)"
+	@python3 -m venv $(TEST_VENV)
+	@awk '/^dependencies = \[/{f=1;next} f&&/^\]/{exit} f' $(ATRIUM_SRC)/pyproject.toml \
+	  | grep -oE '"[^"]+"' | tr -d '"' > /tmp/.atrium-reqs
+	@awk '/^dependencies = \[/{f=1;next} f&&/^\]/{exit} f' backend/pyproject.toml \
+	  | grep -oE '"[^"]+"' | tr -d '"' >> /tmp/.atrium-reqs
+	@printf 'aiosqlite\npytest\npytest-asyncio\npytest-xdist\n' >> /tmp/.atrium-reqs
+	@$(TEST_VENV)/bin/pip install -q --disable-pip-version-check -r /tmp/.atrium-reqs
+	@echo "$(TEST_VENV) ready"
+
+test-unit: $(TEST_VENV)/bin/python  ## backend unit tests. SQLite, no docker, ~8s
+	@# No container, no MySQL, no migrations. `-m "not functional"` drops the
+	@# 71 tests that genuinely need infrastructure — a bindable port 53, a
+	@# migrated schema, or atrium's MySQL-only SQL. Those run in `test-backend`.
+	@PYTHONPATH=$(ATRIUM_SRC):backend/src \
+	 DATABASE_URL='sqlite+aiosqlite:///:memory:' \
+	 $(TEST_VENV)/bin/python -m pytest backend/tests -q --no-header \
+	   -p no:cacheprovider -m "not functional" $(PYTEST_ARGS)
+
+test-functional: ## the 71 that need real infrastructure (container + MySQL)
+	$(COMPOSE) exec -T api /opt/venv/bin/python -m pytest $(HOST_APP)/tests -m functional -ra $(PYTEST_ARGS)
+
 test-backend: check-fresh  ## backend tests + service-free compat guards, in the api container
 	$(COMPOSE) exec -T api /opt/venv/bin/python -m pytest $(HOST_APP)/tests $(PYTEST_ARGS)
 	$(COMPOSE) exec -T api /opt/venv/bin/python -m pytest $(COMPAT_TESTS) -ra $(PYTEST_ARGS)

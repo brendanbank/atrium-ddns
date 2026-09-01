@@ -170,6 +170,45 @@ from sqlalchemy.ext.asyncio import AsyncSession
 #: This worker's namespace. Ten workers share one MySQL, so anything a
 #: test creates carries it — a hardcoded email or device name produces
 #: collisions that read as flakiness.
+# --- unit lane: in-memory SQLite ---
+#
+# Seeded at conftest IMPORT time, before anything calls `app.db.get_engine()`,
+# because that function caches its engine in a module global and passes
+# `isolation_level="READ COMMITTED"` — which SQLite rejects. Doing this in a
+# fixture would run too late.
+#
+# Opt-in: nothing happens unless DATABASE_URL names sqlite, so `make
+# test-backend` against MySQL is untouched.
+if os.environ.get("DATABASE_URL", "").startswith("sqlite"):
+    import app.db as _atrium_db
+    from sqlalchemy import event as _event
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession as _AS,
+        async_sessionmaker as _asm,
+        create_async_engine as _cae,
+    )
+    from sqlalchemy.pool import StaticPool as _StaticPool
+
+    if _atrium_db._engine is None:
+        _atrium_db._engine = _cae(
+            "sqlite+aiosqlite:///:memory:",
+            poolclass=_StaticPool,          # `:memory:` is per-connection
+            connect_args={"check_same_thread": False},
+        )
+        _atrium_db._session_factory = _asm(
+            _atrium_db._engine, class_=_AS, expire_on_commit=False
+        )
+
+        @_event.listens_for(_atrium_db._engine.sync_engine, "connect")
+        def _sqlite_foreign_keys(dbapi_connection, _record):  # noqa: ANN001
+            # SQLite ignores foreign keys unless asked. Off by default means
+            # ON DELETE CASCADE silently does nothing — "no error, wrong
+            # data", which is the worst way for this to present.
+            cur = dbapi_connection.cursor()
+            cur.execute("PRAGMA foreign_keys=ON")
+            cur.close()
+
+
 WORKER = os.environ.get("PYTEST_XDIST_WORKER", "serial")
 
 #: The advisory lock every fixture write takes. Server-wide, and the

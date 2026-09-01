@@ -173,3 +173,4 @@ deploy_key*
 # and a bundle carries the whole history including anything in it.
 *.bundle
 .gate-venv/
+.test-venv/
