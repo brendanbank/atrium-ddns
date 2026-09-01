@@ -696,7 +696,8 @@ gate:  ## unit tests only. No docker, ever. Only what the diff can reach.
 	changed=$$( { git diff --name-only "$$base"...HEAD 2>/dev/null; git diff --name-only; git ls-files -o --exclude-standard; } | sort -u ); \
 	if [ -z "$$changed" ]; then echo "gate: no changes against $$base — nothing to check"; exit 0; fi; \
 	fe=$$(printf '%s\n' "$$changed" | grep -cE '^frontend/' || true); \
-	be=$$(printf '%s\n' "$$changed" | grep -cE '^(backend/|tests/|scripts/.*\.py)' || true); \
+	sf=$$(printf '%s\n' "$$changed" | grep -cE '^(tests/|scripts/.*\.py)' || true); \
+	bk=$$(printf '%s\n' "$$changed" | grep -cE '^backend/' || true); \
 	echo "gate: $$(printf '%s\n' "$$changed" | wc -l | tr -d ' ') file(s) changed against $$base"; \
 	if [ "$$fe" -gt 0 ]; then \
 		echo "gate: frontend ($$fe file(s)) -> typecheck + vitest"; \
@@ -704,14 +705,21 @@ gate:  ## unit tests only. No docker, ever. Only what the diff can reach.
 	else \
 		echo "gate: SKIP frontend — nothing under frontend/ changed."; \
 	fi; \
-	if [ "$$be" -gt 0 ]; then \
-		echo "gate: backend ($$be file(s)) -> service-free unit tests"; \
+	if [ "$$sf" -gt 0 ]; then \
+		echo "gate: compat/scripts ($$sf file(s)) -> service-free unit tests"; \
 		[ -x .gate-venv/bin/python ] || { python3 -m venv .gate-venv && .gate-venv/bin/pip install -q --disable-pip-version-check pytest pyyaml; }; \
 		.gate-venv/bin/python -m pytest tests/ -q; \
-	else \
-		echo "gate: SKIP backend — nothing under backend/, tests/ or scripts/*.py changed."; \
 	fi; \
-	if [ "$$fe" -eq 0 ] && [ "$$be" -eq 0 ]; then \
+	if [ "$$bk" -gt 0 ]; then \
+		echo "gate: backend ($$bk file(s)) changed, and THERE IS NO DOCKER-FREE SUITE FOR IT."; \
+		echo "gate:   \`pytest tests/\` is a different tree and does not contain backend/tests/,"; \
+		echo "gate:   so running it here would print a green from a suite that cannot see"; \
+		echo "gate:   your change. Reported rather than done."; \
+		echo "gate:   The suite that covers it is \`make test-backend\` — functional, needs"; \
+		echo "gate:   MySQL, deliberately not in the gate. Run it yourself if the change"; \
+		echo "gate:   warrants it, and say so in the PR."; \
+	fi; \
+	if [ "$$fe" -eq 0 ] && [ "$$sf" -eq 0 ] && [ "$$bk" -eq 0 ]; then \
 		echo "gate: this diff reaches no test, and that is the result rather than"; \
 		echo "gate: a skipped step. Evidence is the diff plus a direct demonstration."; \
 	fi; \
