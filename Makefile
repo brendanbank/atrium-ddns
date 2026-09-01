@@ -123,7 +123,7 @@ endef
 
 .PHONY: help dev-bootstrap dev-up dev-down up down build logs ps migrate gate \
 	seed-admin seed-bundle seed-compat-fixture verify-compat-rehash \
-	test test-frontend test-backend test-compat \
+	test test-frontend test-backend test-compat check-compat-executed \
 	check-fresh check-compat-fresh check-backend-fresh check-host-pkg-fresh \
 	test-backend-serial test-backend-file typecheck smoke \
 	e2e-up e2e-deps e2e-down test-e2e check-bundle-fresh \
@@ -387,9 +387,15 @@ check-host-pkg-fresh:  ## fail if the INSTALLED atrium_ddns is not this worktree
 	$(call CHECK_FRESH,check-host-pkg-fresh,backend/src/$(HOST_PKG),pkg:$(HOST_PKG),the installed $(HOST_PKG) package)
 
 # The wire table. NOT part of `make test` and NOT part of the gate: it replays
-# 114 cases against a running service, and which service that is has to be
-# stated, not guessed. Defaulting either option to make this target "work" is
-# the bug #8 was written about.
+# the frozen table against a running service, and which service that is has to
+# be stated, not guessed. Defaulting either option to make this target "work"
+# is the bug #8 was written about.
+#
+# No case count in this sentence, deliberately. It read "114 cases" for three
+# freezes after the table stopped having 114 of them, which is the inherited
+# number `docs/ops/overnight-template.md` keeps telling agents not to write
+# down. The runner prints its own accounting block on every run, derived from
+# the table it actually loaded; that is the reading, and it cannot go stale.
 #
 # BASE_URL is resolved from inside the api container, because that is the one
 # environment guaranteed to have pytest and PyYAML. `http://api:8000` is this
@@ -424,6 +430,94 @@ test-compat:  ## wire table vs a live service (TARGET=legacy|host BASE_URL=http:
 	@$(MAKE) --no-print-directory check-compat-fresh
 	$(COMPOSE) exec -T api /opt/venv/bin/python -m pytest $(COMPAT_TESTS)/compat \
 		--target "$(TARGET)" --base-url "$(BASE_URL)" -ra $(PYTEST_ARGS)
+
+# Did the table actually run, or did it merely exit 0?
+#
+# `test-compat` above answers "did anything fail". It does NOT answer "did
+# anything run", and the two come apart in exactly the ways that matter:
+#
+#   $ make test-compat TARGET=host BASE_URL=... PYTEST_ARGS='-k checkip-default-is-html'
+#   1 passed ... NOT RUN 126
+#
+# — exit 0, a green summary line, and one case of the table exercised. A CI job
+# whose only instrument is `make test-compat`'s exit code reports that as a
+# clean wire table. So CI captures the run and reads the runner's own
+# accounting block back, and this target is what does the reading.
+#
+# Four ways it goes red, and none of them is "a case failed" (test-compat owns
+# that): the freshness guard's PASS line is absent, so the table may have been
+# replayed out of a stale image; the runner printed NOT RUN, in either of its
+# two spellings — the whole table (no `--target`) or a shortfall (`-k`, or
+# collection stopping early); the accounting block is unreadable, which is NOT
+# zero and NOT a pass; or fewer cases passed than the block says were
+# executable.
+#
+# Deliberately NOT folded into `test-compat`. That target is also the
+# diagnostic — `PYTEST_ARGS='-k one-case'` is how anyone bisects a failing
+# case, and a guard that refuses a filtered run is a guard standing in front of
+# the diagnosis. The vacuity question belongs to the unattended caller, which
+# is CI, and it is asked there.
+#
+# No expected count in here. The invariants are relational (`passed` equals
+# `executable`, shortfall is nought), so freezing the table at a different size
+# cannot make this target stale — which is the one property a hardcoded 124
+# would not have had.
+check-compat-executed:  ## assert a captured `make test-compat` log really ran the table (LOG=<file>)
+	@set -u; \
+	log="$(LOG)"; \
+	if [ -z "$$log" ]; then \
+		echo "usage: make check-compat-executed LOG=<file>"; \
+		echo; \
+		echo "  <file> is what a \`make test-compat ... 2>&1 | tee <file>\` run wrote."; \
+		exit 2; \
+	fi; \
+	if [ ! -s "$$log" ]; then \
+		echo "check-compat-executed: '$$log' is missing or empty."; \
+		echo "  An absent log is not a clean run. Refusing."; \
+		exit 1; \
+	fi; \
+	fail=0; \
+	if ! grep -q 'check-compat-fresh: container matches worktree' "$$log"; then \
+		echo "check-compat-executed: the freshness guard's PASS line is not in '$$log'."; \
+		echo "  Either check-compat-fresh never ran, or the run routed around it."; \
+		echo "  A table replayed from a stale image reports green for the wrong"; \
+		echo "  cases, which is worse than not running it."; \
+		fail=1; \
+	fi; \
+	if grep -q 'NOT RUN' "$$log"; then \
+		echo "check-compat-executed: the runner reported cases NOT RUN:"; \
+		grep 'NOT RUN' "$$log" | sed 's/^/    /'; \
+		fail=1; \
+	fi; \
+	if ! grep -q '^  reachability probe ' "$$log"; then \
+		echo "check-compat-executed: no reachability probe in '$$log' — the runner"; \
+		echo "  never established that anything answered at --base-url."; \
+		fail=1; \
+	fi; \
+	executable=`awk '$$1=="executable" && $$2 ~ /^[0-9]+$$/ {print $$2}' "$$log" | tail -1`; \
+	passed=`awk '/^  ran this session /{for(i=1;i<=NF;i++) if($$i ~ /^passed/) print $$(i-1)}' "$$log" | tail -1`; \
+	if [ -z "$$executable" ] || [ -z "$$passed" ]; then \
+		echo "check-compat-executed: could not read the accounting block from '$$log'"; \
+		echo "  (executable='$$executable' passed='$$passed')."; \
+		echo "  An unreadable block is not nought and is not a pass. Refusing."; \
+		fail=1; \
+	elif [ "$$executable" -lt 1 ]; then \
+		echo "check-compat-executed: executable=$$executable — the table selected"; \
+		echo "  no case at all for this target. That is not a green wire table."; \
+		fail=1; \
+	elif [ "$$passed" -ne "$$executable" ]; then \
+		echo "check-compat-executed: $$passed passed, but the accounting block says"; \
+		echo "  $$executable were executable. Every executable case must be one of"; \
+		echo "  them."; \
+		fail=1; \
+	fi; \
+	if [ "$$fail" -eq 0 ]; then \
+		echo "check-compat-executed: $$passed of $$executable executable cases passed,"; \
+		echo "  0 selected-but-unexecuted, freshness guard PASSED, service probed."; \
+	else \
+		echo "check-compat-executed: REFUSING to call '$$log' a wire-table run."; \
+	fi; \
+	exit $$fail
 
 # Gated: this reports the same "the backend suite passed" claim as
 # test-backend, one worker at a time, and a stale image lies the same way.

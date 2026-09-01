@@ -999,15 +999,53 @@ guards at #25, and 114 cases at #11's freeze. The guard count went 6 → 7 when
 `test_target_selection_partitions_the_table` is parametrised per target, so
 eight functions present as **nine** nodes, with a target and without.)
 
-## In the gate
+## In the gate, and in CI
 
 **Both halves of `tests/compat/` are in the gate as of #23** — the service-free
-half unconditionally, the wire table not at all.
+half unconditionally, the wire table not at all. That is still true. The wire
+table's automation is CI's, not the gate's, and #130 changed only the CI half.
 
 | | runs | how |
 |---|---|---|
 | model guards + runner guards + runner contract | every `make test-backend`, so every gate run | `tests/` is COPYed into the Dockerfile's `dev` stage at `/opt/compat_tests`; `make test-backend` runs a second pytest session over it |
-| the 131-case wire table | never automatically | `make test-compat TARGET=legacy\|host BASE_URL=<url>` — both required, neither defaulted |
+| the wire table, `--target host` | CI's `compat-wire-table` job — PRs into `master` and pushes to it. **Never in the local gate** | that job raises a stack with `ATRIUM_DDNS_COMPAT_STUB=1`, runs `make seed-compat-fixture`, then `make test-compat TARGET=host BASE_URL=http://api:8000` followed by `make check-compat-executed` |
+| the wire table, `--target legacy` | never automatically | `make test-compat TARGET=legacy BASE_URL=<url>` — both required, neither defaulted, and the legacy service has to be stood up by hand (§ *Standing the legacy service up*) |
+
+**The host half stopped being "never automatically" at #130, and the gate did
+not change.** Those are two claims and it is worth keeping them apart. The
+table is still outside `make test` and outside the local gate, for the reason
+below; what #130 added is a CI job that raises the service the table needs and
+then names it on the command line, which is the only way this table was ever
+meant to run. Before it, the frozen wire contract — the one artefact this
+repository exists to preserve — was checked only when somebody remembered to
+type the command.
+
+**Why that job has a second step.** `make test-compat` answers *did a case
+fail*. It does not answer *did a case run*, and the two come apart: with
+`PYTEST_ARGS='-k checkip-default-is-html'` the target exits **0** having
+executed 1 of the 127 selected cases, printing `NOT RUN 126` in an accounting
+block nothing was reading. `make check-compat-executed LOG=<file>` reads that
+block back and refuses four ways — the freshness guard's PASS line absent, any
+`NOT RUN`, an unreadable block (which is *not* nought and *not* a pass), or
+fewer cases passed than the block calls executable. Its invariants are
+relational, so re-freezing the table at a different size cannot make it stale.
+
+**There is no `moto` here, and #130 is where that was decided.** That issue
+asked for a `moto`-backed Route 53 on loopback on the premise that the host
+cases cannot run without one. The premise is wrong: this file's `fixture:`
+block asks for `service: stub` on every backend it declares, and a
+case-insensitive grep for `route53`, `aws` or `boto` across
+`protocol_cases.yaml` matches exactly one line — the upstream repository's
+name, in a comment. The provider under test on this path is
+`atrium_ddns.compat_stub`. Measured on `130_overnight` with no AWS credentials
+in the container, no `AWS_ENDPOINT_URL`, and boto3 resolving to the real
+`https://route53.amazonaws.com`: **124 of 124 executable cases green**. A moto
+server in that job would receive no request from any of the 131 cases, and a
+service nothing reaches cannot go red — the "probe that could not fail" of
+`docs/ops/overnight-template.md`, wearing a dependency pin. (For the record:
+`AWS_ENDPOINT_URL` *does* redirect the client on this image — botocore 1.43.85
+resolves `http://127.0.0.1:5053` from it despite `route53.py`'s `make_client`
+passing no `endpoint_url`. The mechanism works. Nothing on this path needs it.)
 
 `make test-compat` is deliberately outside `make test` and outside the gate: it
 needs a live service, and which service it is has to be stated. Giving either
