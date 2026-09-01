@@ -838,6 +838,7 @@ async def ddns_config_lock(owner: str = "?") -> AsyncIterator[None]:
             )
 
 
+@harness_guard
 @pytest_asyncio.fixture(scope="session", autouse=True)
 async def _sqlite_schema() -> AsyncIterator[None]:
     """Create the schema on a non-MySQL engine.
