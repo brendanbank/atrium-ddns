@@ -1,4 +1,28 @@
-# Atrium Ddns
+# atrium-ddns
+
+**Multi-tenant dynamic DNS, speaking the DynDNS v2 protocol that routers and
+NAS boxes already ship with.** Point a device's built-in "Dynamic DNS" client
+at this service, and it updates the record through Amazon Route 53, Hetzner
+DNS, or any RFC 2136 nameserver (`nsupdate`, e.g. BIND).
+
+[![Release](https://img.shields.io/github/v/release/brendanbank/atrium-ddns?sort=semver)](https://github.com/brendanbank/atrium-ddns/releases)
+[![CI](https://github.com/brendanbank/atrium-ddns/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/brendanbank/atrium-ddns/actions/workflows/ci.yml)
+[![Image](https://img.shields.io/badge/ghcr.io-amd64%20%7C%20arm64-blue)](https://github.com/brendanbank/atrium-ddns/pkgs/container/atrium-ddns)
+
+```bash
+docker pull ghcr.io/brendanbank/atrium-ddns:latest
+```
+
+- **Works with existing hardware.** The `/nic/update` endpoint implements the
+  DynDNS v2 wire protocol, including its `good`/`nochg`/`badauth`/`nohost`
+  reply vocabulary, so no client-side software is needed.
+- **Several DNS backends**, per hostname: Route 53, Hetzner, and RFC 2136 via
+  `nsupdate`. A zone can be moved between them without the device noticing.
+- **Multi-tenant.** Users see only their own devices, domains and hostnames;
+  the boundary is enforced in the query layer rather than the templates.
+- **IPv4 and IPv6**, as independent A and AAAA records.
+- **Audited.** Every update is a row, with the address it came from and the
+  answer the nameserver actually gave.
 
 A host extension on top of [atrium](https://github.com/brendanbank/atrium).
 Atrium ships the platform layer (auth, RBAC, audit, email, jobs,
