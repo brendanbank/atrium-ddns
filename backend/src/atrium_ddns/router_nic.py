@@ -140,6 +140,13 @@ EVENT_AUTH = "auth"
 #: added here cannot go unfilterable.
 EVENT_MANUAL_UPDATE = "manual_update"
 
+#: Adopting what the zone already carries — see `adopt_zone` in
+#: ``router.py``. Deliberately **not** ``update``: nothing was published,
+#: no provider was called, and no rate-limit slot was spent. A row that
+#: said ``update`` here would put a write in the log that never happened,
+#: which is the one thing the log exists to be trusted about.
+EVENT_ADOPT_ZONE = "adopt_zone"
+
 #: The `checkip` HTML wrapper, byte for byte.
 #:
 #: ``html.escape`` is deliberately **not** applied. The value
@@ -971,13 +978,32 @@ async def persist_updates(
     ip: str,
     rtype: str,
 ) -> None:
-    """Write back ``last_ip_*`` and ``last_updated_at`` — on ``good`` only.
+    """Write back ``last_ip_*`` on ``good`` **and on ``nochg``**;
+    ``last_updated_at`` on ``good`` only.
 
-    A ``nochg`` leaves all three untouched, which the frozen table
-    asserts (``update-nochg-single-backend``) and which
+    ``last_updated_at`` still moves on ``good`` alone, which is what
     ``tracked-ip-moves-only-on-good-so-last-updated-at-is-not-a-liveness-signal``
-    explains the consequence of: this column is a record of the last
-    *change*, not of the last successful call.
+    protects: the column is a record of the last *change*, not of the last
+    successful call, and a ``nochg`` is a call in which nothing changed.
+
+    **``last_ip_*`` is different, and this is a deliberate divergence from
+    legacy (freeze v4).** A ``nochg`` means the device asserted an address
+    *and DNS was queried and already answers it* — ``check_hostnameon_
+    server`` is what produces the status. At that moment this service
+    knows what the zone carries, from two sources that did not consult
+    each other. Storing anything else, including ``NULL``, is a record
+    that contradicts something it just observed.
+
+    Leaving it alone is not neutral, because nothing else can fix it. The
+    repair a person would reach for — publish the correct address — is the
+    request that produces ``nochg``, so the wire path could never converge:
+    a name whose zone moved on independently stayed wrong for ever, the
+    board accented it for ever, and the accent stopped meaning anything.
+
+    The two frozen cases that pinned ``last_ip_*: unchanged`` on ``nochg``
+    (``update-nochg-single-backend`` and its ``-ipv6`` twin) are amended in
+    freeze v4 rather than worked around. No wire response changes: this is
+    only what is stored.
 
     **One column, chosen by the record type**, and the mirror is
     asserted in both directions: a v6 update must leave ``last_ip_v4``
@@ -987,16 +1013,20 @@ async def persist_updates(
     ``update-ipv4-persists-last-ip-v4-not-v6`` for the other direction,
     and neither is visible on the wire.
     """
-    changed = [
+    # `good` moves the address AND the clock; `nochg` moves only the
+    # address, and only when it is not already what we hold. Both are
+    # confirmations that the zone carries `ip`; only the first is a change.
+    settled = [
         result
         for result in results
-        if result.status == STATUS_GOOD and result.plan.hostname_id is not None
+        if result.status in (STATUS_GOOD, STATUS_NOCHG)
+        and result.plan.hostname_id is not None
     ]
-    if not changed:
+    if not settled:
         return
     scope = auth.scope
     moment = _now()
-    for result in changed:
+    for result in settled:
         row = await scope.get(session, Hostname, result.plan.hostname_id)
         if row is None:  # pragma: no cover — loaded under the same scope
             log.error(
@@ -1004,10 +1034,21 @@ async def persist_updates(
             )
             continue
         if rtype == RTYPE_A:
+            already = row.last_ip_v4 == ip
             row.last_ip_v4 = ip
         else:
+            already = row.last_ip_v6 == ip
             row.last_ip_v6 = ip
-        row.last_updated_at = moment
+        if result.status == STATUS_GOOD:
+            row.last_updated_at = moment
+        elif not already:
+            # A reconciliation, not a publish. Logged so the record does not
+            # silently acquire an address nothing in the log accounts for.
+            log.info(
+                "ddns.persist.reconciled",
+                hostname_id=result.plan.hostname_id,
+                rtype=rtype,
+            )
 
 
 async def _refuse(

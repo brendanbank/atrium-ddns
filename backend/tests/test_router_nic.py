@@ -852,7 +852,21 @@ async def test_a_good_ipv6_update_moves_last_ip_v6_and_not_v4(
     assert after.last_ip_v4 is None
 
 
-async def test_a_nochg_persists_nothing(client, world) -> None:
+async def test_a_nochg_reconciles_the_address_but_not_the_clock(
+    client, world
+) -> None:
+    """Freeze v4. A ``nochg`` records the address and leaves the clock.
+
+    ``nochg`` is produced by querying DNS and finding the address already
+    there, so at that moment two independent sources agree on what the
+    zone carries. Legacy discarded that, and this used to as well — which
+    made the state unrepairable, because the obvious repair (publish the
+    right address) is the request that produces ``nochg``.
+
+    ``last_updated_at`` still does not move: it is the record of the last
+    *change*, and nothing changed in the zone. That half is unaltered and
+    is what keeps it from becoming a liveness signal.
+    """
     hostname_id = world.hostnames["nochg"]
     before = await hostname_row(hostname_id)
 
@@ -860,13 +874,14 @@ async def test_a_nochg_persists_nothing(client, world) -> None:
         client, "/nic/update", headers=alice(world),
         hostname=world.name("nochg"), myip="203.0.113.10",
     )
+    # The wire is untouched by v4 — only what is stored changed.
     assert response.text == "nochg 203.0.113.10"
 
     after = await hostname_row(hostname_id)
-    assert (after.last_ip_v4, after.last_ip_v6, after.last_updated_at) == (
-        before.last_ip_v4,
-        before.last_ip_v6,
-        before.last_updated_at,
+    assert after.last_ip_v4 == "203.0.113.10"
+    assert after.last_ip_v6 == before.last_ip_v6, "a v4 update must not touch v6"
+    assert after.last_updated_at == before.last_updated_at, (
+        "last_updated_at is the last change, and a nochg is not one"
     )
 
 
