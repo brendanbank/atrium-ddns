@@ -98,6 +98,44 @@ hostnames out of tracked files (the same reason `.env.example` ships
 `TRAEFIK_HOSTNAME=ddns.example.invalid`). `scripts/dev-admin.sh` has the
 rest of the reasoning.
 
+## Running the published image
+
+On a server there is no worktree to build from, and no reason to compile: the
+image CI built, tested and published is the artefact. Put two lines in `.env`
+and everything else — `make up`, `make migrate`, `make seed-admin` — works
+unchanged, because `docker compose` reads `COMPOSE_FILE` from there and
+`compose exec` finds containers by project name, not by file list.
+
+```dotenv
+COMPOSE_FILE=compose.yaml:compose.prod.yaml
+DDNS_IMAGE=ghcr.io/brendanbank/atrium-ddns:v0.1.3
+```
+
+```bash
+make up          # pulls; never builds
+make migrate     # both alembic chains, atrium's then this repo's
+```
+
+Pin a version rather than `latest`, so what runs is a decision and not
+whatever was pushed most recently. `compose.prod.yaml` removes the `build:`
+section outright — while it is there, one `--build` compiles the working
+directory and runs it under the tag you asked for.
+
+To upgrade, change `DDNS_IMAGE` and `make up` again; `pull_policy: always`
+means a moved tag is fetched rather than assumed.
+
+Verify what is actually running — the tag is a string, the label is not:
+
+```bash
+docker inspect <container> \
+  --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
+```
+
+The health endpoints are `/api/healthz` and `/api/readyz`. **Not** `/healthz`
+or `/readyz`: the UI is served from the same origin with a catch-all, so any
+unmatched path returns 200 and an HTML page. A monitor pointed at the wrong
+one passes forever.
+
 ## Layout
 
 ```

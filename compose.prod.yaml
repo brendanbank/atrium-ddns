@@ -1,0 +1,28 @@
+# Run the published image instead of building one.
+#
+#   docker compose -f compose.yaml -f compose.prod.yaml up -d
+#
+# The base file builds from this worktree and carries `pull_policy: never`,
+# which is right for development — two worktrees building concurrently must
+# not race for one tag. On a production host there is no worktree to build
+# from and no reason to compile at all: the image that CI built, tested and
+# published is the artefact, and building a second one locally produces a
+# different image with the same name.
+#
+# `build: !reset null` removes the section outright rather than leaving it
+# unused. While it is present, `docker compose up --build` (or a missing
+# image with nothing to pull) will quietly compile whatever is in the
+# directory and run that under the tag you asked for. Requires Compose
+# v2.24 or newer for the `!reset` tag.
+services:
+  api:
+    build: !reset null
+    image: ${DDNS_IMAGE:?set DDNS_IMAGE, e.g. ghcr.io/brendanbank/atrium-ddns:v0.1.3}
+    # `always`, not `missing`: a tag is a moving pointer, and the point of
+    # pinning one is to be told when the thing behind it changed rather than
+    # to keep running whatever was pulled first.
+    pull_policy: always
+
+  worker:
+    image: ${DDNS_IMAGE:?set DDNS_IMAGE, e.g. ghcr.io/brendanbank/atrium-ddns:v0.1.3}
+    pull_policy: always
