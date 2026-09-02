@@ -1871,6 +1871,11 @@ def test_the_readers_of_the_swept_columns_are_a_named_population() -> None:
     mechanisms: dict[str, tuple[str, str] | None] = {
         # The whole file, through its own tenant fixture — #149.
         "test_router_board.py": ("tenants", "installation_wide_sweep"),
+        # A successful publish drops the DNS reading it invalidated, and
+        # `test_a_good_publish_drops_the_dns_reading_it_just_invalidated`
+        # asserts the columns came back NULL — so this file joined the
+        # population and its tenant fixture took the lock.
+        "test_router_hostname_backends.py": ("world", "installation_wide_sweep"),
         # This module's `config` is an alias for `conftest.ddns_config`,
         # which holds DDNS_CONFIG_LOCK for the length of the test. All
         # 19 of its health-check and prune tests already took it before

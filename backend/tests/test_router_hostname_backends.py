@@ -58,6 +58,7 @@ from __future__ import annotations
 import ast
 import base64
 import contextlib
+import datetime as dt
 import os
 import pathlib
 from typing import Any, AsyncIterator
@@ -121,8 +122,16 @@ REVISION_0004 = (
 
 
 @pytest_asyncio.fixture
-async def world() -> AsyncIterator[dict[str, Any]]:
+async def world(installation_wide_sweep: None) -> AsyncIterator[dict[str, Any]]:
     """Two tenants. A has a zone with **three** backends and a device.
+
+    **Why this takes `installation_wide_sweep` — #149.** Since a successful
+    publish clears `dns_ip_*` and `dns_checked_at`, a test here asserts they
+    came back NULL. Those are four of the columns the one forced cross-tenant
+    health-check sweep rewrites, from another xdist worker, so a row this
+    fixture owns can be stamped between the publish and the assertion. The
+    lock is held for the length of the test because the race is with a reader
+    as much as a writer.
 
     Three rather than one because every interesting property of this
     feature needs a subset to exist: "explicit selection wins" cannot be
@@ -1103,6 +1112,56 @@ async def test_a_manual_update_normalises_the_address_it_was_given(
             "a v6 manual update wrote last_ip_v4. One column moves, chosen by "
             "the record type — the mirror the frozen table asserts for the wire."
         )
+
+
+async def test_a_good_publish_drops_the_dns_reading_it_just_invalidated(
+    world: dict[str, Any],
+):
+    """A successful publish must not leave the board marking a divergence.
+
+    The board reads `published` (what we sent) against `answered` (what DNS
+    told us) and marks the row when they differ. Writing the zone makes the
+    previous answer describe a state that no longer exists, so a publish that
+    *worked* used to paint the divergence marker and "Current IP in zone: <the
+    old address>" against its own stale reading, until someone pressed Check
+    now.
+
+    `None`, not the address published: the answered station means "what DNS
+    told us", and writing our own intent there would report a confirmation
+    nothing gave. A null `dns_checked_at` is stale by the health check's own
+    clause, so the reading is replaced on the next tick.
+    """
+    a = world["a"]
+    async with get_session_factory()() as s:
+        row = await s.get(m.Hostname, a["hostname_id"])
+        row.dns_ip_v4 = "203.0.113.9"
+        row.dns_checked_at = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        row.dns_check_error = "NXDOMAIN"
+        await s.commit()
+
+    async with _client(a["user"]) as client:
+        body = (
+            await client.post(
+                _update_url(a["hostname_id"]), json={"ip": "203.0.113.55"}
+            )
+        ).json()
+    assert body["status"] == "good", body
+
+    async with get_session_factory()() as s:
+        row = await s.get(m.Hostname, a["hostname_id"])
+        await s.refresh(row)
+        assert row.last_ip_v4 == "203.0.113.55"
+        assert row.dns_ip_v4 is None, (
+            "a successful publish kept the previous DNS answer, so the board "
+            "compares the new address against the zone's old one and marks a "
+            "divergence on a publish that worked."
+        )
+        assert row.dns_checked_at is None, (
+            "the reading was cleared but its timestamp was not, so the row is "
+            "not stale and nothing re-resolves it."
+        )
+        assert row.dns_check_error is None
+        assert row.dns_ip_v6 is None, "the other family must be untouched"
 
 
 async def test_a_manual_update_moves_the_clock_only_on_good(world: dict[str, Any]):

@@ -1041,6 +1041,30 @@ async def persist_updates(
             row.last_ip_v6 = ip
         if result.status == STATUS_GOOD:
             row.last_updated_at = moment
+            # We just rewrote the zone, so the last DNS observation describes
+            # a state that no longer exists. Leaving it in place makes the
+            # board compare the address we published against the address the
+            # zone held *before* we published it, and mark a divergence on a
+            # publish that succeeded — the red marker and "Current IP in zone"
+            # both firing on our own stale reading, until someone presses
+            # Check now.
+            #
+            # Cleared rather than set to `ip`. The answered station means "what
+            # DNS told us", and writing our own intent into it would have the
+            # board report a confirmation nothing ever gave. `None` says we do
+            # not currently know, which is true for the moment between writing
+            # a record and resolving it.
+            #
+            # `dns_checked_at = None` counts as stale in the health check's
+            # staleness clause, so the row becomes due and the observation is
+            # replaced on the next tick rather than at the next scheduled
+            # interval.
+            if rtype == RTYPE_A:
+                row.dns_ip_v4 = None
+            else:
+                row.dns_ip_v6 = None
+            row.dns_checked_at = None
+            row.dns_check_error = None
         elif not already:
             # A reconciliation, not a publish. Logged so the record does not
             # silently acquire an address nothing in the log accounts for.
