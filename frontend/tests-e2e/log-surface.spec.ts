@@ -236,7 +236,11 @@ test.describe('the log surface renders', () => {
     await expect(dialog.getByTestId('log-detail-Called from')).toHaveText(
       NAT_ADDRESS_V4,
     );
-    await expect(dialog.getByTestId('log-detail-Name')).toHaveText(
+    // `log-detail-<label>`: the testid is derived from the field's own
+    // label, so renaming the label to `Hostname` moved it. That coupling
+    // is why this spec caught the rename rather than silently passing on
+    // a field that had quietly become something else.
+    await expect(dialog.getByTestId('log-detail-Hostname')).toHaveText(
       seeded.nochgName,
     );
 
