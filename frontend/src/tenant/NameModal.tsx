@@ -83,15 +83,19 @@
  */
 import { useState } from 'react';
 import {
+  ActionIcon,
   Alert,
   Button,
+  CopyButton,
   Group,
   Modal,
   Select,
   Stack,
   Text,
   TextInput,
+  Tooltip,
 } from '@mantine/core';
+import { IconCheck, IconCopy } from '@tabler/icons-react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import {
@@ -100,6 +104,7 @@ import {
   createHostname,
   deleteHostname,
   hostnamesQuery,
+  adoptZone,
   manualUpdate,
   publishingQuery,
   publishingQueryKey,
@@ -144,7 +149,7 @@ export function NameModal({
     <Modal
       opened={opened}
       onClose={onClose}
-      title={nameId === null ? 'Register a name' : 'Name'}
+      title={nameId === null ? 'Register a hostname' : 'Hostname'}
       size={640}
       {...CARD_MODAL_PROPS}
       styles={CARD_MODAL_STYLES}
@@ -285,6 +290,17 @@ function NameModalBody({
     },
     onError: fail,
   });
+  const adopt = useMutation({
+    mutationFn: () => adoptZone(nameId as number),
+    onSuccess: (r) => {
+      setError(null);
+      const now = r.adopted_v6 ?? r.adopted_v4 ?? '—';
+      const was = r.previous_v6 ?? r.previous_v4 ?? 'nothing';
+      setResult(`adopted ${now} — was ${was}. Nothing was published.`);
+      invalidate();
+    },
+    onError: fail,
+  });
   const remove = useMutation({
     mutationFn: () => deleteHostname(nameId as number),
     onSuccess: () => {
@@ -395,7 +411,7 @@ function NameModalBody({
           at the provider. The consequence is stated below instead. */}
       {/* Name first, then zone — the order the value reads in. The
           trailing `.zone` echo is gone: it repeated the select sitting
-          next to it, and the `will send:` line below already shows the
+          next to it, and the `hostname:` line below already shows the
           composed result, which is the thing that actually leaves the
           browser. */}
       <Group gap="sm" align="flex-end" wrap="nowrap">
@@ -416,9 +432,31 @@ function NameModalBody({
         />
       </Group>
       {willSend === '' ? null : (
-        <Text size="xs" c="dimmed">
-          will send: <code data-testid="hostname-will-send">{willSend}</code>
-        </Text>
+        <Group gap={6} align="center" wrap="nowrap">
+          <Text>
+            hostname: <span data-testid="hostname-will-send">{willSend}</span>
+          </Text>
+          {/* Copies the composed name and nothing else — not the label, not
+            the zone select's value. It is the string a router is configured
+            with, so it is the one thing on this form worth carrying to
+            another window. */}
+          <CopyButton value={willSend} timeout={2000}>
+            {({ copied, copy }) => (
+              <Tooltip label={copied ? 'Copied' : 'Copy the hostname'} withArrow>
+                <ActionIcon
+                  variant="subtle"
+                  size="sm"
+                  color={copied ? 'teal' : 'gray'}
+                  onClick={copy}
+                  aria-label="Copy the hostname"
+                  data-testid="copy-hostname"
+                >
+                  {copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
+                </ActionIcon>
+              </Tooltip>
+            )}
+          </CopyButton>
+        </Group>
       )}
       {/* Only when there is something to orphan. The note was
           unconditional, so it fired on a name that had never published —
@@ -556,6 +594,22 @@ function NameModalBody({
               >
                 Publish now
               </Button>
+              {/* Only when the zone disagrees. Publishing the zone's own
+                value answers `nochg`, and `nochg` writes no `last_ip_*` by
+                frozen rule — so without this there is no way to clear a
+                divergence at all, and the row stays accented for ever. It
+                calls no provider and spends no rate-limit slot. */}
+              {publishing.data?.zone_differs ? (
+                <Button
+                  size="xs"
+                  variant="default"
+                  disabled={locked}
+                  onClick={() => adopt.mutate()}
+                  data-testid="adopt-zone"
+                >
+                  Adopt {publishing.data.zone_differs}
+                </Button>
+              ) : null}
             </Group>
             {result ? (
               <Text size="xs" ff="monospace" data-testid="publish-result">

@@ -157,6 +157,9 @@ export interface HostnameBackendChoice {
 }
 
 export interface HostnamePublishing {
+  /** What the zone carries, when it differs from what we last published.
+   *  `null` when they agree or the zone has not been read. */
+  zone_differs: string | null;
   hostname_id: number;
   name: string;
   domain_id: number;
@@ -249,5 +252,28 @@ export async function manualUpdate(
     `/atrium_ddns/hostnames/${id}/update`,
     'POST',
     { ip },
+  );
+}
+
+/** What the zone already carries, recorded as ours — see `adopt_zone`.
+ *
+ * Publishes nothing. It exists because *Publish now* cannot clear a
+ * divergence: republishing the zone's own value is a `nochg`, and `nochg`
+ * writes no `last_ip_*` by frozen rule, so the row stays marked for ever.
+ */
+export interface AdoptZoneResult {
+  hostname_id: number;
+  name: string;
+  adopted_v4: string | null;
+  adopted_v6: string | null;
+  previous_v4: string | null;
+  previous_v6: string | null;
+}
+
+export async function adoptZone(id: number): Promise<AdoptZoneResult> {
+  return apiSend<AdoptZoneResult>(
+    `/atrium_ddns/hostnames/${id}/adopt-zone`,
+    'POST',
+    {},
   );
 }
