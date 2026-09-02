@@ -475,7 +475,21 @@ release:  ## cut an official release: make release VERSION=0.2.0
 	@# `pyproject.toml` is what the package reports.
 	@if [ -z "$(VERSION)" ]; then 		echo "usage: make release VERSION=0.2.0"; 		echo; 		echo "  current: $$(sed -n 's/^version = \"\(.*\)\"/\1/p' backend/pyproject.toml | head -n1)"; 		echo "  no leading v — the tag gets one, the file does not."; 		exit 2; 	fi
 	@case "$(VERSION)" in v*) echo "drop the leading v: make release VERSION=$${VERSION#v}"; exit 2 ;; esac
-	@test -z "$$(git status --porcelain)" || { echo "working tree is dirty"; exit 2; }
+	@# Tracked changes refuse; untracked only warn. An untracked file cannot
+	@# reach the tag, so it cannot change what is released — but it *can* be a
+	@# source file nobody added, which would be missing from the image without
+	@# anything saying so. Named rather than ignored, and rather than blocking
+	@# on `.claude/` and friends.
+	@git diff --quiet && git diff --cached --quiet || { \
+		echo "uncommitted tracked changes — commit or stash them first:"; \
+		git status --porcelain | grep -v '^??' | sed 's/^/  /'; \
+		exit 2; \
+	}
+	@u=$$(git ls-files -o --exclude-standard | wc -l | tr -d ' '); \
+	 if [ "$$u" != "0" ]; then \
+		echo "  note: $$u untracked file(s), which will NOT be in v$(VERSION):"; \
+		git ls-files -o --exclude-standard | head -5 | sed 's/^/    /'; \
+	 fi
 	@cur=$$(sed -n 's/^version = "\(.*\)"/\1/p' backend/pyproject.toml | head -n1); 	 sed -i '' "0,/^version = \"$$cur\"$$/s//version = \"$(VERSION)\"/" backend/pyproject.toml; 	 grep -q "^version = \"$(VERSION)\"$$" backend/pyproject.toml || { echo "the version did not change"; exit 1; }; 	 echo "  $$cur -> $(VERSION)"
 	@git add backend/pyproject.toml
 	@git commit -q -m "Release v$(VERSION)"
