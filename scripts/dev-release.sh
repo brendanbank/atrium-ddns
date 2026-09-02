@@ -59,11 +59,27 @@ if [ ! -f "$CI_FILE" ]; then
   echo "refusing: $CI_FILE is missing — cannot prove CI will not fire." >&2
   exit 1
 fi
-if grep -qE '^\s*tags:' "$CI_FILE"; then
-  echo "refusing: $CI_FILE has a tag trigger, so tagging would start a run." >&2
-  echo "  Either drop it, or exclude dev tags explicitly, then re-run." >&2
-  exit 1
-fi
+
+# EVERY workflow, not just ci.yml. This guard used to name one file, three
+# lines under a comment warning that a guard trusting its own copy of the
+# policy stops matching the day the policy moves. The policy moved:
+# `release.yml` arrived with `tags: ['v*']`, which matches `v0.1.0-dev.*`,
+# and this check looked straight past it because it was not ci.yml.
+#
+# A dev tag reaching that workflow builds a two-architecture image and cuts a
+# public GitHub Release for code explicitly declared not ready. Ask the file
+# that decides, not a remembered name.
+for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
+  [ -f "$wf" ] || continue
+  # The tag list must exclude dev tags. Anchored patterns are fine; a bare
+  # `v*` or `*` is not.
+  if awk '/^ *tags:/{f=1} f&&/v\*|"\*"|'"'"'\*'"'"'/{print; exit}' "$wf" | grep -q .; then
+    echo "refusing: $wf has a tag trigger matching dev tags." >&2
+    echo "  It would fire on ${TAG:-this tag}, which is the one thing this" >&2
+    echo "  script exists to avoid. Narrow the pattern, then re-run." >&2
+    exit 1
+  fi
+done
 # EVERY branch list the workflow reacts to must be exactly `[master]`.
 #
 # Note the quantifier. An earlier version asked whether *any* line said
