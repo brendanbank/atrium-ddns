@@ -174,3 +174,13 @@ deploy_key*
 *.bundle
 .gate-venv/
 .test-venv/
+
+# Agent worktrees. `.claude/worktrees/` holds one checkout per agent run and
+# reached 63 entries here, which is what made `make release` refuse — its
+# dirty-tree guard counted untracked files. The guard was fixed to refuse only
+# tracked changes, but the noise had no reason to exist either.
+#
+# Blanket, not `.claude/worktrees/`: nothing under `.claude/` is tracked today.
+# If this repo ever wants to share `.claude/settings.json` or an agent
+# definition, `git add -f` it, or add a `!.claude/settings.json` negation.
+.claude/
