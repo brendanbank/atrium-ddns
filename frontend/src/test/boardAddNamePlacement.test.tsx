@@ -224,7 +224,11 @@ describe('the instruments themselves', () => {
     // return `undefined` and every `expect(...).toBe('max-content')`
     // fails loudly — but the *rule* checks below would pass on ''.
     expect(CSS.length).toBeGreaterThan(2000);
-    expect(boardColumns()).toHaveLength(11);
+    // Eight since "Called from", "Updates / N d" and "Answered" were removed.
+    // The first two became tooltips; the answered address surfaces on
+    // Published only when it disagrees, which is the only time it said
+    // anything Published did not.
+    expect(boardColumns()).toHaveLength(8);
     expect(rowChildRule()).not.toBe('');
   });
 

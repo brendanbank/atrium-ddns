@@ -36,6 +36,7 @@ import {
 import { IconListSearch, IconPlus } from "@tabler/icons-react";
 
 import type { Board, BoardDevice, BoardHostname, Strip } from "../api/board";
+import { DdnsPortalScope } from "../host/DdnsRoot";
 import { LogLink } from "../LogSearchPage";
 import { absoluteTitle, formatAge } from "./format";
 import { boardNameHref, boardNameNewHref } from "../paths";
@@ -112,16 +113,6 @@ function divergenceReason(strip: Strip | null): string | null {
     return "This device is reporting a different address than this name carries — the device moved and the name has not followed.";
   }
   return null;
-}
-
-function answeredText(strip: Strip | null): string {
-  if (strip === null) return "nothing published";
-  const { address, status } = strip.answered;
-  if (address) return address;
-  // The status vocabulary verbatim — `missing`, `never_checked`,
-  // `lookup_failed` are different facts and collapsing them to a dash
-  // is the "four states in one type" mistake §4.2 is written against.
-  return status.replace(/_/g, " ");
 }
 
 /** True when every strip on the board has never been checked — and there
@@ -294,7 +285,7 @@ export function BoardTable({
           data-testid="board-filter-device"
         />
         <Select
-          label="Name"
+          label="Hostname"
           placeholder="any name"
           data={nameOptions}
           value={filters.name}
@@ -340,20 +331,15 @@ export function BoardTable({
         <div className="ddns-boardtable__head">
           <span className="ddns-th" />
           <span className="ddns-th">Device</span>
-          <span className="ddns-th">Name</span>
+          <span className="ddns-th">Hostname</span>
           <span className="ddns-th">Family</span>
-          <span className="ddns-th">Answered</span>
           <span className="ddns-th">Published</span>
-          <span className="ddns-th">Called from</span>
           <span className="ddns-th">Checked</span>
           {/* The device half of §0's question — "which of my devices
             stopped talking" — which the first flat draft dropped. A
             board that answers only the name half answers half the
             question it exists for. */}
           <span className="ddns-th">Last seen</span>
-          <span className="ddns-th" data-testid="board-updates-head">
-            Updates / {board.window_days} d
-          </span>
           <span className="ddns-th" />
         </div>
         {rows.length === 0 ? (
@@ -434,7 +420,7 @@ export function BoardTable({
                 {row.device ? (
                   <button
                     type="button"
-                    className="ddns-data ddns-boardtable__device"
+                    className="ddns-cell ddns-boardtable__device"
                     onClick={() => onOpenDevice(row.device!.id)}
                     data-testid={`board-open-${row.device.name}`}
                   >
@@ -493,7 +479,7 @@ export function BoardTable({
                    ellipsis, which is what that rule was written to do.
                    With a wrapper in between, the rule applied to the
                    wrapper and the anchor overflowed it intact. */
-                <a className="ddns-data" href={boardNameHref(row.hostname.id)}>
+                <a className="ddns-cell" href={boardNameHref(row.hostname.id)}>
                   {row.hostname.name}
                 </a>
               ) : (
@@ -522,19 +508,85 @@ export function BoardTable({
                 </Group>
               )}
               <span className="ddns-cell">{row.strip?.family ?? "—"}</span>
-              <span className="ddns-cell">{answeredText(row.strip)}</span>
-              <span className="ddns-cell">
-                {row.strip?.published.address ?? "—"}
-              </span>
-              <span className="ddns-cell">
-                {row.strip?.called_from.address ?? "—"}
-              </span>
-              <span
-                className="ddns-cell"
-                title={absoluteTitle(row.strip?.answered.checked_at ?? null)}
-              >
-                {formatAge(row.strip?.answered.checked_at ?? null)}
-              </span>
+              {/* Published carries two facts, each only when it has one.
+              
+                `called_from` is null for a name never updated, so "Called from —"
+                would cost a movement and hand back a dash.
+              
+                The divergence line is the one that matters: when DNS answers
+                something other than what we last published, the zone carries a
+                value this service did not put there. Same condition the row accent
+                marks, said in full — and it names the ANSWERED address, because
+                that is what actually resolves right now. */}
+              {(() => {
+                const answered = row.strip?.answered.address ?? null;
+                const published = row.strip?.published.address ?? null;
+                const calledFrom = row.strip?.called_from.address ?? null;
+                const diverged =
+                  answered !== null && published !== null && answered !== published;
+                const cell = <span className="ddns-cell">{published ?? "—"}</span>;
+                if (!calledFrom && !diverged) return cell;
+                return (
+                  <Tooltip
+                    label={
+                      <DdnsPortalScope>
+                        <span className="ddns-tip">
+                          {/* Called from first — it is the ordinary fact. The zone-file line
+                            is the exception, and an exception reads better after the thing it
+                            is an exception to. Both are blocks, and the JSX carries no text
+                            nodes between them: with `white-space: pre-line` the newlines in
+                            this source became a blank line in the rendered tooltip. */}
+                          {calledFrom ? (
+                            <span className="ddns-tip__line">Called from {calledFrom}</span>
+                          ) : null}
+                          {diverged ? (
+                            <span className="ddns-tip__alert">
+                              Current IP in zone: {answered}
+                            </span>
+                          ) : null}
+                        </span>
+                      </DdnsPortalScope>
+                    }
+                    withArrow
+                    multiline
+                  >
+                    {cell}
+                  </Tooltip>
+                );
+              })()}
+              {/* No device, no tooltip. "Updates / 7 d: —" is a sentence whose
+                only content is that it does not apply — the same reason the
+                Called-from hover is suppressed when there is no address. */}
+              {row.device ? (
+                <Tooltip
+                  label={
+                    <DdnsPortalScope>
+                      <span className="ddns-tip">
+                        {/* Both readings on one surface. The absolute time was already
+                          here as a `title`; a second hover mechanism on the same cell
+                          would have been two things to discover. */}
+                        {/* Just the updates. The absolute timestamp used to be
+                          here — it was the cell's `title` before this became a
+                          tooltip — but the cell already shows the age in words
+                          beside it, so the exact instant was a second spelling
+                          of a thing the reader had just read. */}
+                        Updates / {board.window_days} d:{" "}
+                        {row.device ? row.device.updates_display : "—"}
+                      </span>
+                    </DdnsPortalScope>
+                  }
+                  withArrow
+                  multiline
+                >
+                  <span className="ddns-cell">
+                    {formatAge(row.strip?.answered.checked_at ?? null)}
+                  </span>
+                </Tooltip>
+              ) : (
+                <span className="ddns-cell">
+                  {formatAge(row.strip?.answered.checked_at ?? null)}
+                </span>
+              )}
               <span
                 className="ddns-cell"
                 title={absoluteTitle(row.device?.last_seen_at ?? null)}
@@ -543,18 +595,6 @@ export function BoardTable({
                 }
               >
                 {row.device ? formatAge(row.device.last_seen_at) : "—"}
-              </span>
-              <span
-                className="ddns-cell"
-                data-testid={
-                  row.device ? `device-${row.device.name}-updates` : undefined
-                }
-              >
-                {/* `updates_display` and not a computed count: a device that
-                  has never called and one that called zero times in the
-                  window are different facts, and the server is the only
-                  thing that knows which. */}
-                {row.device ? row.device.updates_display : "—"}
               </span>
               {row.hostname ? (
                 <Tooltip label="Show this name in the log" withArrow>

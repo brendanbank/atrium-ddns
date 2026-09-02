@@ -941,6 +941,40 @@
 
 /* A value in a column. Not a label — it names nothing — so it takes no
    `; ` marker. */
+/* Tooltip content on the board. Same face and size as `.ddns-cell`, which
+   is what the Answered column's address is rendered in — a tooltip that
+   carries an address should not render it in a different font from the
+   column beside it.
+
+   Scoped like everything else. That is only possible because the labels are
+   wrapped in `DdnsPortalScope`: Mantine portals a tooltip outside
+   `[data-ddns-root]`, and both the selector and the `--ddns-font-*`
+   variables are on that attribute, so without the wrapper this would match
+   nothing and silently inherit the page font. */
+/* The divergence line inside a tooltip. Same red the row accent uses, so
+   "this row is marked" and "here is why" are one colour rather than two —
+   the marker and the sentence explaining it should not disagree about how
+   alarming the thing is. Block, so it owns its line when a second clause
+   follows it. */
+[data-ddns-root] .ddns-tip__line {
+  display: block;
+}
+
+[data-ddns-root] .ddns-tip__alert {
+  /* A literal, not `--ddns-diverge`. That variable is tuned for the row
+     accent against the board's own background; a Mantine tooltip is dark in
+     both colour schemes, and the accent read as muted orange on it. This is
+     the same alarm said at the volume the surface needs. */
+  color: #ff6b6b;
+  font-weight: 700;
+  display: block;
+}
+
+[data-ddns-root] .ddns-tip {
+  font-family: var(--ddns-font-body);
+  font-size: var(--mantine-font-size-md);
+}
+
 [data-ddns-root] .ddns-cell {
   font-family: var(--ddns-font-body);
   font-size: var(--mantine-font-size-md);
@@ -1375,12 +1409,15 @@
    ==================================================================== */
 [data-ddns-root] .ddns-boardtable {
   display: grid;
-  /* mark | device | name | family | answered | published | called from |
-     checked | log. The name takes the slack; everything else is sized
-     to what it holds. */
+  /* mark | device | name | family | published | checked | last seen | log.
+     Eight, matching the eight header cells. "Called from", "Updates / N d"
+     and "Answered" were removed — the first two live in tooltips now, and
+     the answered address surfaces in the Published tooltip when it differs
+     from what we published, which is the only time it says anything the
+     Published column does not. The name takes the slack. */
   grid-template-columns:
     1.25rem max-content minmax(12rem, 1fr) max-content max-content
-    max-content max-content max-content max-content max-content max-content;
+    max-content max-content max-content;
   column-gap: var(--mantine-spacing-md);
   align-items: center;
 }
@@ -1427,6 +1464,17 @@
 [data-ddns-root] .ddns-boardtable__mark {
   color: var(--ddns-diverge);
   font-weight: 700;
+  /* The glyph is one character in a 1.25rem column, so the hoverable area
+     was about as wide as the `!` itself — you had to hit it, and the only
+     explanation of why the row is accented was behind that. Filling the
+     grid cell makes the whole column hoverable without moving anything:
+     the box grows, the glyph stays centred where it was. */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  align-self: stretch;
+  min-height: 1.5rem;
+  cursor: help;
 }
 
 /* The device name is a button that has to sit in a text row. */

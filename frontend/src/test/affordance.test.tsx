@@ -145,7 +145,9 @@ describe('the zones list — §16, row 2', () => {
     expect(name.tagName).toBe('A');
     expect(name).toHaveAttribute('href', zoneHrefParam(ZONE_ROW.id));
 
-    // …and it is still `.ddns-data`. This is the fix that was
+    // …and it carries `.ddns-cell` — the board's own face. It was
+    // `.ddns-data` (monospace) until the columns were trimmed and the
+    // row was made one face throughout. This is the fix that was
     // explicitly ruled out — dropping the class to get Mantine's link
     // colour back — because it would break §2.3 on the most important
     // string on the page.
@@ -203,7 +205,7 @@ describe('the board — §16, row 1: it was not a link at all', () => {
     // A `<span>` here passes every CSS guard in `design.test.ts` and is
     // still not reachable by keyboard, by screen reader, or by a click.
     expect(name.tagName).toBe('BUTTON');
-    expect(name.className.split(/\s+/)).toContain('ddns-data');
+    expect(name.className.split(/\s+/)).toContain('ddns-cell');
   });
 
   test('the row has one control, and it is the name', async () => {

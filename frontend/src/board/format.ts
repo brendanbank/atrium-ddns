@@ -186,6 +186,33 @@ export function absoluteTitle(iso: string | null): string {
   return iso ?? 'never';
 }
 
+/** The same instant, for a surface that *displays* it rather than offers
+ *  it to be copied.
+ *
+ * `absoluteTitle` deliberately hands back the API's own string, so it can
+ * be pasted into a log search and match. That is the right answer in a
+ * `title=` and the wrong one in a tooltip a person is reading:
+ * `2026-09-02T07:38:26.322297Z` is a machine's spelling.
+ *
+ * UTC, and labelled as such. Rendering it in the browser's zone would be
+ * friendlier and would stop it agreeing with the log, which is the one
+ * place you would go next.
+ */
+export function absoluteDisplay(iso: string | null): string {
+  if (iso === null) return 'never';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const months = [
+    'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+  ];
+  return (
+    `${d.getUTCDate()} ${months[d.getUTCMonth()]} ${d.getUTCFullYear()}, ` +
+    `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} UTC`
+  );
+}
+
 /** The rate limit, as a sentence that says which of three states it is.
  *
  * #73. `rate_limit_per_minute` is `null` (*inherit*), `0` (*may never

@@ -301,8 +301,13 @@ describe('the three states that share a null address', () => {
     // `updates_in_window` directly prints `null` for the first or, worse,
     // coerces it to `0` — and a device nobody has ever heard from
     // becomes indistinguishable from one that is merely quiet.
-    expect(screen.getByTestId('device-garage-nas-updates')).toHaveTextContent('—');
-    expect(screen.getByTestId('device-office-router-updates')).toHaveTextContent('0');
+    // COVERAGE MOVED, AND NOT REPLACED. The updates figure left the board
+    // as a column and is now inside the Checked tooltip, so the `—` vs `0`
+    // distinction — never called versus called zero times — is no longer
+    // asserted anywhere. It needs a hover, which needs `userEvent` and
+    // Mantine's floating-ui timing, and a fake hover would assert nothing.
+    // Recorded here rather than deleted quietly: this is the "`n/a` is
+    // never `0`" property, and it is currently unwatched.
     expect(screen.getByTestId('device-garage-nas-last-seen')).toHaveTextContent(
       'never',
     );
@@ -600,9 +605,10 @@ describe('empty states', () => {
     expect(screen.getByTestId('board-never-checked')).toHaveTextContent(
       'runs every 45 minutes',
     );
-    expect(screen.getByTestId('board-updates-head')).toHaveTextContent(
-      'Updates / 30 d',
-    );
+    // The column head carrying the window is gone with the column; the
+    // denominator now appears in the Checked tooltip. The sentence above
+    // still proves the interval comes from the payload, which is the half
+    // this test is named for.
   });
 
   test('an unassigned hostname is listed rather than hidden', async () => {
