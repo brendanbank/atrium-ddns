@@ -62,7 +62,13 @@ jobs:
       statuses: read
       actions: read
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # NOT GITHUB_TOKEN. A merge performed with it is a push that triggers
+      # no workflow — GitHub suppresses those to stop a workflow feeding
+      # itself. auto-release.yml watches pushes to master, so merging with
+      # GITHUB_TOKEN meant the bump landed and the chain stopped dead, with
+      # every run green and nothing released. auto-release.yml's own header
+      # states this rule for its tag push; it applies one step earlier too.
+      GH_TOKEN: ${{ secrets.ATRIUM_BUMP_TOKEN }}
       REPO: ${{ github.repository }}
       HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
       CI_SHA: ${{ github.event.workflow_run.head_sha }}
@@ -80,6 +86,13 @@ jobs:
       - name: Merge if every check on the head commit passed
         run: |
           set -euo pipefail
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::ATRIUM_BUMP_TOKEN is not set. Merging with the"
+            echo "::error::default token produces a push that triggers no"
+            echo "::error::workflow, so auto-release would never run."
+            exit 1
+          fi
 
           # Branch names reach us from an event payload; pin the shape
           # before using one in a query, and decide from the shape alone who
