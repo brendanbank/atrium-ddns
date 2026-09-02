@@ -73,6 +73,10 @@ updates:
         applies-to: security-updates
         patterns: ["*"]
 
+  # Dependabot has no "run now" API. Editing THIS FILE on the default branch
+  # is what forces a re-check off-schedule — that, or the "Check for updates"
+  # button on the repo's Dependabot graph page. Worth knowing before waiting a
+  # week to find out whether the auto-release chain works.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
