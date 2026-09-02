@@ -1105,14 +1105,14 @@ async def test_a_manual_update_normalises_the_address_it_was_given(
         )
 
 
-async def test_a_manual_update_moves_last_ip_only_on_good(world: dict[str, Any]):
+async def test_a_manual_update_moves_the_clock_only_on_good(world: dict[str, Any]):
     """The persistence rule, unchanged and not re-implemented.
 
-    With only the `nochg` backend selected the aggregate is `nochg`, and
-    `nochg` leaves `last_ip_*` and `last_updated_at` untouched — the
-    same rule `update-nochg-single-backend` freezes for the wire, held
-    here because the endpoint calls `persist_updates` rather than
-    writing its own.
+    With only the `nochg` backend selected the aggregate is `nochg`. Since
+    freeze v4 that records `last_ip_*` and still leaves `last_updated_at`
+    alone — the same split `update-nochg-single-backend` freezes for the
+    wire, held here because the endpoint calls `persist_updates` rather
+    than writing its own.
     """
     a = world["a"]
     async with _client(a["user"]) as client:
@@ -1129,12 +1129,15 @@ async def test_a_manual_update_moves_last_ip_only_on_good(world: dict[str, Any])
     async with get_session_factory()() as s:
         row = await s.get(m.Hostname, a["hostname_id"])
         await s.refresh(row)
-    assert row.last_ip_v4 is None, (
-        "a `nochg` aggregate moved last_ip_v4. This column is a record of the "
-        "last *change*, and a manual update must not be the one thing that "
-        "makes it a liveness signal."
+    # Freeze v4: `nochg` records the confirmed address. Two sources agreed
+    # that the zone carries it — the caller asserted it and DNS answered it
+    # — and keeping `None` would be a record contradicting an observation.
+    assert row.last_ip_v4 == PUBLISHED
+    assert row.last_updated_at is None, (
+        "a `nochg` aggregate moved last_updated_at. That column is a record "
+        "of the last *change*, and a manual update must not be the one thing "
+        "that makes it a liveness signal. v4 changed the address, not this."
     )
-    assert row.last_updated_at is None
 
 
 async def test_a_manual_update_is_logged_as_manual_update_not_as_update(

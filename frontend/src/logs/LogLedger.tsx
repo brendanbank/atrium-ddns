@@ -254,7 +254,7 @@ export function LogLedger({ page, onFilter, onOpen }: LogLedgerProps) {
       <div className="ddns-logs__head" data-testid="log-head">
         <span className="ddns-th">When</span>
         <span className="ddns-th">Device</span>
-        <span className="ddns-th">Name</span>
+        <span className="ddns-th">Hostname</span>
         <span className="ddns-th">Event</span>
         <span className="ddns-th">Result</span>
         <span className="ddns-th">Via</span>

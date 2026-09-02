@@ -486,9 +486,11 @@ describe('deleting a device is the card’s job, not the board row’s — #155'
     expect(
       within(row).getByTestId('board-log-host-a.example.net'),
     ).toBeInTheDocument();
-    expect(
-      within(row).getByTestId('device-home-router-updates'),
-    ).toHaveTextContent('213');
+    // The updates figure moved into the Checked tooltip, so it is no longer
+    // a cell to find here. The positive half of this test — that the row is
+    // intact rather than blank, which is what stops the negative assertion
+    // below passing on a broken render — still rests on the device button,
+    // the name link, the `+` and the log link above.
 
     // --- the negative half, twice, differently shaped ---
     // 1. by what the control *is*, rather than by what it was called.

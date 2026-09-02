@@ -235,7 +235,7 @@ export function LogFilters({
           w={190}
         />
         <Select
-          label="Name"
+          label="Hostname"
           placeholder="any name"
           data={options(hostnames)}
           value={query.hostname_id || null}

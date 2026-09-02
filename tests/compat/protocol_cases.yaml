@@ -10,6 +10,34 @@
 # the case carries a `divergence` tag. See README.md.
 
 # ---------------------------------------------------------------------------
+# FROZEN at version 4. 2026-09-02.
+# Previously: version 3, issue #29, at 131 cases.
+#
+# v4 changes NO case's wire response and NO case's identity. It amends the
+# `persist:` effect of exactly two:
+#
+#   update-nochg-single-backend        last_ip_v4: unchanged -> "203.0.113.10"
+#   update-nochg-single-backend-ipv6   last_ip_v6: unchanged -> "2001:db8:113::20"
+#
+# Why, and it is a deliberate divergence from `dyndns-route53`:
+#
+# A `nochg` is produced by `check_hostnameon_server` — the device asserted
+# an address and DNS was queried and already answers it. At that moment the
+# service knows what the zone carries, from two sources that did not consult
+# each other, and legacy threw that knowledge away.
+#
+# Leaving `last_ip_*` alone is not neutral, because nothing else can repair
+# it. The obvious fix — publish the correct address — is the request that
+# produces `nochg`, so the wire path could never converge: a name whose zone
+# moved on independently stayed wrong for ever, and the board's divergence
+# accent stopped meaning anything.
+#
+# `last_updated_at` is NOT changed by v4. It still moves on `good` alone, so
+# it remains a record of the last *change* rather than of the last call —
+# the property `tracked-ip-moves-only-on-good-so-last-updated-at-is-not-a-
+# liveness-signal` exists to protect.
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # FROZEN at version 3. Issue #29, 2026-08-15, in V1M2.
 # Previously: version 2, issue #11, closing V1M1, at 114 cases.
 #
@@ -54,28 +82,28 @@
 # not trip it, and changing a single expected byte does. It is a freeze on the
 # data, which is what a runner iterates.
 # ---------------------------------------------------------------------------
-version: 3
+version: 4
 
 frozen:
   issue: 29
   date: 2026-08-15
   milestone: V1M2
-  version: 3
+  version: 4
   cases: 131
   deleted_cases: 11
   spec_rows: 37
-  content_digest: 2add2f37f3b5a41e82bd247353d633c99cdd00b2509de283f1d4ea748d93b83f
+  content_digest: 3d06d86f21bff0a5aa6df135bd70a395bf06039ced2d252b093808f14cc325b5
   # The freeze this one supersedes, as DATA so a test can read it. v3 adds 17
   # cases for address-family coverage and changes none of the 114: checked case
   # by case on the parsed lists, 0 removed and 0 modified. See baseline.md §7.
   previous:
-    issue: 11
-    milestone: V1M1
-    version: 2
-    cases: 114
+    issue: 29
+    milestone: V1M2
+    version: 3
+    cases: 131
     deleted_cases: 11
     spec_rows: 37
-    content_digest: d46d789a71fa20d0d493670be0b6c6843f5e326541aff833715ff40467569bda
+    content_digest: 2add2f37f3b5a41e82bd247353d633c99cdd00b2509de283f1d4ea748d93b83f
   # What the frozen table is known NOT to cover. Recorded here rather than in
   # prose somewhere, because a frozen table that overstates its own coverage is
   # worse than one that is honestly narrow.
@@ -910,7 +938,7 @@ cases:
     query: {hostname: nochg.example.com, myip: 203.0.113.10}
     covers: [update/backend-status, update/aggregate-nochg]
     effects:
-      persist: {hostname: nochg.example.com, last_ip_v4: unchanged, last_updated_at: unchanged}
+      persist: {hostname: nochg.example.com, last_ip_v4: "203.0.113.10", last_updated_at: unchanged}
     expect:
       body: "nochg 203.0.113.10"
 
@@ -924,7 +952,7 @@ cases:
     query: {hostname: nochg.example.com, myip: "2001:db8:113::20"}
     covers: [update/backend-status, update/aggregate-nochg]
     effects:
-      persist: {hostname: nochg.example.com, last_ip_v6: unchanged, last_updated_at: unchanged}
+      persist: {hostname: nochg.example.com, last_ip_v6: "2001:db8:113::20", last_updated_at: unchanged}
     expect:
       body: "nochg 2001:db8:113::20"
 

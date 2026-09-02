@@ -74,7 +74,11 @@ from sqlalchemy.sql import Select
 from app.auth.rbac import require_perm
 from app.auth.users import current_user
 from app.db import get_session
-from app.host_sdk.crypto import apply_secret_update, unlock_user_secrets
+from app.host_sdk.crypto import (
+    SecretDecryptError,
+    apply_secret_update,
+    unlock_user_secrets,
+)
 from app.models.auth import User
 
 # atrium's own audit table, read (never written) directly by the
@@ -132,6 +136,7 @@ from .providers.base import zone_contains
 from .router_nic import (
     EVENT_AUTH,
     EVENT_DELETE,
+    EVENT_ADOPT_ZONE,
     EVENT_MANUAL_UPDATE,
     EVENT_UPDATE,
     STATUS_911,
@@ -2422,7 +2427,35 @@ async def _apply_credentials(
     comparing raw ciphertext bytes.
     """
     if isinstance(incoming, dict):
-        await unlock_user_secrets(session, backend.user_id, create=True)
+        try:
+            await unlock_user_secrets(session, backend.user_id, create=True)
+        except SecretDecryptError as exc:
+            # `create=True` does not help here: the row exists, it simply
+            # cannot be read. So the obvious recovery — "re-enter the
+            # credentials" — is itself blocked by the thing it would fix,
+            # and the operator is left with a 500 on the one screen that
+            # could have got them out.
+            #
+            # Say so, and say what actually clears it. Deleting the key row
+            # is destructive and is therefore named rather than done: every
+            # value encrypted under it becomes unreadable, though by this
+            # point they already are.
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "This user's secret key cannot be decrypted, so no "
+                    "credential can be stored or read. It was written under "
+                    "a different SECRET_ENCRYPTION_KEY than this "
+                    "installation has — usually a database copied from "
+                    "another environment without its key. Re-entering the "
+                    "credentials cannot fix it, because storing them needs "
+                    "the same key. Either restore the original "
+                    "SECRET_ENCRYPTION_KEY, or delete this user's row from "
+                    "`user_secret_keys` — which discards every secret "
+                    f"encrypted under it, all of which are already "
+                    f"unreadable. ({exc})"
+                ),
+            ) from exc
     touched = apply_secret_update(backend, "credentials", incoming)
     if touched:
         flag_dirty(backend)
@@ -3553,6 +3586,12 @@ class HostnameBackendChoiceOut(BaseModel):
 
 
 class HostnamePublishingOut(BaseModel):
+    #: What the zone carries, when it differs from what we last published.
+    #: `null` when they agree, when the zone has never been read, or when
+    #: there is nothing published to disagree with — three states that all
+    #: mean "no adoption is on offer", and are distinguished in the log
+    #: rather than here.
+    zone_differs: str | None = None
     """The whole publishing configuration of one name."""
 
     hostname_id: int
@@ -3630,6 +3669,19 @@ class ManualUpdateIn(BaseModel):
     ip: str = Field(min_length=1, max_length=IPV6_LEN)
 
 
+class AdoptZoneOut(BaseModel):
+    hostname_id: int
+    name: str
+    #: What this service now records as published, i.e. what the zone was
+    #: already carrying. `null` for a family the zone has nothing for.
+    adopted_v4: str | None
+    adopted_v6: str | None
+    #: What it recorded before, kept so the caller can show the move. The
+    #: log row carries the same pair.
+    previous_v4: str | None
+    previous_v6: str | None
+
+
 class ManualUpdateOut(BaseModel):
     hostname_id: int
     name: str
@@ -3668,7 +3720,17 @@ def _publishing_out(hostname: Hostname, domain: Domain) -> HostnamePublishingOut
     """Render the configuration. Both relationships must be loaded."""
     selected_ids = {backend.id for backend in hostname.selected_backends}
     resolved = resolve_backends(hostname)
+    # Only when there is something to adopt: the zone has been read, and
+    # what it carries is not what we recorded writing.
+    zone_differs = None
+    if hostname.dns_checked_at is not None and (
+        (hostname.dns_ip_v4, hostname.dns_ip_v6)
+        != (hostname.last_ip_v4, hostname.last_ip_v6)
+    ):
+        zone_differs = hostname.dns_ip_v6 or hostname.dns_ip_v4
+
     return HostnamePublishingOut(
+        zone_differs=zone_differs,
         hostname_id=hostname.id,
         name=hostname.name,
         domain_id=domain.id,
@@ -3865,6 +3927,115 @@ async def set_hostname_publishing(
     return _publishing_out(hostname, domain)
 
 
+@router.post(
+    "/hostnames/{hostname_id}/adopt-zone", response_model=AdoptZoneOut
+)
+async def adopt_zone(
+    hostname_id: int,
+    user: User = Depends(require_perm(HOSTNAME_MANAGE_PERMISSION)),
+    scope: DdnsScope = Depends(get_scope),
+    session: AsyncSession = Depends(get_session),
+) -> AdoptZoneOut:
+    """Record what the zone already carries, without publishing anything.
+
+    **The gap this closes.** ``last_ip_*`` is what this service last wrote
+    and ``dns_ip_*`` is what the health check last read back. When they
+    disagree the row is accented, and the ordinary repair — *Publish now*
+    with the zone's own value — cannot clear it: the provider correctly
+    answers ``nochg``, and ``persist_updates`` writes ``last_ip_*`` **on
+    ``good`` only**, which the frozen table asserts
+    (``update-nochg-single-backend``). So a name whose zone moved on
+    independently stays marked for ever, and the mark stops meaning
+    anything.
+
+    That is not a defect in the ``nochg`` rule. It is a missing verb: the
+    operator needs to say *the zone is right, adopt it*, and there was no
+    way to say it.
+
+    **It publishes nothing.** No provider is called, no rate-limit slot is
+    spent, and the event is ``adopt_zone`` rather than ``update`` — a row
+    claiming a write that never happened would cost the log the one thing
+    it is for. The previous values go in ``message`` so the move is
+    recoverable from the log alone.
+
+    Refusals:
+
+    * **404** — no such hostname, or not yours.
+    * **409 when the zone has never been read.** ``dns_checked_at`` null
+      means there is nothing to adopt *yet*, which is a different state
+      from a zone that agrees, and collapsing them would let a click
+      silently write nulls over a good record.
+    * **409 when they already agree.** Nothing to do, and a 200 here
+      would report an adoption that changed nothing.
+    """
+    hostname, domain = await _load_publishing(session, scope, hostname_id)
+
+    if hostname.dns_checked_at is None:
+        raise _conflict(
+            f"{hostname.name} has not been checked yet, so there is nothing "
+            "to adopt. The health check reads the zone and records what it "
+            "found; until it has run once, this service has no reading to "
+            "take over."
+        )
+
+    previous_v4, previous_v6 = hostname.last_ip_v4, hostname.last_ip_v6
+    if (hostname.dns_ip_v4, hostname.dns_ip_v6) == (previous_v4, previous_v6):
+        raise _conflict(
+            f"{hostname.name} already records what the zone carries. There "
+            "is nothing to adopt."
+        )
+
+    hostname.last_ip_v4 = hostname.dns_ip_v4
+    hostname.last_ip_v6 = hostname.dns_ip_v6
+
+    owner_email = (
+        await session.execute(select(User.email).where(User.id == domain.user_id))
+    ).scalar_one_or_none()
+    device = (
+        await scope.get(session, Device, hostname.device_id)
+        if hostname.device_id is not None
+        else None
+    )
+    record_event(
+        session,
+        event_type=EVENT_ADOPT_ZONE,
+        response_code=None,
+        auth=DeviceAuth(
+            device=device, user_id=domain.user_id, user_email=owner_email or ""
+        )
+        if device is not None
+        else None,
+        ip=hostname.dns_ip_v6 or hostname.dns_ip_v4,
+        message=(
+            f"adopted the zone's addresses for {hostname.name}; "
+            f"was v4={previous_v4!r} v6={previous_v6!r}, "
+            f"now v4={hostname.dns_ip_v4!r} v6={hostname.dns_ip_v6!r}"
+        ),
+    )
+    await record_audit(
+        session,
+        actor_user_id=user.id,
+        entity="ddns_hostname",
+        entity_id=hostname.id,
+        action="adopt_zone",
+        # Both readings, so "who decided the zone was right" is answerable
+        # from the audit log without joining the ddns log to it.
+        diff={
+            "last_ip_v4": [previous_v4, hostname.dns_ip_v4],
+            "last_ip_v6": [previous_v6, hostname.dns_ip_v6],
+        },
+    )
+    await session.commit()
+    return AdoptZoneOut(
+        hostname_id=hostname.id,
+        name=hostname.name,
+        adopted_v4=hostname.dns_ip_v4,
+        adopted_v6=hostname.dns_ip_v6,
+        previous_v4=previous_v4,
+        previous_v6=previous_v6,
+    )
+
+
 @router.post("/hostnames/{hostname_id}/update", response_model=ManualUpdateOut)
 async def manual_update(
     hostname_id: int,
@@ -4007,7 +4178,38 @@ async def manual_update(
             headers={"Retry-After": "60"},
         )
 
-    plans = await load_plans(session, auth, [hostname.name])
+    try:
+        plans = await load_plans(session, auth, [hostname.name])
+    except SecretDecryptError as exc:
+        # The provider credential exists and cannot be read. That is a
+        # configuration fault, not a server fault, and the difference is
+        # the whole value of this branch: `500 Internal Server Error` sent
+        # an operator to the application logs to discover something the
+        # application already knew and could have said.
+        #
+        # The canonical way to reach it is a database copied between
+        # installations — the ciphertext travels, `SECRET_ENCRYPTION_KEY`
+        # does not, and every provider call then fails at the same point
+        # with the same opaque 500.
+        #
+        # 503, not 500: the request is well-formed and the service cannot
+        # perform it *right now*, which is what a wrong key is. The
+        # exception's own text names the purpose and the owner; it is
+        # passed through rather than summarised, because a key mismatch
+        # and a corrupt row read identically from the outside and only
+        # that string distinguishes them.
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "This zone's provider credentials cannot be decrypted, so "
+                "nothing can be published. They were encrypted with a "
+                "different SECRET_ENCRYPTION_KEY than this installation is "
+                "configured with — the usual cause is a database copied "
+                "from another environment without its key. Re-enter the "
+                "credentials on the zone, or restore the key they were "
+                f"written under. ({exc})"
+            ),
+        ) from exc
     results = await anyio.to_thread.run_sync(
         functools.partial(run_dns_phase, plans, op="update", ip=ip, rtype=rtype)
     )
@@ -4142,7 +4344,19 @@ BACKEND_TYPE_NONE = "__none__"
 #: rather than on the one that shipped an unfilterable row. That is the
 #: rule working; the count is not the point, the writer is.
 EVENT_TYPES: tuple[str, ...] = tuple(
-    sorted({EVENT_UPDATE, EVENT_DELETE, EVENT_AUTH, EVENT_MANUAL_UPDATE})
+    sorted(
+        {
+            EVENT_UPDATE,
+            EVENT_DELETE,
+            EVENT_AUTH,
+            EVENT_MANUAL_UPDATE,
+            # Five now. `adopt_zone` records taking over what the zone
+            # already carried — no provider call, no publish. The
+            # derivation test failed on the commit that added the constant,
+            # which is again the rule working rather than the count.
+            EVENT_ADOPT_ZONE,
+        }
+    )
 )
 
 #: Every ``response_code`` the wire can carry, from the two modules that
