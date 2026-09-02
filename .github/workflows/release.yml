@@ -47,7 +47,7 @@ jobs:
     name: Multi-arch image + GitHub Release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
           fetch-depth: 0
@@ -80,6 +80,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # org.opencontainers.image.created must be the moment of the build.
+      # There is no context value for it — github.event.repository.updated_at
+      # is when the repo record last changed, which is not the same thing and
+      # is wrong in a way nobody would notice.
+      - name: Build timestamp
+        id: stamp
+        run: echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
@@ -92,6 +100,17 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:${{ (github.event.inputs.tag || github.ref_name) }}
             ${{ env.IMAGE }}:latest
+          # Conventional OCI keys, so an image can be asked what it is rather
+          # than inferred from the tag it happens to be pulled by. `.revision`
+          # is the one that matters: a tag can be moved, a commit sha cannot.
+          labels: |
+            org.opencontainers.image.title=atrium-ddns
+            org.opencontainers.image.description=DynDNS host extension for atrium
+            org.opencontainers.image.version=${{ (github.event.inputs.tag || github.ref_name) }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.created=${{ steps.stamp.outputs.created }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -110,6 +129,44 @@ jobs:
           case "$got" in
             *linux/arm64*) ;; *) echo "arm64 missing"; exit 1 ;;
           esac
+
+      # Same reasoning as the arch check above: a label that failed to apply
+      # pushes just as successfully as one that did, and the whole point of
+      # these is to be trusted later by someone holding only the image.
+      # Checked on every platform in the manifest, because labels are per
+      # image config and a two-arch build writes two of them.
+      - name: The labels are actually on the image
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          docker buildx imagetools inspect "$IMAGE:$tag" --format '{{json .Image}}' \
+            > /tmp/img.json
+          python3 - "$tag" "${{ github.sha }}" <<'EOF'
+          import json, sys
+
+          want_version, want_revision = sys.argv[1], sys.argv[2]
+          images = json.load(open("/tmp/img.json"))
+          # Single-platform builds return one config, not a map keyed by
+          # platform. Normalise so this cannot pass by iterating nothing.
+          if "config" in images:
+              images = {"(single)": images}
+          if not images:
+              sys.exit("no image configs in the manifest")
+
+          failed = False
+          for platform, image in images.items():
+              labels = (image.get("config") or {}).get("Labels") or {}
+              version = labels.get("org.opencontainers.image.version")
+              revision = labels.get("org.opencontainers.image.revision")
+              print(f"{platform}: version={version} revision={revision}")
+              if version != want_version:
+                  print(f"  ERROR: version is {version!r}, tag is {want_version!r}")
+                  failed = True
+              if revision != want_revision:
+                  print(f"  ERROR: revision is {revision!r}, sha is {want_revision!r}")
+                  failed = True
+          sys.exit(1 if failed else 0)
+          EOF
 
       - name: GitHub Release
         env:

@@ -66,7 +66,7 @@ jobs:
         working-directory: frontend
 
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@v7
 
       - uses: pnpm/action-setup@v6
         with:
@@ -117,7 +117,7 @@ jobs:
     # is not run here could not name the thing it was declining to run.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@v7
 
       # setup-python is new to this workflow, so it goes in at the current
       # major (v7.0.0). checkout stays at the pin the rest of the file uses;
@@ -139,7 +139,7 @@ jobs:
     # chain mismatch) the frontend job won't see.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@v7
 
       - name: Prepare smoke .env
         run: |
@@ -256,7 +256,7 @@ jobs:
     # a compatibility check to sit.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@v7
 
       # Same shape as `smoke`'s, and a copy for the same stated reason: these
       # jobs raise differently configured stacks, and one shared file would
@@ -352,7 +352,7 @@ jobs:
 
       - name: Upload the wire-table log
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7
         with:
           name: compat-run-log
           path: ${{ runner.temp }}/compat-run.log
@@ -382,7 +382,7 @@ jobs:
     # stack configuration.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@v7
 
       - uses: pnpm/action-setup@v6
         with:
@@ -438,7 +438,7 @@ jobs:
         # v7.0.1 is the current major (checked against the releases page,
         # not remembered): actions/upload-artifact v6 and older are on an
         # older runtime.
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-report
           path: |

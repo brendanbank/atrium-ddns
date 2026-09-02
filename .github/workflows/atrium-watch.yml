@@ -54,7 +54,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@v7
         with:
           # The PAT, not GITHUB_TOKEN. A branch pushed and a PR opened with
           # GITHUB_TOKEN do not trigger `pull_request` workflows, so CI would

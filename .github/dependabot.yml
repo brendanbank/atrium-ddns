@@ -76,12 +76,11 @@ updates:
         applies-to: security-updates
         patterns: ["*"]
 
-  # Every action here is pinned at a MAJOR tag (@v7, @v3). Dependabot can only
-  # propose a new major against that style — a patch like v7.0.0 -> v7.0.1 is
-  # invisible to it. So the two groups below that carry minor and patch cannot
-  # fire, and the only actions PR this repo will ever see is the major group,
-  # which auto-merge.yml deliberately holds for a human. Pinning to full patch
-  # versions would change that; it has not been decided yet.
+  # Every action is pinned at a MAJOR tag (@v7, @v4), deliberately. Dependabot
+  # only proposes a new major against that style — v7.0.0 -> v7.0.1 is
+  # invisible to it — but GitHub resolves a moving major tag to the newest
+  # release within it at run time, so patches arrive without a PR. The cost is
+  # that a patch is not recorded anywhere; the benefit is no weekly PR for one.
   #
   # The gate that merges these PRs must not use GITHUB_TOKEN: a merge made with
 # it is a push that triggers no workflow, so auto-release.yml never sees the
