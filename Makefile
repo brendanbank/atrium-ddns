@@ -490,7 +490,7 @@ release:  ## cut an official release: make release VERSION=0.2.0
 		echo "  note: $$u untracked file(s), which will NOT be in v$(VERSION):"; \
 		git ls-files -o --exclude-standard | head -5 | sed 's/^/    /'; \
 	 fi
-	@cur=$$(sed -n 's/^version = "\(.*\)"/\1/p' backend/pyproject.toml | head -n1); 	 sed -i '' "0,/^version = \"$$cur\"$$/s//version = \"$(VERSION)\"/" backend/pyproject.toml; 	 grep -q "^version = \"$(VERSION)\"$$" backend/pyproject.toml || { echo "the version did not change"; exit 1; }; 	 echo "  $$cur -> $(VERSION)"
+	@python3 scripts/bump_version.py "$(VERSION)"
 	@git add backend/pyproject.toml
 	@git commit -q -m "Release v$(VERSION)"
 	@git tag -a "v$(VERSION)" -m "v$(VERSION)"
