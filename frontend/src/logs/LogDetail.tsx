@@ -60,7 +60,7 @@ export function LogDetail({
               <Field label="Result" value={row.response_code} />
               <Field label="Via" value={row.backend_type} />
               <Field label="Device" value={row.device_name} />
-              <Field label="Name" value={row.hostname} />
+              <Field label="Hostname" value={row.hostname} />
               <Field label="Zone" value={row.domain_name} />
               <Field label="User" value={row.user_email} />
               <Field label="Called from" value={row.client_ip} />
