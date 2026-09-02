@@ -472,37 +472,70 @@ async def purge_tenants(
             # worker owns its database, and delete nine other workers' rows
             # on the shared MySQL. That is the #117 / #149 failure exactly,
             # reintroduced by a cleanup written to fix it.
-            await s.execute(
-                sa.text(
-                    "DELETE FROM ddns_hostname_backend WHERE hostname_id IN ("
-                    "  SELECT id FROM ddns_hostname WHERE device_id IN ("
-                    "    SELECT id FROM ddns_device WHERE user_id IN :ids)"
-                    "  OR domain_id IN (SELECT id FROM ddns_domain WHERE user_id IN :ids))"
-                ).bindparams(sa.bindparam("ids", expanding=True)),
-                {"ids": user_ids},
+            #
+            # The ids are resolved by SELECT first, and the deletes take a
+            # plain literal list. They used to carry the lookup as a subquery
+            # — `DELETE FROM ddns_rate_limit_event WHERE device_id IN (SELECT
+            # id FROM ddns_device WHERE user_id IN ...)` — and under InnoDB's
+            # REPEATABLE READ a subquery inside a DML statement takes shared
+            # next-key locks on every row it reads. So each delete locked
+            # `ddns_device` for read and then a child table for write, while
+            # the last two deletes in this same sequence lock `ddns_device`
+            # for write. Two workers tearing down different tenants at once
+            # took those in opposite orders and one of them was chosen as the
+            # deadlock victim: error 1213, on a teardown, naming a table the
+            # test never mentions. Reproduced 1 run in 5 locally at -n 10.
+            #
+            # Resolving first means every statement takes X locks on one
+            # table and holds no read locks across the sequence.
+            _ids = sa.bindparam("ids", expanding=True)
+
+            async def _scalars(sql: str, ids: list[int]) -> list[int]:
+                if not ids:
+                    return []
+                return list(
+                    (
+                        await s.execute(sa.text(sql).bindparams(_ids), {"ids": ids})
+                    ).scalars()
+                )
+
+            async def _delete(table: str, column: str, ids: list[int]) -> None:
+                # An empty IN () is a syntax error on MySQL, and a delete with
+                # nothing to match still scans. Skip it.
+                if not ids:
+                    return
+                await s.execute(
+                    sa.text(f"DELETE FROM {table} WHERE {column} IN :ids").bindparams(
+                        _ids
+                    ),
+                    {"ids": ids},
+                )
+
+            device_ids = await _scalars(
+                "SELECT id FROM ddns_device WHERE user_id IN :ids", user_ids
             )
-            await s.execute(
-                sa.text(
-                    "DELETE FROM ddns_hostname WHERE device_id IN ("
-                    "  SELECT id FROM ddns_device WHERE user_id IN :ids)"
-                    " OR domain_id IN (SELECT id FROM ddns_domain WHERE user_id IN :ids)"
-                ).bindparams(sa.bindparam("ids", expanding=True)),
-                {"ids": user_ids},
+            domain_ids = await _scalars(
+                "SELECT id FROM ddns_domain WHERE user_id IN :ids", user_ids
             )
-            await s.execute(
-                sa.text(
-                    "DELETE FROM ddns_domain_backend WHERE domain_id IN ("
-                    "  SELECT id FROM ddns_domain WHERE user_id IN :ids)"
-                ).bindparams(sa.bindparam("ids", expanding=True)),
-                {"ids": user_ids},
+            hostname_ids = sorted(
+                set(
+                    await _scalars(
+                        "SELECT id FROM ddns_hostname WHERE device_id IN :ids",
+                        device_ids,
+                    )
+                )
+                | set(
+                    await _scalars(
+                        "SELECT id FROM ddns_hostname WHERE domain_id IN :ids",
+                        domain_ids,
+                    )
+                )
             )
-            await s.execute(
-                sa.text(
-                    "DELETE FROM ddns_rate_limit_event WHERE device_id IN ("
-                    "  SELECT id FROM ddns_device WHERE user_id IN :ids)"
-                ).bindparams(sa.bindparam("ids", expanding=True)),
-                {"ids": user_ids},
-            )
+
+            await _delete("ddns_hostname_backend", "hostname_id", hostname_ids)
+            await _delete("ddns_hostname", "id", hostname_ids)
+            await _delete("ddns_domain_backend", "domain_id", domain_ids)
+            await _delete("ddns_rate_limit_event", "device_id", device_ids)
             # atrium's audit rows too. `audit_log.actor_user_id` is a real
             # FK on the migrated schema, so MySQL cascades them away with the
             # user; `create_all` has no constraint, the rows survive, and the
@@ -513,16 +546,11 @@ async def purge_tenants(
                 sa.text(
                     "DELETE FROM audit_log WHERE actor_user_id IN :ids"
                     " OR impersonator_user_id IN :ids"
-                ).bindparams(sa.bindparam("ids", expanding=True)),
+                ).bindparams(_ids),
                 {"ids": user_ids},
             )
-            for _t in ("ddns_domain", "ddns_device"):
-                await s.execute(
-                    sa.text(f"DELETE FROM {_t} WHERE user_id IN :ids").bindparams(
-                        sa.bindparam("ids", expanding=True)
-                    ),
-                    {"ids": user_ids},
-                )
+            await _delete("ddns_domain", "id", domain_ids)
+            await _delete("ddns_device", "id", device_ids)
             await s.execute(
                 sa.text(
                     "DELETE FROM user_secret_keys WHERE user_id IN :ids"
