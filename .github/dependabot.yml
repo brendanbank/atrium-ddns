@@ -73,6 +73,13 @@ updates:
         applies-to: security-updates
         patterns: ["*"]
 
+  # Every action here is pinned at a MAJOR tag (@v7, @v3). Dependabot can only
+  # propose a new major against that style — a patch like v7.0.0 -> v7.0.1 is
+  # invisible to it. So the two groups below that carry minor and patch cannot
+  # fire, and the only actions PR this repo will ever see is the major group,
+  # which auto-merge.yml deliberately holds for a human. Pinning to full patch
+  # versions would change that; it has not been decided yet.
+  #
   # Dependabot has no "run now" API. Editing THIS FILE on the default branch
   # is what forces a re-check off-schedule — that, or the "Check for updates"
   # button on the repo's Dependabot graph page. Worth knowing before waiting a

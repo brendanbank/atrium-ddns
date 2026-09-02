@@ -41,7 +41,7 @@ jobs:
     name: Bump the patch and tag it
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0
           token: ${{ secrets.ATRIUM_BUMP_TOKEN }}
