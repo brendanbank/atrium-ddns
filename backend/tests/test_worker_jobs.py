@@ -109,6 +109,8 @@ from datetime import datetime, timedelta
 from typing import Any, Iterator
 
 import dns.exception
+import dns.rcode
+import dns.rdatatype
 import dns.resolver
 import pytest
 import pytest_asyncio
@@ -2149,3 +2151,181 @@ def test_device_status_is_frozen_so_a_renderer_cannot_patch_the_state():
     with pytest.raises(Exception):
         status.updates_in_window = 0  # type: ignore[misc]
     assert status.render_updates() == "—"
+
+
+# ===================================================================== #
+# The authoritative walk                                                #
+# ===================================================================== #
+#
+# The health check used to read `/etc/resolv.conf` — in a container, a
+# recursive cache. The board's column says *Current IP in zone*, which is a
+# claim about the authoritative server, and inside one TTL the two disagree:
+# two publishes re-checked 28 and 40 seconds later against a 60-second TTL
+# came back `mismatch: 2` from cache, on publishes that had succeeded.
+#
+# Nothing below opens a socket. `authoritative_nameserver` takes its query
+# function and its system resolver as arguments for exactly that reason.
+
+
+class _FakeName:
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    def to_text(self) -> str:
+        return self._text
+
+
+class _FakeRecord:
+    def __init__(self, rdtype: Any, target: str = "") -> None:
+        self.rdtype = rdtype
+        self.target = target
+
+
+class _FakeAnswer:
+    def __init__(self, address: str) -> None:
+        self.rrset = [_FakeName(address)]
+
+
+class _FakeResponse:
+    def __init__(self, rcode: Any, authority: list[Any], answer: list[Any]) -> None:
+        self._rcode = rcode
+        self.authority = authority
+        self.answer = answer
+
+    def rcode(self) -> Any:
+        return self._rcode
+
+
+class _FakeSystemResolver:
+    """Stands in for the resolver used to start the walk and map NS names."""
+
+    def __init__(self, nameservers: list[str], addresses: dict[str, str]) -> None:
+        self.nameservers = nameservers
+        self._addresses = addresses
+
+    async def resolve(self, name: Any) -> _FakeAnswer:
+        key = str(name)
+        if key not in self._addresses:
+            raise dns.resolver.NXDOMAIN(f"no address for {key}")
+        return _FakeAnswer(self._addresses[key])
+
+
+def _delegating_query(chain: dict[str, str]):
+    """A query that hands back an NS delegation per zone, then SOA."""
+    asked: list[str] = []
+
+    async def _send(message: Any, nameserver: str, timeout: float) -> _FakeResponse:
+        zone = str(message.question[0].name)
+        asked.append(f"{nameserver}->{zone}")
+        if zone in chain:
+            return _FakeResponse(
+                dns.rcode.NOERROR,
+                [[_FakeRecord(dns.rdatatype.NS, target=chain[zone])]],
+                [],
+            )
+        # No delegation below here: answer SOA, which stops the walk.
+        return _FakeResponse(dns.rcode.NOERROR, [[_FakeRecord(dns.rdatatype.SOA)]], [])
+
+    _send.asked = asked  # type: ignore[attr-defined]
+    return _send
+
+
+@pytest.mark.asyncio
+async def test_the_walk_returns_the_server_the_delegation_chain_ends_at() -> None:
+    """The address of the NS the parent last delegated to, not the cache."""
+    system = _FakeSystemResolver(
+        nameservers=["203.0.113.1"],
+        addresses={"ns.example.invalid.": "203.0.113.53"},
+    )
+    query = _delegating_query({"invalid.": "ns.example.invalid."})
+
+    got = await wj.authoritative_nameserver(
+        "name.zone.invalid", timeout=2.0, system=system, query=query
+    )
+    assert got == "203.0.113.53", (
+        "the walk returned something other than the address of the server the "
+        f"delegation ended at; it asked {query.asked}"  # type: ignore[attr-defined]
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_walk_refuses_rather_than_falling_back_to_a_cache() -> None:
+    """A walk that cannot finish raises. It must not answer from anywhere else.
+
+    This is the whole point of the change. A fallback would return an
+    address, and a cached address that disagrees with what we published is
+    indistinguishable from a zone that has really drifted — which is the
+    false MISMATCH this replaced.
+    """
+    system = _FakeSystemResolver(nameservers=["203.0.113.1"], addresses={})
+
+    async def _timeout(message: Any, nameserver: str, timeout: float) -> Any:
+        raise dns.exception.Timeout("no answer")
+
+    with pytest.raises(wj.AuthoritativeLookupError):
+        await wj.authoritative_nameserver(
+            "name.zone.invalid", timeout=2.0, system=system, query=_timeout
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_walk_is_recorded_as_error_not_as_a_mismatch() -> None:
+    """`could not measure` and `the zone is wrong` are different rows.
+
+    `_resolve_one` maps any exception to an error string and
+    `classify_record` maps that to ERROR. A walk failure reaching the tenant
+    as MISMATCH would accuse the zone of a fault in our own resolution.
+    """
+
+    async def _explodes(name: str, rdtype: str) -> list[str]:
+        raise wj.AuthoritativeLookupError("the parent would not answer")
+
+    addresses, error = await wj._resolve_one(_explodes, "n.invalid", "A")
+    assert addresses is None
+    assert error is not None and "AuthoritativeLookupError" in error
+
+    status, stored, _detail = wj.classify_record("203.0.113.7", addresses, error)
+    assert status is wj.DnsCheckStatus.ERROR, (
+        "a resolution failure was classified as something other than ERROR"
+    )
+    assert stored is None, "a failed measurement stored an address"
+
+
+@pytest.mark.asyncio
+async def test_the_delegation_is_walked_once_per_name_per_sweep() -> None:
+    """A and AAAA for one name share one walk; the cache does not outlive it."""
+    calls: list[str] = []
+
+    async def _walk(fqdn: str, **kwargs: Any) -> str:
+        calls.append(fqdn)
+        return "203.0.113.53"
+
+    class _Recording:
+        def __init__(self, *a: Any, **k: Any) -> None:
+            self.nameservers: list[str] = []
+            self.timeout = 0.0
+            self.lifetime = 0.0
+
+        async def resolve(self, name: str, rdtype: str) -> list[Any]:
+            return [_FakeRecord(rdtype)]
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(wj, "authoritative_nameserver", _walk)
+        mp.setattr(wj.dns.asyncresolver, "Resolver", _Recording)
+        resolve = wj.make_resolver(2.0)
+        for rdtype in ("A", "AAAA"):
+            with contextlib.suppress(AttributeError):
+                await resolve("name.zone.invalid", rdtype)
+    assert calls == ["name.zone.invalid"], (
+        f"the delegation was walked {len(calls)} times for one name: {calls}"
+    )
+
+    # A second resolver is a second sweep, and must walk again.
+    calls.clear()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(wj, "authoritative_nameserver", _walk)
+        mp.setattr(wj.dns.asyncresolver, "Resolver", _Recording)
+        resolve = wj.make_resolver(2.0)
+        with contextlib.suppress(AttributeError):
+            await resolve("name.zone.invalid", "A")
+    assert calls == ["name.zone.invalid"], "the cache outlived its sweep"
