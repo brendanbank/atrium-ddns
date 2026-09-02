@@ -86,11 +86,11 @@ jobs:
           # is allowed to have authored it.
           #
           # The Dependabot pattern is an allow-list of the group names in
-          # .github/dependabot.yml that carry minor, patch and security
-          # bumps. The `*-major-updates` groups are deliberately not on it:
-          # a major that typechecks and builds can still be wrong in ways no
-          # green tick catches, so those wait for a human. A branch that
-          # matches nothing here is not an error — the PR simply stays open.
+          # .github/dependabot.yml. Every version and security update rides
+          # one of them, majors included: a bump that breaks anything fails
+          # five checks, and a PR held for a review nobody has time for is
+          # staler, not safer. A branch that matches nothing here is not an
+          # error — the PR simply stays open.
           if printf '%s' "$HEAD_BRANCH" | grep -qE '^atrium-bump/[0-9]+\.[0-9]+\.[0-9]+$'; then
             EXPECTED_AUTHOR="$BUMP_AUTHOR"
           elif printf '%s' "$HEAD_BRANCH" | grep -qE '^dependabot/[^/]+(/[^/]+)*/(pip|npm|actions|docker)-(version|security)-updates(-[0-9a-zA-Z.]+)?$'; then

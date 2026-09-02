@@ -1,24 +1,37 @@
 version: 2
-# Each ecosystem declares three groups:
-#   - *-major-updates     (applies-to: version-updates, majors only)
-#   - *-version-updates   (applies-to: version-updates, minor + patch)
+# Each ecosystem declares two groups:
+#   - *-version-updates   (applies-to: version-updates, everything)
 #   - *-security-updates  (applies-to: security-updates)
 #
 # Without the explicit security-updates group, Dependabot opens one
 # PR per advisory even when the `groups` block is set for version
 # updates.
 #
-# Majors are split off into their own PR rather than riding along in the
-# ecosystem's weekly bump, because .github/workflows/auto-merge.yml merges
-# a green `*-version-updates` or `*-security-updates` PR unattended and
-# leaves `*-major-updates` for a human. The branch name is the only signal
-# that gate has, so the split is what makes "majors get read" enforceable
-# rather than aspirational. Renaming a group here silently takes its PRs
-# off auto-merge — the gate allow-lists these names.
+# There used to be a third, `*-major-updates`, so that majors got a separate
+# PR and a human. It did not work, and it took every minor and patch update
+# with it. A dependency is assigned to the first group whose `patterns`
+# match — `update-types` filters *afterwards*, it does not participate in the
+# assignment. With `patterns: ["*"]` on both, the major group claimed every
+# dependency in the ecosystem, then discarded anything that was not a major.
+# Dependabot says so plainly:
 #
-# A group only claims a dependency when both its patterns and its
-# update-types match, so the major group is listed first and the
-# catch-all below it deliberately does not list "major".
+#   Skipping actions/checkout in group actions-version-updates
+#   as it has already been handled by a previous group
+#   Nothing to update for Dependency Group: 'actions-version-updates'
+#
+# So from 515b245 until this commit, this repo received major PRs and nothing
+# else, and the silence looked like "everything is current".
+#
+# The tier is gone rather than repaired. Its premise was that a major needs a
+# human where a patch does not, but a bump that breaks anything fails five
+# checks including e2e, smoke and the compat wire table, and PRs held for a
+# review nobody has time for are not safer, only staler. The one real gap is
+# that release.yml is not exercised by CI, so an action bump that only that
+# workflow uses is unproven until a release runs — and that costs a tag with
+# no image, recoverable by re-running release.yml with its workflow_dispatch.
+#
+# Renaming a group here silently takes its PRs off auto-merge — the gate
+# allow-lists these names.
 #
 # Grouping is about the lockfile, not tidiness: several single-package PRs
 # against one pnpm-lock.yaml are several conflicting relocks of the same
@@ -32,14 +45,9 @@ updates:
     schedule:
       interval: "weekly"
     groups:
-      pip-major-updates:
-        applies-to: version-updates
-        patterns: ["*"]
-        update-types: ["major"]
       pip-version-updates:
         applies-to: version-updates
         patterns: ["*"]
-        update-types: ["minor", "patch"]
       pip-security-updates:
         applies-to: security-updates
         patterns: ["*"]
@@ -61,14 +69,9 @@ updates:
       - dependency-name: "@brendanbank/atrium-host-types"
       - dependency-name: "@brendanbank/atrium-test-utils"
     groups:
-      npm-major-updates:
-        applies-to: version-updates
-        patterns: ["*"]
-        update-types: ["major"]
       npm-version-updates:
         applies-to: version-updates
         patterns: ["*"]
-        update-types: ["minor", "patch"]
       npm-security-updates:
         applies-to: security-updates
         patterns: ["*"]
@@ -89,14 +92,9 @@ updates:
     schedule:
       interval: "weekly"
     groups:
-      actions-major-updates:
-        applies-to: version-updates
-        patterns: ["*"]
-        update-types: ["major"]
       actions-version-updates:
         applies-to: version-updates
         patterns: ["*"]
-        update-types: ["minor", "patch"]
       actions-security-updates:
         applies-to: security-updates
         patterns: ["*"]
@@ -112,14 +110,9 @@ updates:
       # Dockerfile-only bump would fail the bump script's own lockstep check.
       - dependency-name: "ghcr.io/brendanbank/atrium"
     groups:
-      docker-major-updates:
-        applies-to: version-updates
-        patterns: ["*"]
-        update-types: ["major"]
       docker-version-updates:
         applies-to: version-updates
         patterns: ["*"]
-        update-types: ["minor", "patch"]
       docker-security-updates:
         applies-to: security-updates
         patterns: ["*"]
