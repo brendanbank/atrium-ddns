@@ -465,6 +465,28 @@ $(TEST_VENV)/bin/python:  ## the unit lane's venv — atrium's deps, no containe
 	@$(TEST_VENV)/bin/pip install -q --disable-pip-version-check -r /tmp/.atrium-reqs
 	@echo "$(TEST_VENV) ready"
 
+release:  ## cut an official release: make release VERSION=0.2.0
+	@# Bumps `backend/pyproject.toml`, commits, tags and pushes. The tag is
+	@# what `.github/workflows/release.yml` watches; it builds the multi-arch
+	@# image and creates the GitHub Release.
+	@#
+	@# The version lives in exactly one file and the release workflow refuses
+	@# when the tag and that file disagree — a tag is a string somebody typed,
+	@# `pyproject.toml` is what the package reports.
+	@if [ -z "$(VERSION)" ]; then 		echo "usage: make release VERSION=0.2.0"; 		echo; 		echo "  current: $$(sed -n 's/^version = \"\(.*\)\"/\1/p' backend/pyproject.toml | head -n1)"; 		echo "  no leading v — the tag gets one, the file does not."; 		exit 2; 	fi
+	@case "$(VERSION)" in v*) echo "drop the leading v: make release VERSION=$${VERSION#v}"; exit 2 ;; esac
+	@test -z "$$(git status --porcelain)" || { echo "working tree is dirty"; exit 2; }
+	@cur=$$(sed -n 's/^version = "\(.*\)"/\1/p' backend/pyproject.toml | head -n1); 	 sed -i '' "0,/^version = \"$$cur\"$$/s//version = \"$(VERSION)\"/" backend/pyproject.toml; 	 grep -q "^version = \"$(VERSION)\"$$" backend/pyproject.toml || { echo "the version did not change"; exit 1; }; 	 echo "  $$cur -> $(VERSION)"
+	@git add backend/pyproject.toml
+	@git commit -q -m "Release v$(VERSION)"
+	@git tag -a "v$(VERSION)" -m "v$(VERSION)"
+	@echo
+	@echo "  committed and tagged v$(VERSION). Nothing is published until you push:"
+	@echo "    git push origin HEAD && git push origin v$(VERSION)"
+	@echo
+	@echo "  the tag push is what builds and publishes the image."
+
+
 test-unit: $(TEST_VENV)/bin/python  ## backend unit tests. SQLite, no docker, ~8s
 	@# No container, no MySQL, no migrations. `-m "not functional"` drops the
 	@# 71 tests that genuinely need infrastructure — a bindable port 53, a

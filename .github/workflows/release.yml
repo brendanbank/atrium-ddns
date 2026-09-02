@@ -1,0 +1,127 @@
+# Publish a multi-architecture image for a tagged release.
+#
+# Triggered by a `v*` tag. The tag is the decision; everything here is
+# mechanical.
+#
+# ## Two things this gets right that a default `docker build` does not
+#
+# **`target: runtime`, not the default.** `dev` is the LAST stage in the
+# Dockerfile, so a plain build produces it — and `dev` carries pytest,
+# pytest-xdist, httpx and the whole `tests/` compat tree. Publishing the
+# default would ship the test harness to production, and it would look
+# identical from the outside.
+#
+# **The version is checked against the source, not trusted from the tag.**
+# A tag is a string somebody typed. `backend/pyproject.toml` is what the
+# package actually reports. When they disagree the image would claim a
+# version the code does not, so this refuses instead.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build, e.g. v0.2.0. Must already exist.'
+        required: true
+
+permissions:
+  contents: write     # create the GitHub Release
+  packages: write     # push to ghcr.io
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  publish:
+    name: Multi-arch image + GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: The tag and the package must agree
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          tag_version="${tag#v}"
+          pkg_version="$(sed -n 's/^version = "\(.*\)"/\1/p' backend/pyproject.toml | head -n1)"
+          echo "tag        $tag_version"
+          echo "pyproject  $pkg_version"
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo
+            echo "The tag says $tag_version and backend/pyproject.toml says $pkg_version."
+            echo "The image would report a version the code does not. Bump the"
+            echo "version in pyproject.toml and re-tag, or tag the right commit."
+            exit 1
+          fi
+
+      # The base image is multi-arch (linux/amd64 + linux/arm64, verified
+      # 2026-09-02), so arm64 is a real build rather than emulated-and-hoped.
+      # QEMU is still needed for the frontend-builder stage's npm work.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime          # NOT the default; see the header
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: true
+          sbom: true
+          tags: |
+            ${{ env.IMAGE }}:${{ (github.event.inputs.tag || github.ref_name) }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Assert on the manifest, not on the push exiting 0. A single-arch
+      # image pushes just as successfully as a two-arch one.
+      - name: Both architectures are actually in the manifest
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          got="$(docker buildx imagetools inspect "$IMAGE:$tag" \
+                 | grep -oE 'linux/(amd64|arm64)' | sort -u | tr '\n' ' ')"
+          echo "platforms in the manifest: $got"
+          case "$got" in
+            *linux/amd64*) ;; *) echo "amd64 missing"; exit 1 ;;
+          esac
+          case "$got" in
+            *linux/arm64*) ;; *) echo "arm64 missing"; exit 1 ;;
+          esac
+
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          {
+            echo "**Image**"
+            echo
+            echo '```'
+            echo "docker pull $IMAGE:$tag"
+            echo '```'
+            echo
+            echo "\`linux/amd64\` and \`linux/arm64\`. Built from the \`runtime\`"
+            echo "stage — the \`dev\` stage, which carries pytest and the compat"
+            echo "suite, is deliberately not published."
+          } > /tmp/notes.md
+          gh release create "$tag" --title "$tag" --generate-notes \
+            --notes-file /tmp/notes.md

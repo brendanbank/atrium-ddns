@@ -1,0 +1,108 @@
+# A dependency bump that reaches master becomes a release.
+#
+# Dependabot and the atrium watcher both land as merged PRs on master. Each
+# changes what the image *contains* — a pinned base image, a Python or npm
+# dependency — so each deserves an image someone can pull. Without this they
+# accumulate silently and the published image drifts behind the branch.
+#
+# ## Why it tags rather than publishing
+#
+# The build lives in `release.yml`, triggered by the tag. Doing it here too
+# would be two places that know how to publish, and they would disagree
+# eventually. This decides *whether* to release; that decides *how*.
+#
+# ## Why the tag is pushed with a PAT
+#
+# A tag pushed with `GITHUB_TOKEN` does not trigger another workflow — by
+# design, to stop loops. So `release.yml` would never fire and the tag would
+# sit there looking like a release that produced nothing. `ATRIUM_BUMP_TOKEN`
+# is the same token the atrium watcher already uses to open its PR.
+#
+# ## What it will not do
+#
+# Release a hand-written commit. Only merges whose head branch is
+# `dependabot/*` or the atrium watcher's bump branch qualify. Ordinary work
+# is released deliberately, by tagging.
+name: Auto-release on a dependency bump
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Bump the patch and tag it
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.ATRIUM_BUMP_TOKEN }}
+
+      - name: Was this a bump?
+        id: why
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The merged PR's HEAD BRANCH, not the commit message. A message is
+          # prose someone can write by hand; the branch is what the bot
+          # actually pushed, and it is the thing that cannot be faked by
+          # accident.
+          head="$(gh pr list --state merged --limit 1 \
+                    --search "${{ github.sha }}" --json headRefName \
+                    --jq '.[0].headRefName // ""')"
+          echo "merged head branch: ${head:-<none>}"
+          case "$head" in
+            dependabot/*|atrium-bump/*|*atrium-bump*)
+              echo "release=yes" >> "$GITHUB_OUTPUT"
+              echo "reason=$head" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "release=no" >> "$GITHUB_OUTPUT"
+              echo "Not a bump — releases for ordinary work are made by tagging."
+              ;;
+          esac
+
+      - name: Bump the patch version
+        if: steps.why.outputs.release == 'yes'
+        id: bump
+        run: |
+          set -euo pipefail
+          cur="$(sed -n 's/^version = "\(.*\)"/\1/p' backend/pyproject.toml | head -n1)"
+          IFS=. read -r maj min pat <<< "$cur"
+          next="$maj.$min.$((pat + 1))"
+          echo "$cur -> $next"
+          # Anchored to the line, not a bare string replace: the file mentions
+          # other versions (the atrium pin among them) and a loose match would
+          # bump one of those instead, silently.
+          sed -i "0,/^version = \"$cur\"$/s//version = \"$next\"/" backend/pyproject.toml
+          grep -q "^version = \"$next\"$" backend/pyproject.toml
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and tag
+        if: steps.why.outputs.release == 'yes'
+        env:
+          NEXT: ${{ steps.bump.outputs.version }}
+          REASON: ${{ steps.why.outputs.reason }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/pyproject.toml
+          git commit -m "Release v$NEXT — $REASON" \
+                     -m "The bump changed what the image contains, so it gets an image."
+          git tag -a "v$NEXT" -m "v$NEXT"
+          # The tag push is what triggers release.yml. Push the branch first:
+          # a tag pointing at a commit master does not have is a release of
+          # something nobody can check out.
+          git push origin HEAD:master
+          git push origin "v$NEXT"
+          echo "tagged v$NEXT — release.yml builds and publishes it"
