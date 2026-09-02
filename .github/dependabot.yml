@@ -83,7 +83,11 @@ updates:
   # which auto-merge.yml deliberately holds for a human. Pinning to full patch
   # versions would change that; it has not been decided yet.
   #
-  # Dependabot has no "run now" API. Editing THIS FILE on the default branch
+  # The gate that merges these PRs must not use GITHUB_TOKEN: a merge made with
+# it is a push that triggers no workflow, so auto-release.yml never sees the
+# bump land. See the comment on GH_TOKEN in auto-merge.yml.
+#
+# Dependabot has no "run now" API. Editing THIS FILE on the default branch
   # is what forces a re-check off-schedule — that, or the "Check for updates"
   # button on the repo's Dependabot graph page. Worth knowing before waiting a
   # week to find out whether the auto-release chain works.

@@ -352,7 +352,7 @@ jobs:
 
       - name: Upload the wire-table log
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.0
         with:
           name: compat-run-log
           path: ${{ runner.temp }}/compat-run.log
@@ -438,7 +438,7 @@ jobs:
         # v7.0.1 is the current major (checked against the releases page,
         # not remembered): actions/upload-artifact v6 and older are on an
         # older runtime.
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.0
         with:
           name: playwright-report
           path: |
