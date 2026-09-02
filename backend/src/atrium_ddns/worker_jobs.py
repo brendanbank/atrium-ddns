@@ -90,8 +90,13 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any, Awaitable, Callable, Iterable, Sequence
 
+import dns.asyncquery
 import dns.asyncresolver
 import dns.exception
+import dns.message
+import dns.name
+import dns.rcode
+import dns.rdatatype
 import dns.resolver
 import sqlalchemy as sa
 from app.db import get_session_factory
@@ -670,19 +675,143 @@ def _now() -> datetime:
 Resolve = Callable[[str, str], Awaitable[list[str]]]
 
 
-def make_resolver(timeout: float) -> Resolve:
-    """The real resolver: ``dns.asyncresolver``, never the blocking one.
+class AuthoritativeLookupError(Exception):
+    """The delegation walk did not reach a server that owns the name.
 
-    ``dns.resolver.resolve`` on this scheduler blocks the worker's only
-    event loop — see the module docstring. dnspython reaches the image
-    as a hard dependency of atrium's ``email-validator``
-    (``pip show dnspython`` → ``Required-by: email-validator``); that is
-    a transitive path, so ``tests/test_worker_jobs.py`` asserts the
-    import rather than trusting it to stay there.
+    Raised rather than falling back to a cache. :func:`_resolve_one` turns
+    any exception into an error string and :func:`classify_record` turns that
+    into ``ERROR`` — *could not measure*, which is what this is. A fallback
+    would produce an ``address`` instead, and a cached address that disagrees
+    with what we published is indistinguishable from a zone that really has
+    drifted. `providers.base.check_hostnameon_server` does fall back to a
+    public resolver, and is right to: a stale answer there means "changed",
+    so it writes, and a spurious write is idempotent. Here the same stale
+    answer means "your zone is wrong", shown to a tenant.
     """
 
+
+#: Where the delegation walk starts. Not used to answer the question — only
+#: to ask the root/parent side who is authoritative.
+_WALK_START_TIMEOUT = 5.0
+
+
+async def authoritative_nameserver(
+    fqdn: str,
+    *,
+    timeout: float,
+    system: Any = None,
+    query: Any = None,
+) -> str:
+    """The address of a nameserver that owns ``fqdn``.
+
+    The async twin of ``providers.base.BaseProvider.get_authoritative_
+    nameserver``, walking the same delegation chain the same way — label
+    by label from the public suffix down, following NS targets, stopping
+    where the parent stops delegating.
+
+    Two arguments exist for the tests, which state that nothing in the
+    health-check suite opens a socket: ``query`` stands in for
+    ``dns.asyncquery.udp`` and ``system`` for the resolver used to turn an
+    NS *name* into an address.
+    """
+    resolver = system if system is not None else dns.asyncresolver.Resolver()
+    send = query if query is not None else dns.asyncquery.udp
+
+    if not resolver.nameservers:
+        raise AuthoritativeLookupError(
+            "no system resolver to start the delegation walk from"
+        )
+    nameserver = resolver.nameservers[0]
+
+    name = dns.name.from_text(fqdn)
+    depth = 2
+    last = False
+    while not last:
+        split = name.split(depth)
+        last = split[0].to_unicode() == "@"
+        sub = split[1]
+
+        message = dns.message.make_query(sub, dns.rdatatype.NS)
+        try:
+            response = await send(message, str(nameserver), timeout=timeout)
+        except (dns.exception.Timeout, OSError) as exc:
+            raise AuthoritativeLookupError(
+                f"NS query for {sub} failed: {exc}"
+            ) from exc
+
+        rcode = response.rcode()
+        if rcode != dns.rcode.NOERROR:
+            if rcode == dns.rcode.NXDOMAIN and depth > 2:
+                # No delegation at this level, so the server found at the
+                # parent owns the whole remaining name.
+                return str(nameserver)
+            raise AuthoritativeLookupError(
+                f"NS query for {sub} answered {dns.rcode.to_text(rcode)}"
+            )
+
+        if not response.authority and not response.answer:
+            raise AuthoritativeLookupError(f"NS query for {sub} carried no records")
+        rrset = response.authority[0] if response.authority else response.answer[0]
+        record = rrset[0]
+        if record.rdtype != dns.rdatatype.SOA:
+            authority = record.target
+            try:
+                answer = await resolver.resolve(authority)
+                nameserver = answer.rrset[0].to_text()
+            except (
+                dns.exception.Timeout,
+                dns.resolver.NoNameservers,
+                dns.resolver.NXDOMAIN,
+                dns.resolver.NoAnswer,
+                OSError,
+            ) as exc:
+                raise AuthoritativeLookupError(
+                    f"the NS target {authority} has no address: {exc}"
+                ) from exc
+
+        depth += 1
+
+    return str(nameserver)
+
+
+def make_resolver(timeout: float) -> Resolve:
+    """The real resolver: the **authoritative** server, asked directly.
+
+    This used to be a bare ``dns.asyncresolver.Resolver()``, which reads
+    ``/etc/resolv.conf`` — in a container, Docker's embedded DNS forwarding
+    to a recursive cache. That answers "what does the world currently see",
+    and the board's column claims something else: *Current IP in zone*.
+
+    Inside one TTL the two disagree, and the disagreement is not theoretical.
+    A publish at 20:07:05 and another at 20:07:17 were re-checked at 20:07:45
+    — 40 and 28 seconds later, against a 60-second default TTL — and the
+    cache returned the pre-update address for both: ``mismatch: 2``,
+    ``transitions: 2``, on two publishes that had succeeded. Clearing the
+    stale reading on a good publish made the rows due immediately, which put
+    the re-check *inside* the cache window rather than after it.
+
+    ``dns.asyncresolver``, never the blocking one: ``dns.resolver.resolve``
+    on this scheduler blocks the worker's only event loop — see the module
+    docstring. dnspython reaches the image as a hard dependency of atrium's
+    ``email-validator``, a transitive path, so ``tests/test_worker_jobs.py``
+    asserts the import rather than trusting it to stay there.
+    """
+    # Per-sweep, and deliberately not wider: a delegation that changes
+    # between sweeps must be followed, and a process-lifetime cache would
+    # pin the answer to whatever was true when the worker started. Within
+    # one sweep it saves a walk per record — A and AAAA for one name is two
+    # lookups of the same delegation.
+    seen: dict[str, str] = {}
+
     async def _resolve(name: str, rdtype: str) -> list[str]:
-        resolver = dns.asyncresolver.Resolver()
+        key = name.lower().rstrip(".")
+        nameserver = seen.get(key)
+        if nameserver is None:
+            nameserver = await authoritative_nameserver(name, timeout=timeout)
+            seen[key] = nameserver
+
+        resolver = dns.asyncresolver.Resolver(configure=False)
+        resolver.nameservers = [nameserver]
         resolver.timeout = timeout
         resolver.lifetime = timeout
         answers = await resolver.resolve(name, rdtype)
@@ -1644,6 +1773,8 @@ __all__ = [
     "device_statuses",
     "guarded",
     "load_config",
+    "AuthoritativeLookupError",
+    "authoritative_nameserver",
     "make_resolver",
     "register_jobs",
     "reset_counters",
