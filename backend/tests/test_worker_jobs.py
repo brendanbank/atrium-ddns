@@ -2329,3 +2329,131 @@ async def test_the_delegation_is_walked_once_per_name_per_sweep() -> None:
         with contextlib.suppress(AttributeError):
             await resolve("name.zone.invalid", "A")
     assert calls == ["name.zone.invalid"], "the cache outlived its sweep"
+
+
+async def test_a_name_published_seconds_ago_is_not_checked_yet(config, tenants):
+    """The provider's own propagation window, not DNS caching.
+
+    Route 53 accepts a change and reaches its own authoritative servers
+    asynchronously — PENDING, then INSYNC, typically inside 60 seconds. So a
+    check that runs immediately after a publish can ask an authoritative
+    server that does not have the change yet and record a mismatch against a
+    publish that worked. Querying authoritatively removed the *caching*
+    cause; it cannot remove this one, because the disagreement is between
+    the provider's own servers.
+
+    Measured in production: a publish at 20:40:25.835 was checked at
+    20:40:28.366 — 2.53 seconds — and stored an address the zone no longer
+    held. Asked again afterwards, the authoritative answer was exactly what
+    had been published. The wrong verdict then sat on the board for the full
+    15-minute interval.
+    """
+    a = tenants["a"]
+    zone = f"a-grace-{W}.example.invalid"
+    just_published = f"justpub.{zone}"
+    settled = f"settled.{zone}"
+
+    for name in (just_published, settled):
+        await _add_hostname(a["domain_id"], name, last_ip_v4="192.0.2.60")
+
+    factory = get_session_factory()
+    async with factory() as s:
+        # One published a moment ago, one long enough ago to be trusted.
+        await s.execute(
+            sa.text("UPDATE ddns_hostname SET last_updated_at = :t WHERE name = :n"),
+            {"t": _now(), "n": just_published},
+        )
+        await s.execute(
+            sa.text("UPDATE ddns_hostname SET last_updated_at = :t WHERE name = :n"),
+            {"t": _now() - timedelta(hours=1), "n": settled},
+        )
+        await s.commit()
+
+    resolver = FakeResolver({(n, "A"): ["192.0.2.60"] for n in (just_published, settled)})
+    summary = await run_health_checks(
+        resolve=resolver,
+        scope=DdnsScope.for_user_id(a["user_id"]),
+        config=DdnsConfig(
+            health_check_enabled=True,
+            health_check_interval_minutes=15,
+            health_check_publish_grace_seconds=120,
+        ),
+    )
+
+    assert summary.hostnames_checked == 1, (
+        "a name published seconds ago was checked anyway, which is the read "
+        "that records a mismatch against a publish that worked"
+    )
+    assert summary.hostnames_not_due == 1
+    summary.assert_consistent()
+
+
+async def test_a_forced_run_is_not_withheld_by_the_grace_window(config, tenants):
+    """`Check now` overrides the schedule, and that includes this.
+
+    The first version of the grace applied to forced runs too, on the
+    argument that the answer is equally wrong whoever asked. It made the
+    button a silent no-op at the exact moment somebody reaches for it —
+    having just published — and five tests of the run endpoint said so. The
+    button's contract is that it checks what the sweep would skip.
+
+    The harm being fixed is a *sweep* painting a mismatch nobody asked for
+    and leaving it up for a whole interval. A person who presses the button
+    three seconds after publishing and sees a mismatch can press it again.
+    """
+    a = tenants["a"]
+    zone = f"a-grace-forced-{W}.example.invalid"
+    name = f"justpub.{zone}"
+    await _add_hostname(a["domain_id"], name, last_ip_v4="192.0.2.60")
+
+    factory = get_session_factory()
+    async with factory() as s:
+        await s.execute(
+            sa.text("UPDATE ddns_hostname SET last_updated_at = :t WHERE name = :n"),
+            {"t": _now(), "n": name},
+        )
+        await s.commit()
+
+    resolver = FakeResolver({(name, "A"): ["192.0.2.60"]})
+    summary = await run_health_checks(
+        resolve=resolver,
+        scope=DdnsScope.for_user_id(a["user_id"]),
+        due_only=False,
+        config=DdnsConfig(
+            health_check_enabled=True,
+            health_check_publish_grace_seconds=120,
+        ),
+    )
+    assert summary.hostnames_checked == 1, (
+        "a forced run was withheld by the publish grace, so `Check now` does "
+        "nothing for two minutes after a publish"
+    )
+
+
+async def test_a_zero_grace_checks_immediately(config, tenants):
+    """The window is configurable to nothing, and that must mean nothing."""
+    a = tenants["a"]
+    zone = f"a-grace-zero-{W}.example.invalid"
+    name = f"justpub.{zone}"
+    await _add_hostname(a["domain_id"], name, last_ip_v4="192.0.2.60")
+
+    factory = get_session_factory()
+    async with factory() as s:
+        await s.execute(
+            sa.text("UPDATE ddns_hostname SET last_updated_at = :t WHERE name = :n"),
+            {"t": _now(), "n": name},
+        )
+        await s.commit()
+
+    resolver = FakeResolver({(name, "A"): ["192.0.2.60"]})
+    summary = await run_health_checks(
+        resolve=resolver,
+        scope=DdnsScope.for_user_id(a["user_id"]),
+        config=DdnsConfig(
+            health_check_enabled=True,
+            health_check_publish_grace_seconds=0,
+        ),
+    )
+    assert summary.hostnames_checked == 1, (
+        "grace 0 still withheld a name, so the setting cannot be turned off"
+    )

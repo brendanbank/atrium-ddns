@@ -121,13 +121,15 @@ async def test_every_field_of_the_model_is_on_exactly_one_page():
         f"does not have, and omits {sorted(expected - rendered)} that it "
         f"does"
     )
-    # Vacuity: twelve fields today — the eleven #73 was opened about,
-    # plus #75's `health_check_manual_cooldown_seconds`, which arrived at
-    # the rebase and was caught by the `ungrouped` guard below rather
-    # than by anybody reading a diff. A model that lost every field would
-    # satisfy the equality above.
-    assert len(expected) == 12, (
-        f"DdnsConfig now has {len(expected)} fields, not 12 — update the "
+    # Vacuity: thirteen fields today — the eleven #73 was opened about,
+    # #75's `health_check_manual_cooldown_seconds`, and
+    # `health_check_publish_grace_seconds`, the window in which a name that
+    # was just published is left alone because the provider has not finished
+    # propagating it. Both later fields were caught by the `ungrouped` guard
+    # below rather than by anybody reading a diff. A model that lost every
+    # field would satisfy the equality above.
+    assert len(expected) == 13, (
+        f"DdnsConfig now has {len(expected)} fields, not 13 — update the "
         f"grouping in settings_schema.FIELD_GROUPS and this count together"
     )
 

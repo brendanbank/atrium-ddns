@@ -239,6 +239,20 @@ class DdnsConfig(BaseModel):
             "the reason this field is not an integer."
         ),
     )
+    health_check_publish_grace_seconds: int = Field(
+        default=120,
+        ge=0,
+        le=3600,
+        description=(
+            "How long after a publish a name is left alone before its first "
+            "check. A provider accepts a change and reaches its own "
+            "authoritative servers asynchronously — Route 53 reports PENDING "
+            "then INSYNC, typically inside 60 seconds — so a check that runs "
+            "immediately can read a server that has not got the change yet "
+            "and record a mismatch against a publish that worked. Set to 0 "
+            "to check immediately."
+        ),
+    )
     health_check_concurrency: int = Field(
         default=8,
         ge=1,
@@ -1051,6 +1065,9 @@ async def run_health_checks(
 
         now = _now()
         stale_before = now - timedelta(minutes=config.health_check_interval_minutes)
+        grace_after = now - timedelta(
+            seconds=config.health_check_publish_grace_seconds
+        )
 
         # The two predicates, built once and used by both statements
         # below. Spelled as values rather than repeated inline because a
@@ -1081,10 +1098,40 @@ async def run_health_checks(
         # The staleness clause, or a literal `true` when the caller
         # forced the run. One value, so there is one place the ordering
         # and the batch ceiling are applied.
+        # Published moments ago, so not yet worth asking about. The window
+        # is the provider's, not DNS's: Route 53 accepts a change and
+        # reaches its own authoritative servers asynchronously (PENDING then
+        # INSYNC), so a check inside it can read a server that has not got
+        # the change and record a mismatch against a publish that worked.
+        #
+        # Measured, not assumed. In production a publish at 20:40:25.835 was
+        # checked at 20:40:28.366 — 2.53 seconds — and recorded an address
+        # the zone no longer held; asked again later the authoritative
+        # answer was exactly what had been published. A second name
+        # published 17 seconds afterwards and first checked 46 seconds later
+        # agreed. The wrong verdict then sat on the board for a full
+        # `health_check_interval_minutes` (15) before anything re-checked it.
+        #
+        # **Scheduled runs only.** A forced run is a person asking, and the
+        # button's contract is that it checks what the sweep would skip —
+        # `test_a_run_checks_a_name_the_scheduled_sweep_would_call_not_due`
+        # says so. Withholding there makes `Check now` a silent no-op at the
+        # moment somebody reaches for it, which trades a wrong answer for no
+        # answer and no explanation. The harm being fixed is a sweep painting
+        # a mismatch nobody asked for and leaving it up for a full interval;
+        # a person who presses the button three seconds after publishing and
+        # sees a mismatch can press it again.
+        published_within_grace = sa.and_(
+            Hostname.last_updated_at.isnot(None),
+            Hostname.last_updated_at > grace_after,
+        )
         staleness = (
-            sa.or_(
-                Hostname.dns_checked_at.is_(None),
-                Hostname.dns_checked_at < stale_before,
+            sa.and_(
+                sa.or_(
+                    Hostname.dns_checked_at.is_(None),
+                    Hostname.dns_checked_at < stale_before,
+                ),
+                sa.not_(published_within_grace),
             )
             if due_only
             else sa.true()

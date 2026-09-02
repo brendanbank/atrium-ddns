@@ -95,6 +95,7 @@ FIELD_GROUPS: dict[str, tuple[str, ...]] = {
         # bucket being non-empty. This is what the derivation is for —
         # nobody had to notice.
         "health_check_manual_cooldown_seconds",
+        "health_check_publish_grace_seconds",
     ),
     "retention": (
         "event_retention_days",
