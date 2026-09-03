@@ -15,6 +15,12 @@
 # so it is named here and nowhere tracked. See scripts/dev-admin.sh.
 .devstack.local.conf
 
+# Log shipping. The overlay compose reads is a copy of the tracked
+# compose.loki.yaml.example, and it stays untracked for the same reason as the
+# two files above: it presumes one site's Loki, one tenant's label set, and a
+# credential that lives in .env. Copy the example, do not commit the copy.
+compose.loki.yaml
+
 # Node
 node_modules/
 dist/

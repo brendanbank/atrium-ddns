@@ -77,6 +77,13 @@ services:
       - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
       - --log.level=INFO
       - --accesslog=true
+      # Repeated from compose.yaml because `command:` is `!override` here, not
+      # merged — every flag the hand-over configuration needs has to be in this
+      # list. Dropping this one would leave the post-cutover proxy emitting CLF
+      # while compose.loki.yaml still parses it as JSON, i.e. the labels would
+      # go missing at exactly the moment the service starts carrying real
+      # traffic. See the longer note on the same flag in compose.yaml.
+      - --accesslog.format=json
       # Query strings are dropped at the producer. `redact` is NOT a real
       # mode — it parses, starts cleanly, and behaves as `keep`.
       - --accesslog.fields.queryparameters.defaultmode=drop
