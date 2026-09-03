@@ -156,10 +156,28 @@ services:
       - --providers.file.watch=true
       - --log.level=INFO
       - --accesslog=true
+      # JSON rather than the default CLF, because a log line is only as useful
+      # as the thing that can query it: compose.loki.yaml promotes
+      # DownstreamStatus and RouterName to Loki labels, and a CLF line gives
+      # that pipeline stage nothing to parse. Costs a dev stack nothing —
+      # `docker compose logs proxy` is one field per line either way.
+      #
+      # Traefik's own application log (--log.level above) stays plain text, so
+      # this container's stdout is mixed. That is fine downstream: a json stage
+      # that cannot parse a line extracts nothing from it rather than dropping
+      # it. --log.format=json would make both streams JSON, and is deliberately
+      # NOT set — the access log and the application log then share a shape but
+      # not a field set, and `level` reads empty on every access-log line.
+      - --accesslog.format=json
       # Query strings are dropped at the producer. /nic/* accepts only HTTP
       # Basic (query-parameter auth was removed), but a client that appends
       # credentials anyway must not have them land in a log. `redact` is NOT
       # a real mode — it parses, starts cleanly, and behaves as `keep`.
+      #
+      # This is also why nothing downstream redacts: dyndns-route53 ran a Loki
+      # `replace` stage that was correct in every isolated test and still
+      # leaked a canary password on the live container. Stripping here has no
+      # such failure mode.
       - --accesslog.fields.queryparameters.defaultmode=drop
     ports:
       - "${TLS_HOST_PORT:-8443}:8443"

@@ -1,0 +1,219 @@
+# Log shipping to Loki — the site-specific overlay, and nothing else.
+#
+#   cp compose.loki.yaml.example compose.loki.yaml
+#   # in .env:  LOKI_URL=https://CLASS:PASSWORD@loki.example.invalid/loki/api/v1/push
+#   #           COMPOSE_FILE=compose.yaml:compose.prod.yaml:compose.loki.yaml
+#   docker compose up -d
+#
+# The last line RECREATES all four containers. That is not incidental: log
+# options are baked into a container when it is CREATED, so `docker compose
+# restart` silently keeps whatever driver the container already had. A stack
+# that looks configured and ships nothing is almost always this.
+#
+# Requires the driver plugin on the host, once:
+#
+#   docker plugin install grafana/loki-docker-driver:latest \
+#       --alias loki --grant-all-permissions
+#
+# ---------------------------------------------------------------------------
+# Why this is a copied file and not a tracked overlay
+# ---------------------------------------------------------------------------
+#
+# Everything here is site-specific — it presumes a Loki that exists, a tenant
+# whose label set is `app="atrium-ddns"`, and a credential scoped to push.
+# None of that is true of a fresh clone, and this repository is public. So the
+# tracked artefact is this `.example` and the file compose actually reads is
+# `compose.loki.yaml`, which `.gitignore` ignores.
+#
+# `LOKI_URL` is `:?` rather than defaulted. Once this overlay is in
+# COMPOSE_FILE it is not optional, and the two ways to get that wrong are both
+# quiet: an unset variable would render `loki-url: ""` and ship to nowhere,
+# and a bare base URL 404s on every push with nothing logged anywhere. A
+# refusal at `compose config` time is the loudest this can be made.
+#
+# ---------------------------------------------------------------------------
+# The one that will waste your afternoon
+# ---------------------------------------------------------------------------
+#
+# COMPOSE_FILE MUST NAME THIS FILE. The Loki recipe this was ported from
+# (dyndns-route53) relies on Compose auto-merging `docker-compose.override.yml`
+# — and that automatic merge does not happen here, because .env sets
+# COMPOSE_FILE explicitly and an explicit file list suppresses it. The overlay
+# is then a file on disk that nothing reads: no error, no warning, and
+# `docker compose config` renders the stack exactly as it did before.
+#
+# ---------------------------------------------------------------------------
+# Four services, three different pipeline shapes
+# ---------------------------------------------------------------------------
+#
+# The stages below are NOT interchangeable — each matches what that service
+# actually writes to stdout, and a `json` stage on a service that logs plain
+# text errors on every line:
+#
+#   proxy   Traefik's access log, JSON (compose.yaml passes
+#           --accesslog.format=json for exactly this reason). Gets a `json`
+#           stage plus a `labels` stage.
+#   api     uvicorn, plain text. Gets `multiline` only, to buffer Python
+#           tracebacks into one entry instead of 40.
+#   worker  one-line JSON metric dicts from atrium's scheduler, plus plain-text
+#           Python logging. Gets `multiline` only — see the note there.
+#   mysql   plain text, no tracebacks. No stages at all; it is here so that a
+#           crash or an OOM kill in the database is not the one event the
+#           estate cannot see.
+#
+# ---------------------------------------------------------------------------
+# `docker logs` keeps working
+# ---------------------------------------------------------------------------
+#
+# The driver's `no-file` option defaults to false, so it still writes the local
+# json-file copy that `docker logs` and `docker compose logs` read, and
+# max-size/max-file below bound that copy. (The option names are all four
+# present in the installed plugin binary, 3.6.0 — the default is the driver's,
+# so prove it on your own host rather than taking it from this comment:
+#
+#   docker compose logs --tail 1 proxy      # must still print a line
+#
+# Do not set `no-file: "true"`: it would take away the local instrument at the
+# same moment shipping starts, and comparing the two is the first thing you
+# will want to do.)
+#
+# ---------------------------------------------------------------------------
+# Verifying it, in the only order that proves anything
+# ---------------------------------------------------------------------------
+#
+#   1. What the container actually got — the container is the authority, not
+#      this file and not `docker compose config`:
+#
+#        docker inspect -f '{{.HostConfig.LogConfig.Type}} {{json .HostConfig.LogConfig.Config}}' \
+#            atrium-ddns-proxy-1
+#
+#   2. That entries are arriving. Query by `compose_service`, NOT by
+#      `container`: the driver's own labels are compose_project /
+#      compose_service / platform / host.
+#
+#        {compose_service="proxy"}
+#
+#   3. That the labels landed — this is the query the whole exercise is for,
+#      and it answers "were there any 500s" in one line and across restarts:
+#
+#        {compose_service="proxy", status=~"5.."}
+#        {compose_service="api"} |= `Traceback`
+#
+# A stage that cannot parse a line extracts nothing from it rather than
+# dropping it, so Traefik's plain-text startup lines still arrive under
+# {compose_service="proxy"} with no `status` label. Confirm that rather than
+# assuming it: a missing label and a missing entry look identical in a
+# dashboard and mean very different things.
+#
+# ---------------------------------------------------------------------------
+# Three things not to reintroduce
+# ---------------------------------------------------------------------------
+#
+#   * A `replace` REDACTION STAGE, as a security control. dyndns-route53 tried
+#     one: it redacted correctly in every isolated test of the exact
+#     production config and still leaked a canary password on the live
+#     long-running Traefik container, cause never identified. Credentials are
+#     kept out of these logs at the PRODUCER instead —
+#     `--accesslog.fields.queryparameters.defaultmode=drop` in compose.yaml,
+#     and /nic/* accepts only HTTP Basic. That has no such failure mode.
+#
+#   * `loki-relabel-config`. Every rule that used to live in one was verified
+#     a no-op against a live Loki: `host -> host` is an identity copy,
+#     `container_name` is a source label that never exists here, and the
+#     driver's stream label is called `source` — so query
+#     source="stdout"|"stderr" where you would reach for `stream`.
+#
+#   * HIGH-CARDINALITY LABELS. RequestPath and ClientHost are extracted and
+#     deliberately left in the log line; as labels they would create a new
+#     Loki stream per unique value, and this service's clients are routers with
+#     changing addresses.
+#
+# One more, about the credential rather than the config: log options are stored
+# verbatim in the container config, so the full `loki-url` — password included
+# — is readable via `docker inspect` and `docker compose config` by anyone in
+# the docker group. Treat it as host-readable and scope it to a class that may
+# only push.
+
+# The three options every service shares. An anchor, because the failure mode
+# of writing them out four times is that one copy quietly disagrees — and
+# because Compose REPLACES a whole option key rather than deep-merging into it,
+# so a service whose `options` block is missing a line ships without it and
+# renders perfectly in `docker compose config`.
+x-loki-options: &loki-options
+  # These bound the LOCAL json-file copy (see `no-file` above), not what Loki
+  # keeps. Loki-side retention is the tenant's business.
+  max-size: "500m"
+  max-file: "1"
+  # `container={{.Name}}` is required, not decorative: the driver applies its
+  # own container_name={{.Name}} default ONLY when loki-external-labels is
+  # unset, so setting this option at all silently drops it.
+  loki-external-labels: "platform=docker,app=atrium-ddns,container={{.Name}}"
+  loki-url: "${LOKI_URL:?the FULL Loki push endpoint, ending /loki/api/v1/push — see .env.example}"
+
+services:
+  proxy:
+    logging:
+      driver: "loki"
+      options:
+        <<: *loki-options
+        # Traefik's JSON access log. `status` is DownstreamStatus — the code
+        # the client actually received, which is the one worth alerting on.
+        loki-pipeline-stages: |
+          - json:
+              expressions:
+                level: level
+                status: DownstreamStatus
+                router: RouterName
+                service: ServiceName
+                entrypoint: entryPointName
+          - labels:
+              level:
+              status:
+              router:
+              entrypoint:
+
+  api:
+    logging:
+      driver: "loki"
+      options:
+        <<: *loki-options
+        # uvicorn writes plain text, so there is nothing here for a `json`
+        # stage to do but fail on every line. The multiline stage exists
+        # because a Python traceback is one event: shipped line-by-line it
+        # arrives interleaved with concurrent requests and reads as noise.
+        loki-pipeline-stages: |
+          - multiline:
+              firstline: '^Traceback \(most recent call last\):'
+              max_wait_time: 3s
+              max_lines: 128
+
+  worker:
+    logging:
+      driver: "loki"
+      options:
+        <<: *loki-options
+        # The scheduler's per-run summary IS one-line JSON, but its keys are
+        # metric names (hostnames_due, records_checked, ...) whose values are
+        # counts. There is no `level` or `msg` to extract, and promoting a
+        # count to a label would open a Loki stream per distinct number. So:
+        # no json stage. Query the numbers out of the line with `json` at read
+        # time instead — `| json | hostnames_moved > 0` — which costs nothing
+        # until asked and cannot damage the index.
+        loki-pipeline-stages: |
+          - multiline:
+              firstline: '^Traceback \(most recent call last\):'
+              max_wait_time: 3s
+              max_lines: 128
+
+  mysql:
+    logging:
+      driver: "loki"
+      options:
+        <<: *loki-options
+        # No stages on purpose. MySQL's error log is plain text with its own
+        # timestamp and `[Note]` / `[Warning]` / `[ERROR]` marker, and there is
+        # no traceback to buffer. Promoting that marker to a label is possible
+        # with a `regex` stage and has not been worth the parse: the reason
+        # this service ships at all is so that an OOM kill or a refusal to
+        # start is visible after the container is gone, and a plain line
+        # carries that.

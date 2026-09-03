@@ -136,6 +136,19 @@ or `/readyz`: the UI is served from the same origin with a catch-all, so any
 unmatched path returns 200 and an HTML page. A monitor pointed at the wrong
 one passes forever.
 
+### Keeping the logs
+
+Container logs die with the container. `docker compose up -d` recreates, so a
+routine deploy discards the access log for everything that came before it —
+which is discovered at the moment somebody asks whether last week had any
+500s. `compose.loki.yaml.example` ships the fix as an optional overlay: the
+Loki Docker log driver on all four services, Traefik's status code promoted to
+a queryable label, and the local `docker logs` copy kept. Copy it to
+`compose.loki.yaml`, set `LOKI_URL` in `.env`, and **add the file to
+`COMPOSE_FILE`** — an explicit file list suppresses Compose's automatic
+override merge, so an overlay that is not named there is never read. The file
+itself documents the rest.
+
 ## Layout
 
 ```
