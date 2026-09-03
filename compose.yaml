@@ -163,11 +163,17 @@ services:
       # `docker compose logs proxy` is one field per line either way.
       #
       # Traefik's own application log (--log.level above) stays plain text, so
-      # this container's stdout is mixed. That is fine downstream: a json stage
-      # that cannot parse a line extracts nothing from it rather than dropping
-      # it. --log.format=json would make both streams JSON, and is deliberately
-      # NOT set — the access log and the application log then share a shape but
-      # not a field set, and `level` reads empty on every access-log line.
+      # this container's stdout is mixed. That is fine downstream, and measured
+      # rather than assumed: a json stage that cannot parse a line extracts
+      # nothing from it rather than dropping it, so the startup lines arrive
+      # with no `status` label beside the access log that has one.
+      #
+      # --log.format=json is deliberately NOT set. It would buy nothing here:
+      # the access log already carries a `level` of its own ("info" on every
+      # line — read off the deployed container, so the `level` label lands
+      # either way), and the two streams would still share a shape without
+      # sharing a field set — no DownstreamStatus on an application line, no
+      # request on an access one.
       - --accesslog.format=json
       # Query strings are dropped at the producer. /nic/* accepts only HTTP
       # Basic (query-parameter auth was removed), but a client that appends

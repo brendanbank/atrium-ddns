@@ -82,28 +82,43 @@
 # ---------------------------------------------------------------------------
 #
 #   1. What the container actually got — the container is the authority, not
-#      this file and not `docker compose config`:
+#      this file and not `docker compose config`. Print the option KEYS, not
+#      the values: `loki-url` carries the password, and the obvious
+#      `{{json .Config}}` form puts it on your screen and in your scrollback.
 #
-#        docker inspect -f '{{.HostConfig.LogConfig.Type}} {{json .HostConfig.LogConfig.Config}}' \
-#            atrium-ddns-proxy-1
+#        docker inspect -f \
+#          '{{.HostConfig.LogConfig.Type}} {{range $k,$v := .HostConfig.LogConfig.Config}}{{$k}} {{end}}' \
+#          atrium-ddns-proxy-1
 #
-#   2. That entries are arriving. Query by `compose_service`, NOT by
-#      `container`: the driver's own labels are compose_project /
-#      compose_service / platform / host.
+#   2. That entries are arriving. ALWAYS SCOPE BY `app` FIRST:
 #
-#        {compose_service="proxy"}
+#        {app="atrium-ddns", compose_service="proxy"}
+#
+#      `{compose_service="proxy"}` alone is NOT this stack — it is every
+#      stack in the tenant that happens to name a service `proxy`, and on
+#      this Loki that is several, most of them nginx emitting CLF. Measured
+#      while verifying the first deploy: 404 entries matched, 58 of them
+#      ours. Every conclusion drawn from the other 346 was wrong, including
+#      "most access-log lines are missing their status label" — those lines
+#      were another application's, and they never had one.
+#
+#      This is what the `app` external label is FOR, and it is also why
+#      `container` is the wrong axis: `container="atrium-ddns-proxy-1"` is
+#      unique but breaks the moment a project is renamed or scaled.
 #
 #   3. That the labels landed — this is the query the whole exercise is for,
 #      and it answers "were there any 500s" in one line and across restarts:
 #
-#        {compose_service="proxy", status=~"5.."}
-#        {compose_service="api"} |= `Traceback`
+#        {app="atrium-ddns", compose_service="proxy", status=~"5.."}
+#        {app="atrium-ddns", compose_service="api"} |= `Traceback`
 #
 # A stage that cannot parse a line extracts nothing from it rather than
-# dropping it, so Traefik's plain-text startup lines still arrive under
-# {compose_service="proxy"} with no `status` label. Confirm that rather than
-# assuming it: a missing label and a missing entry look identical in a
-# dashboard and mean very different things.
+# dropping it — measured on the first deploy: of 58 proxy entries in a
+# quarter of an hour, 42 carried a `status` label and 16 did not, and the 16
+# were Traefik's own plain-text startup lines from the restart. So an entry
+# without `status` is expected and is not a dropped access log. Keep the
+# distinction in mind when reading a dashboard: a missing label and a missing
+# entry look identical there and mean very different things.
 #
 # ---------------------------------------------------------------------------
 # Three things not to reintroduce
