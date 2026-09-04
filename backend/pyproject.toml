@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "atrium-ddns-host"
-version = "0.1.9"
+version = "0.1.10"
 description = "Atrium Ddns host extension for Atrium"
 requires-python = ">=3.12"
 
