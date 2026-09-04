@@ -169,7 +169,7 @@ jobs:
           WEBAUTHN_ORIGIN=http://localhost:8000
           MAIL_BACKEND=console
           MAIL_FROM=no-reply@example.com
-          ATRIUM_IMAGE=ghcr.io/brendanbank/atrium:0.29.0
+          ATRIUM_IMAGE=ghcr.io/brendanbank/atrium:0.29.1
           EOF
 
       - name: Build + start stack
@@ -283,7 +283,7 @@ jobs:
           WEBAUTHN_ORIGIN=http://localhost:8000
           MAIL_BACKEND=console
           MAIL_FROM=no-reply@example.com
-          ATRIUM_IMAGE=ghcr.io/brendanbank/atrium:0.29.0
+          ATRIUM_IMAGE=ghcr.io/brendanbank/atrium:0.29.1
           EOF
 
       # ATRIUM_DDNS_COMPAT_STUB=1 is set in the ENVIRONMENT of this one
@@ -419,7 +419,7 @@ jobs:
           WEBAUTHN_ORIGIN=http://localhost:8000
           MAIL_BACKEND=console
           MAIL_FROM=no-reply@example.com
-          ATRIUM_IMAGE=ghcr.io/brendanbank/atrium:0.29.0
+          ATRIUM_IMAGE=ghcr.io/brendanbank/atrium:0.29.1
           EOF
 
       # `make test-e2e` raises the stack (with the compat stub), migrates

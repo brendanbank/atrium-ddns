@@ -27,7 +27,7 @@ services:
       # override ATRIUM_BUILD_TARGET) for a prod image without test tooling.
       target: ${ATRIUM_BUILD_TARGET:-dev}
       args:
-        ATRIUM_IMAGE: ${ATRIUM_IMAGE:-ghcr.io/brendanbank/atrium:0.29.0}
+        ATRIUM_IMAGE: ${ATRIUM_IMAGE:-ghcr.io/brendanbank/atrium:0.29.1}
     # Tagged per compose project, not a fixed literal. Pinned to a bare
     # `atrium-ddns:latest` with `pull_policy: never`, two worktrees building
     # concurrently overwrite each other's tag and the loser silently runs the
