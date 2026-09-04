@@ -33,6 +33,28 @@ COMPOSE := docker compose -p $(COMPOSE_PROJECT)
 # inherits it without having to know.
 export COMPOSE_PROJECT
 
+# --- Build stamp -------------------------------------------------
+# Baked into the image as ATRIUM_APP_VERSION / ATRIUM_APP_COMMIT (see the
+# Dockerfile) so `GET /api/version` — and the version block at the top of
+# the SPA's user menu — can say which build of this host is running, next
+# to the atrium version it is running on.
+#
+# `--exact-match` is deliberate: only a real release tag counts as a
+# version, and everything else reports the commit alone (`Atrium Ddns:
+# 4e8b243`) rather than the nearest tag plus a distance, which would name
+# a release the image is not. The tag is stamped verbatim (`v0.1.9`, not
+# `0.1.9`) — it is meant to be pasted into `git checkout`.
+#
+# HEAD, not the worktree: a build from uncommitted changes is stamped
+# with the commit it was branched from. That is the same trade the
+# published image makes and is why the stamp names a *build*, not a
+# working tree.
+#
+# `export` puts them in the environment of every recipe, where compose
+# picks them up as the ${ATRIUM_APP_*} build args.
+export ATRIUM_APP_VERSION := $(shell git describe --tags --exact-match 2>/dev/null)
+export ATRIUM_APP_COMMIT := $(shell git rev-parse HEAD 2>/dev/null)
+
 # Where the Dockerfile's `dev` stage puts the repo-root `tests/` tree. Mirrors
 # the repo layout, so `/opt/compat_tests/compat/...` is `tests/compat/...`.
 COMPAT_TESTS := /opt/compat_tests

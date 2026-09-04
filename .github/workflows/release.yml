@@ -68,6 +68,16 @@ jobs:
             exit 1
           fi
 
+      # Read the sha off the checkout, not `github.sha`. On a tag push the
+      # two agree; on `workflow_dispatch` they do not — `github.sha` is then
+      # the head of the branch the workflow file was dispatched from
+      # (master), while the checkout above is at the tag being built. A
+      # re-publish of an older tag would otherwise stamp and label the image
+      # with a commit it was not built from, which is precisely the question
+      # the stamp exists to answer.
+      - name: Resolve build commit
+        run: echo "BUILD_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
       # The base image is multi-arch (linux/amd64 + linux/arm64, verified
       # 2026-09-02), so arm64 is a real build rather than emulated-and-hoped.
       # QEMU is still needed for the frontend-builder stage's npm work.
@@ -97,6 +107,16 @@ jobs:
           push: true
           provenance: true
           sbom: true
+          # The build stamp `GET /api/version` reports and the user menu
+          # renders — the tag verbatim, plus the sha of the checkout this
+          # was built from. Without these the published image reports no
+          # app version at all and the menu shows the atrium line only.
+          # The atrium half of that answer needs nothing here: atrium's own
+          # image sets ATRIUM_VERSION / ATRIUM_COMMIT as ENV, and Docker
+          # inherits ENV across `FROM`.
+          build-args: |
+            ATRIUM_APP_VERSION=${{ github.event.inputs.tag || github.ref_name }}
+            ATRIUM_APP_COMMIT=${{ env.BUILD_COMMIT }}
           tags: |
             ${{ env.IMAGE }}:${{ (github.event.inputs.tag || github.ref_name) }}
             ${{ env.IMAGE }}:latest
@@ -107,7 +127,7 @@ jobs:
             org.opencontainers.image.title=atrium-ddns
             org.opencontainers.image.description=DynDNS host extension for atrium
             org.opencontainers.image.version=${{ (github.event.inputs.tag || github.ref_name) }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ env.BUILD_COMMIT }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.created=${{ steps.stamp.outputs.created }}
@@ -135,13 +155,19 @@ jobs:
       # these is to be trusted later by someone holding only the image.
       # Checked on every platform in the manifest, because labels are per
       # image config and a two-arch build writes two of them.
-      - name: The labels are actually on the image
+      #
+      # The build stamp (ENV, not labels) is checked here for the same
+      # reason and one more: a build arg the Dockerfile does not declare is
+      # silently ignored by buildx — no warning that fails a build — and the
+      # only visible symptom is a user menu that quietly stops naming the
+      # app version months later.
+      - name: The labels and the build stamp are actually on the image
         run: |
           set -euo pipefail
           tag="${{ github.event.inputs.tag || github.ref_name }}"
           docker buildx imagetools inspect "$IMAGE:$tag" --format '{{json .Image}}' \
             > /tmp/img.json
-          python3 - "$tag" "${{ github.sha }}" <<'EOF'
+          python3 - "$tag" "${{ env.BUILD_COMMIT }}" <<'EOF'
           import json, sys
 
           want_version, want_revision = sys.argv[1], sys.argv[2]
@@ -155,7 +181,8 @@ jobs:
 
           failed = False
           for platform, image in images.items():
-              labels = (image.get("config") or {}).get("Labels") or {}
+              config = image.get("config") or {}
+              labels = config.get("Labels") or {}
               version = labels.get("org.opencontainers.image.version")
               revision = labels.get("org.opencontainers.image.revision")
               print(f"{platform}: version={version} revision={revision}")
@@ -165,6 +192,23 @@ jobs:
               if revision != want_revision:
                   print(f"  ERROR: revision is {revision!r}, sha is {want_revision!r}")
                   failed = True
+
+              # What `GET /api/version` will actually read at runtime.
+              env = dict(
+                  entry.split("=", 1)
+                  for entry in (config.get("Env") or [])
+                  if "=" in entry
+              )
+              stamp = {
+                  "ATRIUM_APP_VERSION": want_version,
+                  "ATRIUM_APP_COMMIT": want_revision,
+              }
+              for key, want in stamp.items():
+                  got = env.get(key)
+                  print(f"{platform}: {key}={got}")
+                  if got != want:
+                      print(f"  ERROR: {key} is {got!r}, expected {want!r}")
+                      failed = True
           sys.exit(1 if failed else 0)
           EOF
 

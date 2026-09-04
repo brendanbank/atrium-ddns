@@ -131,6 +131,29 @@ docker inspect <container> \
   --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
 ```
 
+The same answer without shell access to the box: sign in and open the user
+menu (click the avatar). Since atrium 0.30 it names both layers of the
+deployment — the atrium base and this image on top of it:
+
+```
+Atrium v0.30.0
+Atrium Ddns v0.1.9        (or "Atrium Ddns: b2a4e5a" on an untagged build)
+```
+
+Both come from `GET /api/version`, which reads env vars baked into the image
+at build time (`ATRIUM_APP_VERSION` / `ATRIUM_APP_COMMIT`, stamped by
+`release.yml` from the tag it built; atrium's own pair is inherited from the
+base image). Nothing is derived at runtime — the runtime image has no `.git`
+and no git binary, and `backend/pyproject.toml` names a release line rather
+than a commit. The endpoint is authenticated-only, so a scanner cannot
+fingerprint versions anonymously.
+
+The second line is labelled with the **brand name** (`BRAND_NAME` /
+`make seed-brand`), because the image deliberately does not stamp
+`ATRIUM_APP_NAME`: a rebranded deployment should say its own name rather than
+one frozen in at build time. `make up` in a worktree stamps the local git
+state, so a dev stack answers this too.
+
 The health endpoints are `/api/healthz` and `/api/readyz`. **Not** `/healthz`
 or `/readyz`: the UI is served from the same origin with a catch-all, so any
 unmatched path returns 200 and an HTML page. A monitor pointed at the wrong
