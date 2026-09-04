@@ -28,6 +28,14 @@ services:
       target: ${ATRIUM_BUILD_TARGET:-dev}
       args:
         ATRIUM_IMAGE: ${ATRIUM_IMAGE:-ghcr.io/brendanbank/atrium:0.30.0}
+        # Build stamp reported by `GET /api/version` and rendered in the
+        # user menu. The Makefile exports both from git, so `make up`
+        # stamps the worktree's state; a bare `docker compose build`
+        # leaves them empty and the menu shows the atrium line only.
+        # The atrium half (ATRIUM_VERSION / ATRIUM_COMMIT) comes with the
+        # base image as inherited ENV — nothing to pass here.
+        ATRIUM_APP_VERSION: ${ATRIUM_APP_VERSION:-}
+        ATRIUM_APP_COMMIT: ${ATRIUM_APP_COMMIT:-}
     # Tagged per compose project, not a fixed literal. Pinned to a bare
     # `atrium-ddns:latest` with `pull_policy: never`, two worktrees building
     # concurrently overwrite each other's tag and the loser silently runs the

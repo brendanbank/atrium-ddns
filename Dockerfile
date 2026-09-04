@@ -37,6 +37,39 @@ RUN /opt/venv/bin/python -m ensurepip --upgrade \
 # Bake the host bundle into atrium's static dir at /host/main.js.
 COPY --from=frontend-builder /app/dist /opt/atrium/static/host
 
+# Build stamp. `GET /api/version` (atrium 0.30+) reads these and the SPA
+# renders them at the top of the signed-in user menu, so "which build is
+# this box running?" is answerable without exec-ing into the container.
+#
+# Baked at build time on purpose: the runtime image has no `.git` and no
+# git binary, and `backend/pyproject.toml` names a release line, not the
+# commit it was built from.
+#
+# `ATRIUM_VERSION` / `ATRIUM_COMMIT` describe the *atrium base* image and
+# are NOT set here — Docker inherits ENV across `FROM`, so they ride along
+# from ghcr.io/brendanbank/atrium and the menu reports both layers.
+#
+# `ATRIUM_APP_VERSION` is the release tag, verbatim (`v0.1.9`, not
+# `0.1.9`): the string is meant to be pasted into `git checkout`.
+# Untagged, it stays empty and the line renders as `<brand>: <short sha>`
+# off the commit, so a build is always identifiable either way. Fed by
+# `release.yml` from the tag it built, and by the Makefile from git for
+# local builds; a bare `docker build` leaves both empty and the app half
+# of `/api/version` reports nothing.
+#
+# ATRIUM_APP_NAME is deliberately left unset. Unset, atrium labels the
+# line with the brand name from `/app-config` — which is admin-editable
+# here (BRAND_NAME / `make seed-brand`), so a rebranded deployment says
+# its own name instead of one frozen into the image at build time. Set it
+# explicitly only if you want the image to override that.
+#
+# Last layers before USER: every expensive layer (pip install, bundle
+# copy) is above this point, so a changed stamp does not rebuild them.
+ARG ATRIUM_APP_VERSION=""
+ARG ATRIUM_APP_COMMIT=""
+ENV ATRIUM_APP_VERSION=${ATRIUM_APP_VERSION} \
+    ATRIUM_APP_COMMIT=${ATRIUM_APP_COMMIT}
+
 USER app
 
 # Re-declare HEALTHCHECK on the derived image. The base atrium image
