@@ -46,13 +46,14 @@ __pycache__/
 # OS
 .DS_Store
 
-# Extracted TLS material (a copy of the old service.s ACME cert).
+# TLS material extracted from a predecessor's ACME store. Nothing writes this
+# any more — the proxy runs ACME itself — but deploy hosts that predate that
+# change still have the directory, private key and all, so it stays ignored.
 certs/
 
-# This stack's own ACME store, after the hand-over. It holds the account
-# private key and every issued certificate's private key — the one file in
-# the deployment whose loss means re-issuing and whose disclosure means
-# somebody else can speak as the service.
+# This stack's ACME store. It holds the account private key and every issued
+# certificate's private key — the one file in the deployment whose loss means
+# re-issuing and whose disclosure means somebody else can speak as the service.
 letsencrypt/
 
 # Conductor's per-workspace scratch directory: agent notes, todo lists,
@@ -89,8 +90,9 @@ letsencrypt/
 # So nothing below persists because it *must*. Two entries are the
 # exception and carry their reason:
 #
-#  * `certs/` and `letsencrypt/` (above) hold TLS material that has to
-#    exist on disk for the proxy to read, and are covered as directories.
+#  * `letsencrypt/` (above) is the ACME store the proxy writes and reads,
+#    and `certs/` is its disused predecessor; both are covered as
+#    directories.
 #  * `*.db` / `*.db-wal` / `*.db-shm` — `scripts/copy-legacy-db.sh` has to
 #    land the legacy copy somewhere the operator chooses, and the runbook
 #    keeps it deliberately (§ 8.2, indefinitely, off the host). It has to
@@ -125,11 +127,11 @@ letsencrypt/
 .pgpass
 .my.cnf
 
-# Keys and certificates. `TLS_CERT_DIR` and `ACME_STORE_DIR` default to
-# `./certs` and `./letsencrypt` (both covered above) but are overridable,
-# so the material is only reliably caught by its extension. The `.tmp`
-# forms are `scripts/extract-acme-cert.sh`'s atomic-write intermediates,
-# which survive an interrupted extraction.
+# Keys and certificates. `ACME_STORE_DIR` defaults to `./letsencrypt`
+# (covered above) but is overridable, so the material is only reliably
+# caught by its extension. The `.tmp` forms caught atomic-write
+# intermediates from the extraction script that used to live here; they
+# stay because an interrupted `openssl` still leaves them.
 *.pem
 *.pem.tmp
 *.key

@@ -1343,6 +1343,18 @@ demonstration — not a count of closed issues.
 
 ## 5b. Deploying beside the old service
 
+> **Superseded, 2026-09-09.** This section describes the borrowed-certificate
+> arrangement — Traefik on 8443 serving a copy extracted from the old service's
+> ACME store, kept in sync by hand with `make tls-refresh`, with a deadline of
+> 23 Sep when that copy expired. None of it is current: the proxy now runs ACME
+> itself on 80/443 in the base `compose.yaml`, issues on first start and renews
+> on its own timer, and `scripts/extract-acme-cert.sh` and the `tls-refresh`
+> target no longer exist. The reasoning below is why the borrowed arrangement
+> was chosen while the old service still held the ports; it is not how to
+> deploy. See the README's *TLS* section, and `docs/ops/cutover.md` for the
+> hand-over that was planned in between.
+
+
 **Decided: the new stack runs alongside the existing service on port 8443**
 during the development phase. The old one keeps serving real clients until the
 exit criterion is demonstrated, which is what makes the cutover reversible.

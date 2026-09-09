@@ -1,24 +1,65 @@
-# Static TLS for the host stack. No ACME here on purpose — the certificate is
-# extracted from the old service's store by scripts/extract-acme-cert.sh, and
-# that store has exactly one writer (the old service's Traefik). A second
-# ACME-capable instance pointed at the same file corrupts it.
-tls:
-  certificates:
-    - certFile: /certs/cert.pem
-      keyFile: /certs/key.pem
-  stores:
-    default:
-      defaultCertificate:
-        certFile: /certs/cert.pem
-        keyFile: /certs/key.pem
+# Dynamic configuration for the TLS terminator.
+#
+# The certificate is obtained and renewed by Traefik's own ACME client — see
+# the `letsencrypt` resolver in compose.yaml. Nothing here points at a
+# certificate file, and that omission is the load-bearing part of this file.
+#
+# ---------------------------------------------------------------------------
+# Why there is no `tls.stores.default.defaultCertificate` here
+# ---------------------------------------------------------------------------
+#
+# There used to be: a copy of a predecessor's certificate, kept as a fallback
+# so that TLS still terminated if ACME failed. It cost more than it bought.
+#
+# Measured on traefik:3.7 with an empty ACME store: with a `defaultCertificate`
+# block present Traefik logs "No ACME certificate generation required for
+# domains" and never contacts the CA; with the block removed, the identical
+# stack logs "Trying to challenge certificate" and "Building ACME client". A
+# certificate already provided for a domain is a certificate Traefik will not
+# go and ask for.
+#
+# So a fallback does not degrade automatic issuance, it disables it — and
+# silently, because the stack looks perfect from outside. TLS terminates, the
+# chain validates, health checks pass, and the first symptom is the fallback
+# expiring weeks later. `scripts/test-acme.sh` phase C asserts this file has no
+# such block, for that reason and no other.
+#
+# What replaces the fallback is that issuance is now the normal path rather
+# than a thing that has to be reached: an empty store on a fresh stack means a
+# certificate is requested on start-up.
+#
+# ---------------------------------------------------------------------------
+# The hostname is not written here, and that is not squeamishness
+# ---------------------------------------------------------------------------
+#
+# `{{ env "TRAEFIK_HOSTNAME" }}` is Traefik's own file-provider templating,
+# evaluated inside the container against the environment compose.yaml passes
+# it. The real hostname therefore lives in `.env` and in no tracked file.
+#
+# Two things about that templating, both measured against traefik:3.7 rather
+# than assumed:
+#
+#   * it works in a `.yml` file. A file named `.yml.tmpl` is **skipped** by the
+#     directory provider — "Skipping file, unsupported extension" — and skipped
+#     silently enough that the stack comes up with no router at all.
+#   * the router rule is where Traefik finds the domain to request a
+#     certificate for ("Trying to challenge certificate for domain [...] found
+#     in HostSNI rule"). A `PathPrefix(/)` rule — which is what this file
+#     carried while the certificate came from elsewhere — names no domain, so
+#     the resolver below would resolve nothing and say so only at DEBUG level.
+#
+# An unset TRAEFIK_HOSTNAME renders as Host(``), which Traefik rejects: no
+# router, nothing served. `scripts/preflight-acme.sh` refuses before that and
+# names the variable.
 
 http:
   routers:
     host-api:
-      rule: PathPrefix(`/`)
+      rule: Host(`{{ env "TRAEFIK_HOSTNAME" }}`)
       entryPoints: [websecure]
       service: host-api
-      tls: {}
+      tls:
+        certResolver: letsencrypt
   services:
     host-api:
       loadBalancer:

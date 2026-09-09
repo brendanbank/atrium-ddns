@@ -149,6 +149,8 @@ endef
 	check-fresh check-compat-fresh check-backend-fresh check-host-pkg-fresh \
 	test-backend-serial test-backend-file typecheck smoke \
 	e2e-up e2e-deps e2e-down test-e2e check-bundle-fresh \
+	tls-up tls-down tls-preflight tls-config tls-logs tls-verify \
+	acme-verify test-acme \
 	atrium-bump
 
 help:  ## show this help
@@ -996,63 +998,62 @@ test-e2e: e2e-up e2e-deps  ## Playwright specs against a real browser
 e2e-down:  ## stop the e2e stack AND delete its database volume
 	$(COMPOSE) down -v
 
-# --- TLS (prod, "for now" measure) ----------------------------------------
-# The certificate is a COPY of one in the old service's ACME store. That store
-# has a live writer; when it renews, this copy is stale and TLS serves an
-# expired certificate. Re-run tls-refresh after a renewal.
-ACME_JSON ?= /usr/local/dyndns-route53/letsencrypt/acme.json
-TLS_CERT_DIR ?= ./certs
+# --- TLS ------------------------------------------------------------------
+# The proxy runs ACME itself: it issues the certificate for TRAEFIK_HOSTNAME on
+# first start and renews it on Traefik's own timer. There is nothing to extract
+# and nothing to refresh by hand — the `tls-extract` / `tls-refresh` targets
+# that used to live here went with the arrangement that needed them.
+ACME_STORE_DIR ?= ./letsencrypt
 
-tls-extract:  ## copy cert+key out of the old service's ACME store
-	./scripts/extract-acme-cert.sh $(ACME_JSON) $(TLS_CERT_DIR)
-
-tls-up: tls-extract  ## start the TLS terminator in front of api
+# `tls-up` and not `up`: this touches the proxy and nothing else, so a stack
+# that is already serving keeps serving while TLS is reconfigured.
+tls-up: tls-preflight  ## start the TLS terminator in front of api
 	$(COMPOSE) --profile tls up -d proxy
+	@echo "started; the certificate is issued on demand — watch it with:"
+	@echo "  make tls-logs"
+	@echo "  make tls-verify HOST=<name>"
 
-tls-refresh: tls-extract  ## re-extract after a renewal and reload the proxy
-	$(COMPOSE) --profile tls restart proxy
-	@echo "reloaded; verify with: make tls-verify HOST=<name>"
+tls-down:  ## stop the TLS terminator
+	$(COMPOSE) --profile tls stop proxy
+
+# Separately callable because it is worth running before a deploy, not only as
+# a side effect of one.
+tls-preflight:  ## check the ACME configuration without starting anything
+	@./scripts/preflight-acme.sh
+
+tls-config:  ## render the proxy configuration without starting anything
+	$(COMPOSE) --profile tls config
+
+tls-logs:  ## the proxy's own log, ACME lines first
+	@$(COMPOSE) logs --tail 200 proxy | grep -iE 'acme|certificate|challenge|error' || \
+	  echo "no ACME lines yet — the proxy may still be starting"
 
 # CONNECT exists so this can be pointed at a stack that does not resolve —
 # a throwaway one on loopback, or the deploy host before DNS moves. HOST stays
-# the SNI name either way: a check that reaches the right socket with the
-# wrong SNI is a check of the default certificate, not of the router's.
-tls-verify:  ## prove TLS actually serves a valid chain (HOST=<name> required)
-	@test -n "$(HOST)" || { echo "usage: make tls-verify HOST=<name> [PORT=8443] [CONNECT=<addr>]"; exit 2; }
-	@echo | openssl s_client -connect $(or $(CONNECT),$(HOST)):$(or $(PORT),8443) -servername $(HOST) 2>/dev/null \
+# the SNI name either way: a check that reaches the right socket with the wrong
+# SNI is a check of the default certificate, not of the router's.
+tls-verify:  ## prove TLS serves a valid chain (HOST=<name> required)
+	@test -n "$(HOST)" || { echo "usage: make tls-verify HOST=<name> [PORT=443] [CONNECT=<addr>]"; exit 2; }
+	@echo | openssl s_client -connect $(or $(CONNECT),$(HOST)):$(or $(PORT),443) -servername $(HOST) 2>/dev/null \
 	  | openssl x509 -noout -subject -dates -checkend 0 \
 	  && echo "  chain valid and not expired"
 
-# --- ACME hand-over (cutover; docs/ops/cutover.md § 2.2 and § 5.4) ---------
-# Everything above serves a COPY of the incumbent's certificate. Everything
-# below is the arrangement that stops copying: this stack's own ACME store,
-# its own resolver, 80/443. It lives in `compose.acme.yaml` — a file the
-# operator names on purpose — so that a routine `docker compose up -d` can
-# never perform the hand-over by accident.
-COMPOSE_ACME := $(COMPOSE) -f compose.yaml -f compose.acme.yaml
-
-acme-config:  ## render the hand-over configuration without starting anything
-	$(COMPOSE_ACME) --profile tls config
-
-# Deliberately NOT `up -d` on the whole stack: this replaces the proxy and
-# nothing else. Runbook step 5.4(c).
-acme-up:  ## start the TLS terminator with ACME on 80/443 (THE HAND-OVER)
-	$(COMPOSE_ACME) --profile tls up -d proxy
-
-acme-down:  ## stop it again — runbook rollback for step 5.4(c)
-	$(COMPOSE_ACME) --profile tls stop proxy
-
-# The check that distinguishes "TLS works" from "the hand-over took".
-acme-verify:  ## which certificate is on the wire (HOST=<name> required)
+# The check that distinguishes "TLS works" from "this stack issued it".
+#
+# It mattered more when a fallback certificate sat underneath and could serve a
+# perfectly valid chain forever without ACME ever running. That fallback is
+# gone, so the two answers have converged — but this still proves the store on
+# disk is the thing on the wire, which is what "renewal will reach clients"
+# depends on. Keep running it after a deploy.
+acme-verify:  ## prove the served certificate came from THIS stack's store (HOST=<name>)
 	@test -n "$(HOST)" || { echo "usage: make acme-verify HOST=<name> [PORT=443] [CONNECT=<addr>]"; exit 2; }
-	./scripts/verify-acme-handover.sh \
-	  --store $(or $(ACME_STORE_DIR),./letsencrypt)/acme.json \
+	./scripts/verify-acme.sh \
+	  --store $(ACME_STORE_DIR)/acme.json \
 	  --host $(HOST) --port $(or $(PORT),443) \
-	  $(if $(CONNECT),--connect $(CONNECT),) \
-	  --fallback $(TLS_CERT_DIR)/cert.pem
+	  $(if $(CONNECT),--connect $(CONNECT),)
 
-test-acme-handover:  ## gate-test the hand-over on a throwaway stack (LIVE=1 adds LE staging)
-	./scripts/test-acme-handover.sh $(if $(LIVE),--live-staging,)
+test-acme:  ## gate-test issuance and renewal on a throwaway stack (LIVE=1 adds LE staging)
+	./scripts/test-acme.sh $(if $(LIVE),--live-staging,)
 
 # --- Atrium version bump ---------------------------------------------------
 # The pinned atrium version lives in five files plus three npm packages, and

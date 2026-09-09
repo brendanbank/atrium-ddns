@@ -159,6 +159,48 @@ or `/readyz`: the UI is served from the same origin with a catch-all, so any
 unmatched path returns 200 and an HTML page. A monitor pointed at the wrong
 one passes forever.
 
+### TLS
+
+The `tls` profile puts a Traefik in front of the api. It obtains its
+certificate from Let's Encrypt itself and renews it on its own timer — there is
+nothing to extract, copy or refresh, and no cron entry to forget.
+
+Three lines in `.env`, then start it:
+
+```dotenv
+COMPOSE_PROFILES=tls
+TRAEFIK_HOSTNAME=ddns.example.invalid   # the real name; one host, no wildcard
+LETSENCRYPT_EMAIL=ops@example.invalid   # the ACME account contact
+```
+
+```bash
+make tls-preflight            # refuses a configuration that would fail silently
+make tls-up                   # starts the proxy; the certificate is issued on demand
+make tls-logs                 # watch the challenge
+make acme-verify HOST=<name>  # prove the wire is serving THIS stack's store
+```
+
+Ports 80 and 443 both have to reach the box. 80 is where the HTTP-01 challenge
+is answered — a stack that does not publish it never gets a certificate — and
+it carries no application traffic: it redirects to HTTPS and nothing else,
+because DynDNS clients authenticate with HTTP Basic and a plaintext
+`/nic/update` is every device secret on the wire.
+
+`LETSENCRYPT_CASERVER` defaults to the **production** directory. Point it at
+staging for a rehearsal; `make tls-preflight` warns when you have.
+
+Two checks, and they are not redundant. `make tls-verify` says the chain is
+valid and unexpired — which is also true of the self-signed certificate Traefik
+serves before it has issued anything. `make acme-verify` compares the
+certificate on the wire against the one in this stack's ACME store by
+fingerprint, which is what says a renewal will actually reach clients. Run the
+second one after a deploy.
+
+`make test-acme` is the gate test: it stands the shipped service up on
+throwaway ports against a local CA and proves an empty store issues, that a
+certificate near expiry renews, and that neither silently does nothing.
+`LIVE=1` adds one exercise against Let's Encrypt staging.
+
 ### Keeping the logs
 
 Container logs die with the container. `docker compose up -d` recreates, so a
