@@ -150,18 +150,55 @@ services:
 
   # TLS terminator. Enabled with `--profile tls`, so dev is unaffected.
   #
-  # Serves a certificate EXTRACTED from the old service's ACME store rather
-  # than running ACME itself — that store has one writer already and a second
-  # would corrupt it. The copy goes stale when the writer renews; see
-  # scripts/extract-acme-cert.sh and `make tls-refresh`.
+  # This service runs ACME itself: it owns a store under ${ACME_STORE_DIR},
+  # issues the certificate for ${TRAEFIK_HOSTNAME} on first start and renews it
+  # from Traefik's own timer thereafter. There is no second copy of the
+  # certificate anywhere and nothing to refresh by hand.
+  #
+  # It used to serve a certificate EXTRACTED from a predecessor's ACME store,
+  # because that store had a live writer and a second ACME-capable Traefik
+  # pointed at it would corrupt it. That predecessor is gone; the extraction
+  # script, the `compose.acme.yaml` hand-over overlay and the `tls-refresh`
+  # target went with it. docs/ops/cutover.md records what that was for.
   proxy:
     image: traefik:3.7
     profiles: [tls]
     restart: unless-stopped
+    environment:
+      # Reaches the router rule through Traefik's own file-provider templating
+      # — see infra/traefik/dynamic.yml. Passing it as an environment variable
+      # is what keeps the real hostname out of every tracked file here.
+      #
+      # Empty is a legal value for Compose and an illegal one for Traefik: the
+      # rule renders as Host(``), the router is rejected, and nothing is
+      # served. That is a deliberate second line behind
+      # `scripts/preflight-acme.sh`, which refuses first and says which
+      # variable is missing. The guard cannot be `${VAR:?}` — Compose
+      # interpolates the whole document at load time, INCLUDING services whose
+      # profile is not active (measured: `docker compose config` on a file with
+      # an inactive-profile `${X:?}` fails), so a `:?` here would break
+      # `make up` for every developer.
+      TRAEFIK_HOSTNAME: ${TRAEFIK_HOSTNAME:-}
     command:
-      - --entrypoints.websecure.address=:8443
+      - --entrypoints.web.address=:80
+      # 80 exists for the HTTP-01 challenge and for redirecting humans. It
+      # carries no application traffic: DynDNS clients authenticate with HTTP
+      # Basic, and a plaintext /nic/update is every device secret on the wire.
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
       - --providers.file.directory=/etc/traefik/dynamic
       - --providers.file.watch=true
+      - --certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL:-}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      # Defaulted to PRODUCTION on purpose. An unset value has to mean the
+      # thing an operator standing a real stack up wanted, and a staging
+      # default yields certificates no browser trusts. With no fallback
+      # certificate underneath any more, a wrong answer here fails on the
+      # first request instead of hiding for weeks. Rehearsals name the staging
+      # directory explicitly — see .env.example and `make test-acme LIVE=1`.
+      - --certificatesresolvers.letsencrypt.acme.caserver=${LETSENCRYPT_CASERVER:-https://acme-v02.api.letsencrypt.org/directory}
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
       - --log.level=INFO
       - --accesslog=true
       # JSON rather than the default CLF, because a log line is only as useful
@@ -194,10 +231,24 @@ services:
       # such failure mode.
       - --accesslog.fields.queryparameters.defaultmode=drop
     ports:
-      - "${TLS_HOST_PORT:-8443}:8443"
+      # Deliberately unprefixed: Docker binds both address families only when
+      # no host address is given, and about two thirds of this service's real
+      # traffic is IPv6 (cutover runbook § 1.3). A `0.0.0.0:` prefix here
+      # refuses that two thirds outright.
+      #
+      # The variables exist so the gate test can stand the *shipped* service up
+      # on a throwaway port pair instead of testing a copy of it; their
+      # defaults are the production values. 80 is not optional — it is where
+      # the HTTP-01 challenge is answered, so a stack that does not publish it
+      # never gets a certificate.
+      - "${ACME_HTTP_PUBLISH:-80}:80"
+      - "${ACME_HTTPS_PUBLISH:-443}:443"
     volumes:
       - ./infra/traefik/dynamic.yml:/etc/traefik/dynamic/dynamic.yml:ro
-      - ${TLS_CERT_DIR:-./certs}:/certs:ro
+      # This stack's OWN ACME store — read-write. It holds the account key and
+      # every issued certificate's private key, so .gitignore covers it and
+      # nothing else may point at it.
+      - ${ACME_STORE_DIR:-./letsencrypt}:/letsencrypt
     depends_on:
       api:
         condition: service_started

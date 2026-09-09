@@ -1,7 +1,38 @@
 # Cutover runbook — `dyndns-route53` → `atrium-ddns`
 
-**Status: written, not executed.** Executing it is #53, and #53 is operator-gated.
-Nothing in this file has been run against the live service. What *has* been run
+> **Status: partly executed, and the TLS half is superseded. Retained as history.**
+>
+> This file was written before the cutover and describes a hand-over from a
+> `dyndns-route53` stack that no longer exists. Read it for the reasoning, not
+> for the commands.
+>
+> **What is superseded.** The proxy now runs ACME itself, in the base
+> `compose.yaml`, and issues and renews without an operator step. So there is
+> no borrowed certificate, no `compose.acme.yaml` overlay to apply, and no
+> hand-over moment. These are gone, and every step below that names one is
+> dead: `compose.acme.yaml`, `infra/traefik/dynamic-acme.yml`,
+> `scripts/extract-acme-cert.sh`, and the `tls-extract`, `tls-refresh`,
+> `acme-config`, `acme-up` and `acme-down` make targets. § 2.2 and § 5.4 are
+> the sections this affects most; the rollback table's 5.4 rows describe an
+> arrangement that cannot be reached any more. The README's *TLS* section is
+> the current procedure.
+>
+> **What survives, because it was the expensive part to learn.** The measured
+> finding behind § 2.2.3 — that a `defaultCertificate` suppresses first
+> issuance outright, so a stack with a fallback looks flawless and never
+> contacts the CA — is exactly why the current design ships no fallback.
+> `infra/traefik/dynamic.yml` carries the finding, and `scripts/test-acme.sh`
+> phase B keeps it measured rather than remembered.
+>
+> **What was actually executed is not recorded here.** Observed on the deploy
+> host on 2026-09-09: the `dyndns-route53` compose project is absent, the
+> `atrium-ddns` proxy publishes 443, and the old ACME store's last renewal was
+> 2026-08-25. So the port move (step 5.4c) happened. This file was never
+> updated to say so, and nothing here should be read as a record of what ran.
+> The steps below were never reconciled against the live host.
+
+**On the original status line:** this document said "written, not executed" for
+its whole life, including after parts of it were executed. What *has* been run
 is every measurement it quotes; each one names the instrument it came from.
 
 **Audience:** one operator, at a keyboard, with ssh to the deploy host. Every
