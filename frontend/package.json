@@ -15,26 +15,26 @@
   "dependencies": {
     "@brendanbank/atrium-host-bundle-utils": "^0.31.1",
     "@brendanbank/atrium-host-types": "^0.31.1",
-    "@mantine/core": "^9.6.0",
-    "@mantine/hooks": "^9.6.0",
+    "@mantine/core": "^9.6.1",
+    "@mantine/hooks": "^9.6.1",
     "@tabler/icons-react": "^3.41.1",
     "@tanstack/react-query": "^5.102.8",
-    "react": "^19.2.5",
-    "react-dom": "^19.2.5"
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
   },
   "devDependencies": {
     "@brendanbank/atrium-test-utils": "^0.31.1",
-    "@playwright/test": "^1.61.0",
+    "@playwright/test": "^1.63.0",
     "@testing-library/jest-dom": "^7.0.1",
     "@testing-library/react": "^16.3.3",
-    "@types/node": "^26.4.1",
-    "@types/react": "^19.0.0",
-    "@types/react-dom": "^19.2.5",
+    "@types/node": "^26.5.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
     "jsdom": "^30.0.1",
     "otplib": "^13.5.0",
     "typescript": "^7.0.2",
     "vite": "^8.2.2",
     "vite-plugin-css-injected-by-js": "^5.0.2",
-    "vitest": "^4.1.11"
+    "vitest": "^5.0.0"
   }
 }
