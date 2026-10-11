@@ -112,7 +112,10 @@ test('every registered surface still mounts through the wrapper element', async 
   // card, the device create form and the name modal are query parameters
   // on it. Subtracting a surface is exactly the edit this count exists to
   // make someone justify, so the justification is here.
-  expect(rendered.length).toBe(11);
+  //
+  // **Twelve, up from eleven.** The Resolvers settings page — the
+  // recursive resolvers the service uses instead of the host's.
+  expect(rendered.length).toBe(12);
   // Keys are the registry's primary key: two registrations sharing one
   // silently replace each other, so the count above would still read 15
   // while one surface never mounts. Added by #46 because three issues
@@ -128,6 +131,7 @@ test('every registered surface still mounts through the wrapper element', async 
     'atrium-ddns-settings-rate-limits',
     'atrium-ddns-settings-health-checks',
     'atrium-ddns-settings-retention',
+    'atrium-ddns-settings-resolvers',
   ]) {
     expect(
       rendered.find((entry) => entry.key === key),

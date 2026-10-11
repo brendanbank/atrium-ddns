@@ -113,8 +113,8 @@ test('every child points at a path the bundle actually registered', async () => 
       true,
     );
   }
-  // Vacuity: three children, not zero.
-  expect(groups[0].children.length).toBe(3);
+  // Vacuity: four children, not zero.
+  expect(groups[0].children.length).toBe(4);
 });
 
 test('the pages are registered even when the group cannot be', async () => {

@@ -1509,6 +1509,37 @@ class TestNameserverSelection:
         provider = BaseProvider(ProviderAccount(service="x", domains=("example.com",)))
         assert provider.get_authoritative_nameserver("a.example.com") is None
 
+    def test_configured_resolvers_replace_the_system_resolver(
+        self, fake_dns: FakeDns, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``DdnsConfig.dns_resolvers`` is where the walk starts, and
+        ``/etc/resolv.conf`` is not read at all."""
+
+        def _refuse() -> Any:
+            raise AssertionError("the system resolver was read")
+
+        monkeypatch.setattr(dns.resolver, "get_default_resolver", _refuse)
+        configured = ("192.0.2.53", "2001:db8::53")
+        provider = BaseProvider(
+            ProviderAccount(service="x", domains=("example.com",)),
+            resolvers=configured,
+        )
+        assert tuple(provider._resolver().nameservers) == configured
+        assert provider.get_authoritative_nameserver("a.example.com") is None
+        # FakeDns times out every query, so the first hop must have tried
+        # each configured resolver in order before giving up.
+        assert [where for _q, where in fake_dns.udp_queries] == list(configured)
+
+    def test_a_failed_walk_falls_back_to_the_configured_resolvers(
+        self, r53: FakeRoute53Client, fake_dns: FakeDns
+    ) -> None:
+        """Not to the hardcoded public address: the operator's list wins."""
+        configured = ("192.0.2.53", "192.0.2.54")
+        provider = get_provider(r53_account(), resolvers=configured)
+        assert provider is not None
+        provider.createrecords(V4, ZONES, rtype="A")
+        assert fake_dns.last_nameservers == configured
+
 
 # --------------------------------------------------------------------------
 # Failures are dnserr, never an exception

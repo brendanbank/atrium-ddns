@@ -130,7 +130,7 @@ export const SURFACES: {
     blurb:
       'Every update, delete and authentication attempt, filterable by device, zone, name and address.',
   },
-  // #73's three settings pages. They are administrator surfaces rather
+  // The settings pages — #73's three, and Resolvers. They are administrator surfaces rather
   // than tenant ones — behind atrium's `app_setting.manage`, in the
   // Admin sidebar rather than the main one — and they are listed here
   // anyway, because the sweep in `HelpPage.test.tsx` is over *every*
@@ -155,6 +155,12 @@ export const SURFACES: {
     label: 'Retention (administrators)',
     blurb:
       'How long the log is kept, how hard the scheduled prune may work in one tick, and the window the board counts “updates / N d” over.',
+  },
+  {
+    to: SETTINGS_ROUTES.resolvers,
+    label: 'Resolvers (administrators)',
+    blurb:
+      'The public DNS resolvers this service asks, in order, to find each zone’s authoritative nameserver — used instead of the hosting provider’s, so an outage there does not stop health checks or updates.',
   },
 ];
 

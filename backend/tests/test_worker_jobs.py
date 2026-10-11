@@ -113,6 +113,7 @@ import dns.rcode
 import dns.rdatatype
 import dns.resolver
 import pytest
+from pydantic import ValidationError
 import pytest_asyncio
 import sqlalchemy as sa
 from app.db import get_engine, get_session_factory
@@ -843,6 +844,32 @@ async def test_the_rate_limit_table_is_pruned_on_its_own_window(config, tenants)
 # ===================================================================== #
 # 4. Health checks
 # ===================================================================== #
+
+
+async def test_the_health_check_resolves_through_the_configured_resolvers(
+    config, tenants, monkeypatch
+):
+    """The sweep builds its resolver from ``DdnsConfig.dns_resolvers``.
+
+    Every other health-check test injects ``resolve=``, which skips the
+    one line that reads the setting.
+    """
+    a = tenants["a"]
+    name = f"resolvers.a-jobs-{W}.example.invalid"
+    await _add_hostname(a["domain_id"], name, last_ip_v4="192.0.2.10")
+    configured = ["192.0.2.53", "2001:db8::53"]
+    built: list[tuple[float, tuple[str, ...]]] = []
+
+    def _factory(timeout: float, resolvers: Any = ()) -> Any:
+        built.append((timeout, tuple(resolvers)))
+        return FakeResolver({(name, "A"): ["192.0.2.10"]})
+
+    monkeypatch.setattr(wj, "make_resolver", _factory)
+    await run_health_checks(
+        scope=DdnsScope.for_user_id(a["user_id"]),
+        config=DdnsConfig(health_check_enabled=True, dns_resolvers=configured),
+    )
+    assert built == [(5.0, tuple(configured))], built
 
 
 async def test_the_health_check_classifies_ok_mismatch_missing_and_error(
@@ -2266,6 +2293,110 @@ async def test_the_walk_refuses_rather_than_falling_back_to_a_cache() -> None:
         await wj.authoritative_nameserver(
             "name.zone.invalid", timeout=2.0, system=system, query=_timeout
         )
+
+
+@pytest.mark.asyncio
+async def test_the_first_hop_fails_over_to_the_next_resolver() -> None:
+    """One resolver timing out or answering SERVFAIL is not a failed walk.
+
+    The 2026-10-08 outage, in miniature: the host's resolvers stopped
+    answering and every name on the board went to ``error``. The first hop
+    is the only one sent to a recursive resolver, so it is the one that
+    moves down the list.
+    """
+    system = _FakeSystemResolver(
+        nameservers=["192.0.2.1", "192.0.2.2", "192.0.2.3"],
+        addresses={"ns.example.invalid.": "203.0.113.53"},
+    )
+    delegating = _delegating_query({"invalid.": "ns.example.invalid."})
+    asked: list[str] = []
+
+    async def _flaky(message: Any, nameserver: str, timeout: float) -> Any:
+        asked.append(nameserver)
+        if nameserver == "192.0.2.1":
+            raise dns.exception.Timeout("no answer")
+        if nameserver == "192.0.2.2":
+            return _FakeResponse(dns.rcode.SERVFAIL, [], [])
+        return await delegating(message, nameserver, timeout)
+
+    got = await wj.authoritative_nameserver(
+        "name.zone.invalid", timeout=2.0, system=system, query=_flaky
+    )
+    assert got == "203.0.113.53"
+    assert asked[:3] == ["192.0.2.1", "192.0.2.2", "192.0.2.3"], asked
+    # Past the first hop the walk asks the authoritative server it was
+    # handed, not the resolver list.
+    assert set(asked[3:]) == {"203.0.113.53"}, asked
+
+
+@pytest.mark.asyncio
+async def test_a_walk_with_every_resolver_down_names_each_of_them() -> None:
+    system = _FakeSystemResolver(nameservers=["192.0.2.1", "192.0.2.2"], addresses={})
+
+    async def _down(message: Any, nameserver: str, timeout: float) -> Any:
+        raise dns.exception.Timeout(f"{nameserver} did not answer")
+
+    with pytest.raises(wj.AuthoritativeLookupError) as raised:
+        await wj.authoritative_nameserver(
+            "name.zone.invalid", timeout=2.0, system=system, query=_down
+        )
+    assert "192.0.2.1" in str(raised.value)
+    assert "192.0.2.2" in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_the_walk_starts_from_the_configured_resolvers_not_resolv_conf() -> None:
+    """``configure=False`` is what keeps ``/etc/resolv.conf`` out of it."""
+    built: list[dict[str, Any]] = []
+
+    class _Recording:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            built.append(kwargs)
+            self.nameservers: list[str] = []
+
+    asked: list[str] = []
+
+    async def _soa(message: Any, nameserver: str, timeout: float) -> Any:
+        asked.append(nameserver)
+        return _FakeResponse(dns.rcode.NOERROR, [[_FakeRecord(dns.rdatatype.SOA)]], [])
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(wj.dns.asyncresolver, "Resolver", _Recording)
+        await wj.authoritative_nameserver(
+            "name.zone.invalid",
+            timeout=2.0,
+            query=_soa,
+            resolvers=["192.0.2.9", "2001:db8::9"],
+        )
+    assert built == [{"configure": False}], built
+    assert asked[0] == "192.0.2.9", asked
+
+
+def test_the_resolver_setting_defaults_to_two_public_operators() -> None:
+    config = DdnsConfig()
+    assert config.dns_resolvers == [
+        "8.8.8.8",
+        "8.8.4.4",
+        "2001:4860:4860::8888",
+        "2001:4860:4860::8844",
+        "1.1.1.1",
+        "1.0.0.1",
+        "2606:4700:4700::1111",
+        "2606:4700:4700::1001",
+    ]
+    # A mutable default must not be shared between instances.
+    config.dns_resolvers.append("192.0.2.1")
+    assert "192.0.2.1" not in DdnsConfig().dns_resolvers
+
+
+def test_the_resolver_setting_takes_addresses_only() -> None:
+    cleaned = DdnsConfig(
+        dns_resolvers=[" 2001:4860:4860:0:0:0:0:8888 ", "8.8.8.8", "8.8.8.8", ""]
+    ).dns_resolvers
+    assert cleaned == ["2001:4860:4860::8888", "8.8.8.8"]
+    for refused in ([], [""], ["dns.google"], ["8.8.8.8", "not-an-address"]):
+        with pytest.raises(ValidationError):
+            DdnsConfig(dns_resolvers=refused)
 
 
 @pytest.mark.asyncio

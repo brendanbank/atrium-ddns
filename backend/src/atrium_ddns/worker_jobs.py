@@ -102,10 +102,17 @@ import sqlalchemy as sa
 from app.db import get_session_factory
 from app.logging import log
 from app.services.app_config import get_namespace, register_namespace
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import Device, DnsEvent, Hostname, RateLimitEvent
+from .resolvers import (
+    DEFAULT_DNS_RESOLVERS,
+    MAX_DNS_RESOLVERS,
+    MIN_DNS_RESOLVERS,
+    PER_RESOLVER_TIMEOUT,
+    normalise_resolvers,
+)
 from .scope import DdnsScope
 
 # --------------------------------------------------------------------- #
@@ -324,6 +331,36 @@ class DdnsConfig(BaseModel):
             "mutes every device that inherits."
         ),
     )
+
+    # --- resolvers ----------------------------------------------------- #
+    #: Where both delegation walks start — the health check's and
+    #: ``/nic/update``'s ``nochg`` check — in place of the host's
+    #: ``/etc/resolv.conf``. See :mod:`atrium_ddns.resolvers` for the
+    #: outage that made this a setting.
+    dns_resolvers: list[str] = Field(
+        # A literal, not a ``default_factory``: a factory leaves no
+        # ``default`` in the JSON schema, and the form prints the default
+        # beside the input. pydantic copies a mutable default per instance.
+        default=list(DEFAULT_DNS_RESOLVERS),
+        min_length=MIN_DNS_RESOLVERS,
+        max_length=MAX_DNS_RESOLVERS,
+        description=(
+            "Recursive DNS resolvers, by IP address, tried in order. They "
+            "are used to find each zone's authoritative nameserver, for "
+            "the health check and for /nic/update's unchanged-address "
+            "check. They are used instead of the host's resolvers, so an "
+            "outage at the hosting provider's DNS does not stop either. "
+            "Provider API calls still use the host's resolvers."
+        ),
+    )
+
+    @field_validator("dns_resolvers")
+    @classmethod
+    def _canonical_resolvers(cls, value: list[str]) -> list[str]:
+        cleaned = normalise_resolvers(value)
+        if len(cleaned) < MIN_DNS_RESOLVERS:
+            raise ValueError("at least one resolver address is required")
+        return cleaned
 
 
 # Module top level, in the module that *reads* the namespace.
@@ -709,12 +746,33 @@ class AuthoritativeLookupError(Exception):
 _WALK_START_TIMEOUT = 5.0
 
 
+def recursive_resolver(addresses: Sequence[str], timeout: float) -> Any:
+    """A ``dns.asyncresolver.Resolver`` that asks ``addresses`` and nothing else.
+
+    ``configure=False`` is the point: it never reads ``/etc/resolv.conf``.
+    dnspython tries the nameservers in order and moves on from one that
+    times out, refuses or answers ``SERVFAIL``, within ``lifetime``.
+    """
+    resolver = dns.asyncresolver.Resolver(configure=False)
+    resolver.nameservers = list(addresses)
+    resolver.timeout = min(timeout, PER_RESOLVER_TIMEOUT)
+    resolver.lifetime = timeout
+    return resolver
+
+
+#: Rcodes that say "this resolver could not help", as opposed to an answer
+#: about the name. The walk's first hop moves on to the next resolver on
+#: these; any other rcode is an answer and is acted on as before.
+_TRY_NEXT_RESOLVER = frozenset({dns.rcode.SERVFAIL, dns.rcode.REFUSED})
+
+
 async def authoritative_nameserver(
     fqdn: str,
     *,
     timeout: float,
     system: Any = None,
     query: Any = None,
+    resolvers: Sequence[str] = DEFAULT_DNS_RESOLVERS,
 ) -> str:
     """The address of a nameserver that owns ``fqdn``.
 
@@ -723,19 +781,27 @@ async def authoritative_nameserver(
     by label from the public suffix down, following NS targets, stopping
     where the parent stops delegating.
 
+    The walk starts at ``resolvers`` (``DdnsConfig.dns_resolvers``), not at
+    the host's resolver. The first hop is the only one that goes to a
+    recursive resolver, and it is the only one with a choice of server, so
+    it is the one that fails over: a timeout, a socket error, ``SERVFAIL``
+    or ``REFUSED`` moves on to the next address. Every later hop asks the
+    one authoritative server the previous hop named.
+
     Two arguments exist for the tests, which state that nothing in the
     health-check suite opens a socket: ``query`` stands in for
     ``dns.asyncquery.udp`` and ``system`` for the resolver used to turn an
-    NS *name* into an address.
+    NS *name* into an address. ``system`` wins over ``resolvers``.
     """
-    resolver = system if system is not None else dns.asyncresolver.Resolver()
+    resolver = system if system is not None else recursive_resolver(resolvers, timeout)
     send = query if query is not None else dns.asyncquery.udp
 
     if not resolver.nameservers:
         raise AuthoritativeLookupError(
-            "no system resolver to start the delegation walk from"
+            "no resolver configured to start the delegation walk from"
         )
-    nameserver = resolver.nameservers[0]
+    candidates = [str(server) for server in resolver.nameservers]
+    first_hop_timeout = min(timeout, PER_RESOLVER_TIMEOUT)
 
     name = dns.name.from_text(fqdn)
     depth = 2
@@ -746,19 +812,46 @@ async def authoritative_nameserver(
         sub = split[1]
 
         message = dns.message.make_query(sub, dns.rdatatype.NS)
-        try:
-            response = await send(message, str(nameserver), timeout=timeout)
-        except (dns.exception.Timeout, OSError) as exc:
+        failures: list[str] = []
+        response = None
+        nameserver = candidates[0]
+        for nameserver in candidates:
+            try:
+                response = await send(
+                    message,
+                    nameserver,
+                    timeout=first_hop_timeout if len(candidates) > 1 else timeout,
+                )
+            except (dns.exception.Timeout, OSError) as exc:
+                failures.append(f"{nameserver}: {exc}")
+                continue
+            if len(candidates) > 1 and response.rcode() in _TRY_NEXT_RESOLVER:
+                failures.append(
+                    f"{nameserver}: answered {dns.rcode.to_text(response.rcode())}"
+                )
+                response = None
+                continue
+            break
+        if response is None:
             raise AuthoritativeLookupError(
-                f"NS query for {sub} failed: {exc}"
-            ) from exc
+                f"NS query for {sub} failed: {'; '.join(failures)}"
+            )
+        if failures and len(candidates) > 1:
+            # Promote the resolver that answered. The NS-target lookups
+            # below go through the same resolver object, and so does every
+            # later walk in the sweep (`make_resolver` shares one), so a
+            # dead first entry costs one timeout per sweep rather than one
+            # per lookup.
+            resolver.nameservers = [nameserver] + [
+                server for server in candidates if server != nameserver
+            ]
 
         rcode = response.rcode()
         if rcode != dns.rcode.NOERROR:
             if rcode == dns.rcode.NXDOMAIN and depth > 2:
                 # No delegation at this level, so the server found at the
                 # parent owns the whole remaining name.
-                return str(nameserver)
+                return nameserver
             raise AuthoritativeLookupError(
                 f"NS query for {sub} answered {dns.rcode.to_text(rcode)}"
             )
@@ -782,13 +875,16 @@ async def authoritative_nameserver(
                 raise AuthoritativeLookupError(
                     f"the NS target {authority} has no address: {exc}"
                 ) from exc
+        candidates = [nameserver]
 
         depth += 1
 
-    return str(nameserver)
+    return nameserver
 
 
-def make_resolver(timeout: float) -> Resolve:
+def make_resolver(
+    timeout: float, resolvers: Sequence[str] = DEFAULT_DNS_RESOLVERS
+) -> Resolve:
     """The real resolver: the **authoritative** server, asked directly.
 
     This used to be a bare ``dns.asyncresolver.Resolver()``, which reads
@@ -810,6 +906,11 @@ def make_resolver(timeout: float) -> Resolve:
     ``email-validator``, a transitive path, so ``tests/test_worker_jobs.py``
     asserts the import rather than trusting it to stay there.
     """
+    # One recursive resolver per sweep, shared by every walk in it, so
+    # `authoritative_nameserver`'s promotion of a working resolver carries
+    # from one name to the next.
+    recursive = recursive_resolver(resolvers, timeout)
+
     # Per-sweep, and deliberately not wider: a delegation that changes
     # between sweeps must be followed, and a process-lifetime cache would
     # pin the answer to whatever was true when the worker started. Within
@@ -821,7 +922,9 @@ def make_resolver(timeout: float) -> Resolve:
         key = name.lower().rstrip(".")
         nameserver = seen.get(key)
         if nameserver is None:
-            nameserver = await authoritative_nameserver(name, timeout=timeout)
+            nameserver = await authoritative_nameserver(
+                name, timeout=timeout, system=recursive
+            )
             seen[key] = nameserver
 
         resolver = dns.asyncresolver.Resolver(configure=False)
@@ -1220,7 +1323,9 @@ async def run_health_checks(
         log.info("atrium_ddns.health_check.nothing_due", **summary.as_log_fields())
         return summary
 
-    resolve = resolve or make_resolver(config.health_check_timeout_seconds)
+    resolve = resolve or make_resolver(
+        config.health_check_timeout_seconds, config.dns_resolvers
+    )
     gate = asyncio.Semaphore(config.health_check_concurrency)
 
     async def _check(hostname: Hostname) -> tuple[Hostname, list[RecordCheck]]:
@@ -1823,6 +1928,7 @@ __all__ = [
     "AuthoritativeLookupError",
     "authoritative_nameserver",
     "make_resolver",
+    "recursive_resolver",
     "register_jobs",
     "reset_counters",
     "run_health_checks",

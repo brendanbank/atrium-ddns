@@ -23,12 +23,12 @@
  * a setting that exists, validates, enforces and is uneditable — the
  * exact state #73 was opened about, reintroduced one layer down.
  */
-import { NumberInput, Switch, Text, TextInput } from '@mantine/core';
+import { NumberInput, Switch, TagsInput, Text, TextInput } from '@mantine/core';
 
 import type { SettingField } from '../api/config';
 
 /** What a field's value can be over the wire. */
-export type SettingValue = string | number | boolean | null;
+export type SettingValue = string | number | boolean | string[] | null;
 
 export function isNumeric(field: SettingField): boolean {
   return field.type === 'integer' || field.type === 'number';
@@ -41,6 +41,21 @@ export function isNumeric(field: SettingField): boolean {
  *  otherwise nowhere to read the inherited number. */
 export function fieldHelp(field: SettingField): string {
   const parts = [field.help];
+  if (field.type === 'array') {
+    const min = field.min_items ?? null;
+    const max = field.max_items ?? null;
+    if (min !== null && max !== null) {
+      parts.push(`${min} to ${max} entries.`);
+    } else if (min !== null) {
+      parts.push(`At least ${min} ${min === 1 ? 'entry' : 'entries'}.`);
+    } else if (max !== null) {
+      parts.push(`At most ${max} entries.`);
+    }
+    if (Array.isArray(field.default)) {
+      parts.push(`Default ${field.default.join(', ')}.`);
+    }
+    return parts.filter((part) => part.length > 0).join(' ');
+  }
   if (field.minimum !== null && field.maximum !== null) {
     parts.push(`${field.minimum} to ${field.maximum}.`);
   } else if (field.minimum !== null) {
@@ -111,6 +126,26 @@ export function SettingInput({
         value={typeof value === 'string' ? value : ''}
         disabled={disabled}
         onChange={(event) => onChange(event.currentTarget.value)}
+        data-testid={testid}
+      />
+    );
+  }
+  if (field.type === 'array' && field.item_type === 'string') {
+    // One entry per tag, in order — the order is meaningful for a list
+    // tried first to last. The server canonicalises and refuses what it
+    // cannot parse; a refusal comes back through the save error, word for
+    // word, rather than being second-guessed here.
+    return (
+      <TagsInput
+        label={field.label}
+        description={fieldHelp(field)}
+        value={Array.isArray(value) ? value : []}
+        disabled={disabled}
+        maxTags={field.max_items ?? undefined}
+        splitChars={[',', ' ']}
+        allowDuplicates={false}
+        clearable
+        onChange={(next) => onChange(next)}
         data-testid={testid}
       />
     );

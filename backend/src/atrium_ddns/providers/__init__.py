@@ -61,7 +61,7 @@ asserts exactly those and is satisfied by either implementation.
 """
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import structlog
 
@@ -143,7 +143,9 @@ def provider_class(service: Any) -> type[BaseProvider] | None:
     return _REGISTRY.get(service)
 
 
-def get_provider(account: ProviderAccount) -> BaseProvider | None:
+def get_provider(
+    account: ProviderAccount, *, resolvers: Sequence[str] = ()
+) -> BaseProvider | None:
     """Resolve and construct the adapter for ``account``, or ``None``.
 
     ``None`` — never an exception — for a service nobody claims, and
@@ -158,6 +160,9 @@ def get_provider(account: ProviderAccount) -> BaseProvider | None:
     path. It logs at ``critical`` with the exception text intact,
     because the alternative is a tenant seeing ``911`` forever with
     nothing in the log to say why.
+
+    ``resolvers`` is ``DdnsConfig.dns_resolvers``: where the adapter's
+    delegation walk starts. Empty means the host's resolver.
     """
     cls = provider_class(account.service)
     if cls is None:
@@ -170,7 +175,7 @@ def get_provider(account: ProviderAccount) -> BaseProvider | None:
         return None
 
     try:
-        return cls(account)
+        return cls(account, resolvers=resolvers)
     except Exception as exc:  # noqa: BLE001
         log.critical(
             "provider.construction_failed",

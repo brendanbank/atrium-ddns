@@ -55,7 +55,7 @@ export const CONFIG_PERMISSION = 'app_setting.manage';
  *  `number` are separate on purpose: `health_check_timeout_seconds` is
  *  a float and an input that rounds it to 5 has silently changed the
  *  operator's setting. */
-export type SettingType = 'integer' | 'number' | 'boolean' | 'string';
+export type SettingType = 'integer' | 'number' | 'boolean' | 'string' | 'array';
 
 export interface SettingField {
   name: string;
@@ -67,6 +67,13 @@ export interface SettingField {
   /** `null` is *unbounded*, never `0`. */
   minimum: number | null;
   maximum: number | null;
+  /** Entry type for an `array` field; only `string` is served today.
+   *  Absent on the other types. */
+  item_type?: 'string' | null;
+  /** Entry-count bounds for an `array` field. Not `minimum`/`maximum`,
+   *  which bound a value rather than how many there are. */
+  min_items?: number | null;
+  max_items?: number | null;
 }
 
 export interface SettingGroup {

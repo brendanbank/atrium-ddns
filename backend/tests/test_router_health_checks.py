@@ -200,7 +200,7 @@ def _scripted(answers: dict[str, list[str]]):
     seam production could take.
     """
 
-    def factory(_timeout: float):
+    def factory(_timeout: float, _resolvers: Any = ()):
         async def resolve(name: str, rdtype: str) -> list[str]:
             return answers.get(f"{name}/{rdtype}", [])
 
@@ -612,7 +612,7 @@ async def test_the_claim_is_committed_before_the_fan_out(
     """
     a = tenants["a"]
 
-    def exploding(_timeout: float):
+    def exploding(_timeout: float, _resolvers: Any = ()):
         async def resolve(_name: str, _rdtype: str) -> list[str]:
             raise RuntimeError("scripted resolver failure")
 

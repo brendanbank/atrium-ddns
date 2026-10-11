@@ -102,7 +102,7 @@ from .providers import (
     ProviderAccount,
     get_provider,
 )
-from .worker_jobs import load_config
+from .worker_jobs import DdnsConfig, load_config
 
 router = APIRouter(tags=["nic"])
 
@@ -294,7 +294,13 @@ def aggregate(statuses: Sequence[str]) -> str:
 
 
 def _run_backend(
-    backend: BackendPlan, hostname: str, *, op: str, ip: str | None, rtype: str | None
+    backend: BackendPlan,
+    hostname: str,
+    *,
+    op: str,
+    ip: str | None,
+    rtype: str | None,
+    resolvers: Sequence[str] = (),
 ) -> str:
     """One backend's contribution for one hostname. **Blocking.**
 
@@ -325,7 +331,8 @@ def _run_backend(
             credentials=backend.credentials or {},
             config=backend.config,
             id=str(backend.backend_id),
-        )
+        ),
+        resolvers=resolvers,
     )
     if provider is None:
         # `get_provider` logs the unknown service and the known set.
@@ -346,7 +353,12 @@ def _run_backend(
 
 
 def run_dns_phase(
-    plans: Sequence[HostnamePlan], *, op: str, ip: str | None, rtype: str | None
+    plans: Sequence[HostnamePlan],
+    *,
+    op: str,
+    ip: str | None,
+    rtype: str | None,
+    resolvers: Sequence[str] = (),
 ) -> list[HostnameResult]:
     """Every backend call for the whole request. **Blocking.**
 
@@ -384,7 +396,12 @@ def run_dns_phase(
             continue
         for backend in plan.backends:
             status = _run_backend(
-                backend, plan.lookup, op=op, ip=ip, rtype=rtype
+                backend,
+                plan.lookup,
+                op=op,
+                ip=ip,
+                rtype=rtype,
+                resolvers=resolvers,
             )
             result.attempts.append((backend.backend_type, status))
         result.status = aggregate([status for _, status in result.attempts])
@@ -705,6 +722,22 @@ class Admission:
 
     auth: DeviceAuth | None
     refusal: str | None
+    #: The namespace as read for the rate limit, handed on so the DNS
+    #: phase can use ``dns_resolvers`` without a second read. ``None`` on
+    #: a refusal that happened before it was read.
+    config: DdnsConfig | None = None
+
+
+def _resolvers(admission: Admission) -> tuple[str, ...]:
+    """``DdnsConfig.dns_resolvers`` from an admitted request.
+
+    Admission reads the namespace for the rate limit; an admitted request
+    always carries it. The model default is the answer if it somehow does
+    not, rather than the host's resolver — which is what the setting exists
+    to avoid.
+    """
+    config = admission.config or DdnsConfig()
+    return tuple(config.dns_resolvers)
 
 
 async def _admit(
@@ -767,7 +800,7 @@ async def _admit(
         )
         return Admission(auth=None, refusal=STATUS_ABUSE)
 
-    return Admission(auth=auth, refusal=None)
+    return Admission(auth=auth, refusal=None, config=config)
 
 
 def _touch_device(
@@ -949,7 +982,14 @@ async def update(
 
     plans = await load_plans(session, auth, requested)
     results = await anyio.to_thread.run_sync(
-        functools.partial(run_dns_phase, plans, op="update", ip=ip, rtype=rtype)
+        functools.partial(
+            run_dns_phase,
+            plans,
+            op="update",
+            ip=ip,
+            rtype=rtype,
+            resolvers=_resolvers(admission),
+        )
     )
 
     await persist_updates(session, auth, results, ip=ip, rtype=rtype)
@@ -1175,7 +1215,14 @@ async def delete(
 
     plans = await load_plans(session, auth, requested)
     results = await anyio.to_thread.run_sync(
-        functools.partial(run_dns_phase, plans, op="delete", ip=None, rtype=rtype)
+        functools.partial(
+            run_dns_phase,
+            plans,
+            op="delete",
+            ip=None,
+            rtype=rtype,
+            resolvers=_resolvers(admission),
+        )
     )
 
     # Delete persists nothing: `last_ip_v4` / `last_ip_v6` /

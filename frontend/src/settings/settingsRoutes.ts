@@ -27,6 +27,7 @@ export const SETTINGS_ROUTES: Record<string, string> = {
   'rate-limits': '/atrium-ddns/settings/rate-limits',
   'health-checks': '/atrium-ddns/settings/health-checks',
   retention: '/atrium-ddns/settings/retention',
+  resolvers: '/atrium-ddns/settings/resolvers',
 };
 
 /** Sidebar labels. Deliberately the same words as the backend's
@@ -36,6 +37,7 @@ export const SETTINGS_LABELS: Record<string, string> = {
   'rate-limits': 'Rate limits',
   'health-checks': 'Health checks',
   retention: 'Retention',
+  resolvers: 'Resolvers',
 };
 
 /** The registry key for the group itself. */
