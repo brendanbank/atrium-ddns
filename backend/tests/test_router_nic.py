@@ -537,6 +537,41 @@ async def test_an_ipv4_update_writes_an_a_record(client, world) -> None:
     assert [call.ip for call in creates()] == ["203.0.113.10"]
 
 
+async def test_the_configured_resolvers_reach_every_provider(
+    client, world, monkeypatch
+) -> None:
+    """``DdnsConfig.dns_resolvers`` is where the ``nochg`` walk starts.
+
+    The adapter is built in a worker thread with no session, so the list
+    has to be carried there from admission. A dropped hand-off is silent:
+    the adapter falls back to the host's resolver, which is the dependency
+    the setting exists to remove.
+    """
+    configured = ["192.0.2.53", "2001:db8::53"]
+
+    async def _config(_session: Any) -> router_nic.DdnsConfig:
+        return router_nic.DdnsConfig(dns_resolvers=configured)
+
+    seen: list[tuple[str, ...]] = []
+    real = router_nic.get_provider
+
+    def _recording(account: Any, *, resolvers: Any = ()) -> Any:
+        seen.append(tuple(resolvers))
+        return real(account, resolvers=resolvers)
+
+    monkeypatch.setattr(router_nic, "load_config", _config)
+    monkeypatch.setattr(router_nic, "get_provider", _recording)
+
+    for path in ("/nic/update", "/nic/delete"):
+        response = await get(
+            client, path, headers=alice(world),
+            hostname=world.name("ok"), myip="203.0.113.10",
+        )
+        assert response.status_code == 200, response.text
+    assert seen, "no provider was built; the assertion below would be vacuous"
+    assert set(seen) == {tuple(configured)}, seen
+
+
 async def test_an_ipv6_update_writes_an_aaaa_record(client, world) -> None:
     response = await get(
         client, "/nic/update", headers=alice(world),

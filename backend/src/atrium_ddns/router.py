@@ -4211,7 +4211,14 @@ async def manual_update(
             ),
         ) from exc
     results = await anyio.to_thread.run_sync(
-        functools.partial(run_dns_phase, plans, op="update", ip=ip, rtype=rtype)
+        functools.partial(
+            run_dns_phase,
+            plans,
+            op="update",
+            ip=ip,
+            rtype=rtype,
+            resolvers=tuple(config.dns_resolvers),
+        )
     )
     result = results[0]
 

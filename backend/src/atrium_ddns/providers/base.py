@@ -52,6 +52,8 @@ import dns.rdatatype
 import dns.resolver
 import structlog
 
+from ..resolvers import PER_RESOLVER_TIMEOUT
+
 log = structlog.get_logger(__name__)
 
 #: The three statuses an adapter may return, per hostname.
@@ -277,8 +279,14 @@ class BaseProvider:
     #: identical defect one release later.
     SETTING_FIELDS: ClassVar[tuple["SettingField", ...]] = ()
 
-    def __init__(self, account: ProviderAccount) -> None:
+    def __init__(
+        self, account: ProviderAccount, *, resolvers: Sequence[str] = ()
+    ) -> None:
         self._account = account
+        #: ``DdnsConfig.dns_resolvers``, passed down by ``/nic/*``. Empty
+        #: means the host's ``/etc/resolv.conf`` — the legacy behaviour,
+        #: kept for callers that hold no config (the importer, tests).
+        self._resolvers: tuple[str, ...] = tuple(resolvers)
         # Seeded from the configured domains and from nothing else.
         # Zone discovery may *refine* an entry (a domain hosted inside a
         # wider zone maps to that zone's provider-side handle) but it
@@ -618,10 +626,13 @@ class BaseProvider:
 
         if nameserver is None:
             nameserver = self.get_authoritative_nameserver(hostname)
-            if nameserver is None:
-                nameserver = FALLBACK_NAMESERVER
 
-        resolver.nameservers = [nameserver]
+        if nameserver is not None:
+            resolver.nameservers = [nameserver]
+        else:
+            # The configured resolvers when there are any — dnspython fails
+            # over between them — else the legacy single public address.
+            resolver.nameservers = list(self._resolvers) or [FALLBACK_NAMESERVER]
 
         try:
             rdatatype = dns.rdatatype.from_text(rrtype)
@@ -692,7 +703,12 @@ class BaseProvider:
         if not default.nameservers:
             log.error("provider.no_system_resolver", domain=domain)
             return None
-        nameserver = default.nameservers[0]
+        # Only the first hop goes to a recursive resolver, and only it has
+        # a choice of server, so only it fails over: a timeout, a socket
+        # error, SERVFAIL or REFUSED moves on to the next address. Every
+        # later hop asks the one authoritative server the previous named.
+        candidates = [str(server) for server in default.nameservers]
+        nameserver = candidates[0]
 
         depth = 2
         last = False
@@ -702,16 +718,53 @@ class BaseProvider:
             sub = split[1]
 
             query = dns.message.make_query(sub, dns.rdatatype.NS)
-            try:
-                response = dns.query.udp(query, nameserver, timeout=5)
-            except (dns.exception.Timeout, OSError) as exc:
-                log.error(
-                    "provider.ns_query_failed",
-                    zone=str(sub),
-                    nameserver=str(nameserver),
-                    error=str(exc),
-                )
+            failover = len(candidates) > 1
+            # One resolver missing is a failover, not a failure: logged at
+            # warning per resolver, and at error only when none answered.
+            report = log.warning if failover else log.error
+            response = None
+            for nameserver in candidates:
+                try:
+                    response = dns.query.udp(
+                        query,
+                        nameserver,
+                        timeout=PER_RESOLVER_TIMEOUT if failover else 5,
+                    )
+                except (dns.exception.Timeout, OSError) as exc:
+                    report(
+                        "provider.ns_query_failed",
+                        zone=str(sub),
+                        nameserver=str(nameserver),
+                        error=str(exc),
+                    )
+                    continue
+                if failover and response.rcode() in (
+                    dns.rcode.SERVFAIL,
+                    dns.rcode.REFUSED,
+                ):
+                    report(
+                        "provider.ns_query_rcode",
+                        zone=str(sub),
+                        nameserver=str(nameserver),
+                        rcode=dns.rcode.to_text(response.rcode()),
+                    )
+                    response = None
+                    continue
+                break
+            if response is None:
+                if failover:
+                    log.error(
+                        "provider.ns_query_no_resolver_answered",
+                        zone=str(sub),
+                        resolvers=candidates,
+                    )
                 return None
+            if failover and nameserver != candidates[0]:
+                # Promote the resolver that answered, so the NS-target
+                # lookups below do not wait on the dead one first.
+                default.nameservers = [nameserver] + [
+                    server for server in candidates if server != nameserver
+                ]
 
             rcode = response.rcode()
             if rcode != dns.rcode.NOERROR:
@@ -746,21 +799,32 @@ class BaseProvider:
                         error=str(exc),
                     )
                     return None
+            candidates = [nameserver]
 
             depth += 1
 
         return nameserver
 
     def _resolver(self) -> dns.resolver.Resolver:
-        """The system resolver, built once, lazily.
+        """The recursive resolver the walk starts from, built once, lazily.
 
-        Lazily because ``get_default_resolver()`` reads
-        ``/etc/resolv.conf``: doing it in ``__init__`` makes constructing
-        an adapter — which happens once per backend row per request — a
-        filesystem read, and makes this class untestable without one.
+        The configured resolvers when the caller passed any, with
+        ``configure=False`` so ``/etc/resolv.conf`` is never read. Otherwise
+        the system resolver — lazily, because ``get_default_resolver()``
+        reads ``/etc/resolv.conf``: doing it in ``__init__`` makes
+        constructing an adapter — which happens once per backend row per
+        request — a filesystem read, and makes this class untestable
+        without one.
         """
         if self._default_resolver is None:
-            self._default_resolver = dns.resolver.get_default_resolver()
+            if self._resolvers:
+                resolver = dns.resolver.Resolver(configure=False)
+                resolver.nameservers = list(self._resolvers)
+                resolver.timeout = PER_RESOLVER_TIMEOUT
+                resolver.lifetime = 5.0
+                self._default_resolver = resolver
+            else:
+                self._default_resolver = dns.resolver.get_default_resolver()
         return self._default_resolver
 
     # -- the operations -------------------------------------------- #

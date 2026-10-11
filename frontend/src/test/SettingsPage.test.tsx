@@ -298,6 +298,71 @@ test('saving one page writes every field of the namespace', async () => {
   await waitFor(() => expect(screen.getByTestId('settings-saved')).toBeTruthy());
 });
 
+test('a list setting is edited as entries and saved as a list', async () => {
+  // Addresses from the documentation ranges, not the real defaults — a
+  // form with the production list hardcoded would fail this.
+  schemaPayload = {
+    ...SCHEMA,
+    groups: [
+      ...SCHEMA.groups,
+      {
+        key: 'resolvers',
+        label: 'Resolvers',
+        blurb: 'The recursive resolvers this service asks.',
+        fields: [
+          {
+            name: 'dns_resolvers',
+            type: 'array',
+            item_type: 'string',
+            label: 'Dns Resolvers',
+            help: 'Recursive DNS resolvers, by IP address, tried in order.',
+            default: ['192.0.2.1', '2001:db8::1'],
+            minimum: null,
+            maximum: null,
+            min_items: 1,
+            max_items: 5,
+          },
+        ],
+      },
+    ],
+  };
+  adminConfigPayload = {
+    atrium_ddns: { ...STORED, dns_resolvers: ['198.51.100.1', '198.51.100.2'] },
+  };
+  await mount(ADMIN, 'resolvers');
+
+  // The help line names the entry bounds and the default list.
+  const help = screen.getByText(/1 to 5 entries/);
+  expect(help.textContent).toContain('Default 192.0.2.1, 2001:db8::1');
+
+  // The stored entries render as entries, in order.
+  expect(screen.getByText('198.51.100.1')).toBeTruthy();
+  expect(screen.getByText('198.51.100.2')).toBeTruthy();
+
+  const input = screen.getByTestId('setting-dns_resolvers') as HTMLInputElement;
+  // Focus first: Mantine's combobox inputs ignore a change to an input
+  // that is not the active element (it reads as autofill).
+  input.focus();
+  fireEvent.change(input, { target: { value: '203.0.113.9' } });
+  fireEvent.keyDown(input, { key: 'Enter' });
+  await waitFor(() =>
+    expect(
+      (screen.getByTestId('settings-save') as HTMLButtonElement).disabled,
+    ).toBe(false),
+  );
+  fireEvent.click(screen.getByTestId('settings-save'));
+
+  await waitFor(() => expect(puts.length).toBe(1));
+  // A list on the wire, appended in place — not a comma-joined string.
+  expect(puts[0].body.dns_resolvers).toEqual([
+    '198.51.100.1',
+    '198.51.100.2',
+    '203.0.113.9',
+  ]);
+  // The rest of the namespace still travels with it.
+  expect(puts[0].body.rate_limit_per_minute).toBe(30);
+});
+
 test('a group the server sends and this build cannot route to is named', async () => {
   schemaPayload = {
     ...SCHEMA,

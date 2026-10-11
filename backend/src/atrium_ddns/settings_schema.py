@@ -70,7 +70,9 @@ UNGROUPED_KEY = "ungrouped"
 #:
 #: Three pages, one per legacy surface #73 lists: ``/admin/rate-limits``,
 #: ``/admin/health-checks/config``, and the retention settings that
-#: replaced ``/admin/events/clear`` (``ui-parity.md`` §3.4).
+#: replaced ``/admin/events/clear`` (``ui-parity.md`` §3.4). A fourth,
+#: ``resolvers``, has no legacy page: it holds the list of recursive
+#: resolvers added after the 2026-10-08 resolver outage.
 #:
 #: ``device_idle_window_days`` is the one field whose home is arguable:
 #: it is the board's denominator, not a retention window. It sits on the
@@ -103,6 +105,7 @@ FIELD_GROUPS: dict[str, tuple[str, ...]] = {
         "prune_max_batches",
         "device_idle_window_days",
     ),
+    "resolvers": ("dns_resolvers",),
 }
 
 #: Group key -> (label, the sentence under the heading). The labels are
@@ -126,6 +129,13 @@ GROUP_LABELS: dict[str, tuple[str, str]] = {
         "How long the log and the limiter's own rows are kept, and how "
         "hard the scheduled prune is allowed to work in one tick.",
     ),
+    "resolvers": (
+        "Resolvers",
+        "The recursive DNS resolvers this service asks, in order, instead "
+        "of the host's. They are only used to find each zone's "
+        "authoritative nameserver; the address checks themselves go to "
+        "that nameserver directly.",
+    ),
     UNGROUPED_KEY: (
         "Assigned to no page yet",
         "These settings exist in the model and this build assigns them "
@@ -147,7 +157,10 @@ class SettingFieldOut(BaseModel):
     #: JSON-schema type. ``integer`` and ``number`` are different on
     #: purpose: ``health_check_timeout_seconds`` is a float and an input
     #: that rounds it to 5 has silently changed the operator's setting.
-    type: Literal["integer", "number", "boolean", "string"]
+    type: Literal["integer", "number", "boolean", "string", "array"]
+    #: The JSON-schema type of each entry when ``type`` is ``array``,
+    #: ``None`` otherwise. Only ``string`` entries are rendered today.
+    item_type: Literal["string"] | None = None
     label: str
     #: The model's ``description``. Empty is a test failure, not a
     #: rendering decision — see the module docstring.
@@ -159,6 +172,12 @@ class SettingFieldOut(BaseModel):
     #: as ``0`` — the four states rule applied to a bound.
     minimum: float | None
     maximum: float | None
+    #: Entry-count bounds for an ``array`` field (``minItems`` /
+    #: ``maxItems``). Separate from ``minimum`` / ``maximum``, which are
+    #: bounds on a *value* — a list of at least one address is not a list
+    #: whose addresses are at least 1.
+    min_items: int | None = None
+    max_items: int | None = None
 
 
 class SettingGroupOut(BaseModel):
@@ -193,12 +212,20 @@ def _field_descriptor(name: str, schema: dict[str, Any]) -> SettingFieldOut:
     # today, and a `type` that is missing rather than wrong is the
     # honest failure. Refuse instead of guessing "string".
     field_type = schema.get("type")
-    if field_type not in ("integer", "number", "boolean", "string"):
+    if field_type not in ("integer", "number", "boolean", "string", "array"):
         raise ValueError(
             f"{CONFIG_NAMESPACE}.{name}: JSON-schema type {field_type!r} "
             f"is not one this form can render. Add a renderer before "
             f"adding the field."
         )
+    item_type = None
+    if field_type == "array":
+        item_type = (schema.get("items") or {}).get("type")
+        if item_type != "string":
+            raise ValueError(
+                f"{CONFIG_NAMESPACE}.{name}: a list of {item_type!r} is not "
+                f"one this form can render; only lists of strings are."
+            )
     return SettingFieldOut(
         name=name,
         type=field_type,
@@ -211,6 +238,9 @@ def _field_descriptor(name: str, schema: dict[str, Any]) -> SettingFieldOut:
         default=schema.get("default"),
         minimum=schema.get("minimum"),
         maximum=schema.get("maximum"),
+        item_type=item_type,
+        min_items=schema.get("minItems"),
+        max_items=schema.get("maxItems"),
     )
 
 
