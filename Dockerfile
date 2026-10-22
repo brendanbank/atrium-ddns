@@ -10,7 +10,13 @@
 ARG ATRIUM_IMAGE=ghcr.io/brendanbank/atrium:0.31.4
 
 # ---- frontend-builder ----
-FROM node:26-alpine AS frontend-builder
+# `--platform=$BUILDPLATFORM`: the output is a plain JS bundle, identical
+# on every architecture, so it is built once on the runner's native arch
+# rather than once per target. Without it the arm64 leg ran `vite build`
+# under QEMU, and rolldown (vite 8's multithreaded native bundler) hung
+# there indefinitely — the v0.1.26 release sat on it for 6h until the job
+# was killed, and no image was published.
+FROM --platform=$BUILDPLATFORM node:26-alpine AS frontend-builder
 WORKDIR /app
 RUN npm install -g pnpm@10.33.1
 

@@ -46,6 +46,9 @@ jobs:
   publish:
     name: Multi-arch image + GitHub Release
     runs-on: ubuntu-latest
+    # A healthy run takes ~4 minutes. The default is 6 hours, which is how
+    # long v0.1.26 sat on a hung emulated build before anyone was told.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
@@ -80,7 +83,9 @@ jobs:
 
       # The base image is multi-arch (linux/amd64 + linux/arm64, verified
       # 2026-09-02), so arm64 is a real build rather than emulated-and-hoped.
-      # QEMU is still needed for the frontend-builder stage's npm work.
+      # QEMU is still needed for the runtime stage's arm64 `pip install`. The
+      # frontend-builder stage runs on the build platform and never touches
+      # it — see the comment on that stage in the Dockerfile.
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
 
