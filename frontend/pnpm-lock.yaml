@@ -9,11 +9,11 @@ importers:
   .:
     dependencies:
       '@brendanbank/atrium-host-bundle-utils':
-        specifier: ^0.32.0
-        version: 0.32.0(@tanstack/react-query@5.104.5(@types/react@19.3.0)(react@19.3.1))(react-dom@19.3.1(react@19.3.1))(react@19.3.1)(vite-plugin-css-injected-by-js@5.0.2(vite@8.3.5(@types/node@26.6.5)))(vite@8.3.5(@types/node@26.6.5))
+        specifier: ^0.32.1
+        version: 0.32.1(@tanstack/react-query@5.104.5(@types/react@19.3.0)(react@19.3.1))(react-dom@19.3.1(react@19.3.1))(react@19.3.1)(vite-plugin-css-injected-by-js@5.0.2(vite@8.3.5(@types/node@26.6.5)))(vite@8.3.5(@types/node@26.6.5))
       '@brendanbank/atrium-host-types':
-        specifier: ^0.32.0
-        version: 0.32.0(react@19.3.1)
+        specifier: ^0.32.1
+        version: 0.32.1(react@19.3.1)
       '@mantine/core':
         specifier: ^9.7.3
         version: 9.7.3(@mantine/hooks@9.7.3(react@19.3.1))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
@@ -34,8 +34,8 @@ importers:
         version: 19.3.1(react@19.3.1)
     devDependencies:
       '@brendanbank/atrium-test-utils':
-        specifier: ^0.32.0
-        version: 0.32.0(@tanstack/react-query@5.104.5(@types/react@19.3.0)(react@19.3.1))(@testing-library/react@16.3.3(@testing-library/dom@10.4.1)(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(react-dom@19.3.1(react@19.3.1))(react@19.3.1)(vite-plugin-css-injected-by-js@5.0.2(vite@8.3.5(@types/node@26.6.5)))(vite@8.3.5(@types/node@26.6.5))(vitest@5.0.5(@types/node@26.6.5)(jsdom@30.1.3(@noble/hashes@2.4.0))(vite@8.3.5(@types/node@26.6.5)))
+        specifier: ^0.32.1
+        version: 0.32.1(@tanstack/react-query@5.104.5(@types/react@19.3.0)(react@19.3.1))(@testing-library/react@16.3.3(@testing-library/dom@10.4.1)(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(react-dom@19.3.1(react@19.3.1))(react@19.3.1)(vite-plugin-css-injected-by-js@5.0.2(vite@8.3.5(@types/node@26.6.5)))(vite@8.3.5(@types/node@26.6.5))(vitest@5.0.5(@types/node@26.6.5)(jsdom@30.1.3(@noble/hashes@2.4.0))(vite@8.3.5(@types/node@26.6.5)))
       '@playwright/test':
         specifier: ^1.64.1
         version: 1.64.1
@@ -102,8 +102,8 @@ packages:
     resolution: {integrity: sha512-ctxtJ/eA+t+6q2++vj5j7FYX3nRu311q1wfYH3xjlLOsczhlhxAg2FWNUXhpGvAw3BWo1xBcvOV6/YLc2r5FJw==}
     hasBin: true
 
-  '@brendanbank/atrium-host-bundle-utils@0.32.0':
-    resolution: {integrity: sha512-FCUbWbQALQsgMSdRgwLt8snhFL1pJvKo1SuZHEqRGbDTRfwutxwy6tT2PlLxd1SwEPDgOutXPq2Ps/4O8TMcPQ==}
+  '@brendanbank/atrium-host-bundle-utils@0.32.1':
+    resolution: {integrity: sha512-YKPYQW2eCt9i29OGgoFkqe6/DuYV0S+LGOalpna2lcz4dWbmbMh0zdS1QNUuIlqwK4P+CzHEPfsruKJnbtdncA==}
     peerDependencies:
       '@tanstack/react-query': ^5.0.0
       react: ^18.0.0 || ^19.0.0
@@ -116,13 +116,13 @@ packages:
       vite-plugin-css-injected-by-js:
         optional: true
 
-  '@brendanbank/atrium-host-types@0.32.0':
-    resolution: {integrity: sha512-rfOhH6/FsjHLyY6+t/O9r0Siy/AZF0rF6U/ei8aItfUAWGe/E7Km8/xaDqQeHEvtCWBZ314fzzt7EPK6qc0l5g==}
+  '@brendanbank/atrium-host-types@0.32.1':
+    resolution: {integrity: sha512-ynM1RbjebUN7N8vE4TZMylwaHfzJLcONcI4JRF0uyWgHOWMozNwjKojiEdROGAhgZWjmz1pGcmhJeiy4C4HZSQ==}
     peerDependencies:
       react: ^18.0.0 || ^19.0.0
 
-  '@brendanbank/atrium-test-utils@0.32.0':
-    resolution: {integrity: sha512-4JpuK2/XHoJ/qre5ChcOTDyg9mZqO+KsM+Gbtc0Bcudrcht2hvecfmStacOvBUFW4uds+zR84ysF7fcRZsNHyw==}
+  '@brendanbank/atrium-test-utils@0.32.1':
+    resolution: {integrity: sha512-P47VUOhkodceqNk84Dyd2z5O1Av3iA5Jm2khxRu6XS4Z2KB/WhBgvokp9jhN06XImytlhnkbqekL67bEglMfVw==}
     peerDependencies:
       '@tanstack/react-query': ^5.0.0
       '@testing-library/react': ^16.0.0
@@ -1113,9 +1113,9 @@ snapshots:
     dependencies:
       css-tree: 3.2.1
 
-  '@brendanbank/atrium-host-bundle-utils@0.32.0(@tanstack/react-query@5.104.5(@types/react@19.3.0)(react@19.3.1))(react-dom@19.3.1(react@19.3.1))(react@19.3.1)(vite-plugin-css-injected-by-js@5.0.2(vite@8.3.5(@types/node@26.6.5)))(vite@8.3.5(@types/node@26.6.5))':
+  '@brendanbank/atrium-host-bundle-utils@0.32.1(@tanstack/react-query@5.104.5(@types/react@19.3.0)(react@19.3.1))(react-dom@19.3.1(react@19.3.1))(react@19.3.1)(vite-plugin-css-injected-by-js@5.0.2(vite@8.3.5(@types/node@26.6.5)))(vite@8.3.5(@types/node@26.6.5))':
     dependencies:
-      '@brendanbank/atrium-host-types': 0.32.0(react@19.3.1)
+      '@brendanbank/atrium-host-types': 0.32.1(react@19.3.1)
       '@tanstack/react-query': 5.104.5(@types/react@19.3.0)(react@19.3.1)
       react: 19.3.1
       react-dom: 19.3.1(react@19.3.1)
@@ -1123,14 +1123,14 @@ snapshots:
       vite: 8.3.5(@types/node@26.6.5)
       vite-plugin-css-injected-by-js: 5.0.2(vite@8.3.5(@types/node@26.6.5))
 
-  '@brendanbank/atrium-host-types@0.32.0(react@19.3.1)':
+  '@brendanbank/atrium-host-types@0.32.1(react@19.3.1)':
     dependencies:
       react: 19.3.1
 
-  '@brendanbank/atrium-test-utils@0.32.0(@tanstack/react-query@5.104.5(@types/react@19.3.0)(react@19.3.1))(@testing-library/react@16.3.3(@testing-library/dom@10.4.1)(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(react-dom@19.3.1(react@19.3.1))(react@19.3.1)(vite-plugin-css-injected-by-js@5.0.2(vite@8.3.5(@types/node@26.6.5)))(vite@8.3.5(@types/node@26.6.5))(vitest@5.0.5(@types/node@26.6.5)(jsdom@30.1.3(@noble/hashes@2.4.0))(vite@8.3.5(@types/node@26.6.5)))':
+  '@brendanbank/atrium-test-utils@0.32.1(@tanstack/react-query@5.104.5(@types/react@19.3.0)(react@19.3.1))(@testing-library/react@16.3.3(@testing-library/dom@10.4.1)(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1))(react-dom@19.3.1(react@19.3.1))(react@19.3.1)(vite-plugin-css-injected-by-js@5.0.2(vite@8.3.5(@types/node@26.6.5)))(vite@8.3.5(@types/node@26.6.5))(vitest@5.0.5(@types/node@26.6.5)(jsdom@30.1.3(@noble/hashes@2.4.0))(vite@8.3.5(@types/node@26.6.5)))':
     dependencies:
-      '@brendanbank/atrium-host-bundle-utils': 0.32.0(@tanstack/react-query@5.104.5(@types/react@19.3.0)(react@19.3.1))(react-dom@19.3.1(react@19.3.1))(react@19.3.1)(vite-plugin-css-injected-by-js@5.0.2(vite@8.3.5(@types/node@26.6.5)))(vite@8.3.5(@types/node@26.6.5))
-      '@brendanbank/atrium-host-types': 0.32.0(react@19.3.1)
+      '@brendanbank/atrium-host-bundle-utils': 0.32.1(@tanstack/react-query@5.104.5(@types/react@19.3.0)(react@19.3.1))(react-dom@19.3.1(react@19.3.1))(react@19.3.1)(vite-plugin-css-injected-by-js@5.0.2(vite@8.3.5(@types/node@26.6.5)))(vite@8.3.5(@types/node@26.6.5))
+      '@brendanbank/atrium-host-types': 0.32.1(react@19.3.1)
       '@tanstack/react-query': 5.104.5(@types/react@19.3.0)(react@19.3.1)
       '@testing-library/react': 16.3.3(@testing-library/dom@10.4.1)(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
       react: 19.3.1
