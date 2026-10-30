@@ -254,7 +254,12 @@ services:
         condition: service_started
 
   mysql:
-    image: mysql:8.0
+    # 8.4 LTS, the same line atrium has run since 0.32. NOT bumped by
+    # atrium-watch.yml — the bump action rewrites the atrium tag only, so
+    # this line moves by hand. 8.4 upgrades an 8.0 data directory in place
+    # on first start and 8.0 cannot open it afterwards: dump the database
+    # BEFORE an existing stack first starts on a new major line.
+    image: mysql:8.4
     restart: unless-stopped
     command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --default-time-zone=+00:00
     environment:
