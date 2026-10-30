@@ -241,9 +241,10 @@ class TsigReceiver:
         client side checks ``rdata.error`` *before* it checks the MAC,
         so this reaches the client as ``PeerBadKey`` / ``PeerBadSignature``
         rather than as a response it accepts. A bare unsigned ``NOTAUTH``
-        is accepted by dnspython's client without complaint — measured,
-        not assumed; see ``test_an_unsigned_refusal_would_be_accepted``
-        — which is why this is not one.
+        is a different fault: dnspython 2.8.0 accepted one without
+        complaint, and 2.9.0 refuses it with ``FormError``. See
+        ``test_an_unsigned_refusal_is_refused_by_the_client``. This is
+        the refusal a nameserver actually sends, so it is not one.
         """
         # The header is all we can trust: the rest failed to
         # authenticate. Opcode comes off the wire by hand rather than
@@ -319,8 +320,8 @@ class TsigReceiver:
         # ``make_response`` carries the request's keyring and key name
         # over, so this answer is really TSIG-signed, with ``error=0``.
         # That matters: an *unsigned* refusal is a different fault, and
-        # one dnspython's client accepts without complaint — measured by
-        # ``test_an_unsigned_refusal_would_be_accepted_by_the_client``.
+        # one dnspython's client refuses with ``FormError`` since 2.9.0.
+        # See ``test_an_unsigned_refusal_is_refused_by_the_client``.
         # The refusal the adapter is shown here is the one a nameserver
         # actually sends.
         response.set_rcode(RCODE_BEHAVIOURS[self.behaviour])

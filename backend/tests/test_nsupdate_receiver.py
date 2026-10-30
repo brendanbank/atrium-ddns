@@ -81,6 +81,7 @@ import pathlib
 import time
 from typing import Iterator
 
+import dns.exception
 import dns.flags
 import dns.message
 import dns.opcode
@@ -466,21 +467,30 @@ class TestTheSignatureIsVerified:
         assert receiver.updates == []
 
     @pytest.mark.harness_guard
-    def test_an_unsigned_refusal_would_be_accepted_by_the_client(
+    def test_an_unsigned_refusal_is_refused_by_the_client(
         self, receiver: TsigReceiver
     ) -> None:
-        """Why the receiver's refusal carries a TSIG error code.
+        """An unsigned answer to a signed request does not parse.
 
-        Measured rather than assumed, because the obvious
-        implementation — answer a bare ``NOTAUTH`` and let the client
-        notice — does not work: dnspython does not require a signed
-        request to get a signed response, so an unsigned refusal comes
-        back as an ordinary message with no exception raised. Before
-        #142 that was compounded — the adapter did not read the rcode
-        either — and a rejected update reported ``good``. The rcode is
-        read now (:class:`TestTheRcodeIsReadNow`), but this half still
-        has to hold on its own: a refusal the client accepts silently is
-        a refusal whose rcode never reaches the code that reads it.
+        Inverted, not deleted. This was
+        ``test_an_unsigned_refusal_would_be_accepted_by_the_client`` and
+        it pinned dnspython 2.8.0, where a bare ``NOTAUTH`` answering a
+        signed request came back as an ordinary message with no
+        exception raised. dnspython 2.9.0, which atrium 0.32.1 ships,
+        refuses it: ``from_wire`` given a ``request_mac`` now raises
+        ``FormError`` when the response carries no TSIG. So an unsigned
+        refusal no longer reaches the adapter as a message at all. It is
+        an exception, and ``nsupdate.py`` reports every exception from
+        ``dns.query.tcp`` as ``dnserr``.
+
+        The receiver still signs its refusals. A real nameserver answers
+        a bad key or signature with a TSIG error code
+        (``_tsig_error_response``), and that reaches the client as
+        ``PeerBadKey`` / ``PeerBadSignature``, which is the shape the
+        signature tests assert. This test says what happens to the shape
+        the receiver does not send. If dnspython ever relaxes the check
+        again, this goes red and points at the change rather than letting
+        an unsigned refusal pass silently.
 
         This sends the raw message itself rather than going through the
         adapter: it is a statement about dnspython's client, not about
@@ -504,18 +514,21 @@ class TestTheSignatureIsVerified:
         bare.set_rcode(dns.rcode.NOTAUTH)
         wire = bare.to_wire()
 
-        # Parsed the way `dns.query.tcp` parses a response to a signed
-        # request: the client's keyring and the request's MAC. No
-        # exception, which is the finding — an unsigned refusal is
-        # accepted, so a receiver that answered one would be reporting
-        # a rejected update through a path the adapter treats as normal.
-        parsed = dns.message.from_wire(
-            wire, keyring=receiver.keyring, request_mac=signed.mac
-        )
-        assert parsed.rcode() == dns.rcode.NOTAUTH
-        assert not parsed.had_tsig, (
+        # Without a request MAC the same bytes parse cleanly. That makes
+        # the MAC the only thing the refusal below depends on, rather
+        # than a malformed message.
+        unchecked = dns.message.from_wire(wire)
+        assert unchecked.rcode() == dns.rcode.NOTAUTH
+        assert not unchecked.had_tsig, (
             "this test is about an UNsigned refusal and built a signed one"
         )
+
+        # Parsed the way `dns.query.tcp` parses a response to a signed
+        # request: the client's keyring and the request's MAC.
+        with pytest.raises(dns.exception.FormError, match="requires a TSIG"):
+            dns.message.from_wire(
+                wire, keyring=receiver.keyring, request_mac=signed.mac
+            )
 
 
 # --------------------------------------------------------------------------
