@@ -7,7 +7,7 @@
 #      bundle into /opt/atrium/static/host so atrium serves it at
 #      /host/main.js (same origin as the SPA, no CORS).
 
-ARG ATRIUM_IMAGE=ghcr.io/brendanbank/atrium:0.32.2
+ARG ATRIUM_IMAGE=ghcr.io/brendanbank/atrium:0.32.4
 
 # ---- frontend-builder ----
 # `--platform=$BUILDPLATFORM`: the output is a plain JS bundle, identical
